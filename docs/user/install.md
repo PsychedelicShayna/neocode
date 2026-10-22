@@ -205,6 +205,29 @@ or effort changes. Following stops when you close the inspector or turn it off.
 Role-definition changes may still need Refresh. Opening the inspector does not
 start a stopped session or change the terminal's settings.
 
+Open the right panel and choose **Native history**, either in its launcher or
+the **+** menu, to inspect a NeoPi thread's canonical journal. **Active branch**
+reads the branch selected by NeoPi when the snapshot starts. **Whole journal**
+includes alternate branches. Select
+an entry to inspect its content, native ID and parent. Compaction, context-reset
+and branch-summary records remain visible. Tools and system-event filters change
+only what the panel shows.
+
+Use **Load older entries** to page through the complete snapshot, including
+history beyond the chat import's limits. **Refresh snapshot** starts a new read.
+The panel does not follow live changes. If the active branch changes during
+paging, NeoCode discards the old snapshot and asks you to refresh rather than
+mixing branches.
+
+This view is read-only. It does not start a stopped agent, change model settings,
+move NeoPi's active leaf or replace the main chat's imported transcript. Live
+sessions are read through their existing owner; stopped sessions use NeoPi's
+read-only journal command. The configured NeoPi must advertise `session_journal`.
+Unknown entry and content types remain available as canonical JSON. Native
+images, text, reasoning, tool calls and results use their recorded content;
+extension-specific media without a recognized native format can be inspected in
+JSON rather than being silently removed.
+
 To go the other way, use **Continue in terminal** in a NeoPi thread's header:
 NeoCode stops its NeoPi process and copies the command that reopens the same
 native session in `npi`. If the terminal still owns the session, NeoCode only

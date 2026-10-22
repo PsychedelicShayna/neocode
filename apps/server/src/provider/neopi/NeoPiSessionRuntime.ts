@@ -187,6 +187,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const attachedReadCommands = new Set([
     "get_state",
     "get_entries",
+    "get_entries_page",
     "get_messages_page",
     "get_usage",
     "get_roles",

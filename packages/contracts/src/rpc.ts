@@ -50,6 +50,7 @@ import {
   NeoPiSessionConfigurationInput,
   NeoPiSessionConfigurationResult,
 } from "./neopiSessions.ts";
+import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 import {
   AssetAccessError,
   AssetCreateUrlInput,
@@ -308,6 +309,7 @@ export const WS_METHODS = {
   neopiSessionsHandoff: "neopiSessions.handoff",
   neopiSessionsConfiguration: "neopiSessions.configuration",
   neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
+  neopiSessionsJournal: "neopiSessions.journal",
   assetsCreateUrl: "assets.createUrl",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
   attachmentsDelete: "attachments.delete",
@@ -1027,6 +1029,12 @@ const WsNeoPiSessionsWatchConfigurationRpc = Rpc.make(WS_METHODS.neopiSessionsWa
   stream: true,
 });
 
+const WsNeoPiSessionsJournalRpc = Rpc.make(WS_METHODS.neopiSessionsJournal, {
+  payload: NeoPiSessionJournalInput,
+  success: NeoPiSessionJournalResult,
+  error: EnvironmentAuthorizationError,
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -1522,6 +1530,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiSessionsHandoffRpc,
   WsNeoPiSessionsConfigurationRpc,
   WsNeoPiSessionsWatchConfigurationRpc,
+  WsNeoPiSessionsJournalRpc,
   WsAssetsCreateUrlRpc,
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,

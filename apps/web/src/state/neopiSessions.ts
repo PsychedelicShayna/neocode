@@ -34,6 +34,11 @@ export const neopiSessionConfiguration = createEnvironmentRpcCommand(connectionA
   tag: WS_METHODS.neopiSessionsConfiguration,
 });
 
+export const neopiSessionJournal = createEnvironmentRpcCommand(connectionAtomRuntime, {
+  label: "environment-data:neopi-sessions:journal",
+  tag: WS_METHODS.neopiSessionsJournal,
+});
+
 export const neopiSessionConfigurationChanges = createEnvironmentRpcSubscriptionAtomFamily(
   connectionAtomRuntime,
   {

@@ -117,6 +117,8 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeNeoPiSessionCatalog } from "./provider/neopi/NeoPiSessionCatalog.ts";
+import { makeNeoPiSessionJournal } from "./provider/neopi/NeoPiSessionJournal.ts";
+import { makeNeoPiNativeConversation } from "./provider/neopi/NeoPiNativeConversation.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -630,6 +632,8 @@ const makeWsRpcLayer = (
       >();
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
       const neopiSessionCatalog = yield* makeNeoPiSessionCatalog();
+      const neopiSessionJournal = yield* makeNeoPiSessionJournal();
+      const neopiNativeConversation = yield* makeNeoPiNativeConversation();
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -3209,6 +3213,18 @@ const makeWsRpcLayer = (
             neopiSessionCatalog.watchConfiguration(input),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.neopiSessionsJournal]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsJournal, neopiSessionJournal(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiSessionsWatchJournal]: (input) =>
+          observeRpcStream(WS_METHODS.neopiSessionsWatchJournal, neopiNativeConversation.watch(input.threadId), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsNavigateTree]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsNavigateTree, neopiNativeConversation.navigate(input), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsResumeTree]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsResumeTree, neopiNativeConversation.resume(input), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsCancelNavigation]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsCancelNavigation, neopiNativeConversation.cancel(input.threadId), { "rpc.aggregate": "workspace" }),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,

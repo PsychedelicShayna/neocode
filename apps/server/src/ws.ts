@@ -117,6 +117,7 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeNeoPiSessionCatalog } from "./provider/neopi/NeoPiSessionCatalog.ts";
+import { makeNeoPiModels } from "./provider/neopi/NeoPiModels.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -630,6 +631,7 @@ const makeWsRpcLayer = (
       >();
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
       const neopiSessionCatalog = yield* makeNeoPiSessionCatalog();
+      const neopiModels = yield* makeNeoPiModels();
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -3209,6 +3211,14 @@ const makeWsRpcLayer = (
             neopiSessionCatalog.watchConfiguration(input),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.neopiModelsRead]: (input) => neopiModels.read(input),
+        [WS_METHODS.neopiModelsWatch]: (input) => neopiModels.watch(input),
+        [WS_METHODS.neopiModelsUpdate]: (input) => neopiModels.update(input),
+        [WS_METHODS.neopiModelsAccounts]: (input) => neopiModels.accounts(input),
+        [WS_METHODS.neopiModelsAuthStart]: (input) => neopiModels.startAuth(input),
+        [WS_METHODS.neopiModelsAuthWatch]: (input) => neopiModels.watchAuth(input),
+        [WS_METHODS.neopiModelsAuthRespond]: (input) => neopiModels.respondAuth(input),
+        [WS_METHODS.neopiModelsAuthCancel]: (input) => neopiModels.cancelAuth(input),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,

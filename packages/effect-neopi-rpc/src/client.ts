@@ -339,7 +339,8 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               if (result.kind === "reply") return result.value;
             }
           })
-        : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
+        // Native login owns its interactive lifetime; Models keeps an explicit cancellation lease.
+        : cmd.type === "login" ? awaitReply : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
       return yield* wait.pipe(
         Effect.catchTag("TimeoutError", () =>
           Effect.fail(

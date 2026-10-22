@@ -14,6 +14,18 @@ You need an installed, authenticated provider before starting a thread. You can
 launch NeoCode and configure providers afterwards. NeoPi is enabled by default;
 explicit saved provider and model choices are preserved.
 
+Open **Models** from the sidebar or press **Alt-M** to configure NeoPi's native
+inference providers, model roles and effort rules. Choose the environment and
+project whose settings you want to change. Opening Models from a connected
+thread uses that native session instead. Changes go through NeoPi and retain
+its global/project scope rules; an edit made elsewhere can require a refresh
+before you save.
+
+Provider login, API keys and saved-account removal are handled by NeoPi.
+NeoCode does not keep another credential vault. Models requires a native
+executable advertising the Models configuration contract; an older executable
+shows an update error rather than pretending a save worked.
+
 ## Upstream command line
 
 ```bash
@@ -79,7 +91,7 @@ update fails. Download the new `.deb` and install it the same way.
 The [NeoPi-enabled Linux AppImage](https://github.com/PsychedelicShayna/neocode/releases)
 includes `npi` and runs it without a separate installation. To use its terminal
 agent, run `./T3-Code-npi.AppImage --npi --help` (or replace `--help` with any
-`npi` arguments). Authenticate with `npi` before using accounts that require it.
+`npi` arguments). Authenticate through **Models**, or use the native `npi` login.
 
 On Linux, packaged NeoCode claims the `t3code:` login callback handler. Starting
 a source build normally leaves the installed handler unchanged. To use a built

@@ -182,19 +182,30 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       : Effect.fail(
           new NeoPiRuntimeError({ code: "closed", message: "NeoPi session is not connected" }),
         );
-  // Only read operations and interrupting our own turn may cross an attached
-  // control connection. New mutating commands are refused by default.
-  const attachedReadCommands = new Set([
+  // Native settings/auth operations and interrupting our own turn may cross
+  // an attached control connection. Other session mutations remain owner-only.
+  const attachedCommands = new Set([
     "get_state",
     "get_entries",
     "get_messages_page",
     "get_usage",
     "get_roles",
     "get_commands",
+    "get_models_configuration",
+    "set_model_role_configuration",
+    "set_model_role_storage",
+    "set_effort_rules",
+    "get_login_providers",
+    "get_logout_accounts",
+    "set_provider_api_key",
+    "login",
+    "cancel_login",
+    "logout",
   ]);
+  const modelsAuthUi = new Set<string>();
   const request: NeoPiRpcClient["request"] = (cmd) =>
     Effect.gen(function* () {
-      if (!attachedReadCommands.has(cmd.type) && !(cmd.type === "abort" && active))
+      if (!attachedCommands.has(cmd.type) && !(cmd.type === "abort" && active))
         yield* requireOwner(cmd.type);
       if (!client)
         return yield* new NeoPiRpcError({
@@ -414,7 +425,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     });
   const handleEvent = (frame: NeoPiRuntimeFrame) =>
     Effect.gen(function* () {
-      if (frame.type === "model_changed" || frame.type === "thinking_level_changed")
+      if (frame.type === "model_changed" || frame.type === "thinking_level_changed" || frame.type === "models_configuration_changed" || frame.type === "themes_configuration_changed")
         yield* invalidateConfiguration;
       // Control subscriptions include terminal-originated turns. They are not
       // imported live: without a NeoCode-started turn there is no thread turn
@@ -675,6 +686,12 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
               );
               yield* Stream.runForEach(transport.uiRequests, (frame) =>
                 Effect.gen(function* () {
+                  if (typeof frame.loginId === "string") {
+                    if (frame.method === "input") modelsAuthUi.add(frame.id);
+                    if (frame.method === "cancel" && typeof frame.targetId === "string") modelsAuthUi.delete(frame.targetId);
+                    yield* emit(frame);
+                    return;
+                  }
                   if (attached && !active) return;
                   if (activeUiMethods.has(frame.method)) {
                     if (
@@ -1254,7 +1271,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     applyModelSelection,
     respondUi: (response) =>
       Effect.gen(function* () {
-        yield* requireOwner("respond to owner UI");
+        if (!modelsAuthUi.has(response.id)) yield* requireOwner("respond to owner UI");
         const channel = client ?? earlyUi;
         if (!channel)
           return yield* new NeoPiRpcError({
@@ -1263,6 +1280,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           });
         yield* channel.respondUi(response);
         uiPending.delete(response.id);
+        modelsAuthUi.delete(response.id);
       }),
   } satisfies NeoPiSessionRuntimeShape;
 });

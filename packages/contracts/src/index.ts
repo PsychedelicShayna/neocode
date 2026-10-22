@@ -34,6 +34,7 @@ export * from "./project.ts";
 export * from "./filesystem.ts";
 export * from "./agentSessions.ts";
 export * from "./neopiSessions.ts";
+export * from "./neopiModels.ts";
 export * from "./assets.ts";
 export * from "./review.ts";
 export * from "./browserImport.ts";

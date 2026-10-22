@@ -2,7 +2,7 @@ import {
   T3_CODE_DARK_THEME_COLORS,
   T3_CODE_LIGHT_THEME_COLORS,
   type ThemeAppearance,
-} from "./themePalettes.js";
+} from "./themePalettes.ts";
 
 export type ThemePreviewColors = Readonly<{
   canvas: string;

@@ -9,6 +9,7 @@ import {
   type OrchestrationProjectShell,
   ProjectId,
   ProviderInstanceId,
+  resolveProviderInstanceEnabled,
   ThreadId,
   TurnId,
   WORKTREE_SETUP_ACTIVITY_KIND,
@@ -16,6 +17,7 @@ import {
   worktreeSetupActivityId,
 } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { getThreadRuntimeReadOnlyReason, isModelSelectionProviderEnabled } from "@t3tools/shared/serverSettings";
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
@@ -176,10 +178,23 @@ const recordStartupHeartbeat = Effect.gen(function* () {
   });
 });
 
-const getAutoBootstrapThreadModelSelection = (): ModelSelection => ({
-  instanceId: ProviderInstanceId.make("codex"),
-  model: DEFAULT_MODEL,
-});
+const getAutoBootstrapThreadModelSelection = (
+  settings: ServerSettingsValue,
+): ModelSelection | null => {
+  const defaultId = ProviderInstanceId.make("neopi");
+  const explicitDefault = settings.providerInstances[defaultId];
+  const defaultEnabled = explicitDefault === undefined
+    ? settings.providers.neopi.enabled
+    : explicitDefault.driver === "neopi" && resolveProviderInstanceEnabled(explicitDefault);
+  let instanceId: ProviderInstanceId | undefined = defaultEnabled ? defaultId : undefined;
+  if (instanceId === undefined) {
+    const configured = Object.entries(settings.providerInstances).find(
+      ([, instance]) => instance.driver === "neopi" && resolveProviderInstanceEnabled(instance),
+    );
+    if (configured) instanceId = ProviderInstanceId.make(configured[0]);
+  }
+  return instanceId === undefined ? null : { instanceId, model: DEFAULT_MODEL };
+};
 
 export const resolveWelcomeBase = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
@@ -207,14 +222,16 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
 
   if (serverConfig.autoBootstrapProjectFromCwd) {
     const settings = yield* (yield* ServerSettings.ServerSettingsService).getSettings;
-    const defaultModelSelection =
-      settings.defaultModelSelection ?? getAutoBootstrapThreadModelSelection();
+    const defaultModelSelection = settings.defaultModelSelection &&
+      isModelSelectionProviderEnabled(settings, settings.defaultModelSelection)
+      ? settings.defaultModelSelection
+      : getAutoBootstrapThreadModelSelection(settings);
     yield* Effect.gen(function* () {
       const existingProject = yield* projectionReadModelQuery.getActiveProjectByWorkspaceRoot(
         serverConfig.cwd,
       );
       let nextProjectId: ProjectId;
-      let nextThreadModelSelection: ModelSelection;
+      let nextThreadModelSelection: ModelSelection | null;
 
       if (Option.isNone(existingProject)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
@@ -234,15 +251,20 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
       } else {
         nextProjectId = existingProject.value.id;
         bootstrapProjectId = nextProjectId;
-        nextThreadModelSelection =
-          resolveProjectSettings(settings, nextProjectId, existingProject.value).settings
-            .defaultModelSelection ?? defaultModelSelection;
+        const scopedSelection = resolveProjectSettings(
+          settings, nextProjectId, existingProject.value,
+        ).settings.defaultModelSelection;
+        nextThreadModelSelection = scopedSelection &&
+          isModelSelectionProviderEnabled(settings, scopedSelection)
+          ? scopedSelection
+          : defaultModelSelection;
       }
 
       yield* Effect.gen(function* () {
         const existingThreadId =
           yield* projectionReadModelQuery.getFirstActiveThreadIdByProjectId(nextProjectId);
         if (Option.isNone(existingThreadId)) {
+          if (nextThreadModelSelection === null) return;
           const createdAt = DateTime.formatIso(yield* DateTime.now);
           const createdThreadId = ThreadId.make(yield* randomUUID);
           yield* orchestrationEngine.dispatch({
@@ -642,6 +664,15 @@ export const reconcileProviderSessions = Effect.gen(function* () {
           ),
         );
       });
+    const readOnlyReason = getThreadRuntimeReadOnlyReason({
+      modelSelection: thread.modelSelection,
+      session,
+      settings: Option.getOrUndefined(restartSettings),
+    });
+    if (readOnlyReason !== null) {
+      yield* settleAsError(readOnlyReason);
+      continue;
+    }
 
     if (
       Option.isSome(binding) &&

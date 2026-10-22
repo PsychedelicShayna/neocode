@@ -49,6 +49,7 @@ import { GitCommitSheet } from "./features/threads/git/GitCommitSheet";
 import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
 import { GitOverviewSheet } from "./features/threads/git/GitOverviewSheet";
 import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
+import { NeoPiModelsScreen } from "./features/threads/NeoPiModelsScreen";
 import { ConnectionsRouteScreen } from "./features/connection/ConnectionsRouteScreen";
 import { ConnectionsNewRouteScreen } from "./features/connection/ConnectionsNewRouteScreen";
 import { HomeRouteScreen } from "./features/home/HomeRouteScreen";
@@ -614,6 +615,11 @@ const RootStackConfig = createNativeStackNavigator({
         headerBackVisible: false,
         ...getCompactBrandHeaderOptions(),
       },
+    }),
+    Models: createNativeStackScreen({
+      screen: NeoPiModelsScreen,
+      linking: "models",
+      options: { ...GLASS_HEADER_OPTIONS, title: "Models" },
     }),
     Thread: createNativeStackScreen({
       screen: ThreadRouteScreen,

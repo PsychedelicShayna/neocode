@@ -13,6 +13,7 @@ import { createModelSelection } from "./model.ts";
 import { resolveProjectScripts, projectScriptsInheritDefaults } from "./projectScripts.ts";
 import {
   applyServerSettingsPatch,
+  getThreadRuntimeReadOnlyReason,
   isModelSelectionProviderEnabled,
   parsePersistedServerObservabilitySettings,
   resolveSourceControlWriterModelSelection,
@@ -24,6 +25,28 @@ import {
 const FOLDED_SERVER_SETTINGS = { ...DEFAULT_SERVER_SETTINGS, projectSettingsFolded: true };
 
 describe("serverSettings helpers", () => {
+  it("keeps old runtime settings but never treats them as an enabled execution choice", () => {
+    const instanceId = ProviderInstanceId.make("legacy");
+    const legacy = { driver: ProviderDriverKind.make("codex"), enabled: true, config: { homePath: "/saved/codex" } };
+    const settings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: { [instanceId]: legacy } };
+    expect(isModelSelectionProviderEnabled(settings, { instanceId, model: "old-model" })).toBe(false);
+    expect(settings.providerInstances[instanceId]).toBe(legacy);
+    expect(isModelSelectionProviderEnabled(settings, { instanceId: ProviderInstanceId.make("neopi"), model: "openai-codex/current" })).toBe(true);
+  });
+
+  it("makes legacy history read-only even when a draft selects NeoPi", () => {
+    const modelSelection = { instanceId: ProviderInstanceId.make("neopi"), model: "anthropic/current" };
+    expect(getThreadRuntimeReadOnlyReason({ modelSelection, session: { providerName: "claudeAgent" }, settings: DEFAULT_SERVER_SETTINGS })).toContain("read-only");
+    expect(getThreadRuntimeReadOnlyReason({ modelSelection, session: { providerName: "neopi" }, settings: DEFAULT_SERVER_SETTINGS })).toBeNull();
+  });
+
+  it("distinguishes native inference-provider names from runtime identity", () => {
+    const instanceId = ProviderInstanceId.make("personal");
+    const settings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: { [instanceId]: { driver: ProviderDriverKind.make("neopi"), enabled: true } } };
+    for (const model of ["openai-codex/current", "anthropic/current", "cursor/current", "openrouter/current"]) {
+      expect(getThreadRuntimeReadOnlyReason({ modelSelection: { instanceId, model }, settings })).toBeNull();
+    }
+  });
   it("changes a cleanup rule without replacing the machine's other rules", () => {
     const enabled = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
       storageCleanup: { worktreeAfterDays: 8, worktreeOnMerge: true, logsAfterDays: 30 },

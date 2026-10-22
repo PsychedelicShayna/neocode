@@ -141,6 +141,12 @@ function AppSettingsSection() {
       ) : (
         versionRow
       )}
+      {Constants.expoConfig?.extra?.distribution === "sideload" ? (
+        <Text className="px-4 pb-4 text-sm text-foreground-muted">
+          NeoCode sideload build. Install a signed NeoCode build to update.
+          Upstream store and automatic OTA replacements are disabled.
+        </Text>
+      ) : null}
     </SettingsSection>
   );
 }

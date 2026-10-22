@@ -1,10 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
+import { EventEmitter } from "node:events";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import type * as Electron from "electron";
+import * as Option from "effect/Option";
 import { beforeEach, vi } from "vite-plus/test";
 
 const {
@@ -108,6 +110,42 @@ describe("ElectronWindow", () => {
     windowsForegroundPrepareMock.mockReset().mockResolvedValue(false);
     windowsForegroundCloseMock.mockReset();
   });
+
+  it.effect("keeps surviving renderers registered when the active window closes", () =>
+    Effect.gen(function* () {
+      const createWindow = (id: number) =>
+        Object.assign(new EventEmitter(), {
+          id,
+          isDestroyed: () => false,
+          webContents: { id: id + 100 },
+        }) as unknown as Electron.BrowserWindow & EventEmitter;
+      const first = createWindow(1);
+      const second = createWindow(2);
+      const preview = createWindow(3);
+      const windows = yield* ElectronWindow.ElectronWindow;
+      yield* windows.setMain(first);
+      yield* windows.setMain(second);
+      assert.strictEqual(Option.getOrThrow(yield* windows.main), second);
+      first.emit("focus");
+      assert.strictEqual(Option.getOrThrow(yield* windows.main), first);
+      getFocusedWindowMock.mockReturnValue(preview);
+      assert.strictEqual(Option.getOrThrow(yield* windows.focusedMainOrFirst), first);
+      assert.strictEqual(Option.getOrThrow(yield* windows.fromWebContentsId(102)), second);
+      assert.isTrue(Option.isNone(yield* windows.fromWebContentsId(103)));
+
+      first.emit("closed");
+      assert.equal(first.listenerCount("focus"), 0);
+      assert.strictEqual(Option.getOrThrow(yield* windows.main), second);
+      assert.isTrue(Option.isNone(yield* windows.fromWebContentsId(101)));
+      yield* windows.clearMain(Option.some(first));
+      assert.strictEqual(Option.getOrThrow(yield* windows.main), second);
+      second.emit("closed");
+      assert.isTrue(Option.isNone(yield* windows.main));
+      const reopened = createWindow(4);
+      yield* windows.setMain(reopened);
+      assert.strictEqual(Option.getOrThrow(yield* windows.main), reopened);
+    }).pipe(Effect.provide(TestLayer)),
+  );
 
   for (const initial of [
     { name: "hidden", visible: false, minimized: false },

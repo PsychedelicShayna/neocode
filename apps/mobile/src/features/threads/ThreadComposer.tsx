@@ -1,3 +1,4 @@
+import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
 import { APP_BASE_NAME } from "../../lib/mobileBranding";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
@@ -320,6 +321,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       : "Send";
   const currentModelSelection = props.selectedThread.modelSelection;
   const currentRuntimeMode = props.selectedThread.runtimeMode;
+  const runtimeReadOnlyReason = getThreadRuntimeReadOnlyReason({
+    modelSelection: props.selectedThread.modelSelection,
+    session: props.selectedThread.session,
+    settings: props.serverConfig?.settings,
+    providers: props.serverConfig?.providers,
+  });
   const modelUnavailable =
     props.connectionState === "connected" &&
     isModelSelectionUnavailable(props.serverConfig, currentModelSelection);
@@ -417,6 +424,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const contextImports = useAtomValue(composerContextImportsAtom);
   const sendBlockedReason =
     props.sendBlockedReason ??
+    runtimeReadOnlyReason ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
     attachmentBlockReason;
   const canSend =
@@ -669,7 +677,12 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             {selectedProviderStatus.compatibilityAdvisory.message}
           </Text>
         ) : null}
-        {modelUnavailable ? (
+        {runtimeReadOnlyReason ? (
+          <Text accessibilityRole="text" className="px-3 py-2 text-xs text-foreground">
+            {runtimeReadOnlyReason}
+          </Text>
+        ) : null}
+        {!runtimeReadOnlyReason && modelUnavailable ? (
           <Pressable accessibilityRole="button" className="px-3 py-2" onPress={openSettings}>
             <Text className="text-xs text-foreground">Model unavailable. Open model settings.</Text>
           </Pressable>
@@ -757,7 +770,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 ref={inputRef}
                 multiline
                 value={props.draftMessage}
-                readOnly={voiceInput.freezesEditor}
+                readOnly={voiceInput.freezesEditor || runtimeReadOnlyReason !== null}
                 skills={composerMenu.skills}
                 selection={composerMenu.selection}
                 onChangeText={props.onChangeDraftMessage}

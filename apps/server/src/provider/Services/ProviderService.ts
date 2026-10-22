@@ -21,8 +21,6 @@ import type {
   ProviderSession,
   ProviderSessionStartInput,
   ProviderStopSessionInput,
-  ProviderUploadFeedbackInput,
-  ProviderUploadFeedbackResult,
   MessageId,
   ThreadId,
   ProviderTurnStartResult,
@@ -121,12 +119,6 @@ export interface ProviderServiceShape {
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
 
-  /**
-   * Upload a thread and return the provider's shareable feedback identifier.
-   */
-  readonly uploadFeedback: (
-    input: ProviderUploadFeedbackInput,
-  ) => Effect.Effect<ProviderUploadFeedbackResult, ProviderServiceError>;
 
   /**
    * Canonical provider runtime event stream.

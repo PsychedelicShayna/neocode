@@ -1139,3 +1139,30 @@ it.live("closes with EOF, drains stdout, then SIGTERM and SIGKILL", () =>
     ),
   ),
 );
+
+it.live("closes a bounded native observer even with an undrained event and active prompt", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const peer = yield* scriptedPeer({
+      ready: v2Ready,
+      onLine: (command, emit) => Effect.gen(function* () {
+        if (yield* negotiate(command, emit)) return;
+        if (command.type === "prompt") {
+          yield* emit({ type: "response", id: command.id, command: "prompt", success: true, data: { agentInvoked: true } });
+          yield* emit({ type: "message_start", messageId: "msg-stalled", message: { role: "assistant", content: [] } });
+        } else if (command.type === "get_state") {
+          yield* emit({ type: "response", id: command.id, command: "get_state", success: true, data: { isStreaming: true } });
+        }
+      }),
+    });
+    const client = yield* Client.make({
+      spawn: () => Effect.succeed(peer.handle), command: "npi", args: ["ctl", "pipe", "owner"], cwd: "/unused", env: {}, eventQueueCapacity: 1,
+    });
+    const prompt = yield* client.prompt({ type: "prompt", message: "pending" });
+    yield* Deferred.await(prompt.outcome);
+    // The response is behind message_start on stdout, so this is a receipt
+    // that the single-slot event queue is full without sleeping or polling.
+    yield* client.request({ type: "get_state" });
+    yield* client.close(0);
+    assert.equal((yield* Deferred.await(client.exit)).code, null);
+  })),
+);

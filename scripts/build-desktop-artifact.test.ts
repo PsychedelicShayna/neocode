@@ -585,7 +585,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }
 
     assert.deepStrictEqual(DESKTOP_FILE_EXCLUSIONS, [
-      "!**/node_modules/@anthropic-ai/claude-agent-sdk-*/**/*",
       "!**/*.map",
       "!**/*.d.cts",
       "!apps/desktop/resources/browser-secret",
@@ -684,10 +683,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         ...WINDOWS_SERVER_EXTRA_RESOURCES,
       ]);
       assert.deepStrictEqual(win.nsis, { differentialPackage: true });
-      // The Claude SDK platform packages and .bin shims never ship.
+      // Package-manager .bin shims never ship.
       assert.deepStrictEqual(WINDOWS_SERVER_ASAR_IGNORE_GLOBS, [
-        "**/node_modules/@anthropic-ai/claude-agent-sdk-*",
-        "**/node_modules/@anthropic-ai/claude-agent-sdk-*/**",
         "**/node_modules/.bin",
         "**/node_modules/.bin/**",
         "**/*.map",
@@ -770,9 +767,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       resolveMergedStageDependencies({
         platform: "mac",
         serverDependencies: {
-          "@anthropic-ai/claude-agent-sdk": "^0.3.170",
           "@ff-labs/fff-node": "0.9.4",
-          "@opencode-ai/sdk": "^1.3.15",
           "@pierre/diffs": "1.3.0",
           "node-pty": "1.1.0",
         },

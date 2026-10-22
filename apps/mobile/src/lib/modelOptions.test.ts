@@ -1,581 +1,123 @@
 import { describe, expect, it } from "vite-plus/test";
+import { DEFAULT_SERVER_SETTINGS, ProviderDriverKind, ProviderInstanceId, type ModelSelection, type ServerConfig, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
+import { buildModelOptions, groupByProvider, isModelSelectionUnavailable, resolveDefaultableModelSelection, resolveNewTaskModelSelection, resolveSelectableModelSelection } from "./modelOptions";
 
-import { ProviderInstanceId, type ModelSelection, type ServerConfig } from "@t3tools/contracts";
+const model = (slug: string, overrides: Partial<ServerProviderModel> = {}): ServerProviderModel => ({ slug, name: slug, isCustom: false, capabilities: null, ...overrides });
+const provider = (instanceId = "neopi", overrides: Partial<ServerProvider> = {}): ServerProvider => ({
+  instanceId: ProviderInstanceId.make(instanceId), driver: ProviderDriverKind.make("neopi"), displayName: "NeoPi",
+  enabled: true, installed: true, status: "ready", version: "1.0.0", auth: { status: "unknown" },
+  checkedAt: "2026-10-22T00:00:00.000Z", models: [model("openai-codex/current", { isDefault: true }), model("anthropic/current")], skills: [], slashCommands: [], ...overrides,
+});
+const config = (...providers: ReadonlyArray<ServerProvider>): ServerConfig => ({
+  providers,
+  settings: { ...DEFAULT_SERVER_SETTINGS, providerInstances: Object.fromEntries(providers.map((entry) => [entry.instanceId, { driver: entry.driver, enabled: entry.enabled, config: {} }])) },
+} as unknown as ServerConfig);
+const select = (instanceId = "neopi", model = "openai-codex/current"): ModelSelection => ({ instanceId: ProviderInstanceId.make(instanceId), model });
+const choose = (modelOptions: ReturnType<typeof buildModelOptions>, draftSelection: ModelSelection | null = null, projectDefaultSelection: ModelSelection | null = null, stickySelection: ModelSelection | null = null) => resolveNewTaskModelSelection({ modelOptions, draftSelection, projectDefaultSelection, stickySelection });
 
-import {
-  buildModelOptions,
-  groupByProvider,
-  isModelSelectionUnavailable,
-  resolveDefaultableModelSelection,
-  resolveNewTaskModelSelection,
-  resolveSelectableModelSelection,
-  type ModelOption,
-} from "./modelOptions";
-
-describe("mobile model options", () => {
-  it("groups models by provider and flags legacy entries", () => {
-    const config = {
-      providers: [
-        {
-          instanceId: "codex",
-          driver: "codex",
-          displayName: "Codex",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [
-            {
-              slug: "gpt-5.6-sol",
-              name: "GPT-5.6 Sol",
-              isCustom: false,
-              capabilities: null,
-            },
-            {
-              slug: "gpt-5.4",
-              name: "GPT-5.4",
-              isCustom: false,
-              isLegacy: true,
-              capabilities: null,
-            },
-          ],
-        },
-      ],
-    } as unknown as ServerConfig;
-
-    expect(groupByProvider(buildModelOptions(config, null))).toMatchObject([
-      {
-        providerKey: "codex",
-        providerLabel: "Codex",
-        models: [
-          { key: "codex:gpt-5.6-sol", label: "GPT-5.6 Sol", subtitle: "", isLegacy: false },
-          { key: "codex:gpt-5.4", label: "GPT-5.4", isLegacy: true },
-        ],
-      },
-    ]);
+describe("mobile NeoPi model options", () => {
+  it("groups native model backends without changing inference-provider identifiers", () => {
+    const native = provider("work", { displayName: "NeoPi Work", models: [
+      model("openai-codex/current", { name: "Current", subProvider: "OpenAI Codex" }),
+      model("anthropic/current", { name: "Current", subProvider: "Anthropic" }),
+      model("cursor/current", { subProvider: "Cursor" }),
+      model("openrouter/current", { subProvider: "OpenRouter" }),
+      model("google/current", { subProvider: "Google", isLegacy: true }),
+    ] });
+    const options = buildModelOptions(config(native), null);
+    expect(options.map((option) => option.selection.model)).toEqual(native.models.map((entry) => entry.slug));
+    expect(options.map((option) => option.subtitle)).toEqual(["OpenAI Codex", "Anthropic", "Cursor", "OpenRouter", "Google"]);
+    expect(options.at(-1)?.isLegacy).toBe(true);
+    expect(groupByProvider(options)).toEqual([{ providerKey: "work", providerLabel: "NeoPi Work", models: options }]);
   });
 
-  it("distinguishes same-name OpenCode models without changing their routing", () => {
-    const sources = [
-      { id: "anthropic", label: "Anthropic" },
-      { id: "github-copilot", label: "GitHub Copilot" },
-      { id: "opencode", label: "OpenCode Zen" },
-    ];
-    const config = {
-      providers: [
-        {
-          instanceId: "opencode_work",
-          driver: "opencode",
-          displayName: "OpenCode Work",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: sources.map((source) => ({
-            slug: `${source.id}/claude-fable-5`,
-            name: "Claude Fable 5",
-            subProvider: source.label,
-            isCustom: false,
-            capabilities: null,
-          })),
-        },
-      ],
-    } as unknown as ServerConfig;
-    const selection = {
-      instanceId: ProviderInstanceId.make("opencode_work"),
-      model: "github-copilot/claude-fable-5",
-    };
-
-    const options = buildModelOptions(config, selection);
-
-    expect(options).toMatchObject(
-      sources.map((source) => ({
-        key: `opencode_work:${source.id}/claude-fable-5`,
-        label: "Claude Fable 5",
-        subtitle: source.label,
-        providerLabel: "OpenCode Work",
-        selection: {
-          instanceId: "opencode_work",
-          model: `${source.id}/claude-fable-5`,
-        },
-      })),
-    );
-    expect(groupByProvider(options)).toEqual([
-      { providerKey: "opencode_work", providerLabel: "OpenCode Work", models: options },
-    ]);
+  it("keeps saved option choices without materializing catalog defaults", () => {
+    const native = provider("neopi", { models: [model("openai-codex/current", { capabilities: { optionDescriptors: [
+      { id: "reasoningEffort", label: "Thinking", type: "select", options: [{ id: "low", label: "Low", isDefault: true }, { id: "high", label: "High" }], currentValue: "low" },
+    ] } })] });
+    const environment = config(native);
+    expect(buildModelOptions(environment, select())[0]?.selection.options).toBeUndefined();
+    const selection = { ...select(), options: [{ id: "reasoningEffort", value: "high" }] };
+    expect(buildModelOptions(environment, selection)[0]?.selection.options).toEqual(selection.options);
   });
 
-  it("does not materialize catalog defaults for missing stored options", () => {
-    const config = {
-      providers: [
-        {
-          instanceId: "codex",
-          driver: "codex",
-          displayName: "Codex",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [
-            {
-              slug: "gpt-test",
-              name: "GPT Test",
-              isCustom: false,
-              capabilities: {
-                optionDescriptors: [
-                  {
-                    id: "serviceTier",
-                    label: "Service Tier",
-                    type: "select",
-                    options: [
-                      { id: "default", label: "Standard", isDefault: true },
-                      { id: "priority", label: "Fast" },
-                    ],
-                    currentValue: "default",
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      ],
-    } as unknown as ServerConfig;
-
-    const [option] = buildModelOptions(config, {
-      instanceId: ProviderInstanceId.make("codex"),
-      model: "gpt-test",
-    });
-
-    expect(option?.capabilities?.optionDescriptors?.[0]?.id).toBe("serviceTier");
-    expect(option?.selection.options).toBeUndefined();
-
-    const [explicitOption] = buildModelOptions(config, {
-      instanceId: ProviderInstanceId.make("codex"),
-      model: "gpt-test",
-      options: [{ id: "serviceTier", value: "priority" }],
-    });
-    expect(explicitOption?.selection.options).toEqual([{ id: "serviceTier", value: "priority" }]);
+  it.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"])("does not offer %s as a runtime or a new-task default", (driver) => {
+    const legacy = provider(driver, { driver: ProviderDriverKind.make(driver), displayName: driver });
+    const saved = select(driver, "saved-model");
+    const environment = config(legacy, provider());
+    const options = buildModelOptions(environment, saved);
+    expect(options.every((option) => option.providerDriver === "neopi")).toBe(true);
+    expect(resolveSelectableModelSelection(environment, saved)).toBeNull();
+    expect(resolveDefaultableModelSelection(environment, saved)).toBeNull();
+    expect(isModelSelectionUnavailable(environment, saved)).toBe(true);
+    expect(choose(options, saved)).toEqual(select());
+    expect(saved).toEqual(select(driver, "saved-model"));
   });
 
-  it("rejects stored selections whose provider is not usable", () => {
-    const config = {
-      providers: [
-        {
-          instanceId: "codex",
-          driver: "codex",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [],
-        },
-        {
-          instanceId: "claudeAgent",
-          driver: "claudeAgent",
-          enabled: false,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [],
-        },
-      ],
-    } as unknown as ServerConfig;
-
-    const usable = {
-      instanceId: ProviderInstanceId.make("codex"),
-      model: "gpt-5.6-sol",
-    };
-    const disabled = {
-      instanceId: ProviderInstanceId.make("claudeAgent"),
-      model: "claude-sonnet-5",
-    };
-    const removed = {
-      instanceId: ProviderInstanceId.make("codex_personal"),
-      model: "gpt-5.6-sol",
-    };
-
-    expect(resolveSelectableModelSelection(config, usable)).toBe(usable);
-    expect(resolveSelectableModelSelection(config, disabled)).toBeNull();
-    expect(resolveSelectableModelSelection(config, removed)).toBeNull();
-    expect(isModelSelectionUnavailable(config, disabled)).toBe(false);
-    // An offline environment has no config to validate.
-    expect(resolveSelectableModelSelection(null, disabled)).toBe(disabled);
+  it("does not resurrect an obsolete offline default as a phantom model option", () => {
+    const saved = select("claudeAgent", "saved-model");
+    expect(buildModelOptions(null, saved)).toEqual([]);
+    expect(choose([], saved)).toBeNull();
+    // The stored value survives until the environment can resolve its real runtime.
+    expect(resolveSelectableModelSelection(null, saved)).toBe(saved);
   });
 
-  describe("Antigravity selections", () => {
-    const selection = {
-      instanceId: ProviderInstanceId.make("google_work"),
-      model: "gemini-3.1-pro-high",
-      options: [{ id: "native-option", value: "saved/opaque-choice" }],
-    };
-    const model = {
-      slug: selection.model,
-      name: "Gemini 3.1 Pro High",
-      subProvider: "Google",
-      isCustom: false,
-      isDefault: true,
-      isLegacy: true,
-      capabilities: {
-        optionDescriptors: [
-          {
-            id: "native-option",
-            label: "Native option",
-            type: "select",
-            options: [{ id: "current/default", label: "Default", isDefault: true }],
-            currentValue: "current/default",
-          },
-        ],
-      },
-    };
-    const config = {
-      providers: [
-        {
-          instanceId: selection.instanceId,
-          driver: "antigravity",
-          displayName: "Google Work",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [model],
-        },
-      ],
-    } as unknown as ServerConfig;
-
-    it.each([
-      ["disabled", { enabled: false }],
-      ["uninstalled", { installed: false }],
-      ["signed out", { auth: { status: "unauthenticated" } }],
-      ["unavailable", { availability: "unavailable" }],
-    ] as const)("keeps a %s provider's selection and known model details", (_state, update) => {
-      const unavailableConfig = {
-        ...config,
-        providers: config.providers.map((provider) => ({ ...provider, ...update })),
-      };
-
-      expect(resolveSelectableModelSelection(unavailableConfig, selection)).toBe(selection);
-      expect(resolveDefaultableModelSelection(unavailableConfig, selection)).toBe(selection);
-      expect(isModelSelectionUnavailable(unavailableConfig, selection)).toBe(true);
-      expect(buildModelOptions(unavailableConfig, null)).toEqual([]);
-      const [option] = buildModelOptions(unavailableConfig, selection);
-      expect(option).toMatchObject({
-        key: `google_work:${selection.model}`,
-        label: model.name,
-        subtitle: "Google",
-        providerKey: "google_work",
-        providerLabel: "Google Work",
-        providerDriver: "antigravity",
-        isDefault: false,
-        isLegacy: true,
-        isUnavailable: true,
-        capabilities: model.capabilities,
-      });
-      expect(option?.selection).toBe(selection);
-    });
-
-    it("keeps an exact selection when its model leaves and returns to the catalog", () => {
-      const changedConfig = {
-        ...config,
-        providers: config.providers.map((provider) => ({
-          ...provider,
-          models: provider.models.map((model) => ({ ...model, slug: "gemini-3.1-pro-low" })),
-        })),
-      };
-
-      expect(resolveDefaultableModelSelection(changedConfig, selection)).toBe(selection);
-      expect(isModelSelectionUnavailable(changedConfig, selection)).toBe(true);
-      const options = buildModelOptions(changedConfig, selection);
-      const missing = options.find((option) => option.selection.model === selection.model);
-      expect(missing).toMatchObject({
-        label: selection.model,
-        providerLabel: "Google Work",
-        providerDriver: "antigravity",
-        isUnavailable: true,
-        capabilities: null,
-      });
-      expect(missing?.selection).toBe(selection);
-      expect(
-        resolveNewTaskModelSelection({
-          draftSelection: null,
-          projectDefaultSelection: resolveDefaultableModelSelection(changedConfig, selection),
-          stickySelection: null,
-          modelOptions: options,
-        }),
-      ).toBe(selection);
-
-      const [restored] = buildModelOptions(config, selection);
-      expect(isModelSelectionUnavailable(config, selection)).toBe(false);
-      expect(restored?.isUnavailable).not.toBe(true);
-      expect(restored?.selection).toBe(selection);
-      expect(resolveDefaultableModelSelection(config, selection)).toBe(selection);
-      expect(buildModelOptions(config, null)[0]?.selection.options).toBeUndefined();
-    });
-
-    it("uses configured instance metadata when provider status is missing", () => {
-      const missingStatusConfig = {
-        providers: [],
-        settings: {
-          providerInstances: {
-            [selection.instanceId]: { driver: "antigravity", displayName: "Google Work" },
-          },
-        },
-      } as unknown as ServerConfig;
-
-      expect(resolveDefaultableModelSelection(missingStatusConfig, selection)).toBe(selection);
-      expect(isModelSelectionUnavailable(missingStatusConfig, selection)).toBe(true);
-      expect(buildModelOptions(missingStatusConfig, selection)).toMatchObject([
-        {
-          providerDriver: "antigravity",
-          providerLabel: "Google Work",
-          isUnavailable: true,
-          selection,
-        },
-      ]);
-    });
-
-    it("keeps offline selections without assuming that an unknown instance is Antigravity", () => {
-      const unknownConfig = { ...config, providers: [] };
-
-      expect(resolveDefaultableModelSelection(null, selection)).toBe(selection);
-      expect(isModelSelectionUnavailable(null, selection)).toBe(false);
-      expect(buildModelOptions(null, selection)[0]?.selection).toBe(selection);
-      expect(buildModelOptions(null, selection)[0]?.isUnavailable).not.toBe(true);
-      expect(isModelSelectionUnavailable(unknownConfig, selection)).toBe(false);
-      expect(resolveSelectableModelSelection(unknownConfig, selection)).toBeNull();
-    });
+  it("uses runtime metadata rather than an instance id that happens to name an old runtime", () => {
+    const native = provider("codex_work");
+    const environment = config(native);
+    const saved = select("codex_work", "anthropic/current");
+    expect(resolveSelectableModelSelection(environment, saved)).toBe(saved);
+    expect(choose(buildModelOptions(environment, saved), saved)).toBe(saved);
+    expect(isModelSelectionUnavailable(environment, saved)).toBe(false);
   });
 
-  it("keeps legacy models out of implicit defaults", () => {
-    const config = {
-      providers: [
-        {
-          instanceId: "codex",
-          driver: "codex",
-          displayName: "Codex",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [
-            { slug: "gpt-5.6-sol", name: "GPT-5.6 Sol", isCustom: false, capabilities: null },
-            {
-              slug: "gpt-5.4",
-              name: "GPT-5.4",
-              isCustom: false,
-              isLegacy: true,
-              capabilities: null,
-            },
-          ],
-        },
-      ],
-    } as unknown as ServerConfig;
-
-    const current = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" };
-    const legacy = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
-
-    expect(resolveDefaultableModelSelection(config, current)).toBe(current);
-    // A legacy last-used selection falls through to the provider default.
-    expect(resolveDefaultableModelSelection(config, legacy)).toBeNull();
-    // Offline: nothing to validate against, selection passes through.
-    expect(resolveDefaultableModelSelection(null, legacy)).toBe(legacy);
+  it.each([
+    { enabled: false }, { installed: false }, { auth: { status: "unauthenticated" as const } },
+    { availability: "unavailable" as const },
+  ])("rejects unavailable native configurations for new selections: %j", (state) => {
+    const environment = config(provider("neopi", state));
+    expect(resolveSelectableModelSelection(environment, select())).toBeNull();
+    expect(isModelSelectionUnavailable(environment, select())).toBe(true);
   });
 
-  describe("NeoPi-first new tasks", () => {
-    const config = {
-      providers: [
-        {
-          instanceId: "codex",
-          driver: "codex",
-          status: "ready",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [{ slug: "codex-default", name: "Codex Default", isDefault: true }],
-        },
-        {
-          instanceId: "claudeAgent",
-          driver: "claudeAgent",
-          status: "ready",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          models: [{ slug: "claude-default", name: "Claude Default", isDefault: true }],
-        },
-        {
-          instanceId: "neopi_work",
-          driver: "neopi",
-          status: "ready",
-          displayName: "NeoPi/OMP",
-          enabled: true,
-          installed: true,
-          auth: { status: "authenticated" },
-          availability: "available",
-          models: [
-            { slug: "neopi-other", name: "NeoPi Other" },
-            { slug: "neopi-default", name: "NeoPi Default", isDefault: true },
-          ],
-        },
-      ],
-    } as unknown as ServerConfig;
-    const neopiSelection = {
-      instanceId: ProviderInstanceId.make("neopi_work"),
-      model: "neopi-default",
-    };
-    const resolveImplicit = (serverConfig: ServerConfig, fallback: ModelSelection | null = null) =>
-      resolveNewTaskModelSelection({
-        draftSelection: null,
-        projectDefaultSelection: null,
-        stickySelection: null,
-        modelOptions: buildModelOptions(serverConfig, fallback),
-      });
-
-    it("shows NeoPi first while retaining the other groups and their model routing", () => {
-      expect(groupByProvider(buildModelOptions(config, null))).toMatchObject([
-        {
-          providerKey: "neopi_work",
-          models: [
-            { selection: { instanceId: "neopi_work", model: "neopi-other" } },
-            { selection: neopiSelection },
-          ],
-        },
-        { providerKey: "codex" },
-        { providerKey: "claudeAgent" },
-      ]);
-    });
-
-    it("prefers the ready NeoPi default over other providers' defaults", () => {
-      expect(resolveImplicit(config)).toEqual(neopiSelection);
-    });
-
-    it("prefers a ready NeoPi model even when only another provider declares a default", () => {
-      const noNeopiDefault = {
-        ...config,
-        providers: config.providers.map((provider) =>
-          provider.driver === "neopi"
-            ? {
-                ...provider,
-                models: provider.models.map((model) => ({ ...model, isDefault: false })),
-              }
-            : provider,
-        ),
-      };
-      expect(resolveImplicit(noNeopiDefault)).toEqual({
-        instanceId: "neopi_work",
-        model: "neopi-other",
-      });
-    });
-
-    it("uses a ready alternative before NeoPi with a warning, without replacing explicit choices", () => {
-      const warningConfig = {
-        ...config,
-        providers: config.providers.map((provider) =>
-          provider.driver === "neopi" ? { ...provider, status: "warning" as const } : provider,
-        ),
-      };
-      expect(resolveImplicit(warningConfig)).toEqual({
-        instanceId: "codex",
-        model: "codex-default",
-      });
-
-      const options = buildModelOptions(warningConfig, neopiSelection);
-      expect(
-        resolveNewTaskModelSelection({
-          draftSelection: null,
-          projectDefaultSelection: neopiSelection,
-          stickySelection: null,
-          modelOptions: options,
-        }),
-      ).toBe(neopiSelection);
-      expect(
-        resolveImplicit({
-          ...warningConfig,
-          providers: warningConfig.providers.map((provider) => ({
-            ...provider,
-            status: "warning" as const,
-          })),
-        }),
-      ).toEqual(neopiSelection);
-    });
-
-    it.each([
-      ["disabled", { enabled: false }],
-      ["uninstalled", { installed: false }],
-      ["signed out", { auth: { status: "unauthenticated" } }],
-      ["unavailable", { availability: "unavailable" }],
-      ["without models", { models: [] }],
-      ["broken", { status: "error" }],
-      ["disabled state", { status: "disabled" }],
-    ] as const)("keeps healthy alternatives when NeoPi is %s", (_state, update) => {
-      const unavailableConfig = {
-        ...config,
-        providers: config.providers.map((provider) =>
-          provider.driver === "neopi" ? { ...provider, ...update } : provider,
-        ),
-      };
-
-      expect(resolveImplicit(unavailableConfig)).toEqual({
-        instanceId: "codex",
-        model: "codex-default",
-      });
-      // A retained selection may still be shown, but must not become an implicit default.
-      expect(resolveImplicit(unavailableConfig, neopiSelection)).toEqual({
-        instanceId: "codex",
-        model: "codex-default",
-      });
-      expect(
-        buildModelOptions(unavailableConfig, neopiSelection).find(
-          (option) => option.selection.instanceId === neopiSelection.instanceId,
-        )?.isUnavailable,
-      ).toBe(true);
-    });
-
-    it("uses a healthy alternative when NeoPi status is missing", () => {
-      const missingConfig = {
-        ...config,
-        providers: config.providers.filter((provider) => provider.driver !== "neopi"),
-        settings: {
-          providerInstances: { neopi_work: { driver: "neopi" } },
-        },
-      } as unknown as ServerConfig;
-
-      expect(resolveImplicit(missingConfig, neopiSelection)).toEqual({
-        instanceId: "codex",
-        model: "codex-default",
-      });
-    });
+  it("retains an explicit native model when its catalog temporarily disappears", () => {
+    const saved = { ...select("neopi", "anthropic/saved"), options: [{ id: "reasoningEffort", value: "high" }] };
+    const environment = config(provider("neopi", { models: [], status: "error" }));
+    const options = buildModelOptions(environment, saved);
+    expect(options).toHaveLength(1);
+    expect(options[0]?.selection).toBe(saved);
+    expect(options[0]?.isUnavailable).toBe(true);
+    expect(choose(options, saved)).toBe(saved);
   });
 
-  it("keeps draft, project, and sticky choices ahead of ready NeoPi", () => {
-    const draft = { instanceId: ProviderInstanceId.make("codex"), model: "draft" };
-    const project = { instanceId: ProviderInstanceId.make("codex"), model: "project" };
-    const sticky = { instanceId: ProviderInstanceId.make("codex"), model: "sticky" };
-    const providerDefault = {
-      selection: { instanceId: ProviderInstanceId.make("codex"), model: "default" },
-      isDefault: true,
-    } as ModelOption;
-    const neopiDefault = {
-      providerDriver: "neopi",
-      selection: { instanceId: ProviderInstanceId.make("neopi_work"), model: "neopi-default" },
-      isDefault: true,
-    } as ModelOption;
-    const resolve = (
-      draftSelection: ModelSelection | null,
-      projectDefaultSelection: ModelSelection | null,
-      stickySelection: ModelSelection | null,
-    ) =>
-      resolveNewTaskModelSelection({
-        draftSelection,
-        projectDefaultSelection,
-        stickySelection,
-        modelOptions: [providerDefault, neopiDefault],
-      });
+  it("does not choose retired native models implicitly but preserves an explicit selection", () => {
+    const saved = select("neopi", "anthropic/retired");
+    const environment = config(provider("neopi", { models: [model(saved.model, { isLegacy: true })] }));
+    expect(resolveDefaultableModelSelection(environment, saved)).toBeNull();
+    expect(resolveSelectableModelSelection(environment, saved)).toBe(saved);
+  });
 
-    expect(resolve(draft, project, sticky)).toBe(draft);
-    expect(resolve(null, project, sticky)).toBe(project);
-    expect(resolve(null, null, sticky)).toBe(sticky);
-    expect(resolve(null, null, null)).toBe(neopiDefault.selection);
+  it("preserves draft, project, then sticky native choices before choosing the native default", () => {
+    const environment = config(provider(), provider("work"));
+    const options = buildModelOptions(environment, null);
+    const draft = select("work", "anthropic/current");
+    const project = select("neopi", "anthropic/current");
+    const sticky = select("work", "openai-codex/current");
+    expect(choose(options, draft, project, sticky)).toBe(draft);
+    expect(choose(options, null, project, sticky)).toBe(project);
+    expect(choose(options, null, null, sticky)).toBe(sticky);
+    expect(choose(options)).toEqual(select());
+  });
 
-    const unavailable = { ...providerDefault, isUnavailable: true };
-    expect(
-      resolveNewTaskModelSelection({
-        draftSelection: null,
-        projectDefaultSelection: null,
-        stickySelection: null,
-        modelOptions: [unavailable],
-      }),
-    ).toBeNull();
+  it("skips an obsolete higher-priority preference without losing a valid native project choice", () => {
+    const options = buildModelOptions(config(provider()), null);
+    const project = select("neopi", "anthropic/current");
+    expect(choose(options, select("codex", "saved"), project)).toBe(project);
+  });
+
+  it("prefers a ready native instance over an unavailable default and returns null without usable options", () => {
+    const environment = config(provider("neopi", { status: "error" }), provider("work"));
+    expect(choose(buildModelOptions(environment, null))).toEqual(select("work"));
+    expect(choose(buildModelOptions(config(provider("neopi", { models: [] })), null))).toBeNull();
   });
 });

@@ -12,6 +12,52 @@ const request: DesktopAppActivationRequest = {
 };
 
 describe("DesktopAppActivationBroker", () => {
+  it("survives a background window closing and rejects another window's completion", async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
+    broker.registerRenderer(first, 1);
+    broker.registerRenderer(second, 2);
+    const result = broker.request(request);
+    const response = {
+      version: 1 as const,
+      requestId: request.requestId,
+      ok: true as const,
+      projectId: ProjectId.make("project-1"),
+      threadId: ThreadId.make("thread-1"),
+    };
+    broker.complete(response, 1);
+    broker.clearRenderer(1);
+    broker.complete(response, 2);
+    await expect(result).resolves.toEqual(response);
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledOnce();
+    broker.close();
+  });
+
+  it("routes queued work to the surviving window after a renderer crash", async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
+    broker.registerRenderer(first, 1);
+    broker.registerRenderer(second, 2);
+    const active = broker.request(request);
+    const queuedRequest = { ...request, requestId: "request-2" };
+    const queued = broker.request(queuedRequest);
+    broker.clearRenderer(2);
+    await expect(active).resolves.toMatchObject({ ok: false, code: "renderer-unavailable" });
+    expect(first).toHaveBeenCalledWith(queuedRequest);
+    broker.complete({
+      version: 1,
+      requestId: queuedRequest.requestId,
+      ok: true,
+      projectId: ProjectId.make("project-1"),
+      threadId: ThreadId.make("thread-1"),
+    }, 1);
+    await expect(queued).resolves.toMatchObject({ ok: true });
+    broker.close();
+  });
+
   it("focuses immediately and waits for renderer readiness", async () => {
     const activate = vi.fn();
     const send = vi.fn();

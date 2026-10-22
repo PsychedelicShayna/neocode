@@ -559,7 +559,7 @@ it.live("does not invoke session catalog commands unless the capability was adve
 );
 
 it.live(
-  "drops terminal-originated turns and relaunches the session file after the owner pipe exits",
+  "publishes external native identities without SQL turns and relaunches after owner exit",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -598,8 +598,22 @@ it.live(
             if (frame.type === "t3.session.exited") yield* Deferred.succeed(exited, undefined);
           }),
         ).pipe(Effect.forkScoped);
+        const native = yield* runtime.observeNative!;
+        const persisted = yield* Deferred.make<void>();
+        const nativeFrames: Array<Record<string, unknown>> = [];
+        yield* Stream.runForEach(native, (frame) => Effect.gen(function* () {
+          nativeFrames.push(frame);
+          if (frame.type === "message_persisted") yield* Deferred.succeed(persisted, undefined);
+        })).pipe(Effect.forkScoped);
         yield* runtime.start;
         yield* fixture.pipe.emit({ type: "agent_start" });
+        yield* fixture.pipe.emit({ type: "message_start", messageId: "msg-external", message: { role: "assistant", content: [] } });
+        yield* fixture.pipe.emit({ type: "message_update", messageId: "msg-external", assistantMessageEvent: { type: "text_delta", delta: "terminal" } });
+        yield* fixture.pipe.emit({ type: "message_end", messageId: "msg-external", message: { role: "assistant", content: [{ type: "text", text: "terminal" }] } });
+        yield* fixture.pipe.emit({ type: "message_persisted", sessionId: "s1", sessionFile: attachedCursor.sessionFile, leafId: "entry-external", messageId: "msg-external", entryId: "entry-external" });
+        yield* Deferred.await(persisted);
+        NodeAssert.deepEqual(nativeFrames.filter((frame) => typeof frame.messageId === "string").map((frame) => frame.messageId), ["msg-external", "msg-external", "msg-external", "msg-external"]);
+        NodeAssert.equal(nativeFrames.some((frame) => "turnId" in frame), false);
         yield* fixture.pipe.emit({ type: "agent_end", messages: [] });
         yield* fixture.pipe.finish(null);
         yield* Deferred.await(exited);
@@ -2602,8 +2616,18 @@ it.live("follows idle terminal model and effort changes without importing its tu
     Effect.gen(function* () {
       let model = "first";
       let thinkingLevel = "low";
+      let recordedCost = 12;
       const fixture = yield* attachFixture(true, attachCapabilities, {
-        state: () => ({ model: { provider: "test", id: model }, thinkingLevel }),
+        state: () => ({
+          model: { provider: "test", id: model }, thinkingLevel,
+          tokensPerSecond: 42,
+          contextUsage: { tokens: 500, contextWindow: 1000, percent: 50 },
+          approvalMode: "always-ask",
+          sessionUsage: {
+            input: 25, cacheRead: 75, cacheWrite: 0,
+            cost: recordedCost, subagentCost: 2, advisorCost: 3, advisorCostState: "ready",
+          },
+        }),
         roles: () => ({ roles: [configurationRole] }),
       });
       const { runtime, pipe, launches } = fixture;
@@ -2651,9 +2675,19 @@ it.live("follows idle terminal model and effort changes without importing its tu
       const initial = yield* Queue.take(output);
       NodeAssert.equal(initial.status, "available");
       NodeAssert.equal(initial.model?.id, "first");
+      NodeAssert.equal(initial.telemetry?.sessionUsage?.cost, 12);
+      NodeAssert.equal(initial.telemetry?.approvalMode, "always-ask");
       yield* pipe.emit({ type: "agent_start" });
+      yield* Queue.take(output);
+      recordedCost = 19;
       yield* pipe.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+      const metrics = yield* Queue.take(output);
+      NodeAssert.equal(metrics.status, "available");
+      NodeAssert.equal(metrics.telemetry?.sessionUsage?.cost, 19);
+      NodeAssert.equal(metrics.telemetry?.tokensPerSecond, 42);
+      NodeAssert.equal(metrics.telemetry?.context?.percent, 50);
       yield* pipe.emit({ type: "agent_end", isTerminal: true });
+      yield* Queue.take(output);
       model = "second";
       yield* pipe.emit({ type: "model_changed", model: { provider: "test", id: model } });
       const changed = yield* Queue.take(output);
@@ -2681,7 +2715,7 @@ it.live("follows idle terminal model and effort changes without importing its tu
       );
       NodeAssert.deepEqual(
         pipe.commands.slice(commandCount).map((cmd) => cmd.type),
-        Array.from({ length: 3 }, () => ["get_state", "get_roles", "get_state"]).flat(),
+        Array.from({ length: 6 }, () => ["get_state", "get_roles", "get_state"]).flat(),
       );
       yield* pipe.finish(null);
       NodeAssert.equal((yield* Queue.take(output)).status, "unavailable");

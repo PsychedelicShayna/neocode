@@ -1,8 +1,7 @@
 import type { KeybindingCommand, ResolvedKeybindingsConfig } from "@t3tools/contracts";
-import type { UsageChartMetric } from "./UsageProviderChart";
 import { resolveShortcutCommand, type ShortcutEventLike } from "../../keybindings";
 
-export type UsageMetric = UsageChartMetric | "limits";
+export type UsageMetric = "cost" | "tokens" | "limits";
 export const METRIC_OPTIONS = [
   { value: "cost", label: "Cost", command: "usage.cost" },
   { value: "tokens", label: "Tokens", command: "usage.tokens" },

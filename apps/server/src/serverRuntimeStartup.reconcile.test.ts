@@ -4,6 +4,7 @@ import {
   type OrchestrationSessionStatus,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   type ProviderSendTurnInput,
   ThreadId,
   TurnId,
@@ -28,7 +29,7 @@ import { ServerActivation } from "./serverActivation.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
-const providerInstanceId = ProviderInstanceId.make("codex");
+const providerInstanceId = ProviderInstanceId.make("neopi");
 const updatedAt = "2026-08-20T12:00:00.000Z";
 
 const makeThread = (
@@ -39,13 +40,15 @@ const makeThread = (
   deletedAt: string | null = null,
 ) => ({
   id: ThreadId.make(id),
+  projectId: ProjectId.make("restart-project"),
+  modelSelection: { instanceId: providerInstanceId, model: "openai-codex/current" },
   archivedAt,
   deletedAt,
   interactionMode: "default" as const,
   session: {
     threadId: ThreadId.make(id),
     status,
-    providerName: "codex" as const,
+    providerName: ProviderDriverKind.make("neopi"),
     providerInstanceId,
     runtimeMode: "full-access" as const,
     activeTurnId,
@@ -68,7 +71,6 @@ const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
     assertConversationRollbackSupported: () => Effect.die("unused"),
     getInstanceInfo: () => Effect.die("unused"),
     rollbackConversation: () => Effect.die("unused"),
-    uploadFeedback: () => Effect.die("unused"),
     streamEvents: Stream.empty,
   }) satisfies ProviderService.ProviderService["Service"];
 
@@ -115,6 +117,84 @@ const runReconciliation = (input: {
     ),
   );
 
+it.effect("keeps a legacy session read-only instead of preparing or sending a restart turn", () => {
+  const turnId = TurnId.make("legacy-interrupted-turn");
+  const base = makeThread("legacy-interrupted", "running", turnId);
+  const legacyId = ProviderInstanceId.make("saved-codex");
+  const thread = {
+    ...base,
+    session: {
+      ...base.session,
+      providerName: ProviderDriverKind.make("codex"),
+      providerInstanceId: legacyId,
+    },
+  };
+  const cursor = { threadId: "saved-provider-thread" };
+  const binding: ProviderSessionDirectory.ProviderRuntimeBinding = {
+    threadId: thread.id,
+    provider: ProviderDriverKind.make("codex"),
+    providerInstanceId: legacyId,
+    status: "running",
+    resumeCursor: cursor,
+    runtimePayload: { activeTurnId: turnId, continueAfterServerUpdate: turnId },
+  };
+  const writes: ProviderSessionDirectory.ProviderRuntimeBinding[] = [];
+  const commands: OrchestrationCommand[] = [];
+  let starts = 0;
+  let sends = 0;
+  return runReconciliation({
+    threads: [thread],
+    continueAfterRestart: true,
+    providerService: {
+      ...makeProviderService(),
+      startSession: () =>
+        Effect.sync(() => {
+          starts += 1;
+          throw new Error("Legacy session must not start");
+        }),
+      sendTurn: () =>
+        Effect.sync(() => {
+          sends += 1;
+          throw new Error("Legacy session must not send");
+        }),
+    },
+    directory: {
+      getBinding: () => Effect.succeedSome(binding),
+      listBindings: () => Effect.succeed([{ ...binding, lastSeenAt: "2026-10-22T00:00:00.000Z" }]),
+      upsert: (next) =>
+        Effect.sync(() => {
+          writes.push(next);
+        }),
+      recordImportedTranscript: () => Effect.die("unused"),
+      getProvider: () => Effect.die("unused"),
+      listThreadIds: () => Effect.die("unused"),
+    },
+    dispatch: (command) =>
+      Effect.sync(() => {
+        commands.push(command);
+        return { sequence: commands.length };
+      }),
+  }).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.equal(starts, 0);
+        assert.equal(sends, 0);
+        assert.equal(writes[0]?.status, "stopped");
+        assert.strictEqual(writes[0]?.resumeCursor, cursor);
+        assert.equal(writes[0]?.provider, "codex");
+        assert.equal(writes[0]?.providerInstanceId, legacyId);
+        assert.equal(commands.length, 1);
+        const command = commands[0];
+        assert.equal(command?.type, "thread.session.set");
+        if (command?.type === "thread.session.set") {
+          assert.include(command.session.lastError ?? "", "read-only");
+          assert.equal(command.session.providerName, "codex");
+        }
+      }),
+    ),
+  );
+});
+
 it.effect("marks active running sessions that have persisted resume state", () => {
   const active = makeThread("thread-mark-active", "running", TurnId.make("turn-mark-active"));
   const archived = makeThread(
@@ -143,7 +223,7 @@ it.effect("marks active running sessions that have persisted resume state", () =
           Effect.as(
             Option.some({
               threadId,
-              provider: ProviderDriverKind.make("codex"),
+              provider: ProviderDriverKind.make("neopi"),
               providerInstanceId,
               ...(threadId === active.id ? { resumeCursor: { threadId } } : {}),
               runtimePayload: { activeTurnId: "turn-mark-active" },
@@ -181,10 +261,10 @@ it.effect.each(
   "continues $recovery sessions with a $persistedTurn directory turn",
   ({ recovery, persistedTurn }) =>
     Effect.gen(function* () {
-      const codex = makeThread(
-        "thread-continue-codex",
+      const native = makeThread(
+        "thread-continue-native",
         "running",
-        TurnId.make("turn-continue-codex"),
+        TurnId.make("turn-continue-native"),
       );
       const fallbackContinuationTurnId = TurnId.make("turn-continue-fallback");
       const fallback = makeThread(
@@ -192,28 +272,25 @@ it.effect.each(
         recovery === "marked update" ? "starting" : "running",
         recovery === "marked update" ? null : fallbackContinuationTurnId,
       );
-      const fallbackProviderInstanceId = ProviderInstanceId.make("claudeAgent");
+      const fallbackProviderInstanceId = ProviderInstanceId.make("neopi-older");
       const continuationSent = yield* Deferred.make<void>();
       const continuationCleared = yield* Deferred.make<void>();
       const sends: ProviderSendTurnInput[] = [];
       const dispatched: OrchestrationCommand[] = [];
       const upserts: ProviderSessionDirectory.ProviderRuntimeBinding[] = [];
       const bindings = new Map<ThreadId, ProviderSessionDirectory.ProviderRuntimeBinding>(
-        [codex, fallback].map((thread) => [
+        [native, fallback].map((thread) => [
           thread.id,
           {
             threadId: thread.id,
-            provider:
-              thread.id === codex.id
-                ? ProviderDriverKind.make("codex")
-                : ProviderDriverKind.make("claudeAgent"),
+            provider: ProviderDriverKind.make("neopi"),
             providerInstanceId:
-              thread.id === codex.id ? providerInstanceId : fallbackProviderInstanceId,
+              thread.id === native.id ? providerInstanceId : fallbackProviderInstanceId,
             status: "running" as const,
             resumeCursor: { threadId: thread.id },
             runtimePayload: {
               activeTurnId:
-                thread.id === codex.id && persistedTurn !== "current"
+                thread.id === native.id && persistedTurn !== "current"
                   ? persistedTurn === "previous"
                     ? "previous-provider-turn"
                     : null
@@ -221,8 +298,8 @@ it.effect.each(
               ...(recovery === "marked update"
                 ? {
                     continueAfterServerUpdate:
-                      thread.id === codex.id
-                        ? codex.session.activeTurnId
+                      thread.id === native.id
+                        ? native.session.activeTurnId
                         : fallbackContinuationTurnId,
                   }
                 : {}),
@@ -251,7 +328,7 @@ it.effect.each(
       };
 
       yield* runReconciliation({
-        threads: [codex, fallback],
+        threads: [native, fallback],
         continueAfterRestart: recovery === "opt-in restart",
         providerService,
         directory: {
@@ -299,19 +376,14 @@ it.effect.each(
       yield* Deferred.await(continuationSent);
       yield* Deferred.await(continuationCleared);
 
-      assert.deepStrictEqual(
-        sends.toSorted((left, right) =>
-          String(left.threadId).localeCompare(String(right.threadId)),
-        ),
-        [
-          { threadId: codex.id, continuation: true, interactionMode: "default" },
-          {
-            threadId: fallback.id,
-            input: "Continue where you left off.",
-            interactionMode: "default",
-          },
-        ],
-      );
+      assert.sameDeepMembers(sends, [
+        { threadId: native.id, continuation: true, interactionMode: "default" },
+        {
+          threadId: fallback.id,
+          input: "Continue where you left off.",
+          interactionMode: "default",
+        },
+      ]);
       assert.deepStrictEqual(
         dispatched.map((command) =>
           command.type === "thread.session.set"
@@ -324,7 +396,7 @@ it.effect.each(
         ),
         [
           {
-            threadId: codex.id,
+            threadId: native.id,
             status: "starting",
             activeTurnId: null,
           },
@@ -336,7 +408,7 @@ it.effect.each(
         ],
       );
       for (const [thread, continuationTurnId] of [
-        [codex, codex.session.activeTurnId],
+        [native, native.session.activeTurnId],
         [fallback, fallbackContinuationTurnId],
       ] as const) {
         assert.deepStrictEqual(
@@ -401,7 +473,7 @@ it.effect("does not continue archived or deleted marked sessions", () => {
         const thread = threadId === archived.id ? archived : deleted;
         return Effect.succeedSome({
           threadId,
-          provider: ProviderDriverKind.make("codex"),
+          provider: ProviderDriverKind.make("neopi"),
           providerInstanceId,
           status: "running" as const,
           resumeCursor: { cursor: threadId },
@@ -456,7 +528,7 @@ it.effect("retries continuation preparation before settling a persistent failure
       getBinding: () =>
         Effect.succeedSome({
           threadId: thread.id,
-          provider: ProviderDriverKind.make("codex"),
+          provider: ProviderDriverKind.make("neopi"),
           providerInstanceId,
           status: "running" as const,
           resumeCursor: { cursor: thread.id },
@@ -522,7 +594,7 @@ it.effect("reconciles multiple active and archived orphans but skips live sessio
           Effect.as(
             Option.some({
               threadId: candidate,
-              provider: ProviderDriverKind.make("codex"),
+              provider: ProviderDriverKind.make("neopi"),
               providerInstanceId,
               status: "running" as const,
               resumeCursor: { cursor: candidate },
@@ -611,7 +683,7 @@ it.effect(
               ? Effect.fail(corruptFailure)
               : Effect.succeedSome({
                   threadId: candidate,
-                  provider: ProviderDriverKind.make("codex"),
+                  provider: ProviderDriverKind.make("neopi"),
                   providerInstanceId,
                 }),
         upsert: () => Effect.fail(writeFailure),
@@ -754,7 +826,7 @@ for (const scenario of [
         getBinding: () =>
           Effect.succeedSome({
             threadId: thread.id,
-            provider: ProviderDriverKind.make("codex"),
+            provider: ProviderDriverKind.make("neopi"),
             providerInstanceId,
             status: scenario === "stopped binding" ? "stopped" : "running",
             ...(scenario.includes("cursor") ? {} : { resumeCursor: { threadId: thread.id } }),
@@ -811,7 +883,7 @@ for (const preparedStatus of [
       const sends: ProviderSendTurnInput[] = [];
       let binding: ProviderSessionDirectory.ProviderRuntimeBinding = {
         threadId: thread.id,
-        provider: ProviderDriverKind.make("codex"),
+        provider: ProviderDriverKind.make("neopi"),
         providerInstanceId,
         status: "running",
         resumeCursor: { threadId: thread.id },
@@ -919,7 +991,7 @@ it.effect("settles failed opt-in recovery without retrying the provider turn", (
     const preparedPayloads: unknown[] = [];
     let binding: ProviderSessionDirectory.ProviderRuntimeBinding = {
       threadId: thread.id,
-      provider: ProviderDriverKind.make("codex"),
+      provider: ProviderDriverKind.make("neopi"),
       providerInstanceId,
       status: "running",
       resumeCursor: { threadId: thread.id },

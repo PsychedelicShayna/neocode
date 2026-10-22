@@ -3,6 +3,46 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./neopi-journal": {
+      "types": "./src/neopiJournal.ts",
+      "default": "./src/neopiJournal.ts"
+    },
+    "./neopi-tree": {
+      "types": "./src/neopiTree.ts",
+      "default": "./src/neopiTree.ts"
+    },
+    "./neopi-sessions": {
+      "types": "./src/neopiSessions.ts",
+      "default": "./src/neopiSessions.ts"
+    },
+    "./neopi-session-status": {
+      "types": "./src/neopiSessionStatus.ts",
+      "default": "./src/neopiSessionStatus.ts"
+    },
+    "./state/neopiStats": {
+      "types": "./src/state/neopiStats.ts",
+      "default": "./src/state/neopiStats.ts"
+    },
+    "./neopi-stats-bridge": {
+      "types": "./src/neopi-stats-bridge.ts",
+      "default": "./src/neopi-stats-bridge.ts"
+    },
+    "./state/neopiThemes": {
+      "types": "./src/state/neopiThemes.ts",
+      "default": "./src/state/neopiThemes.ts"
+    },
+    "./neopi-models": {
+      "types": "./src/neopiModels.ts",
+      "default": "./src/neopiModels.ts"
+    },
+    "./neopi-conversation": {
+      "types": "./src/neopiConversation.ts",
+      "default": "./src/neopiConversation.ts"
+    },
+    "./state/neopi-conversation": {
+      "types": "./src/state/neopiConversation.ts",
+      "default": "./src/state/neopiConversation.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

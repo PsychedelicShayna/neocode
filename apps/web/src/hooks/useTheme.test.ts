@@ -26,6 +26,51 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("native theme application", () => {
+  it("uses native appearance without rewriting a saved single-mode palette or mix", async () => {
+    const storage = createStorage();
+    const variables = new Map<string, string>();
+    const classes = new Set<string>();
+    vi.stubGlobal("window", { localStorage: storage, matchMedia: () => ({ matches: false }) });
+    vi.stubGlobal("getComputedStyle", undefined);
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callback(0); return 1; });
+    vi.stubGlobal("document", {
+      documentElement: {
+        dataset: {},
+        classList: {
+          add: (name: string) => classes.add(name),
+          remove: (name: string) => classes.delete(name),
+          toggle: (name: string, enabled: boolean) => enabled ? classes.add(name) : classes.delete(name),
+        },
+        style: {
+          setProperty: (name: string, value: string) => variables.set(name, value),
+          removeProperty: (name: string) => variables.delete(name),
+        },
+      },
+    });
+    const palette = await import("../themePalette");
+    const saved = {
+      id: "saved-dark-palette", label: "Saved dark palette", appearance: "dark" as const,
+      colors: palette.getDefaultThemeColors("dark"),
+    };
+    palette.installCustomTheme(saved);
+    storage.setItem("t3code:theme", saved.id);
+    storage.setItem(palette.THEME_APPEARANCE_MODE_STORAGE_KEY, "light");
+    storage.setItem(palette.THEME_HALVES_STORAGE_KEY, JSON.stringify({ dark: saved.id }));
+    const original = [...Array(storage.length).keys()].map(index => storage.key(index)!).map(key => [key, storage.getItem(key)]);
+    const theme = await import("./useTheme");
+    const native = { dark: palette.getDefaultThemeColors("dark"), light: palette.getDefaultThemeColors("light") };
+    theme.setNeoPiThemePalette(native);
+    expect(classes.has("dark")).toBe(false);
+    expect(variables.get(palette.getThemeColorVariable("canvas"))).toBe(native.light.canvas);
+    expect(original.map(([key]) => [key, storage.getItem(key!)])).toEqual(original);
+    theme.setNeoPiThemePalette(null);
+    expect(classes.has("dark")).toBe(true);
+    expect(variables.get(palette.getThemeColorVariable("canvas"))).toBe(saved.colors.canvas);
+    expect(original.map(([key]) => [key, storage.getItem(key!)])).toEqual(original);
+  });
+});
+
 describe("theme failure handling", () => {
   it("preserves exact storage causes and operation context", async () => {
     const readCause = new Error("storage read blocked");

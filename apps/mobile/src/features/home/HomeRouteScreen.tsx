@@ -22,6 +22,7 @@ import { buildHomeProjectScopes } from "./homeThreadList";
 import { usePendingTaskListActions } from "./usePendingTaskListActions";
 import { useThreadListActions } from "./useThreadListActions";
 import { getConnectionAwareBrandHeaderOptions } from "./WorkspaceConnectionTitle";
+import { NeoPiModelsEntry } from "../threads/NeoPiModelsScreen";
 
 /* ─── Route screen ───────────────────────────────────────────────────── */
 
@@ -189,6 +190,7 @@ export function HomeRouteScreen() {
           onSearchQueryChange={setSearchQuery}
           onStartNewTask={() => navigation.navigate("NewTaskSheet", { screen: "NewTask" })}
         />
+        <NeoPiModelsEntry {...(selectedEnvironmentId ? { environmentId: selectedEnvironmentId } : {})} />
 
         <HomeScreen
           catalogState={catalogState}

@@ -1104,7 +1104,6 @@ describe("deriveMessagesTimelineRows", () => {
       modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
       runtimeMode: "full-access" as const,
       interactionMode: "default" as const,
-      promptEffort: null,
     },
     queuedAfterToolActivityId: null,
     createdAt: "2026-01-01T00:00:01Z",

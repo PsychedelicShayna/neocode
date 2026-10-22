@@ -1,0 +1,18 @@
+diff --git a/android/CMakeLists.txt b/android/CMakeLists.txt
+--- a/android/CMakeLists.txt
++++ b/android/CMakeLists.txt
+@@ -5,11 +5,9 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
+ 
+ # Find prebuilt oniguruma library
+ find_library(LOG_LIB log)
+-find_library(ONIG_LIB onig
+-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/src/main/jniLibs/${ANDROID_ABI}
+-    NO_CMAKE_FIND_ROOT_PATH
+-    REQUIRED
+-)
++# The package ships every Android ABI. Never search the host or reuse a cached
++# host library when cross-compiling, even if the host also provides libonig.
++set(ONIG_LIB "${CMAKE_CURRENT_SOURCE_DIR}/src/main/jniLibs/${ANDROID_ABI}/libonig.so")
+ 
+ # Main library
+ add_library(react-native-shiki-engine SHARED

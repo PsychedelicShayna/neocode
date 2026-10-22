@@ -76,12 +76,12 @@ export interface ProviderInstanceEntry {
  * `ready` probe status can remain in the streamed snapshot until reconciliation.
  */
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled && entry.isAvailable && entry.status === "ready";
+  return entry.driverKind === "neopi" && entry.enabled && entry.isAvailable && entry.status === "ready";
 }
 
 /** Picker rails contain configured, enabled instances only. */
 export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled;
+  return entry.driverKind === "neopi" && entry.enabled;
 }
 
 /**
@@ -240,7 +240,7 @@ export function getDefaultProviderInstanceModel(
 }
 
 const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
-  entry.enabled && entry.isAvailable;
+  entry.driverKind === "neopi" && entry.enabled && entry.isAvailable;
 
 /**
  * Resolve an exact stored instance when it remains enabled and available.

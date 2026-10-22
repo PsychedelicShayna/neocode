@@ -1,4 +1,5 @@
 import { APP_BASE_NAME } from "./src/lib/mobileBranding.ts";
+import { MOBILE_APP_IDENTITIES, androidVersionCode } from "./src/lib/mobileDistribution.ts";
 import type { ExpoConfig } from "expo/config";
 
 import { BRAND_ASSET_PATHS } from "../../scripts/lib/brand-assets.ts";
@@ -75,26 +76,23 @@ const RELEASE_ASSETS = {
 const VARIANT_CONFIG = {
   development: {
     appName: `${APP_BASE_NAME} Dev`,
-    scheme: "t3code-dev",
-    iosBundleIdentifier: "com.t3tools.t3code.dev",
-    androidPackage: "com.t3tools.t3code.dev",
-    relyingParty: "clerk.t3.codes",
+    scheme: MOBILE_APP_IDENTITIES.development.scheme,
+    iosBundleIdentifier: MOBILE_APP_IDENTITIES.development.applicationId,
+    androidPackage: MOBILE_APP_IDENTITIES.development.applicationId,
     assets: DEVELOPMENT_ASSETS,
   },
   preview: {
     appName: `${APP_BASE_NAME} Preview`,
-    scheme: "t3code-preview",
-    iosBundleIdentifier: "com.t3tools.t3code.preview",
-    androidPackage: "com.t3tools.t3code.preview",
-    relyingParty: "clerk.t3.codes",
+    scheme: MOBILE_APP_IDENTITIES.preview.scheme,
+    iosBundleIdentifier: MOBILE_APP_IDENTITIES.preview.applicationId,
+    androidPackage: MOBILE_APP_IDENTITIES.preview.applicationId,
     assets: PREVIEW_ASSETS,
   },
   production: {
     appName: APP_BASE_NAME,
-    scheme: "t3code",
-    iosBundleIdentifier: "com.t3tools.t3code",
-    androidPackage: "com.t3tools.t3code",
-    relyingParty: "clerk.t3.codes",
+    scheme: MOBILE_APP_IDENTITIES.production.scheme,
+    iosBundleIdentifier: MOBILE_APP_IDENTITIES.production.applicationId,
+    androidPackage: MOBILE_APP_IDENTITIES.production.applicationId,
     assets: RELEASE_ASSETS,
   },
 } as const;
@@ -212,24 +210,22 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
 
 const config: ExpoConfig = {
   name: variant.appName,
-  slug: "t3-code",
+  slug: "neocode",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
   version: "1.3.1",
   runtimeVersion: {
-    // Development manifests resolve on every launch, so avoid fingerprint's
-    // expensive native-project calculation there. Preview and production stay
-    // fingerprinted so OTAs only reach binaries with matching native projects.
+    // Keep dev manifests cheap and release native inputs fingerprinted.
+    // This version does not enable OTA updates; sideload updates replace the APK.
     policy: runtimeVersionPolicy,
   },
   orientation: "portrait",
   icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
+  // Sideload updates are signed APK replacements, never upstream Expo OTA bundles.
   updates: {
-    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
-    url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
-    checkAutomatically: "ON_LOAD",
-    fallbackToCacheTimeout: 0,
+    enabled: false,
+    checkAutomatically: "NEVER",
   },
   ios: {
     icon: variant.assets.iosIcon,
@@ -238,16 +234,9 @@ const config: ExpoConfig = {
     // showcase capture build requires full screen (see infoPlist below).
     requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
-    // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
-    // does not fall back to a personal team (which cannot sign app groups,
-    // Sign in with Apple, or push notification entitlements).
-    appleTeamId: "ARK85ZXQ4Z",
-    associatedDomains: [
-      `applinks:${variant.relyingParty}`,
-      `webcredentials:${variant.relyingParty}`,
-    ],
+    ...(repoEnv.NEOCODE_APPLE_TEAM_ID ? { appleTeamId: repoEnv.NEOCODE_APPLE_TEAM_ID } : {}),
     entitlements: {
-      "keychain-access-groups": [`$(AppIdentifierPrefix)${variant.iosBundleIdentifier}`],
+      "keychain-access-groups": [`$(AppIdentifierPrefix)${iosBundleIdentifier}`],
     },
     infoPlist: {
       NSAppTransportSecurity: {
@@ -276,6 +265,7 @@ const config: ExpoConfig = {
   android: {
     icon: variant.assets.appIcon,
     package: variant.androidPackage,
+    versionCode: androidVersionCode(repoEnv.NEOCODE_ANDROID_VERSION_CODE),
     ...(repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE
       ? { googleServicesFile: repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE }
       : {}),
@@ -431,6 +421,7 @@ const config: ExpoConfig = {
   ],
   extra: {
     appVariant: APP_VARIANT,
+    distribution: "sideload",
     iosPersonalTeamBuild: isIosPersonalTeamBuild,
     relay: {
       url: repoEnv.T3CODE_RELAY_URL ?? null,
@@ -453,11 +444,7 @@ const config: ExpoConfig = {
       tracesDataset: repoEnv.EXPO_PUBLIC_OTLP_TRACES_DATASET ?? null,
       tracesToken: repoEnv.EXPO_PUBLIC_OTLP_TRACES_TOKEN ?? null,
     },
-    eas: {
-      projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",
-    },
   },
-  owner: "pingdotgg",
 };
 
 export default config;

@@ -19,18 +19,6 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { CustomModelEditor } from "./CustomModelEditor";
 import { LegendList, LegendListRef } from "@legendapp/list/react";
 
-/**
- * Placeholder text for the "add a custom model" input, keyed by driver
- * kind. Mirrors the prior hardcoded switch in `SettingsPanels.tsx` so the
- * UX is unchanged — only the owning component has moved.
- */
-const CUSTOM_MODEL_PLACEHOLDER_BY_KIND: Partial<Record<ProviderDriverKind, string>> = {
-  [ProviderDriverKind.make("codex")]: "gpt-6.7-codex-ultra-preview",
-  [ProviderDriverKind.make("claudeAgent")]: "claude-sonnet-5",
-  [ProviderDriverKind.make("cursor")]: "claude-sonnet-4-6",
-  [ProviderDriverKind.make("opencode")]: "openai/gpt-5",
-};
-
 /** Above this many models the list gets a filter input. */
 const FILTER_THRESHOLD = 8;
 
@@ -218,7 +206,6 @@ export function ProviderModelsSection({
   }, [displayModels]);
 
   const handleAdd = () => {
-    if (driverKind === "antigravity") return;
     const normalized = normalizeCustomModelSlug(input);
     if (!normalized) {
       setError("Enter a model slug.");
@@ -532,7 +519,7 @@ export function ProviderModelsSection({
             {hiddenCount > 0 ? ` · ${hiddenCount} hidden` : ""}
           </span>
         </div>
-        {driverKind !== "antigravity" && !isAdding ? (
+        {!isAdding ? (
           <Button
             type="button"
             size="xs"
@@ -608,7 +595,6 @@ export function ProviderModelsSection({
                   <CustomModelEditor
                     key={`${instanceId}:${model.slug}:editor`}
                     instanceId={instanceId}
-                    driverKind={driverKind}
                     entry={editingEntry}
                     builtInModels={builtInModels}
                     onSave={handleSaveEdit}
@@ -621,7 +607,7 @@ export function ProviderModelsSection({
         />
       </div>
 
-      {driverKind === "antigravity" ? null : isAdding ? (
+      {isAdding ? (
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
           <Input
             id={`provider-instance-${instanceId}-custom-model`}
@@ -642,7 +628,7 @@ export function ProviderModelsSection({
               event.preventDefault();
               handleAdd();
             }}
-            placeholder={driverKind ? CUSTOM_MODEL_PLACEHOLDER_BY_KIND[driverKind] : "model-slug"}
+            placeholder="provider/model"
             spellCheck={false}
           />
           <div className="flex shrink-0 gap-2">
@@ -656,9 +642,7 @@ export function ProviderModelsSection({
         </div>
       ) : null}
 
-      {driverKind !== "antigravity" && error ? (
-        <p className="mt-2 text-xs text-destructive">{error}</p>
-      ) : null}
+      {error ? <p className="mt-2 text-xs text-destructive">{error}</p> : null}
     </div>
   );
 }

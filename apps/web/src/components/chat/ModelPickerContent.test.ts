@@ -1,287 +1,75 @@
-import {
-  ANTIGRAVITY_DEFAULT_MODEL,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  type ServerProvider,
-} from "@t3tools/contracts";
+import { ProviderDriverKind, ProviderInstanceId, type ServerProvider, type ServerProviderModel } from "@t3tools/contracts";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { describe, expect, it } from "vite-plus/test";
-
 import { deriveProviderInstanceEntries } from "../../providerInstances";
-import {
-  adjacentModelPickerProvider,
-  resolveModelPickerSelectedModel,
-  shouldIncludeModelPickerOption,
-  shouldOfferModelPickerSetup,
-} from "./ModelPickerContent";
+import { getAppModelOptionsForInstance } from "../../modelSelection";
+import { filterNativeSwitcherModels, nativeSwitcherFactCells, nativeSwitcherModels } from "./neopiModelSwitcher";
+import { modelPickerModelKey, parseModelPickerModelKey } from "./modelPickerKeys";
 
-function entry(status: ServerProvider["status"], driver = "opencode") {
-  return deriveProviderInstanceEntries([
-    {
-      instanceId: ProviderInstanceId.make(`${driver}_work`),
-      driver: ProviderDriverKind.make(driver),
-      enabled: true,
-      installed: true,
-      version: null,
-      status,
-      auth: { status: "authenticated" },
-      checkedAt: "2026-08-28T00:00:00.000Z",
-      models: [],
-      slashCommands: [],
-      skills: [],
-    },
-  ])[0]!;
+const instanceId = ProviderInstanceId.make("neopi-work");
+function catalog(models: ReadonlyArray<ServerProviderModel>, status: ServerProvider["status"] = "ready") {
+  const entries = deriveProviderInstanceEntries([{
+    instanceId, driver: ProviderDriverKind.make("neopi"), enabled: true, installed: true,
+    version: null, status, auth: { status: "authenticated" }, checkedAt: "2026-10-22T00:00:00.000Z",
+    models, slashCommands: [], skills: [],
+  }]);
+  const options = new Map(entries.map((entry) => [entry.instanceId, getAppModelOptionsForInstance(DEFAULT_UNIFIED_SETTINGS, entry)]));
+  return { entries, options, activeInstanceId: instanceId };
 }
-
-describe("shouldIncludeModelPickerOption", () => {
-  it.each(["ready", "error"] as const)(
-    "never offers the internal Antigravity default marker as a model when %s",
-    (status) => {
-      const providerEntry = entry(status, "antigravity");
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: ANTIGRAVITY_DEFAULT_MODEL,
-            name: ANTIGRAVITY_DEFAULT_MODEL,
-            isUnavailable: true,
-          },
-          activeInstanceId: providerEntry.instanceId,
-          activeModel: ANTIGRAVITY_DEFAULT_MODEL,
-        }),
-      ).toBe(false);
-    },
-  );
-
-  it.each([
-    ["opencode", "error"],
-    ["opencode", "warning"],
-    ["antigravity", "error"],
-    ["antigravity", "warning"],
-  ] as const)(
-    "keeps only the active synthetic %s row when the provider status is %s",
-    (driver, status) => {
-      const providerEntry = entry(status, driver);
-      const activeInstanceId = providerEntry.instanceId;
-      const activeModel = "missing-model";
-
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: activeModel,
-            name: activeModel,
-            isUnavailable: true,
-          },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(true);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: { slug: "stale/model", name: "Stale model" },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(false);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: "other/missing",
-            name: "Other missing",
-            isUnavailable: true,
-          },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(false);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: { slug: activeModel, name: activeModel, isUnavailable: true },
-          activeInstanceId: ProviderInstanceId.make(`${driver}_personal`),
-          activeModel,
-        }),
-      ).toBe(false);
-    },
-  );
+const nativeModel = (slug: string, facts?: ServerProviderModel["nativeFacts"]): ServerProviderModel => ({
+  slug, name: "Review model", isCustom: false, capabilities: {}, ...(facts ? { nativeFacts: facts } : {}),
 });
 
-describe("resolveModelPickerSelectedModel", () => {
-  it("follows the catalog default for the marker but keeps an explicit native model", () => {
-    const driverKind = ProviderDriverKind.make("antigravity");
-    const previousOptions = [
-      { slug: "gemini-fast", name: "Gemini Fast", aliases: [ANTIGRAVITY_DEFAULT_MODEL] },
-      { slug: "gemini-pro", name: "Gemini Pro" },
-    ];
-    const nextOptions = [
-      { slug: "gemini-fast", name: "Gemini Fast" },
-      { slug: "gemini-pro", name: "Gemini Pro", aliases: [ANTIGRAVITY_DEFAULT_MODEL] },
-    ];
-
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: previousOptions,
-      })?.slug,
-    ).toBe("gemini-fast");
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: nextOptions,
-      })?.slug,
-    ).toBe("gemini-pro");
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: "gemini-fast",
-        options: nextOptions,
-      })?.slug,
-    ).toBe("gemini-fast");
+describe("native model switcher consumers", () => {
+  it("carries catalog facts through composer options without inventing missing metrics", () => {
+    const input = catalog([nativeModel("neoproxy/virtual/review", {
+      intelligence: 43, tokensPerSecond: 118, contextWindow: 200000, inputCostPerMillion: 0, outputCostPerMillion: 15,
+    })]);
+    const rows = nativeSwitcherModels({ ...input, activeModel: "neoproxy/virtual/review" });
+    expect(rows[0]?.group).toBe("neoproxy");
+    expect(nativeSwitcherFactCells(rows[0]!)).toEqual(["43", "Unknown", "~118", "200K", "$0", "$15"]);
+    expect(nativeSwitcherFactCells(nativeModel("local/unknown"))).toEqual(Array(6).fill("Unknown"));
   });
 
-  it("does not guess the default from the first model in a catalog", () => {
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind: ProviderDriverKind.make("antigravity"),
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: [{ slug: "gemini-fast", name: "Gemini Fast" }],
-      }),
-    ).toBeUndefined();
+  it("keeps role aliases and raw virtual IDs distinct through filtering and selection", () => {
+    const input = catalog([nativeModel("@review"), nativeModel("custom-route/Review.V2:blue"), nativeModel("other/basic")]);
+    const rows = nativeSwitcherModels({ ...input, activeModel: "@review" });
+    expect(rows.find((row) => row.slug === "@review")?.group).toBe("Roles");
+    const filtered = filterNativeSwitcherModels(rows, "review.v2:blue");
+    expect(filtered.map((row) => row.slug)).toEqual(["custom-route/Review.V2:blue"]);
+    expect(parseModelPickerModelKey(modelPickerModelKey(filtered[0]!.instanceId, filtered[0]!.slug))).toEqual({ instanceId, slug: "custom-route/Review.V2:blue" });
+    expect(filterNativeSwitcherModels(rows, "/review/JS")).toEqual([]);
+  });
+
+  it("keeps missing and inaccessible saved selections visible without silently substituting a model", () => {
+    const input = catalog([nativeModel("openai/available")], "error");
+    const rows = nativeSwitcherModels({ ...input, activeModel: "private-route/saved:exact" });
+    expect(rows.map((row) => row.slug)).toEqual(["openai/available", "private-route/saved:exact"]);
+    expect(rows.every((row) => row.isUnavailable)).toBe(true);
+    expect(nativeSwitcherFactCells(rows[1]!)).toEqual(Array(6).fill("Unknown"));
   });
 });
 
-describe("shouldOfferModelPickerSetup", () => {
-  const availableModel = { slug: "gemini-3.1-pro", name: "Gemini 3.1 Pro" };
-
-  it("offers setup before an Antigravity account has models", () => {
-    expect(shouldOfferModelPickerSetup(entry("error", "antigravity"), [])).toBe(true);
+it("retains the exact saved native selection when its runtime entry disappears", () => {
+  const rows = nativeSwitcherModels({
+    entries: [],
+    options: new Map(),
+    activeInstanceId: instanceId,
+    activeModel: "custom-proxy/virtual/model:Exact",
   });
-
-  it("offers setup after sign-out even if a model remains cached", () => {
-    const providerEntry = entry("ready", "antigravity");
-    expect(
-      shouldOfferModelPickerSetup(
-        {
-          ...providerEntry,
-          snapshot: { ...providerEntry.snapshot, auth: { status: "unauthenticated" } },
-        },
-        [availableModel],
-      ),
-    ).toBe(true);
-  });
-
-  it("offers setup when the only model is an unavailable saved selection", () => {
-    expect(
-      shouldOfferModelPickerSetup(entry("ready", "antigravity"), [
-        { ...availableModel, isUnavailable: true },
-      ]),
-    ).toBe(true);
-  });
-
-  it("does not offer setup for a ready account with available models", () => {
-    expect(shouldOfferModelPickerSetup(entry("ready", "antigravity"), [availableModel])).toBe(
-      false,
-    );
-  });
-
-  it("does not restore a disabled provider while its status snapshot is stale", () => {
-    expect(
-      shouldOfferModelPickerSetup({ ...entry("error", "antigravity"), enabled: false }, []),
-    ).toBe(false);
-  });
-
-  it("keeps providers without integrated setup on their existing path", () => {
-    expect(shouldOfferModelPickerSetup(entry("error", "codex"), [])).toBe(false);
-  });
-
-  it("uses the environment's setup capability for other drivers", () => {
-    const providerEntry = entry("error", "custom_driver");
-    expect(
-      shouldOfferModelPickerSetup(
-        {
-          ...providerEntry,
-          snapshot: {
-            ...providerEntry.snapshot,
-            setup: { canAuthenticate: true, canInstall: false },
-          },
-        },
-        [],
-      ),
-    ).toBe(true);
-  });
+  expect(rows.map((row) => [row.slug, row.group, row.isUnavailable])).toEqual([
+    ["custom-proxy/virtual/model:Exact", "custom-proxy", true],
+  ]);
 });
 
-describe("adjacentModelPickerProvider", () => {
-  const codex = entry("ready", "codex");
-  const claude = entry("ready", "claudeAgent");
-  const unavailable = entry("error");
-  const input = {
-    entries: [codex, unavailable, claude],
-    disabledInstanceIds: undefined,
-    selectableUnavailableInstanceIds: undefined,
-  };
-
-  it("wraps through favorites and ready instances, skipping unavailable providers", () => {
-    expect(
-      adjacentModelPickerProvider({ ...input, selectedInstanceId: codex.instanceId, direction: 1 }),
-    ).toBe(claude.instanceId);
-    expect(
-      adjacentModelPickerProvider({ ...input, selectedInstanceId: "favorites", direction: -1 }),
-    ).toBe(claude.instanceId);
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: claude.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
-  });
-
-  it("keeps thread locks and the selected unavailable catalog", () => {
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        disabledInstanceIds: new Set([claude.instanceId]),
-        selectedInstanceId: codex.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectableUnavailableInstanceIds: new Set([unavailable.instanceId]),
-        selectedInstanceId: codex.instanceId,
-        direction: 1,
-      }),
-    ).toBe(unavailable.instanceId);
-  });
-
-  it("handles an empty catalog and a removed selection in either direction", () => {
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        entries: [],
-        selectedInstanceId: codex.instanceId,
-        direction: -1,
-      }),
-    ).toBe("favorites");
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: unavailable.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: unavailable.instanceId,
-        direction: -1,
-      }),
-    ).toBe(claude.instanceId);
-  });
+it("retains descriptions for newly discovered roles through composer options and filtering", () => {
+  const input = catalog([{
+    ...nativeModel("@new-project-role"),
+    description: "Find the preceding architecture decision",
+  }]);
+  const rows = nativeSwitcherModels({ ...input, activeModel: "@new-project-role" });
+  expect(rows[0]?.description).toBe("Find the preceding architecture decision");
+  expect(filterNativeSwitcherModels(rows, "preceding architecture").map((row) => row.slug)).toEqual([
+    "@new-project-role",
+  ]);
 });

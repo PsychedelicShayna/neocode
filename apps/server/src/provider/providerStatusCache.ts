@@ -29,18 +29,8 @@ const mergeProviderModels = (
   ];
 };
 
-/**
- * Built-in drivers in presentation order. Codex and Claude lead, the opt-in
- * providers follow, and unknown or fork drivers sort after every built-in.
- */
-const BUILT_IN_DRIVER_ORDER: ReadonlyArray<string> = [
-  "codex",
-  "claudeAgent",
-  "cursor",
-  "grok",
-  "opencode",
-  "antigravity",
-];
+/** Native runtime snapshots precede read-only legacy identities. */
+const BUILT_IN_DRIVER_ORDER: ReadonlyArray<string> = ["neopi"];
 
 const driverRank = (driver: string): number => {
   const index = BUILT_IN_DRIVER_ORDER.indexOf(driver);
@@ -152,9 +142,8 @@ export const writeProviderStatusCache = (input: {
   readonly filePath: string;
   readonly provider: ServerProvider;
 }) => {
-  const { updateState: _updateState, ...cacheableProvider } = input.provider;
   return writeFileStringAtomically({
     filePath: input.filePath,
-    contents: `${JSON.stringify(cacheableProvider, null, 2)}\n`,
+    contents: `${JSON.stringify(input.provider, null, 2)}\n`,
   });
 };

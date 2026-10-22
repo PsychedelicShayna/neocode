@@ -42,6 +42,18 @@ describe("extractPairingUrlFromQrPayload", () => {
     ).toBe("https://remote.example.com/pair#token=pairing-token");
   });
 
+  it("imports an explicit fork pairing payload without rewriting its server or credential", () => {
+    const pairingUrl = "https://desktop.tailnet.ts.net/pair#token=one-time-token";
+    for (const scheme of ["neocode", "neocode-dev", "neocode-preview"]) {
+      const payload = `${scheme}://connections/new?${new URLSearchParams({ pairingUrl })}`;
+      expect(extractPairingUrlFromQrPayload(payload)).toBe(pairingUrl);
+      expect(parsePairingUrl(extractPairingUrlFromQrPayload(payload))).toEqual({
+        host: "https://desktop.tailnet.ts.net",
+        code: "one-time-token",
+      });
+    }
+  });
+
   it("rejects empty qr payloads", () => {
     expect(() => extractPairingUrlFromQrPayload("   ")).toThrowError(PairingQrPayloadEmptyError);
     expect(() => extractPairingUrlFromQrPayload("   ")).toThrowError(

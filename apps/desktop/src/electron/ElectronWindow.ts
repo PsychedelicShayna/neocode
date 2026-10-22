@@ -9,7 +9,6 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as Electron from "electron";
@@ -117,6 +116,9 @@ export class ElectronWindow extends Context.Service<
     readonly focusedMainOrFirst: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly setMain: (window: Electron.BrowserWindow) => Effect.Effect<void>;
     readonly clearMain: (window: Option.Option<Electron.BrowserWindow>) => Effect.Effect<void>;
+    readonly fromWebContentsId: (
+      id: number,
+    ) => Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly prepareReveal: (window: Electron.BrowserWindow) => Effect.Effect<boolean>;
     readonly reveal: (window: Electron.BrowserWindow) => Effect.Effect<void>;
     readonly sendAll: (channel: string, ...args: readonly unknown[]) => Effect.Effect<void>;
@@ -142,7 +144,7 @@ export const make = Effect.gen(function* () {
   // Tracks a capture reveal in flight. Ordinary reveals keep Electron's native path.
   const captureRevealWindows = new Set<number>();
   yield* Effect.addFinalizer(() => Effect.sync(() => windowsForegroundFocus?.close()));
-  const mainWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+  const mainWindows = new Set<Electron.BrowserWindow>();
 
   const listWindows = Effect.try({
     try: () => Electron.BrowserWindow.getAllWindows(),
@@ -169,12 +171,16 @@ export const make = Effect.gen(function* () {
         }),
     }).pipe(Effect.orDie);
 
-  const liveMain = Effect.gen(function* () {
-    const main = yield* Ref.get(mainWindowRef);
-    if (Option.isNone(main) || (yield* isWindowDestroyed(main.value))) {
-      return Option.none<Electron.BrowserWindow>();
+  const liveMain = Effect.sync(() => {
+    let selected: Electron.BrowserWindow | undefined;
+    for (const window of mainWindows) {
+      if (window.isDestroyed()) {
+        mainWindows.delete(window);
+      } else {
+        selected = window;
+      }
     }
-    return main;
+    return Option.fromUndefinedOr(selected);
   });
 
   const currentMainOrFirst = Effect.gen(function* () {
@@ -202,7 +208,11 @@ export const make = Effect.gen(function* () {
           cause,
         }),
     }).pipe(Effect.orDie);
-    if (Option.isSome(focused) && !(yield* isWindowDestroyed(focused.value))) {
+    if (
+      Option.isSome(focused) &&
+      mainWindows.has(focused.value) &&
+      !(yield* isWindowDestroyed(focused.value))
+    ) {
       return focused;
     }
     return yield* currentMainOrFirst;
@@ -241,16 +251,32 @@ export const make = Effect.gen(function* () {
     main: liveMain,
     currentMainOrFirst,
     focusedMainOrFirst,
-    setMain: (window) => Ref.set(mainWindowRef, Option.some(window)),
+    setMain: (window) =>
+      Effect.sync(() => {
+        if (mainWindows.has(window)) return;
+        mainWindows.add(window);
+        const onFocus = () => {
+          mainWindows.delete(window);
+          mainWindows.add(window);
+        };
+        window.on("focus", onFocus);
+        window.once("closed", () => {
+          mainWindows.delete(window);
+          captureRevealWindows.delete(window.id);
+          window.removeListener("focus", onFocus);
+        });
+      }),
     clearMain: (window) =>
-      Ref.update(mainWindowRef, (current) => {
-        if (Option.isNone(current)) {
-          return current;
+      Effect.sync(() => {
+        if (Option.isSome(window)) mainWindows.delete(window.value);
+        else mainWindows.clear();
+      }),
+    fromWebContentsId: (id) =>
+      Effect.sync(() => {
+        for (const window of mainWindows) {
+          if (!window.isDestroyed() && window.webContents.id === id) return Option.some(window);
         }
-        if (Option.isSome(window) && current.value !== window.value) {
-          return current;
-        }
-        return Option.none();
+        return Option.none<Electron.BrowserWindow>();
       }),
     prepareReveal: (window) =>
       Effect.promise(async () => {

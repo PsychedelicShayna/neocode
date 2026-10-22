@@ -4,7 +4,6 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ApprovalRequestId,
-  CodexSettings,
   ProviderDriverKind,
   type OrchestrationEvent,
   type OrchestrationThread,
@@ -42,13 +41,11 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import { ServerSettingsService } from "../src/serverSettings.ts";
 import * as StorageCleanup from "../src/storageCleanup.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
-import { makeCodexAdapter } from "../src/provider/Layers/CodexAdapter.ts";
 import {
   NoOpProviderEventLoggers,
   ProviderEventLoggers,
 } from "../src/provider/Layers/ProviderEventLoggers.ts";
 import { ProviderService } from "../src/provider/Services/ProviderService.ts";
-import { ProviderAuthService } from "../src/provider/Services/ProviderAuthService.ts";
 import { AnalyticsService } from "../src/telemetry/AnalyticsService.ts";
 import { CheckpointReactorLive } from "../src/orchestration/Layers/CheckpointReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
@@ -92,7 +89,6 @@ import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
 
-const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
 function runGit(cwd: string, args: ReadonlyArray<string>) {
   return NodeChildProcess.execFileSync("git", args, {
@@ -233,7 +229,6 @@ export interface OrchestrationIntegrationHarness {
 
 interface MakeOrchestrationIntegrationHarnessOptions {
   readonly provider?: ProviderDriverKind;
-  readonly realCodex?: boolean;
   /** A real adapter with a controlled native runtime, registered through ProviderService. */
   readonly adapter?: ProviderAdapterShape<ProviderAdapterError>;
   /** Tracer for every fiber the harness runtime runs, including reactors. */
@@ -247,10 +242,9 @@ export const makeOrchestrationIntegrationHarness = (
     const path = yield* Path.Path;
     const fileSystem = yield* FileSystem.FileSystem;
 
-    const provider = options?.provider ?? ProviderDriverKind.make("codex");
-    const useRealCodex = options?.realCodex === true;
+    const provider = options?.provider ?? ProviderDriverKind.make("neopi");
     const adapterHarness =
-      useRealCodex || options?.adapter
+      options?.adapter
         ? null
         : yield* makeTestProviderAdapterHarness({
             provider,
@@ -284,29 +278,8 @@ export const makeOrchestrationIntegrationHarness = (
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntime.layer),
     );
-    const realCodexRegistry = Layer.effect(
-      ProviderAdapterRegistry,
-      Effect.gen(function* () {
-        const codexSettings = yield* decodeCodexSettings({});
-        const codexAdapter = yield* makeCodexAdapter(codexSettings);
-        return makeAdapterRegistryMock({
-          [ProviderDriverKind.make("codex")]: codexAdapter,
-        });
-      }),
-    ).pipe(
-      Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
-      Layer.provideMerge(NodeServices.layer),
-      Layer.provideMerge(providerSessionDirectoryLayer),
-    );
     const providerEventLoggersLayer = Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers);
-    const providerLayer = useRealCodex
-      ? makeProviderServiceLive().pipe(
-          Layer.provide(providerSessionDirectoryLayer),
-          Layer.provide(realCodexRegistry),
-          Layer.provide(AnalyticsService.layerTest),
-          Layer.provide(providerEventLoggersLayer),
-        )
-      : makeProviderServiceLive().pipe(
+    const providerLayer = makeProviderServiceLive().pipe(
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(fakeRegistry!),
           Layer.provide(AnalyticsService.layerTest),
@@ -344,11 +317,6 @@ export const makeOrchestrationIntegrationHarness = (
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
     } as unknown as TextGeneration["Service"]);
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
-      Layer.provide(
-        Layer.mock(ProviderAuthService)({
-          tryHandlePromptCommand: () => Effect.succeed(false),
-        }),
-      ),
       Layer.provide(Layer.mock(TerminalManager.TerminalManager)({ closeIdle: () => Effect.void })),
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),

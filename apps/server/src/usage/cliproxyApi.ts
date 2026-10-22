@@ -12,9 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
-import { codexPlanLabel } from "../provider/Layers/CodexProvider.ts";
-import { codexRateLimitsToLimits } from "../provider/Layers/codexUsageLimits.ts";
-import { claudeUsageResponseToLimits } from "../provider/Layers/claudeUsageLimits.ts";
+import { codexPlanLabel, codexRateLimitsToLimits, claudeUsageResponseToLimits } from "./inferenceUsageLimits.ts";
 import { makeUnavailableUsageLimits } from "../provider/providerUsageLimits.ts";
 
 const AuthFile = Schema.Struct({

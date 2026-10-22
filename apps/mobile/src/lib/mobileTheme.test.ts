@@ -21,6 +21,8 @@ import {
   getMobileThemeVariables,
   normalizeMobileThemeId,
   normalizeMobileThemeMode,
+  neoPiMobileThemeVariables,
+  shouldFollowMobileNeoPiTheme,
   resolveMobileThemeIds,
   themeColorWithAlpha,
   themeColorToNativeColor,
@@ -56,6 +58,33 @@ function compositeOver(overlay: string, background: string): string {
   );
   return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
 }
+
+describe("native mobile theme projection", () => {
+  it("preserves saved named palettes until the device explicitly follows NeoPi", () => {
+    expect(shouldFollowMobileNeoPiTheme(null)).toBe(false);
+    expect(shouldFollowMobileNeoPiTheme({})).toBe(true);
+    expect(shouldFollowMobileNeoPiTheme({ themeId: "iris" })).toBe(false);
+    expect(shouldFollowMobileNeoPiTheme({ darkThemeId: "unresolved" })).toBe(false);
+    expect(shouldFollowMobileNeoPiTheme({ themeId: "iris", nativeThemeFollow: true })).toBe(true);
+    expect(shouldFollowMobileNeoPiTheme({ nativeThemeFollow: false })).toBe(false);
+  });
+  it("uses native colors while retaining readable text and the graphical send action", () => {
+    const variables = neoPiMobileThemeVariables("dark", {
+      pageBg: "#14141b", cardBg: "#21212b", infoBg: "#2b2b35",
+      statusLineBg: "#101018", userMessageBg: "#ddddee",
+      text: "#22222a", muted: "#191920", accent: "#8765aa",
+      borderAccent: "#181820",
+    });
+    expect(variables["--color-screen"]).toBe("#14141b");
+    expect(variables["--color-drawer"]).toBe("#101018");
+    for (const background of [variables["--color-screen"], variables["--color-card"], variables["--color-card-alt"]]) {
+      expect(contrastRatio(variables["--color-foreground"], background)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(variables["--color-focus"], background)).toBeGreaterThanOrEqual(3);
+    }
+    expect(contrastRatio(variables["--color-user-bubble-foreground"], variables["--color-user-bubble"])).toBeGreaterThanOrEqual(4.5);
+    expect(variables["--color-primary"]).toBe(getMobileThemeVariables(DEFAULT_MOBILE_THEME_ID, "dark")["--color-primary"]);
+  });
+});
 
 describe("mobile themes", () => {
   it("declares every runtime theme variable in the static stylesheet", () => {

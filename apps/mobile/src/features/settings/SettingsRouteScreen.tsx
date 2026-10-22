@@ -129,6 +129,7 @@ function LocalSettingsRouteScreen() {
 }
 
 function SettingsIndexSections() {
+  const navigation = useNavigation();
   const { selectedTargets, projectGroups, selectedProjectKey } = useSettingsEnvironmentFilter();
   const noServerTargets = selectedTargets.length === 0;
   const selectedProject = projectGroups.find((group) => group.key === selectedProjectKey);
@@ -169,6 +170,12 @@ function SettingsIndexSections() {
       </SettingsSection>
 
       <SettingsSection title="Server settings">
+        <SettingsRow
+          icon="text.bubble"
+          label="Models"
+          disabled={noServerTargets}
+          onPress={() => navigation.navigate("Models", { environmentId: selectedTargets[0]!.environmentId })}
+        />
         <SettingsRow
           icon="text.bubble"
           label="New threads"

@@ -41,17 +41,12 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudInstallRelayClient)).toBe(AuthRelayWriteScope);
   });
 
-  it("requires permission to operate on a thread before uploading feedback", () => {
-    expect(requiredScopeForRpcMethod(WS_METHODS.providerUploadFeedback)).toBe(
-      AuthOrchestrationOperateScope,
-    );
-  });
 
-  it("requires write access to import agent session history", () => {
-    expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsScan)).toBe(
+  it("requires write access to resume native NeoPi history", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.neopiSessionsList)).toBe(
       AuthOrchestrationReadScope,
     );
-    expect(requiredScopeForRpcMethod(WS_METHODS.agentSessionsImport)).toBe(
+    expect(requiredScopeForRpcMethod(WS_METHODS.neopiSessionsResume)).toBe(
       AuthOrchestrationOperateScope,
     );
   });

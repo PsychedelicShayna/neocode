@@ -37,6 +37,7 @@ import {
   createVividThemeColors,
   getDefaultThemeColors,
   themeColorToHex,
+  neoPiThemeColors,
   toCanonicalThemeColor,
   THEME_FILE_VERSION,
   singleAppearanceOf,
@@ -78,6 +79,38 @@ function contrastRatio(first: string, second: string): number {
   const darker = Math.min(luminance(first), luminance(second));
   return (lighter + 0.05) / (darker + 0.05);
 }
+
+describe("native theme projection", () => {
+  it("maps native semantic surfaces without losing text or focus contrast", () => {
+    for (const appearance of ["light", "dark"] as const) {
+      const dark = appearance === "dark";
+      const native = {
+        pageBg: dark ? "#15151c" : "#faf9f5",
+        cardBg: dark ? "#232330" : "#ecebe8",
+        infoBg: dark ? "#30303d" : "#dedddb",
+        statusLineBg: dark ? "#101018" : "#ffffff",
+        userMessageBg: dark ? "#261c30" : "#251e30",
+        text: dark ? "#181820" : "#eeeeee",
+        muted: dark ? "#24242a" : "#dddddd",
+        accent: "#8156bd",
+        borderAccent: dark ? "#191920" : "#eeeeee",
+      };
+      const colors = neoPiThemeColors(appearance, native);
+      expect(asHex(colors.canvas)).toBe(native.pageBg);
+      expect(asHex(colors.sidebar)).toBe(native.statusLineBg);
+      for (const surface of [colors.canvas, colors.surface, colors.surfaceRaised, colors.surfaceOverlay]) {
+        expect(contrastRatio(colors.text, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio(colors.textMuted, surface)).toBeGreaterThanOrEqual(4.5);
+        expect(contrastRatio(colors.focus, surface)).toBeGreaterThanOrEqual(3);
+      }
+      expect(contrastRatio(colors.messageForeground, colors.messageSurface)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(colors.sidebarForeground, colors.sidebar)).toBeGreaterThanOrEqual(4.5);
+      const original = getDefaultThemeColors(appearance);
+      expect(colors.messageAction).toBe(original.messageAction);
+      expect(colors.messageActionForeground).toBe(original.messageActionForeground);
+    }
+  });
+});
 
 describe("theme files", () => {
   it("keeps every built-in palette value in canonical OKLCH form", () => {

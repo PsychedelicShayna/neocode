@@ -161,7 +161,6 @@ import {
   CHAT_TIMELINE_ANCHOR_OFFSET,
   readTimelinePosition,
   rememberTimelinePosition,
-  timelineContentOverflowsViewport,
 } from "./timelineScrollAnchoring";
 import { MessageCopyButton } from "./MessageCopyButton";
 import { PierreEntryIcon } from "./PierreEntryIcon";
@@ -450,12 +449,6 @@ interface MessagesTimelineProps {
    */
   liveFollowEnabled: boolean;
   onIsAtEndChange: (isAtEnd: boolean) => void;
-  /**
-   * Whether the real rows extend past the viewport above the composer.
-   * Reported after scrolls, row size changes, and viewport resizes.
-   */
-  onContentOverflowChange?: (overflows: boolean) => void;
-  onToolOutputCollapsedAtEnd?: () => void;
   onManualNavigation: () => void;
   cancelPositionRestoreRef?: React.RefObject<(() => void) | null>;
   hideEmptyPlaceholder?: boolean;
@@ -514,8 +507,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   contentInsetEndAdjustment,
   liveFollowEnabled,
   onIsAtEndChange,
-  onContentOverflowChange,
-  onToolOutputCollapsedAtEnd,
   onManualNavigation,
   cancelPositionRestoreRef,
   hideEmptyPlaceholder = false,
@@ -628,32 +619,24 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     };
   }, [settlingListIdentity]);
 
-  const suspendEndScrollMaintenanceForDisclosure = useCallback(
-    (anchorKey: string, collapsed = false) => {
-      disclosureAnchorKeyRef.current = anchorKey;
-      setDisclosureToggleSettling(true);
-      if (disclosureSettleFrameRef.current !== null) {
-        cancelAnimationFrame(disclosureSettleFrameRef.current);
-      }
-      if (disclosureSettleSecondFrameRef.current !== null) {
-        cancelAnimationFrame(disclosureSettleSecondFrameRef.current);
-      }
-      disclosureSettleFrameRef.current = requestAnimationFrame(() => {
-        disclosureSettleSecondFrameRef.current = requestAnimationFrame(() => {
-          disclosureAnchorKeyRef.current = null;
-          setDisclosureToggleSettling(false);
-          disclosureSettleFrameRef.current = null;
-          disclosureSettleSecondFrameRef.current = null;
-          // Wait for row measurement and the disclosure click's blur check.
-          // Closing output can reveal the end without a scroll event.
-          if (collapsed && resolveTimelineIsAtEnd(listRef.current?.getState()) === true) {
-            onToolOutputCollapsedAtEnd?.();
-          }
-        });
+  const suspendEndScrollMaintenanceForDisclosure = useCallback((anchorKey: string) => {
+    disclosureAnchorKeyRef.current = anchorKey;
+    setDisclosureToggleSettling(true);
+    if (disclosureSettleFrameRef.current !== null) {
+      cancelAnimationFrame(disclosureSettleFrameRef.current);
+    }
+    if (disclosureSettleSecondFrameRef.current !== null) {
+      cancelAnimationFrame(disclosureSettleSecondFrameRef.current);
+    }
+    disclosureSettleFrameRef.current = requestAnimationFrame(() => {
+      disclosureSettleSecondFrameRef.current = requestAnimationFrame(() => {
+        disclosureAnchorKeyRef.current = null;
+        setDisclosureToggleSettling(false);
+        disclosureSettleFrameRef.current = null;
+        disclosureSettleSecondFrameRef.current = null;
       });
-    },
-    [listRef, onToolOutputCollapsedAtEnd],
-  );
+    });
+  }, []);
 
   const shouldRestoreVisibleContentPosition = useCallback((row: MessagesTimelineRow) => {
     const disclosureAnchorKey = disclosureAnchorKeyRef.current;
@@ -686,7 +669,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const onToggleWorkGroup = useCallback(
     (groupId: string, anchorKey: string) => {
-      suspendEndScrollMaintenanceForDisclosure(anchorKey, expandedWorkGroupIds.has(groupId));
+      suspendEndScrollMaintenanceForDisclosure(anchorKey);
       setExpandedWorkGroupIds((existing) => {
         const next = new Set(existing);
         if (next.has(groupId)) {
@@ -697,11 +680,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         return next;
       });
     },
-    [expandedWorkGroupIds, suspendEndScrollMaintenanceForDisclosure],
+    [suspendEndScrollMaintenanceForDisclosure],
   );
   const onToggleReasoning = useCallback(
     (messageId: string, expanded: boolean, anchorKey: string) => {
-      suspendEndScrollMaintenanceForDisclosure(anchorKey, !expanded);
+      suspendEndScrollMaintenanceForDisclosure(anchorKey);
       setExpandedReasoningMessageIds((current) => {
         if (current.has(messageId) === expanded) return current;
         const next = new Set(current);
@@ -982,42 +965,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [anchoredEndSpace, contentInsetEndAdjustment],
   );
 
-  const measureContentOverflow = useCallback(
-    () =>
-      timelineContentOverflowsViewport(listRef.current?.getState?.(), {
-        composerInset: contentInsetEndAdjustment,
-        anchorOffset: CHAT_TIMELINE_ANCHOR_OFFSET,
-      }),
-    [contentInsetEndAdjustment, listRef],
-  );
-  // LegendList lays rows out from layout effects, so a read on the next frame
-  // sees the settled positions. One frame is shared across bursts of size
-  // changes.
-  const contentOverflowFrameRef = useRef<number | null>(null);
-  const cancelContentOverflowFrame = useCallback(() => {
-    if (contentOverflowFrameRef.current !== null) {
-      cancelAnimationFrame(contentOverflowFrameRef.current);
-      contentOverflowFrameRef.current = null;
-    }
-  }, []);
-  const reportContentOverflow = useCallback(() => {
-    if (!onContentOverflowChange || contentOverflowFrameRef.current !== null) return;
-    contentOverflowFrameRef.current = requestAnimationFrame(() => {
-      contentOverflowFrameRef.current = null;
-      onContentOverflowChange(measureContentOverflow());
-    });
-  }, [measureContentOverflow, onContentOverflowChange]);
-  useEffect(() => cancelContentOverflowFrame, [cancelContentOverflowFrame]);
-  // The list's own layout effects have already run here, so estimated row
-  // positions are in place. Reporting before the first paint lets a thread
-  // open in its final composer layout instead of correcting it a frame later.
-  // A frame scheduled with the previous inset would overwrite this read, so
-  // it is dropped first.
-  useLayoutEffect(() => {
-    cancelContentOverflowFrame();
-    onContentOverflowChange?.(measureContentOverflow());
-  }, [cancelContentOverflowFrame, measureContentOverflow, onContentOverflowChange, rows.length]);
-
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
     if (restoringThreadPosition || state?.data !== rows) return;
@@ -1047,7 +994,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     if (isAtEnd !== undefined && !citationPositioning) {
       onIsAtEndChange(isAtEnd);
     }
-    reportContentOverflow();
     if (!state || minimapItems.length === 0) {
       return;
     }
@@ -1096,7 +1042,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     minimapItems,
     minimapStripMap,
     onIsAtEndChange,
-    reportContentOverflow,
   ]);
 
   useEffect(() => {
@@ -1124,7 +1069,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         current === nextHasPersistentGutter ? current : nextHasPersistentGutter,
       );
       setMinimapHitStripWidth(resolveTimelineMinimapHitStripWidth(viewportWidth, contentWidth));
-      reportContentOverflow();
     };
 
     const frame = requestAnimationFrame(measure);
@@ -1136,7 +1080,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [timelineViewportElement, rows.length, reportContentOverflow, chatWidth]);
+  }, [timelineViewportElement, rows.length, chatWidth]);
 
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
@@ -1323,7 +1267,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             }
             maintainScrollAtEndThreshold={1}
             onScroll={handleScroll}
-            onItemSizeChanged={reportContentOverflow}
             className={cn(
               "scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5",
               topFadeEnabled && "topbar-scroll-fade",

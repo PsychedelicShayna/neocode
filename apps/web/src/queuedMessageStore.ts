@@ -21,8 +21,6 @@ export interface QueuedMessageSendSettings {
   modelSelection: ModelSelection;
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
-  /** Effort written into the prompt text, for providers that read it there. */
-  promptEffort: string | null;
 }
 
 /**

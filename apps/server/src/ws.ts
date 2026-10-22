@@ -55,7 +55,6 @@ import {
   ProjectSearchContentsError,
   ProjectSearchEntriesError,
   ProjectWriteFileError,
-  ProviderUploadFeedbackError,
   ProviderSetupError,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
@@ -82,6 +81,7 @@ import {
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
@@ -109,15 +109,14 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
-import * as ModelManifest from "./provider/ModelManifest.ts";
-import * as ProviderMaintenance from "./provider/providerMaintenance.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
-import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
-import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeNeoPiSessionCatalog } from "./provider/neopi/NeoPiSessionCatalog.ts";
-import { makeProviderInstallation } from "./provider/providerInstallation.ts";
+import { makeNeoPiSessionJournal } from "./provider/neopi/NeoPiSessionJournal.ts";
+import { makeNeoPiNativeConversation } from "./provider/neopi/NeoPiNativeConversation.ts";
+import { makeNeoPiThemes } from "./provider/neopi/NeoPiThemes.ts";
+import { makeNeoPiModels } from "./provider/neopi/NeoPiModels.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -144,8 +143,6 @@ import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
-import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
-import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -564,14 +561,9 @@ const makeWsRpcLayer = (
         yield* Effect.context<Effect.Services<ReturnType<typeof remoteSshDeviceHosts>>>();
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
-      const modelManifest = yield* ModelManifest.ModelManifest;
-      const providerVersionCache = yield* ProviderMaintenance.ProviderVersionCache;
       const providerService = yield* ProviderService.ProviderService;
       const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
-      const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
-      const providerAuth = yield* ProviderAuthService;
       const providerInstances = yield* ProviderInstanceRegistry;
-      const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
@@ -628,8 +620,11 @@ const makeWsRpcLayer = (
         | ServerConfig.ServerConfig
         | WorkspacePaths.WorkspacePaths
       >();
-      const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
       const neopiSessionCatalog = yield* makeNeoPiSessionCatalog();
+      const neopiModels = yield* makeNeoPiModels();
+      const neopiSessionJournal = yield* makeNeoPiSessionJournal();
+      const neopiNativeConversation = yield* makeNeoPiNativeConversation();
+      const neopiThemes = makeNeoPiThemes(neopiModels.connection);
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -1879,6 +1874,40 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
+              const changesConversation =
+                command.type === "thread.turn.start" ||
+                command.type === "thread.runtime-mode.set" ||
+                command.type === "thread.interaction-mode.set" ||
+                command.type === "thread.approval.respond" ||
+                command.type === "thread.user-input.respond" ||
+                command.type === "thread.user-input.dismiss" ||
+                command.type === "thread.checkpoint.revert" ||
+                command.type === "thread.conversation.revert" ||
+                (command.type === "thread.meta.update" && command.modelSelection !== undefined);
+              if (changesConversation && "threadId" in command) {
+                const thread = yield* projectionSnapshotQuery.getThreadShellById(command.threadId);
+                if (Option.isSome(thread)) {
+                  const reason = getThreadRuntimeReadOnlyReason({
+                    modelSelection: thread.value.modelSelection,
+                    session: thread.value.session,
+                    settings: yield* serverSettings.getSettings,
+                  });
+                  if (reason) return yield* new OrchestrationDispatchCommandError({ message: reason });
+                }
+              }
+              if (
+                (command.type === "thread.create" && !command.historyImport) ||
+                command.type === "thread.turn.start" ||
+                command.type === "thread.meta.update"
+              ) {
+                if (command.modelSelection !== undefined) {
+                  const reason = getThreadRuntimeReadOnlyReason({
+                    modelSelection: command.modelSelection,
+                    settings: yield* serverSettings.getSettings,
+                  });
+                  if (reason) return yield* new OrchestrationDispatchCommandError({ message: reason });
+                }
+              }
               yield* ProjectCloneTracker.rejectCommandsDuringClone(projectCloneTracker, command);
               const normalizedCommand = yield* normalizeDispatchCommand(command);
               // Archive removes the thread from the client, so this transport
@@ -2366,22 +2395,13 @@ const makeWsRpcLayer = (
               // Only explicit catalog refreshes bypass T3's caches. Workspace
               // discovery and background status checks retain their timers.
               if (input.refreshModels) {
-                yield* modelManifest.forceRefresh;
                 const instances = yield* providerInstances.listInstances;
                 yield* Effect.forEach(
                   instances.filter(
                     (instance) =>
                       input.instanceId === undefined || input.instanceId === instance.instanceId,
                   ),
-                  (instance) =>
-                    Effect.gen(function* () {
-                      yield* instance.invalidateCaches ?? Effect.void;
-                      const maintenance = yield* instance.snapshot.resolveMaintenance({
-                        fresh: true,
-                      });
-                      if (maintenance.packageName)
-                        providerVersionCache.delete(maintenance.packageName);
-                    }),
+                  (instance) => instance.invalidateCaches ?? Effect.void,
                   { concurrency: "unbounded", discard: true },
                 );
               }
@@ -2431,28 +2451,6 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "server" },
           ),
-        [WS_METHODS.providerUploadFeedback]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.providerUploadFeedback,
-            providerService.uploadFeedback(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderUploadFeedbackError({
-                    threadId: input.threadId,
-                    cause,
-                  }),
-              ),
-            ),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.serverUpdateProvider]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.serverUpdateProvider,
-            providerMaintenanceRunner.updateProvider(input),
-            {
-              "rpc.aggregate": "server",
-            },
-          ),
         [WS_METHODS.providerConsumeResetCredit]: (input) =>
           observeRpcEffect(
             WS_METHODS.providerConsumeResetCredit,
@@ -2489,61 +2487,6 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "provider" },
           ),
-        [WS_METHODS.providerAuthStart]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.providerAuthStart,
-            providerAuth.start(input, currentSessionId),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.providerAuthRespond]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.providerAuthRespond,
-            providerAuth.respond(input, currentSessionId),
-            {
-              "rpc.aggregate": "provider",
-              instanceId: input.instanceId,
-            },
-          ),
-        [WS_METHODS.providerAuthComplete]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.providerAuthComplete,
-            providerAuth.complete(input, currentSessionId),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.providerAuthCancel]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.providerAuthCancel,
-            providerAuth.cancel(input, currentSessionId),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.providerAuthLogout]: (input) =>
-          observeRpcEffect(WS_METHODS.providerAuthLogout, providerAuth.logout(input), {
-            "rpc.aggregate": "provider",
-          }),
-        [WS_METHODS.providerAuthSubscribe]: (input) =>
-          observeRpcStream(
-            WS_METHODS.providerAuthSubscribe,
-            providerAuth.subscribe(input, currentSessionId),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.providerInstallStart]: (input) =>
-          observeRpcEffect(WS_METHODS.providerInstallStart, providerInstallation.start(input), {
-            "rpc.aggregate": "provider",
-          }),
-        [WS_METHODS.providerInstallCancel]: (input) =>
-          observeRpcEffect(WS_METHODS.providerInstallCancel, providerInstallation.cancel(input), {
-            "rpc.aggregate": "provider",
-          }),
-        [WS_METHODS.providerInstallSubscribe]: (input) =>
-          observeRpcStream(
-            WS_METHODS.providerInstallSubscribe,
-            providerInstallation.subscribe(input),
-            { "rpc.aggregate": "provider" },
-          ),
-        [WS_METHODS.providerInstallRemove]: (input) =>
-          observeRpcEffect(WS_METHODS.providerInstallRemove, providerInstallation.remove(input), {
-            "rpc.aggregate": "provider",
-          }),
         [WS_METHODS.serverUpdateServer]: (input) =>
           observeRpcEffect(WS_METHODS.serverUpdateServer, serverUpdate.update(input), {
             "rpc.aggregate": "server",
@@ -3160,31 +3103,6 @@ const makeWsRpcLayer = (
             deletePendingAttachment(input.attachmentId),
             { "rpc.aggregate": "workspace" },
           ),
-        [WS_METHODS.agentSessionsScan]: () =>
-          observeRpcEffect(WS_METHODS.agentSessionsScan, agentSessionScanner.scan, {
-            "rpc.aggregate": "workspace",
-          }),
-        [WS_METHODS.agentSessionsImport]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.agentSessionsImport,
-            importRecentAgentThreads(input).pipe(
-              Effect.provideService(AgentSessionScanner.AgentSessionScanner, agentSessionScanner),
-              Effect.provideService(
-                OrchestrationEngine.OrchestrationEngineService,
-                orchestrationEngine,
-              ),
-              Effect.provideService(
-                ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-                projectionSnapshotQuery,
-              ),
-              Effect.provideService(Crypto.Crypto, crypto),
-              Effect.provideService(
-                ProviderSessionDirectory.ProviderSessionDirectory,
-                providerSessionDirectory,
-              ),
-            ),
-            { "rpc.aggregate": "workspace" },
-          ),
         [WS_METHODS.neopiSessionsList]: (input) =>
           observeRpcEffect(WS_METHODS.neopiSessionsList, neopiSessionCatalog.list(input), {
             "rpc.aggregate": "workspace",
@@ -3209,6 +3127,29 @@ const makeWsRpcLayer = (
             neopiSessionCatalog.watchConfiguration(input),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.neopiSessionsJournal]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsJournal, neopiSessionJournal(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiSessionsWatchJournal]: (input) =>
+          observeRpcStream(WS_METHODS.neopiSessionsWatchJournal, neopiNativeConversation.watch(input.threadId), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsNavigateTree]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsNavigateTree, neopiNativeConversation.navigate(input), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsResumeTree]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsResumeTree, neopiNativeConversation.resume(input), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiSessionsCancelNavigation]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiSessionsCancelNavigation, neopiNativeConversation.cancel(input.threadId), { "rpc.aggregate": "workspace" }),
+        [WS_METHODS.neopiThemesRead]: (input) => neopiThemes.read(input),
+        [WS_METHODS.neopiThemesWatch]: (input) => neopiThemes.watch(input),
+        [WS_METHODS.neopiThemesUpdate]: (input) => neopiThemes.update(input),
+        [WS_METHODS.neopiModelsRead]: (input) => neopiModels.read(input),
+        [WS_METHODS.neopiModelsWatch]: (input) => neopiModels.watch(input),
+        [WS_METHODS.neopiModelsUpdate]: (input) => neopiModels.update(input),
+        [WS_METHODS.neopiModelsAccounts]: (input) => neopiModels.accounts(input),
+        [WS_METHODS.neopiModelsAuthStart]: (input) => neopiModels.startAuth(input),
+        [WS_METHODS.neopiModelsAuthWatch]: (input) => neopiModels.watchAuth(input),
+        [WS_METHODS.neopiModelsAuthRespond]: (input) => neopiModels.respondAuth(input),
+        [WS_METHODS.neopiModelsAuthCancel]: (input) => neopiModels.cancelAuth(input),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
@@ -3884,8 +3825,6 @@ export const websocketRpcRouteLayer = Layer.unwrap(
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
-              Layer.provide(AgentSessionScanner.layer),
-              Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
               // One server-lifetime service means clients share the same PR caches, and a WS
               // mutation invalidates the HTTP diff cache that every client reads from.

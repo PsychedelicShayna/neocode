@@ -102,6 +102,8 @@ export const executeAuthenticatedEnvironmentHttpRequest = Effect.fn(
   readonly request: (input: {
     readonly client: Effect.Success<ReturnType<typeof makeEnvironmentHttpApiGroupClient<Group>>>;
     readonly headers: EnvironmentHttpAuthHeaders;
+    /** Resolved after relay refresh, and identical to the URL signed by DPoP. */
+    readonly url: string;
   }) => Effect.Effect<A, E, R>;
   /** Some endpoints report rejected credentials in a successful response. */
   readonly isUnauthorizedResponse?: (response: NoInfer<A>) => boolean;
@@ -152,7 +154,7 @@ export const executeAuthenticatedEnvironmentHttpRequest = Effect.fn(
       const result = yield* executeEnvironmentHttpRequest(
         requestUrl,
         input.timeoutMs,
-        withEnvironmentCredentials(authorization, input.request({ client, headers })),
+        withEnvironmentCredentials(authorization, input.request({ client, headers, url: requestUrl })),
       ).pipe(Effect.result);
 
       if (Result.isFailure(result)) {

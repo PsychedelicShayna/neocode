@@ -30,7 +30,7 @@ import {
   CommandItem,
   CommandList,
 } from "../ui/command";
-import { filterNeoPiSessions, neopiSessionRowState } from "./neopiSessionPicker.logic";
+import { filterNeoPiSessions, neopiSessionRowState } from "@t3tools/client-runtime/neopi-sessions";
 
 type PendingRestoration = {
   readonly session: NeoPiSessionSummary;

@@ -79,50 +79,18 @@ describe("getProviderModelCapabilities", () => {
 });
 
 describe("resolveSelectableProvider", () => {
-  function provider(driver: string, overrides: Partial<ServerProvider> = {}): ServerProvider {
-    return {
-      driver: ProviderDriverKind.make(driver),
-      instanceId: ProviderInstanceId.make(driver),
-      enabled: true,
-      installed: true,
-      version: null,
-      status: "ready",
-      auth: { status: "authenticated" },
-      checkedAt: "2026-01-01T00:00:00.000Z",
-      models: [model({ slug: "fixture-model", capabilities: {} })],
-      slashCommands: [],
-      skills: [],
-      ...overrides,
-    };
-  }
-
-  it("uses the NeoPi-first fallback for an unset or removed legacy selection", () => {
+  const provider = (driver: string, instanceId = driver, overrides: Partial<ServerProvider> = {}): ServerProvider => ({ driver: ProviderDriverKind.make(driver), instanceId: ProviderInstanceId.make(instanceId), enabled: true, installed: true, version: null, status: "ready", auth: { status: "unknown" }, checkedAt: "2026-10-22T00:00:00.000Z", models: [model({ slug: "openai-codex/current", capabilities: {} })], skills: [], slashCommands: [], ...overrides });
+  it("resolves unset and obsolete runtime choices to NeoPi", () => {
     const providers = [provider("codex"), provider("neopi")];
-
     expect(resolveSelectableProvider(providers, null)).toBe("neopi");
+    expect(resolveSelectableProvider(providers, ProviderInstanceId.make("codex"))).toBe("neopi");
     expect(resolveSelectableProvider(providers, ProviderInstanceId.make("removed"))).toBe("neopi");
   });
-
-  it("keeps an explicitly selected custom instance's driver even after a probe error", () => {
-    const selected = provider("claudeAgent", {
-      instanceId: ProviderInstanceId.make("claude_work"),
-      status: "error",
-    });
-
-    expect(resolveSelectableProvider([provider("neopi"), selected], selected.instanceId)).toBe(
-      "claudeAgent",
-    );
+  it("recognizes a native custom instance even when its id names an inference provider", () => {
+    const selected = provider("neopi", "anthropic-work", { status: "error" });
+    expect(resolveSelectableProvider([selected], selected.instanceId)).toBe("neopi");
   });
-
-  it.each([
-    { enabled: false },
-    { availability: "unavailable" as const },
-    { status: "error" as const },
-    { status: "warning" as const },
-    { models: [] },
-  ])("uses a healthy alternative when NeoPi cannot become the default: %j", (state) => {
-    expect(
-      resolveSelectableProvider([provider("neopi", state), provider("codex")], undefined),
-    ).toBe("codex");
+  it("does not resurrect another runtime when NeoPi is unavailable", () => {
+    expect(resolveSelectableProvider([provider("codex"), provider("neopi", "neopi", { enabled: false })], ProviderInstanceId.make("codex"))).toBe("neopi");
   });
-});
+});;

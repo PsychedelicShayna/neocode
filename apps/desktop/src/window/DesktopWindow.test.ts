@@ -282,6 +282,7 @@ function makeTestLayer(input: {
     focusedMainOrFirst: Ref.get(input.mainWindow),
     setMain: (window) => Ref.set(input.mainWindow, Option.some(window)),
     clearMain: () => Ref.set(input.mainWindow, Option.none()),
+    fromWebContentsId: () => Effect.succeedNone,
     prepareReveal: () => Effect.succeed(false),
     reveal: (window) => Effect.sync(() => input.onReveal?.(window)),
     sendAll: () => Effect.void,
@@ -397,6 +398,7 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
       focusedMainOrFirst: currentMainOrFirst,
       setMain: (window) => Ref.set(mainWindow, Option.some(window)),
       clearMain: () => Ref.set(mainWindow, Option.none()),
+      fromWebContentsId: () => Effect.succeedNone,
       prepareReveal: () => Effect.succeed(false),
       reveal: (window) =>
         Ref.update(revealedWindows, (windows) => [...windows, window]).pipe(
@@ -757,6 +759,48 @@ describe("DesktopWindow", () => {
       }),
     );
   });
+
+  it.effect("keeps another window usable while one renderer recovers", () =>
+    Effect.gen(function* () {
+      const first = makeFakeBrowserWindow();
+      const second = makeFakeBrowserWindow();
+      const scenario = yield* makeSplashScenario([first.window, second.window]);
+      yield* Effect.gen(function* () {
+        const windows = yield* DesktopWindow.DesktopWindow;
+        yield* windows.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        yield* windows.dispatchMenuAction("new-window");
+        assert.equal(yield* Ref.get(scenario.createCalls), 2);
+        assert.strictEqual(yield* windows.ensureMain, second.window);
+        yield* windows.activate;
+        yield* windows.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.equal(yield* Ref.get(scenario.createCalls), 2);
+
+        const onCrash = first.webContentsListeners.get("render-process-gone");
+        assert.isDefined(onCrash);
+        onCrash({}, { reason: "crashed", exitCode: 1 });
+        yield* TestClock.adjust(500);
+        assert.equal(first.loadURL.mock.calls.length, 2);
+        assert.equal(second.loadURL.mock.calls.length, 1);
+        assert.strictEqual(yield* windows.ensureMain, second.window);
+        assert.equal(yield* Ref.get(scenario.createCalls), 2);
+      }).pipe(Effect.provide(scenario.layer));
+    }),
+  );
+
+  it.effect("queues New Window until startup has registered the renderer protocol", () =>
+    Effect.gen(function* () {
+      const first = makeFakeBrowserWindow();
+      const second = makeFakeBrowserWindow();
+      const scenario = yield* makeSplashScenario([first.window, second.window]);
+      yield* Effect.gen(function* () {
+        const windows = yield* DesktopWindow.DesktopWindow;
+        yield* windows.dispatchMenuAction("new-window");
+        assert.equal(yield* Ref.get(scenario.createCalls), 0);
+        yield* windows.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.equal(yield* Ref.get(scenario.createCalls), 1);
+      }).pipe(Effect.provide(scenario.layer));
+    }),
+  );
 
   it.effect("does not open a development window until the backend is ready", () =>
     Effect.gen(function* () {

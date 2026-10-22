@@ -17,7 +17,6 @@ import { KeybindingShortcut } from "./keybindings.ts";
 import {
   CustomModelSetting,
   DEFAULT_TEXT_GENERATION_MODEL,
-  DEFAULT_TEXT_GENERATION_REASONING_EFFORT,
   ProviderOptionSelections,
 } from "./model.ts";
 import {
@@ -442,9 +441,6 @@ export const ClientSettingsSchema = Schema.Struct({
   // Legacy context window meter. The composer hides it by default; users who
   // still want the old usage indicator can restore it from Settings.
   contextWindowMeterEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-  // Desktop resting composer: scrolling an existing thread's conversation
-  // settles the composer into its single-line layout. Losing focus never does.
-  composerCollapseOnScroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   // Rich text is the default; users can opt out for literal Markdown editing.
   composerRichTextEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sendShortcut: Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"]).pipe(
@@ -1277,14 +1273,8 @@ export const ServerSettings = Schema.Struct({
   textGenerationModelSelection: ModelSelection.pipe(
     Schema.withDecodingDefault(
       Effect.succeed({
-        instanceId: ProviderInstanceId.make("codex"),
+        instanceId: ProviderInstanceId.make("neopi"),
         model: DEFAULT_TEXT_GENERATION_MODEL,
-        options: [
-          {
-            id: "reasoningEffort",
-            value: DEFAULT_TEXT_GENERATION_REASONING_EFFORT,
-          },
-        ],
       }),
     ),
   ),
@@ -1692,7 +1682,6 @@ export const ClientSettingsPatch = Schema.Struct({
   ),
   planModeEnabled: Schema.optionalKey(Schema.Boolean),
   contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
-  composerCollapseOnScroll: Schema.optionalKey(Schema.Boolean),
   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),
   followUpBehavior: Schema.optionalKey(Schema.Literals(["queue", "steer"])),

@@ -70,7 +70,6 @@ import {
 } from "../SidebarStageBackdrop";
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
-import { useCustomThemes } from "../../hooks/useCustomThemes";
 import {
   readAppearanceModePreference,
   readThemeHalves,
@@ -242,7 +241,7 @@ const BACKGROUND_ACTIVITY_PROFILE_DESCRIPTIONS: Record<BackgroundActivityProfile
 
 const ADVANCED_BACKGROUND_ACTIVITY_DESCRIPTION = "Uses custom intervals.";
 
-const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("codex");
+const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("neopi");
 const BACKGROUND_ACTIVITY_BOOLEAN_OVERRIDES: ReadonlyArray<{
   readonly key:
     | "pauseWhenHostLocked"
@@ -591,18 +590,12 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.showSkillsInSlashMenu !== DEFAULT_UNIFIED_SETTINGS.showSkillsInSlashMenu
         ? ["Show skills in slash menu"]
         : []),
-      ...(settings.composerCollapseOnScroll !== DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll
-        ? ["Collapse composer on scroll"]
-        : []),
       ...(settings.composerRichTextEnabled !== DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled
         ? ["Rich text composer"]
         : []),
       ...(settings.sendShortcut !== DEFAULT_UNIFIED_SETTINGS.sendShortcut ? ["Send shortcut"] : []),
       ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
         ? ["Follow-up behavior"]
-        : []),
-      ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
-        ? ["Context window indicator"]
         : []),
       ...(settings.responseStreamingMode !== DEFAULT_UNIFIED_SETTINGS.responseStreamingMode
         ? ["Response streaming"]
@@ -661,7 +654,6 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.confirmThreadArchive,
       settings.confirmThreadDelete,
       settings.confirmThreadUnpin,
-      settings.composerCollapseOnScroll,
       settings.composerRichTextEnabled,
       settings.sendShortcut,
       settings.followUpBehavior,
@@ -673,7 +665,6 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.diffLayout,
       settings.proactivePanelsEnabled,
       settings.environmentIdentificationMode,
-      settings.contextWindowMeterEnabled,
       settings.fontFamilyCode,
       settings.fontFamilyComposer,
       settings.fontFamilySans,
@@ -777,11 +768,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       diffLayout: DEFAULT_UNIFIED_SETTINGS.diffLayout,
       proactivePanelsEnabled: DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled,
       showSkillsInSlashMenu: DEFAULT_UNIFIED_SETTINGS.showSkillsInSlashMenu,
-      composerCollapseOnScroll: DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll,
       composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
-      contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
       panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
@@ -1155,18 +1144,6 @@ function BackgroundActivityAdvancedDialog({
 }
 
 export function AppearanceSettingsPanel() {
-  const {
-    appearanceMode,
-    refreshTheme,
-    resolvedTheme,
-    setAppearanceMode,
-    setTheme,
-    setThemeHalf,
-    theme,
-    themeHalves,
-  } = useTheme();
-  const customThemes = useCustomThemes();
-  const [isImportThemeOpen, setIsImportThemeOpen] = useState(false);
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
   const environmentStageLabel = useEnvironmentStageLabel();
@@ -1197,19 +1174,7 @@ export function AppearanceSettingsPanel() {
     <SettingsPageContainer>
       <SettingsSection id="appearance" title="Colors & themes" variant="plain" hideTitle>
         <div id={searchableSetting("theme").id}>
-          <ThemeLibrary
-            appearanceMode={appearanceMode}
-            customThemes={customThemes}
-            initialAppearance={resolvedTheme}
-            refreshTheme={refreshTheme}
-            isImportOpen={isImportThemeOpen}
-            setAppearanceMode={setAppearanceMode}
-            setTheme={setTheme}
-            setThemeHalf={setThemeHalf}
-            theme={theme}
-            themeHalves={themeHalves}
-            onImportOpenChange={setIsImportThemeOpen}
-          />
+          <ThemeLibrary />
         </div>
       </SettingsSection>
 
@@ -2115,19 +2080,6 @@ function LegacyFeaturesSection() {
               }
             />
             <SettingsRow
-              {...searchableSetting("legacy-context-window-indicator")}
-              description="Shows context window usage as a circular indicator in the composer."
-              control={
-                <Switch
-                  checked={settings.contextWindowMeterEnabled}
-                  onCheckedChange={(checked) =>
-                    updateSettings({ contextWindowMeterEnabled: Boolean(checked) })
-                  }
-                  aria-label="Context window indicator (legacy)"
-                />
-              }
-            />
-            <SettingsRow
               {...searchableSetting("legacy-sidebar")}
               description="Restore per-project thread trees instead of the default flat sidebar."
               control={
@@ -2664,33 +2616,6 @@ export function GeneralSettingsPanel() {
         />
 
         <SettingsRow
-          {...searchableSetting("composer-collapse")}
-          description="Rest the composer of an existing thread into a single line when you scroll the conversation. Focus the composer or start typing to expand it again."
-          resetAction={
-            settings.composerCollapseOnScroll !==
-            DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll ? (
-              <SettingResetButton
-                label="collapse composer on scroll"
-                onClick={() =>
-                  updateSettings({
-                    composerCollapseOnScroll: DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll,
-                  })
-                }
-              />
-            ) : null
-          }
-          control={
-            <Switch
-              checked={settings.composerCollapseOnScroll}
-              onCheckedChange={(checked) =>
-                updateSettings({ composerCollapseOnScroll: Boolean(checked) })
-              }
-              aria-label="Collapse composer on scroll"
-            />
-          }
-        />
-
-        <SettingsRow
           {...searchableSetting("send-shortcut")}
           description="Choose when Enter sends a prompt or inserts a new line"
           resetAction={
@@ -2779,35 +2704,6 @@ export function GeneralSettingsPanel() {
           }
         />
 
-        <SettingsRow
-          serverScoped
-          settingKeys={["enableProviderUpdateChecks"]}
-          {...searchableSetting("provider-update-checks")}
-          description="Check installed provider CLIs for newer available versions."
-          resetAction={
-            settings.enableProviderUpdateChecks !==
-            DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks ? (
-              <SettingResetButton
-                label="provider update checks"
-                onClick={() =>
-                  updateSettings({
-                    enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
-                  })
-                }
-              />
-            ) : null
-          }
-          control={
-            <ScopedSwitch
-              settingKeys={["enableProviderUpdateChecks"]}
-              checked={settings.enableProviderUpdateChecks}
-              onCheckedChange={(checked) =>
-                updateSettings({ enableProviderUpdateChecks: Boolean(checked) })
-              }
-              aria-label="Check provider versions"
-            />
-          }
-        />
 
         <SettingsRow
           {...searchableSetting("continue-threads-after-server-update")}
@@ -3200,18 +3096,11 @@ export function GeneralSettingsPanel() {
                   <TraitsPicker
                     provider={textGenProvider}
                     models={
-                      // Use the exact instance's models (rather than the
-                      // first-kind-match) so a custom text-gen instance like
-                      // `codex_personal` gets its own model list, not the
-                      // default Codex one.
+                      // A native profile can expose a different catalog from the default instance.
                       textGenInstanceEntry?.models ?? []
                     }
                     model={textGenModel}
-                    prompt=""
-                    onPromptChange={() => {}}
                     modelOptions={textGenModelOptions}
-                    allowPromptInjectedEffort={false}
-                    planModeEnabled={settings.planModeEnabled}
                     triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
                     onModelOptionsChange={(nextOptions) => {
                       updateSettings({

@@ -35,8 +35,6 @@ import {
   type TerminalSessionStatus,
   type TerminalSummary,
   type TerminalWriteInput,
-  ClaudeSettings,
-  CodexSettings,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { makeKeyedCoalescingWorker } from "@t3tools/shared/KeyedCoalescingWorker";
@@ -60,8 +58,6 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as ServerConfig from "../config.ts";
 import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
-import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
-import { makeClaudeEnvironment } from "../provider/Drivers/ClaudeHome.ts";
 import { deriveProviderInstanceConfigMap } from "../provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import {
@@ -69,7 +65,6 @@ import {
   terminalRestartsTotal,
   terminalSessionsTotal,
 } from "../observability/Metrics.ts";
-import { expandHomePath } from "../pathExpansion.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
 import * as NativeTelemetryClient from "../resourceTelemetry/NativeTelemetryClient.ts";
@@ -103,8 +98,6 @@ const DEFAULT_OPEN_ROWS = 30;
 const TERMINAL_ENV_BLOCKLIST = new Set(["PORT", "ELECTRON_RENDERER_PORT", "ELECTRON_RUN_AS_NODE"]);
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const MAX_TERMINAL_LABEL_LENGTH = 128;
-const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
-const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
 
 class TerminalSubprocessCheckError extends Schema.TaggedError<TerminalSubprocessCheckError>()(
   "TerminalSubprocessCheckError",
@@ -1315,8 +1308,7 @@ function createTerminalSpawnEnv(
   }
   if (runtimeEnv) {
     for (const [key, value] of Object.entries(runtimeEnv)) {
-      spawnEnv[key] =
-        key === "CODEX_HOME" || key === "CLAUDE_CONFIG_DIR" ? expandHomePath(value) : value;
+      spawnEnv[key] = value;
     }
   }
   // Both PTY backends feed truecolor-capable terminal clients.
@@ -1372,7 +1364,6 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
   "terminal.resolveProviderInstanceTerminalEnvironment",
 )(function* (input: {
   readonly serverSettings: ServerSettings.ServerSettingsService["Service"];
-  readonly path: Path.Path;
   readonly rawProviderInstanceId: string;
   readonly env: Record<string, string> | undefined;
 }) {
@@ -1381,28 +1372,11 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
     Effect.mapError((cause) => new TerminalProviderEnvironmentError({ providerInstanceId, cause })),
   );
   const instance = deriveProviderInstanceConfigMap(settings)[providerInstanceId];
-  if (instance === undefined) {
+  if (instance === undefined || instance.driver !== "neopi") {
     return yield* new TerminalProviderInstanceNotFoundError({ providerInstanceId });
   }
 
-  let resolved = mergeProviderInstanceEnvironment(instance.environment, input.env ?? {});
-  if (instance.driver === "codex") {
-    const config = decodeCodexSettings(instance.config ?? {});
-    if (Option.isSome(config)) {
-      const layout = yield* resolveCodexHomeLayout(config.value).pipe(
-        Effect.provideService(Path.Path, input.path),
-      );
-      if (layout.effectiveHomePath)
-        resolved = { ...resolved, CODEX_HOME: layout.effectiveHomePath };
-    }
-  } else if (instance.driver === "claudeAgent") {
-    const config = decodeClaudeSettings(instance.config ?? {});
-    if (Option.isSome(config)) {
-      resolved = yield* makeClaudeEnvironment(config.value, resolved).pipe(
-        Effect.provideService(Path.Path, input.path),
-      );
-    }
-  }
+  const resolved = mergeProviderInstanceEnvironment(instance.environment, input.env ?? {});
 
   return Object.fromEntries(
     Object.entries(resolved).filter((entry): entry is [string, string] => entry[1] !== undefined),
@@ -1416,16 +1390,11 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const portDiscovery = yield* PortScanner.PortDiscovery;
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
-  const path = yield* Path.Path;
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({
-      serverSettings,
-      path,
-      rawProviderInstanceId,
-      env,
-    }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
+    env, }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,

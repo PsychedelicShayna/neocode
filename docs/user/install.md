@@ -1,7 +1,7 @@
 # Install NeoCode
 
-NeoCode runs coding agents on your computer and lets you control them from its
-desktop, web, or mobile app. Set up the machine where the agents will work first.
+NeoCode is a desktop, web, and mobile frontend for NeoPi. Set up NeoPi on the
+machine where your sessions will run first.
 
 Download this fork from [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases).
 For a source checkout, follow the [development guide](../operations/development.md).
@@ -10,9 +10,36 @@ not NeoCode. Existing `t3` commands, data directories and deep links retain thei
 
 ## Requirements
 
-You need an installed, authenticated provider before starting a thread. You can
-launch NeoCode and configure providers afterwards. NeoPi is enabled by default;
-explicit saved provider and model choices are preserved.
+You need NeoPi and an available inference provider before starting a thread.
+NeoCode can open before NeoPi is configured. Existing NeoPi settings are preserved.
+
+## Desktop windows
+
+Use **File > New Window** or `Ctrl+Alt+N`, `Cmd+Alt+N` on macOS, to open another
+NeoCode window. Windows in the same profile share their environment connection,
+backend and running sessions. Launching the app again still raises the most
+recently used window.
+
+Close a window to leave the others running. **Quit** exits the application and
+stops its local backend. Closing the last window also exits on Linux and Windows;
+on macOS, reopen it from the Dock or **File > New Window**.
+
+A separate `T3CODE_HOME` creates a separate desktop profile, including its browser
+storage and instance lock. It does not reuse the default profile's saved browser
+connections. Use another window, not another profile pointed at the same state,
+when you want to work with the same local sessions.
+
+Open **Models** from the sidebar or press **Alt-M** to configure NeoPi's native
+inference providers, model roles and effort rules. Choose the environment and
+project whose settings you want to change. Opening Models from a connected
+thread uses that native session instead. Changes go through NeoPi and retain
+its global/project scope rules; an edit made elsewhere can require a refresh
+before you save.
+
+Provider login, API keys and saved-account removal are handled by NeoPi.
+NeoCode does not keep another credential vault. Models requires a native
+executable advertising the Models configuration contract; an older executable
+shows an update error rather than pretending a save worked.
 
 ## Upstream command line
 
@@ -79,7 +106,7 @@ update fails. Download the new `.deb` and install it the same way.
 The [NeoPi-enabled Linux AppImage](https://github.com/PsychedelicShayna/neocode/releases)
 includes `npi` and runs it without a separate installation. To use its terminal
 agent, run `./T3-Code-npi.AppImage --npi --help` (or replace `--help` with any
-`npi` arguments). Authenticate with `npi` before using accounts that require it.
+`npi` arguments). Authenticate through **Models**, or use the native `npi` login.
 
 On Linux, packaged NeoCode claims the `t3code:` login callback handler. Starting
 a source build normally leaves the installed handler unchanged. To use a built
@@ -97,10 +124,9 @@ close the source app and launch the packaged app again.
 
 ### Windows Subsystem for Linux
 
-Choose a WSL distro in **Settings → Connections** to run agents and projects
-there. Install the provider CLIs inside that distro. T3 Code installs its own
-server runtime there automatically; the first launch after an app update can
-take longer.
+Choose a WSL distro in **Settings → Connections** to run sessions and projects
+there. Install NeoPi inside that distro. NeoCode installs its server runtime
+there automatically; the first launch after an app update can take longer.
 
 ### Open a project from a terminal
 
@@ -129,29 +155,24 @@ component stack that store crash reports leave out. Copy the report and paste it
 into a GitHub issue. Error messages can quote values from the app, so read it over
 before sharing.
 
-## Providers
+## NeoPi
 
-Open **Settings → Providers** in the web or desktop app, select the environment,
-and enable the provider you want. Installation, login, and configuration belong
-to that environment's machine, even when you connect from a phone or another
-computer.
+Open **Settings → Providers** in the web or desktop app and select the environment
+to configure its NeoPi executable. On Linux, the NeoPi-enabled AppImage includes
+`npi`; elsewhere install `npi` or a compatible `omp` CLI. Configure inference
+providers, authentication, and models in NeoPi.
 
-Fresh installations enable only NeoPi and list it first. Enable other harnesses
-in Settings when you want to use them. Existing enabled harnesses stay enabled,
-including choices saved before provider toggles were written explicitly.
-New threads prefer a ready NeoPi instance when no saved provider/model choice
-applies; an enabled, ready alternative remains available when NeoPi is not usable.
-Project defaults and saved selections are preserved.
+NeoCode runs only NeoPi. OpenAI Codex, Anthropic, Cursor, and other inference
+providers exposed by NeoPi remain available. They are model backends, not separate
+NeoCode agent runtimes.
 
-| Provider    | Install and authenticate                                                                                                                                    |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Codex       | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.                                                                       |
-| Claude      | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`.                                                                |
-| Cursor      | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                                                                                       |
-| Grok Build  | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                                                                                          |
-| OpenCode    | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                                                                                    |
-| NeoPi       | On Linux, the NeoPi-enabled AppImage includes `npi`; elsewhere install the NeoPi `npi` CLI or a compatible `omp` CLI. Configure authentication in that CLI. |
-| Antigravity | Install and sign in with Google from T3 Code's provider settings.                                                                                           |
+Saved conversations from other runtimes remain in the database and can still be
+read, renamed, or archived. Their history is read-only and cannot be resumed as a
+NeoPi session. New threads ignore obsolete runtime defaults and use an available
+NeoPi instance without changing the old conversations.
+
+Setup does not scan or import Claude Code or Codex projects. Add a project folder
+explicitly from the workspace, or use **Resume NeoPi session** for native history.
 
 NeoPi automatically checks `npi-nightly`, then `npi`, the desktop app's bundled
 `npi` (when available), and `omp` for session-catalog support. A version string
@@ -199,28 +220,63 @@ imported history before opening the thread. Reopening an already-bound, stopped
 thread restores new terminal turns into that same thread without duplicating
 earlier messages. An active NeoCode thread opens without replacing its history.
 
-If the session is still open in a terminal, NeoCode attaches to that terminal's
-process instead of opening a second writer: messages you send from NeoCode run
-there. Turns started directly in the terminal are not mirrored live; close the
-terminal session and reopen its bound row to restore them. While attached, use
-the terminal to change modes, model settings, or compact history; NeoCode cannot
-change those owner-controlled settings.
+NeoCode follows the native session's selected branch in the main conversation,
+including turns started in its terminal. GUI turns use the existing NeoPi send
+path. Opening a conversation never takes ownership from the terminal or starts a
+second writer. The conversation header distinguishes attached input, terminal
+observation, stopped history and reconnecting state.
 
-To inspect the connected session's model and role configuration, open **NeoPi
-session configuration** in the thread header. It shows the native session
-identity, ownership, current model and effort, and NeoPi's configured role
-fallbacks and resolutions. This view is read-only. Use **Refresh** for a new
-snapshot, or enable **Follow model changes** to refresh when NeoPi reports model
-or effort changes. Following stops when you close the inspector or turn it off.
-Role-definition changes may still need Refresh. Opening the inspector does not
-start a stopped session or change the terminal's settings.
+The status beside the composer follows the connected native model and effort,
+output throughput, journal-wide cache hit rate, context utilization and recorded
+session cost. Context information is always available here, independent of the
+legacy indicator setting. Hover a metric for its observation time and scope.
+Recorded cost includes all journal branches, completed tasks and restored advisor
+spend, but excludes unfinished child runs. Missing counters stay unavailable,
+and disconnected observations are not shown as current.
+
+Open **NeoPi session configuration** in the header to inspect native ownership,
+current permissions and role configuration. **Next owned turn** changes the
+permission preference sent before your next turn, not the current native policy.
+The native runtime must accept it. While attached, permission changes are
+disabled because the terminal owns that policy. Opening this panel does not
+start or restart a session. Use **Refresh** for role-definition changes.
+
+The main conversation reads NeoPi's canonical journal, not an imported SQL
+transcript. Compaction, context-reset and branch-summary boundaries stay visible,
+and **Load older native entries** reaches history before them without a fixed
+history limit. Live messages remain provisional until NeoPi confirms their
+durable journal identities. A reconnect reads a fresh branch and never resends a
+prompt. Unknown entry types and extension content remain available as canonical
+JSON alongside native text, images, reasoning and tool records.
+
+Choose **Session tree**, or **Native history** in the right panel, to inspect
+alternate branches. Filter tools and system events, search loaded entries, and
+load older pages until the point you want is available. Selecting a row only
+inspects it. **Navigate here** runs NeoPi's same-file tree command. It preserves
+alternate futures, restores a selected user request and its ordered images to
+the composer, and can carry a native summary into the chosen branch.
+
+Selecting an old native ask result can reopen its questions without moving the
+branch. Save a new answer to create a sibling answer, wait for the conversation
+to rebuild, then choose **Resume after rebuilt transcript**. Reopened answers and
+pending continuation acknowledgements survive closing the panel. You can keep
+the saved answer without resuming. Cancel before saving leaves the original
+branch intact. Navigation and summary failures remain visible in the panel;
+they are not reported as successful leaf changes.
+
+Stopped history is read through NeoPi's read-only journal command. To navigate a
+stopped session, choose **Start stopped native session and navigate**. This starts
+its native owner without sending a prompt. Navigation requires
+`session_tree_navigation`; live following requires `session_journal_events`, and
+complete paging requires `session_journal`. Missing native support is reported
+explicitly. NeoCode does not substitute a partial SQL transcript.
 
 To go the other way, use **Continue in terminal** in a NeoPi thread's header:
 NeoCode stops its NeoPi process and copies the command that reopens the same
 native session in `npi`. If the terminal still owns the session, NeoCode only
 detaches and explains which process keeps it open instead of offering a resume
-command. After terminal continuation, close that session and use **Resume NeoPi
-session** again to return to the same NeoCode thread with its new turns.
+command. The native conversation reports that detached state while it observes
+the terminal. Refresh or reconnect to observe the current owner again.
 
 Discovery and attachment need `session_catalog` and `control_pipe`; restoration
 and handoff also require `session_history_identity`. Capability errors identify
@@ -238,32 +294,10 @@ refused without replacing the thread; the error includes the native session path
 for continuing safely in NeoPi. Pre-v2 native journals must first be continued
 in NeoPi to persist durable entry identities.
 
-Other provider CLIs must be on the server's `PATH`. If T3 Code cannot find one, set its
-**Binary path** in provider settings, especially when using a version manager.
-Cursor's executable is `cursor-agent`, although its login command is
-`agent login`. Antigravity can use its managed runtime without a `PATH` entry.
-
-T3 Code warns when a provider version has known compatibility problems with your
-release. Check **Settings → Providers** on that environment for the recommended
-version or range. When its package manager supports installing a specific version,
-you can install the recommendation there. Otherwise use the provider's installer
-on the environment's machine. An unlisted version is unverified.
-
-When a provider CLI is behind its latest release, its provider card shows the
-available version. **Update now** appears only when T3 Code can tell which
-installer owns the CLI (its own update command, Homebrew, or a global npm, pnpm,
-bun, or Vite+ install) and runs that installer. Otherwise update the CLI the same
-way you installed it. Homebrew installs compare against the version Homebrew
-offers, which can trail the npm release by a few hours.
-
-Add another provider instance for a separate account or configuration. Each
-instance can have its own environment variables, such as API keys or a custom
-base URL. Mark secret values as sensitive; after saving, T3 Code does not display
-their original values.
-
-For provider-specific setup and accounts, see [Codex](./providers-codex.md),
-[Claude](./providers-claude.md), [OpenCode](./providers-opencode.md), and
-[Antigravity](./providers-antigravity.md).
+Add another NeoPi instance for a separate profile or executable configuration.
+Each instance can have its own environment variables. Mark secret values as
+sensitive; NeoCode does not display their original values after saving.
+NeoPi upgrades and inference-provider sign-in remain in NeoPi, not NeoCode.
 
 ## Next steps
 

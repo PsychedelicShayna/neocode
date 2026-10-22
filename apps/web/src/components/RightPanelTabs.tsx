@@ -23,6 +23,7 @@ import {
   FileDiff,
   Files,
   Globe2,
+  GitBranch,
   Plus,
   TerminalSquare,
   Volume2,
@@ -132,6 +133,7 @@ interface RightPanelTabsProps {
   pullRequestsAvailable: boolean;
   agentsAvailable: boolean;
   deviceAvailable: boolean;
+  nativeHistory?: { onOpen: () => void } | undefined;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
@@ -336,6 +338,7 @@ function RightPanelEmptyState(props: {
   agentsAvailable: boolean;
   deviceAvailable: boolean;
   liveAgentCount: number;
+  nativeHistory?: { onOpen: () => void } | undefined;
 }) {
   // -1 means no highlight: it only appears on hover or arrow use.
   const [highlight, setHighlight] = useState(-1);
@@ -414,6 +417,15 @@ function RightPanelEmptyState(props: {
       onClick: props.onAddDevice,
       badgeCount: 0,
     },
+    ...(props.nativeHistory ? [{
+      label: "Native history",
+      icon: GitBranch,
+      shortcut: "H",
+      available: true,
+      disabledReason: "",
+      onClick: props.nativeHistory.onOpen,
+      badgeCount: 0,
+    }] : []),
   ] as const;
 
   type SurfaceAction = (typeof actions)[number];
@@ -631,6 +643,8 @@ function surfaceTitle(
       return "Pull requests";
     case "agents":
       return "Agents";
+    case "native-history":
+      return "Native history";
     case "device":
       return surface.title ?? surface.target?.name ?? "Device";
     case "preview": {
@@ -716,6 +730,8 @@ function SurfaceIcon({
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "native-history":
+      return <GitBranch className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -934,6 +950,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.device,
       onClick: props.onAddDevice,
     },
+    ...(props.nativeHistory ? [{
+      label: "Native history",
+      icon: GitBranch,
+      shortcut: "H",
+      available: true,
+      disabledReason: "",
+      onClick: props.nativeHistory.onOpen,
+    }] : []),
   ] as const;
 
   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -1426,6 +1450,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             agentsAvailable={props.agentsAvailable}
             deviceAvailable={props.deviceAvailable}
             liveAgentCount={props.liveAgentCount}
+            nativeHistory={props.nativeHistory}
           />
         ) : (
           props.children

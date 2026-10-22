@@ -48,8 +48,6 @@ describe("ServerProvider", () => {
 
     expect(parsed.slashCommands).toEqual([]);
     expect(parsed.skills).toEqual([]);
-    expect(parsed.versionAdvisory).toBeUndefined();
-    expect(parsed.updateState).toBeUndefined();
   });
 
   it("preserves optional slash-command origin and input without changing older providers", () => {
@@ -71,30 +69,20 @@ describe("ServerProvider", () => {
     ]);
   });
 
-  it("defaults one-click update support when decoding older advisory snapshots", () => {
+  it("ignores retired installer metadata in older snapshots", () => {
     const parsed = decodeServerProvider({
-      instanceId: "codex",
-      driver: "codex",
-      enabled: true,
-      installed: true,
-      version: "1.0.0",
-      status: "ready",
-      auth: {
-        status: "authenticated",
-      },
-      checkedAt: "2026-04-10T00:00:00.000Z",
-      models: [],
+      ...baseProviderSnapshot,
       versionAdvisory: {
         status: "behind_latest",
         currentVersion: "1.0.0",
         latestVersion: "1.0.1",
         updateCommand: "npm install -g @openai/codex@latest",
-        checkedAt: "2026-04-10T00:00:00.000Z",
-        message: "Update available.",
       },
+      updateState: { status: "running" },
     });
 
-    expect(parsed.versionAdvisory?.canUpdate).toBe(false);
+    expect(parsed).not.toHaveProperty("versionAdvisory");
+    expect(parsed).not.toHaveProperty("updateState");
   });
 
   it("decodes continuation group metadata", () => {

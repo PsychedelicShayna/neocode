@@ -64,7 +64,7 @@ it("retains a current model absent from a refreshed catalog and reflects active 
   ]);
 });
 
-it("adds visible RPC roles as a distinct picker group and selects the active role", () => {
+it("keeps the native dynamic role inventory and selects the active role", () => {
   const roles = neoPiRolesFromRpc({
     roles: [
       {
@@ -80,12 +80,12 @@ it("adds visible RPC roles as a distinct picker group and selects the active rol
           modelId: "gpt-5.6-luna",
           thinkingLevel: "low",
         },
-        hidden: false,
       },
       {
         id: "private",
         alias: "@private",
         name: "Private",
+        description: "A newly configured role",
         section: "chat",
         source: "configured",
         patterns: [],
@@ -116,6 +116,16 @@ it("adds visible RPC roles as a distinct picker group and selects the active rol
           { id: "fastMode", type: "boolean", label: "Fast mode", currentValue: true },
         ],
       },
+    },
+    {
+      slug: "@private",
+      name: "Private",
+      description: "A newly configured role",
+      shortName: "private",
+      subProvider: "Roles",
+      aliases: ["private"],
+      isCustom: false,
+      capabilities: { optionDescriptors: [] },
     },
     {
       slug: "openai/gpt-5.6-luna",
@@ -366,4 +376,58 @@ it("does not override explicit native non-reasoning metadata with a stale effort
     },
   ]);
   expect(model?.capabilities).toEqual({ reasoning: false, optionDescriptors: [] });
+});
+
+it("projects native facts without inventing missing prices, speed or intelligence", () => {
+  const models = toServerProviderModels([
+    {
+      provider: "neoproxy",
+      id: "virtual/review",
+      int: 43,
+      tps: 118,
+      contextWindow: 200000,
+      cost: { input: 0, output: 15 },
+    },
+    { provider: "local", id: "unknown", int: NaN, tps: 0, contextWindow: 0, cost: { input: -1 } },
+  ]);
+  expect(models[0]?.nativeFacts).toEqual({
+    intelligence: 43,
+    tokensPerSecond: 118,
+    contextWindow: 200000,
+    inputCostPerMillion: 0,
+    outputCostPerMillion: 15,
+  });
+  expect(models[0]?.nativeFacts?.ttftMs).toBeUndefined();
+  expect(models[1]?.nativeFacts).toBeUndefined();
+});
+
+it("uses only the exact resolved model's facts for roles", () => {
+  const models = toServerProviderModels(
+    [{ provider: "custom", id: "virtual/v2", int: 40, contextWindow: 128000 }],
+    undefined,
+    false,
+    neoPiRolesFromRpc({
+      roles: [
+        {
+          id: "review",
+          alias: "@review",
+          name: "Review",
+          source: "configured",
+          patterns: ["custom/*"],
+          resolved: { provider: "custom", modelId: "virtual/v2" },
+          hidden: false,
+        },
+        {
+          id: "unresolved",
+          alias: "@unresolved",
+          name: "Unresolved",
+          source: "configured",
+          patterns: ["custom/*"],
+          hidden: false,
+        },
+      ],
+    }),
+  );
+  expect(models[0]?.nativeFacts).toEqual({ intelligence: 40, contextWindow: 128000 });
+  expect(models[1]?.nativeFacts).toBeUndefined();
 });

@@ -34,8 +34,8 @@ import { ProjectCloneToastCoordinator } from "../components/ProjectCloneToastCoo
 import { SlowRpcRequestToastCoordinator } from "../components/SlowRpcRequestToastCoordinator";
 import { ThemeEditorHost } from "../components/settings/ThemeEditorHost";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
-import { useDefaultThemeAdoption } from "../hooks/useDefaultTheme";
 import { useEnvironmentThemeSync } from "../hooks/useEnvironmentTheme";
+import { NeoPiThemeSync } from "../components/neopi/NeoPiThemeSync";
 import { Button } from "../components/ui/button";
 import { StandalonePage, StandalonePageHeader } from "../components/ui/standalone-page";
 import {
@@ -252,10 +252,9 @@ function RootRouteView() {
 /** Follows the palette the primary environment's machine publishes, if any. */
 function EnvironmentThemeSync() {
   useEnvironmentThemeSync();
-  // Ordered after the palette sync so a first-run client adopting the
-  // environment's own theme finds it already in the library.
-  useDefaultThemeAdoption();
-  return null;
+  // Native theme snapshots are ephemeral and never replace saved palettes.
+  // This child owns native reconciliation independently of settings remounts.
+  return <NeoPiThemeSync />;
 }
 
 function ContrastAppearanceSync() {

@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./state/neopiThemes": {
+      "types": "./src/state/neopiThemes.ts",
+      "default": "./src/state/neopiThemes.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

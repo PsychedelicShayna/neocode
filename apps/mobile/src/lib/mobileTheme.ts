@@ -409,3 +409,59 @@ export function getMobileThemePreviewColors(
     messageAction: themeColorToNativeColor(colors.messageAction),
   };
 }
+
+export function shouldFollowMobileNeoPiTheme(preferences: {
+  readonly nativeThemeFollow?: boolean;
+  readonly themeId?: string;
+  readonly lightThemeId?: string;
+  readonly darkThemeId?: string;
+} | null): boolean {
+  return preferences?.nativeThemeFollow ?? (preferences !== null
+    && preferences.themeId === undefined
+    && preferences.lightThemeId === undefined
+    && preferences.darkThemeId === undefined);
+}
+
+/** Native semantic roles projected into mobile tokens without replacing saved palettes. */
+export function neoPiMobileThemeVariables(
+  appearance: MobileThemeAppearance,
+  native: Readonly<Record<string, string>>,
+): MobileThemeVariables {
+  const base = nativeColors(getMobileThemeColors(DEFAULT_MOBILE_THEME_ID, appearance));
+  const value = (name: string, fallback: string) => {
+    const candidate = native[name];
+    return candidate && rgbChannels(candidate) ? candidate : fallback;
+  };
+  const canvas = value("pageBg", value("statusLineBg", base.canvas));
+  const dark = relativeLuminance(rgbChannels(canvas)!) < 0.179;
+  const sharedSurface = (name: string, fallback: string) => {
+    const candidate = value(name, fallback);
+    return (relativeLuminance(rgbChannels(candidate)!) < 0.179) === dark ? candidate : canvas;
+  };
+  const surface = sharedSurface("cardBg", base.surface);
+  const raised = sharedSurface("infoBg", base.surfaceRaised);
+  const textSurfaces = [canvas, surface, raised];
+  const text = readableTextColor(value("text", base.text), textSurfaces);
+  const muted = readableTextColor(value("muted", base.textMuted), textSurfaces);
+  const sidebar = value("statusLineBg", canvas);
+  const message = value("userMessageBg", base.messageSurface);
+  const code = value("toolSuccessBg", surface);
+  const accent = value("accent", base.accent);
+  const colors: ThemeColors = {
+    ...base,
+    canvas, chrome: canvas, toolbar: canvas, surface, surfaceRaised: raised, surfaceOverlay: raised,
+    text, textMuted: muted, mutedForeground: muted, secondaryLabel: muted, iconMuted: muted,
+    placeholder: muted, toolbarForeground: text,
+    sidebar, sidebarForeground: readableTextColor(text, sidebar),
+    sidebarMutedForeground: readableTextColor(muted, sidebar),
+    sidebarRowSelected: value("selectedBg", base.sidebarRowSelected),
+    sidebarRowActive: value("selectedBg", base.sidebarRowActive),
+    messageSurface: message, messageForeground: readableTextColor(value("userMessageText", text), message),
+    codeBackground: code, codeForeground: readableTextColor(text, code),
+    accent, accentForeground: readableTextColor(text, accent),
+    focus: readableTextColor(value("borderAccent", accent), textSurfaces),
+    border: value("borderMuted", base.border),
+    error: value("error", base.error), warning: value("warning", base.warning),
+  };
+  return createMobileThemeVariables(colors, appearance, raised);
+}

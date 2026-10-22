@@ -802,6 +802,83 @@ export function createVividThemeColors(
   };
 }
 
+/** Native semantic colors share the graphical geometry, not its old theme catalog. */
+export function neoPiThemeColors(
+  appearance: ThemeAppearance,
+  native: Readonly<Record<string, string>>,
+): ThemeColors {
+  const defaults = getDefaultThemeColors(appearance);
+  const valid = (value: string | undefined, fallback: string) =>
+    value && isThemeColor(value) ? value : fallback;
+  const canvas = valid(native.pageBg ?? native.statusLineBg, defaults.canvas);
+  const accent = valid(native.accent, defaults.accent);
+  let colors = createVividThemeColors(appearance, canvas, accent);
+  const canvasRgb = parseThemeRgbColor(canvas, THEME_BLACK_FOREGROUND);
+  const canvasLuminance = themeRelativeLuminance(canvasRgb);
+  const darkCanvas = canvasLuminance < 0.179;
+  const stableSurface = (value: string) => {
+    const source = parseThemeRgbColor(value, canvasRgb);
+    let surface = source;
+    for (let step = 1; step <= 20; step++) {
+      const lightness = themeRelativeLuminance(surface);
+      if (darkCanvas ? lightness <= Math.max(canvasLuminance, 0.12) : lightness >= Math.min(canvasLuminance, 0.3)) break;
+      surface = mixThemeRgbColors(source, canvasRgb, step / 20);
+    }
+    return themeRgbToThemeColor(surface);
+  };
+  const pairs: ReadonlyArray<readonly [ThemeColorRole, string | undefined]> = [
+    ["surface", native.cardBg],
+    ["surfaceRaised", native.infoBg],
+    ["surfaceOverlay", native.infoBg],
+    ["sidebar", native.statusLineBg],
+    ["sidebarRowSelected", native.selectedBg],
+    ["messageSurface", native.userMessageBg],
+    ["codeBackground", native.toolSuccessBg ?? native.cardBg],
+    ["border", native.borderMuted ?? native.border],
+    ["error", native.error],
+    ["warning", native.warning],
+  ];
+  for (const [role, value] of pairs) {
+    if (value && isThemeColor(value)) {
+      const sharedSurface = role === "surface" || role === "surfaceRaised" || role === "surfaceOverlay";
+      colors = updateThemeColorFamily(appearance, colors, role, sharedSurface ? stableSurface(value) : value);
+    }
+  }
+  const rgb = (value: string) => parseThemeRgbColor(value, THEME_BLACK_FOREGROUND);
+  const on = (background: string, candidate: string, ratio = 4.6) => {
+    const parsed = parseThemeColor(candidate)!;
+    return themeOklchToThemeColor(solveOklchLightness(
+      parsed.color, rgb(background), ratio,
+      themeRelativeLuminance(rgb(background)) < 0.179 ? "lighter" : "darker",
+    ));
+  };
+  const sharedBackground = [colors.canvas, colors.surface, colors.surfaceRaised, colors.surfaceOverlay].reduce(
+    (worst, surface) => (darkCanvas
+      ? themeRelativeLuminance(rgb(surface)) > themeRelativeLuminance(rgb(worst))
+      : themeRelativeLuminance(rgb(surface)) < themeRelativeLuminance(rgb(worst))) ? surface : worst,
+  );
+  const text = valid(native.text, colors.text);
+  colors.text = on(sharedBackground, text);
+  colors.toolbarForeground = on(colors.toolbar, text);
+  colors.toolbarControlForeground = on(colors.toolbarControl, text);
+  colors.sidebarForeground = on(colors.sidebar, text);
+  colors.messageForeground = on(colors.messageSurface, valid(native.userMessageText, text));
+  colors.codeForeground = on(colors.codeBackground, text);
+  const muted = valid(native.muted, colors.textMuted);
+  colors.textMuted = on(sharedBackground, muted);
+  colors.mutedForeground = on(colors.muted, muted);
+  colors.placeholder = on(colors.surfaceRaised, muted);
+  colors.secondaryLabel = colors.textMuted;
+  colors.iconMuted = colors.textMuted;
+  colors.sidebarMutedForeground = on(colors.sidebar, muted);
+  colors.focus = on(sharedBackground, valid(native.borderAccent, accent), 3);
+  // Keep the owner's purple send action independent of native terminal accents.
+  colors.messageAction = defaults.messageAction;
+  colors.messageActionForeground = defaults.messageActionForeground;
+  colors.messageActionHover = defaults.messageActionHover;
+  return colors;
+}
+
 function themeContrastRatio(first: ThemeRgbColor, second: ThemeRgbColor): number {
   const firstLuminance = themeRelativeLuminance(first);
   const secondLuminance = themeRelativeLuminance(second);

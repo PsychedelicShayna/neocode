@@ -188,9 +188,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "theme",
     title: "Themes",
     to: "/settings/appearance",
-    searchTerms: ["appearance colors palette custom import"],
-    // Theme cards live directly under the scheme tiles; the section is the
-    // stable scroll destination for both.
+    searchTerms: ["appearance colors palette native NeoPi terminal shared theme scope inherit"],
     targetId: "appearance",
   },
   {

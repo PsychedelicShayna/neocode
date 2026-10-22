@@ -21,6 +21,8 @@ export interface Preferences {
   readonly lightThemeId?: MobileThemeId;
   readonly darkThemeId?: MobileThemeId;
   readonly themeMode?: MobileThemeMode;
+  readonly nativeThemeFollow?: boolean;
+  readonly nativeThemeTarget?: string;
   readonly baseFontSize?: number;
   readonly terminalFontSize?: number | null;
   readonly markdownFontSize?: number;
@@ -89,6 +91,8 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     lightThemeId?: MobileThemeId;
     darkThemeId?: MobileThemeId;
     themeMode?: MobileThemeMode;
+    nativeThemeFollow?: boolean;
+    nativeThemeTarget?: string;
     baseFontSize?: number;
     terminalFontSize?: number | null;
     markdownFontSize?: number;
@@ -105,6 +109,8 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     threadListSnoozedShelfExpanded?: boolean;
   } = {};
 
+  if (typeof parsed.nativeThemeFollow === "boolean") preferences.nativeThemeFollow = parsed.nativeThemeFollow;
+  if (typeof parsed.nativeThemeTarget === "string") preferences.nativeThemeTarget = parsed.nativeThemeTarget;
   if (typeof parsed.liveActivitiesEnabled === "boolean") {
     preferences.liveActivitiesEnabled = parsed.liveActivitiesEnabled;
   }

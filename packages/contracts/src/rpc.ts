@@ -51,6 +51,9 @@ import {
   NeoPiSessionConfigurationResult,
 } from "./neopiSessions.ts";
 import {
+  NeoPiThemesInput, NeoPiThemesUpdate, NeoPiThemesConfiguration, NeoPiThemesError,
+} from "./neopiThemes.ts";
+import {
   AssetAccessError,
   AssetCreateUrlInput,
   AssetCreateUrlResult,
@@ -308,6 +311,9 @@ export const WS_METHODS = {
   neopiSessionsHandoff: "neopiSessions.handoff",
   neopiSessionsConfiguration: "neopiSessions.configuration",
   neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
+  neopiThemesRead: "neopiThemes.read",
+  neopiThemesWatch: "neopiThemes.watch",
+  neopiThemesUpdate: "neopiThemes.update",
   assetsCreateUrl: "assets.createUrl",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
   attachmentsDelete: "attachments.delete",
@@ -1027,6 +1033,23 @@ const WsNeoPiSessionsWatchConfigurationRpc = Rpc.make(WS_METHODS.neopiSessionsWa
   stream: true,
 });
 
+const WsNeoPiThemesReadRpc = Rpc.make(WS_METHODS.neopiThemesRead, {
+  payload: NeoPiThemesInput,
+  success: NeoPiThemesConfiguration,
+  error: Schema.Union([NeoPiThemesError, EnvironmentAuthorizationError]),
+});
+const WsNeoPiThemesWatchRpc = Rpc.make(WS_METHODS.neopiThemesWatch, {
+  payload: NeoPiThemesInput,
+  success: NeoPiThemesConfiguration,
+  error: Schema.Union([NeoPiThemesError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+const WsNeoPiThemesUpdateRpc = Rpc.make(WS_METHODS.neopiThemesUpdate, {
+  payload: NeoPiThemesUpdate,
+  success: NeoPiThemesConfiguration,
+  error: Schema.Union([NeoPiThemesError, EnvironmentAuthorizationError]),
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -1522,6 +1545,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiSessionsHandoffRpc,
   WsNeoPiSessionsConfigurationRpc,
   WsNeoPiSessionsWatchConfigurationRpc,
+  WsNeoPiThemesReadRpc,
+  WsNeoPiThemesWatchRpc,
+  WsNeoPiThemesUpdateRpc,
   WsAssetsCreateUrlRpc,
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,

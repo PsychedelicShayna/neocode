@@ -12,6 +12,7 @@ import {
 import type { PlanProposalResponseFrame } from "effect-neopi-rpc/schema";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -147,6 +148,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   let generation = 0;
   let active: ActiveTurn | undefined;
   let compacting = false;
+  let lastTelemetryAt = 0;
   let pendingProposal:
     | {
         readonly id: string;
@@ -414,7 +416,26 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     });
   const handleEvent = (frame: NeoPiRuntimeFrame) =>
     Effect.gen(function* () {
-      if (frame.type === "model_changed" || frame.type === "thinking_level_changed")
+      if (frame.type === "message_update") {
+        const now = yield* Clock.currentTimeMillis;
+        if (now - lastTelemetryAt >= 1000) {
+          lastTelemetryAt = now;
+          yield* invalidateConfiguration;
+        }
+      }
+      if (
+        frame.type === "model_changed" ||
+        frame.type === "thinking_level_changed" ||
+        frame.type === "approval_mode_changed" ||
+        frame.type === "models_configuration_changed" ||
+        frame.type === "message_end" ||
+        frame.type === "agent_start" ||
+        frame.type === "agent_end" ||
+        frame.type === "auto_compaction_end" ||
+        frame.type === "advisor_cost_changed" ||
+        frame.type === "journal_state" ||
+        frame.type === "journal_entry"
+      )
         yield* invalidateConfiguration;
       // Control subscriptions include terminal-originated turns. They are not
       // imported live: without a NeoCode-started turn there is no thread turn

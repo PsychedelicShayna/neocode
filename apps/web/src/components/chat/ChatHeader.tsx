@@ -3,6 +3,7 @@ import {
   type EditorId,
   type ProjectScript,
   type ResolvedKeybindingsConfig,
+  type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -56,6 +57,8 @@ import { NeoPiTerminalHandoff } from "../neopi/NeoPiTerminalHandoff";
 import { NeoPiSessionConfiguration } from "../neopi/NeoPiSessionConfiguration";
 
 interface ChatHeaderProps {
+  runtimeMode: RuntimeMode;
+  onRuntimeModeChange: (mode: RuntimeMode) => void;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   draftId?: DraftId;
@@ -130,6 +133,8 @@ export const ChatHeader = memo(function ChatHeader({
   activeThreadId,
   draftId,
   activeThreadTitle,
+  runtimeMode,
+  onRuntimeModeChange,
   isServerThread,
   activeProject,
   openInCwd,
@@ -436,7 +441,7 @@ export const ChatHeader = memo(function ChatHeader({
             </WorkspaceBreadcrumbSeparator>
           </>
         ) : null}
-        <WorkspaceBreadcrumbItem current className="min-w-10 flex-1">
+        <WorkspaceBreadcrumbItem current className="min-w-10 max-w-64 flex-1">
           {renamingTitle !== null ? (
             <input
               autoFocus
@@ -490,7 +495,11 @@ export const ChatHeader = memo(function ChatHeader({
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
       <NeoPiTerminalHandoff threadRef={isServerThread ? activeThreadRef : null} />
-      <NeoPiSessionConfiguration threadRef={isServerThread ? activeThreadRef : null} />
+      <NeoPiSessionConfiguration
+        threadRef={isServerThread ? activeThreadRef : null}
+        runtimeMode={runtimeMode}
+        onRuntimeModeChange={onRuntimeModeChange}
+      />
       <div
         ref={headerActionsRef}
         data-chat-header-actions

@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./neopi-session-status": {
+      "types": "./src/neopiSessionStatus.ts",
+      "default": "./src/neopiSessionStatus.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

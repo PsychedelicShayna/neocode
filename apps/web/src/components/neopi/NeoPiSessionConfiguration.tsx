@@ -1,5 +1,5 @@
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
-import type { NeoPiSessionConfigurationResult, ScopedThreadRef } from "@t3tools/contracts";
+import type { NeoPiSessionConfigurationResult, RuntimeMode, ScopedThreadRef } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -29,13 +29,21 @@ import {
 } from "../ui/dialog";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { Switch } from "../ui/switch";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { runtimeModeConfig, runtimeModeOptions } from "../chat/runtimeModeConfig";
+import { useNeoPiSessionStatus } from "./NeoPiSessionStatus";
+
+interface PermissionProps {
+  runtimeMode: RuntimeMode;
+  onRuntimeModeChange: (mode: RuntimeMode) => void;
+}
 
 type SnapshotState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "loaded"; result: NeoPiSessionConfigurationResult };
 
-export function NeoPiSessionConfiguration({ threadRef }: { threadRef: ScopedThreadRef | null }) {
+export function NeoPiSessionConfiguration({ threadRef, ...permissions }: { threadRef: ScopedThreadRef | null } & PermissionProps) {
   const thread = useThreadShell(threadRef);
   const configs = useServerConfigs();
   const provider =
@@ -48,17 +56,18 @@ export function NeoPiSessionConfiguration({ threadRef }: { threadRef: ScopedThre
               (thread.session?.providerInstanceId ?? thread.modelSelection.instanceId),
           )
       : null;
-  if (!threadRef || !thread || provider?.driver !== "neopi") return null;
+  if (threadRef && (!thread || provider?.driver !== "neopi")) return null;
 
   return (
     <SessionConfigurationControl
-      key={JSON.stringify([threadRef.environmentId, threadRef.threadId, provider.instanceId])}
+      key={JSON.stringify([threadRef?.environmentId, threadRef?.threadId, provider?.instanceId])}
       threadRef={threadRef}
+      {...permissions}
     />
   );
 }
 
-function SessionConfigurationControl({ threadRef }: { threadRef: ScopedThreadRef }) {
+function SessionConfigurationControl({ threadRef, ...permissions }: { threadRef: ScopedThreadRef | null } & PermissionProps) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -68,12 +77,15 @@ function SessionConfigurationControl({ threadRef }: { threadRef: ScopedThreadRef
           render={
             <DialogTrigger
               render={
-                <Button size="icon-sm" variant="ghost" aria-label="NeoPi session configuration" />
+                <Button size="sm" variant="ghost" aria-label="NeoPi session configuration" data-session-permissions />
               }
             />
           }
         >
           <InfoIcon className="size-4" />
+          <span className="sr-only sm:not-sr-only">
+            {threadRef ? <NativePermissionSummary threadRef={threadRef} /> : "Session configuration"}
+          </span>
         </TooltipTrigger>
         <TooltipPopup>NeoPi session configuration</TooltipPopup>
       </Tooltip>
@@ -81,12 +93,16 @@ function SessionConfigurationControl({ threadRef }: { threadRef: ScopedThreadRef
         <DialogHeader>
           <DialogTitle>NeoPi session configuration</DialogTitle>
           <DialogDescription>
-            Read-only view of the connected native session. Values are read separately and may
-            change during observation. Refresh to read again, or follow model and effort changes
-            while this inspector is open.
+            Native session observations and the permission preference for your next owned turn.
+            Opening this panel never changes the runtime or terminal owner's policy.
           </DialogDescription>
         </DialogHeader>
-        {open ? <SessionConfigurationSnapshot threadRef={threadRef} /> : null}
+        <DialogPanel>
+          {threadRef
+            ? <ConnectedPermissionPreference threadRef={threadRef} {...permissions} />
+            : <PermissionPreference {...permissions} disabled={false} reason="Applies when NeoCode starts the native session." />}
+        </DialogPanel>
+        {open && threadRef ? <SessionConfigurationSnapshot threadRef={threadRef} /> : null}
       </DialogPopup>
     </Dialog>
   );
@@ -314,4 +330,47 @@ function ConfigurationDetails({
       </section>
     </>
   );
+}
+
+const permissionLabel = (mode: string | null) => mode === "always-ask" ? "Supervised"
+  : mode === "write" ? "Auto-accept edits"
+  : mode === "yolo" ? "Full access" : "Policy unavailable";
+
+function NativePermissionSummary({ threadRef }: { threadRef: ScopedThreadRef }) {
+  const status = useNeoPiSessionStatus(threadRef);
+  return status.status === "observed" ? permissionLabel(status.approvalMode) : "Policy unavailable";
+}
+
+function ConnectedPermissionPreference({ threadRef, ...props }: PermissionProps & { threadRef: ScopedThreadRef }) {
+  const status = useNeoPiSessionStatus(threadRef);
+  const terminal = status.status === "observed" && status.attachment === "terminal";
+  const disabled = status.status !== "observed" || terminal;
+  return <>
+    <p className="mb-3 text-sm">Current native policy: {status.status === "observed" ? permissionLabel(status.approvalMode) : "Unavailable"}</p>
+    <PermissionPreference {...props} disabled={disabled} reason={terminal
+      ? "This session is terminal-owned. Change permissions in its terminal owner. NeoCode cannot apply an owned-turn preference while attached."
+      : disabled ? "Connect to the native session before changing the next-turn preference."
+      : "This preference is sent to the native runtime before your next turn. The current policy does not change until the native runtime accepts it. Per-tool policies and safety checks still apply."} />
+  </>;
+}
+
+function PermissionPreference({ runtimeMode, onRuntimeModeChange, disabled, reason }: PermissionProps & {
+  disabled: boolean;
+  reason: string;
+}) {
+  return <div className="space-y-2 text-sm">
+    <label htmlFor="native-next-turn-permissions">Next owned turn</label>
+    <Select value={runtimeMode === "auto" ? "full-access" : runtimeMode} disabled={disabled}
+      onValueChange={(value) => { if (value) onRuntimeModeChange(value); }}>
+      <SelectTrigger id="native-next-turn-permissions" aria-describedby="native-permission-explanation">
+        <SelectValue>{runtimeModeConfig[runtimeMode === "auto" ? "full-access" : runtimeMode].label}</SelectValue>
+      </SelectTrigger>
+      <SelectPopup>
+        {runtimeModeOptions.filter((mode) => mode !== "auto").map((mode) => <SelectItem key={mode} value={mode}>
+          {runtimeModeConfig[mode].label}
+        </SelectItem>)}
+      </SelectPopup>
+    </Select>
+    <p id="native-permission-explanation" className="text-muted-foreground">{reason}</p>
+  </div>;
 }

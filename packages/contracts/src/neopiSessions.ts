@@ -91,6 +91,24 @@ export const NeoPiSessionConfigurationResult = Schema.Union([
     thinkingLevel: Schema.NullOr(Schema.String),
     activeRole: Schema.NullOr(Schema.String),
     observedAt: IsoDateTime,
+    telemetry: Schema.optional(Schema.Struct({
+      tokensPerSecond: Schema.NullOr(Schema.Number),
+      context: Schema.NullOr(Schema.Struct({
+        tokens: Schema.NullOr(Schema.Number),
+        contextWindow: Schema.Number,
+        percent: Schema.NullOr(Schema.Number),
+      })),
+      sessionUsage: Schema.NullOr(Schema.Struct({
+        input: Schema.Number,
+        cacheRead: Schema.Number,
+        cacheWrite: Schema.Number,
+        cost: Schema.Number,
+        subagentCost: Schema.Number,
+        advisorCost: Schema.Number,
+        advisorCostState: Schema.Literals(["ready", "restoring", "unavailable"]),
+      })),
+      approvalMode: Schema.NullOr(Schema.Literals(["always-ask", "write", "yolo"])),
+    })),
     roles: Schema.Union([
       Schema.Struct({ status: Schema.Literal("unsupported"), reason: Schema.String }),
       Schema.Struct({

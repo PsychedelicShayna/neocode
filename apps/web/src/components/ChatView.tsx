@@ -9755,6 +9755,8 @@ export default function ChatView(props: ChatViewProps) {
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
             activeThreadTitle={activeThread.title}
             isServerThread={isServerThread}
+            runtimeMode={runtimeMode}
+            onRuntimeModeChange={handleRuntimeModeChange}
             activeProject={activeProject}
             openInCwd={gitCwd}
             activeProjectScripts={activeProjectScripts}
@@ -10047,7 +10049,6 @@ export default function ChatView(props: ChatViewProps) {
                             activeTasksProgress={activeComposerTasksProgress}
                             activeTaskSteps={activeComposerTaskSteps}
                             threadSyncPhase={activeEnvironmentUnavailable ? null : threadSyncPhase}
-                            runtimeMode={runtimeMode}
                             interactionMode={interactionMode}
                             lockedProvider={lockedProvider}
                             providerStatuses={providerStatuses as ServerProvider[]}
@@ -10106,7 +10107,6 @@ export default function ChatView(props: ChatViewProps) {
                             onOpenProviderSetup={openProviderSetup}
                             getModelDisabledReason={getModelDisabledReason}
                             toggleInteractionMode={toggleInteractionMode}
-                            handleRuntimeModeChange={handleRuntimeModeChange}
                             handleInteractionModeChange={handleInteractionModeChange}
                             focusComposer={focusComposer}
                             scheduleComposerFocus={scheduleComposerFocus}

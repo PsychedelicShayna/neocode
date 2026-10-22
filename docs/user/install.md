@@ -206,14 +206,20 @@ terminal session and reopen its bound row to restore them. While attached, use
 the terminal to change modes, model settings, or compact history; NeoCode cannot
 change those owner-controlled settings.
 
-To inspect the connected session's model and role configuration, open **NeoPi
-session configuration** in the thread header. It shows the native session
-identity, ownership, current model and effort, and NeoPi's configured role
-fallbacks and resolutions. This view is read-only. Use **Refresh** for a new
-snapshot, or enable **Follow model changes** to refresh when NeoPi reports model
-or effort changes. Following stops when you close the inspector or turn it off.
-Role-definition changes may still need Refresh. Opening the inspector does not
-start a stopped session or change the terminal's settings.
+The status beside the composer follows the connected native model and effort,
+output throughput, journal-wide cache hit rate, context utilization and recorded
+session cost. Context information is always available here, independent of the
+legacy indicator setting. Hover a metric for its observation time and scope.
+Recorded cost includes all journal branches, completed tasks and restored advisor
+spend, but excludes unfinished child runs. Missing counters stay unavailable,
+and disconnected observations are not shown as current.
+
+Open **NeoPi session configuration** in the header to inspect native ownership,
+current permissions and role configuration. **Next owned turn** changes the
+permission preference sent before your next turn, not the current native policy.
+The native runtime must accept it. While attached, permission changes are
+disabled because the terminal owns that policy. Opening this panel does not
+start or restart a session. Use **Refresh** for role-definition changes.
 
 To go the other way, use **Continue in terminal** in a NeoPi thread's header:
 NeoCode stops its NeoPi process and copies the command that reopens the same

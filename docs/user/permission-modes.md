@@ -1,7 +1,9 @@
 # Permission modes
 
-Permission modes control when an agent needs your approval to act. Choose a mode in the message
-composer; it applies to that thread.
+Open **NeoPi session configuration** in the thread header to see the current native
+policy and choose permissions for the **Next owned turn**. Selecting a preference
+does not change the running native policy. NeoCode asks the native runtime to
+apply it before sending your next turn.
 
 Set the default for new threads in **Settings → General → New threads → Permissions**.
 Projects can override the environment default. New threads use this setting rather than the
@@ -12,22 +14,17 @@ and modes you choose in a draft keep their permissions.
 | --------------------- | ------------------------------------------------------------------------------------- |
 | **Supervised**        | Requests approval for commands and file changes.                                      |
 | **Auto-accept edits** | Approves file edits automatically; other actions can still require approval.          |
-| **Auto**              | Uses the provider's automatic review to approve routine actions and ask about others. |
 | **Full access**       | Allows commands and edits without approval prompts.                                   |
 
 Approve or reject requests in the conversation to let the agent continue. Permission modes do
 not prevent the agent from asking questions about the task.
 
-## Provider differences
+## Native ownership
 
-Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
-**Auto** uses automatic review on Codex, Claude, and Cursor; providers without an equivalent,
-including OpenCode and Antigravity, fall back to asking.
+NeoPi enforces permissions. While NeoCode is attached to a terminal-owned session,
+the preference is disabled. Change the policy in that session's terminal instead.
+Opening the configuration panel never starts or restarts the session.
 
-For Grok, **Always allow this session** remembers the matching command or tool input. Other
-actions still require approval.
-
-Antigravity can still send native approval requests in **Full access**. It only offers remembered
-approvals for actions that support them.
-
-See the [provider guides](./install.md#providers) for setup and provider-specific limits.
+Per-tool policies and native safety checks can still require approval or refuse
+an action, including in Full access. Saved Auto preferences use NeoPi's Full
+access policy rather than a separate automatic-review mode.

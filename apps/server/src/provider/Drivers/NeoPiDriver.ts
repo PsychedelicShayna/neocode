@@ -1,6 +1,8 @@
 import { NeoPiSettings, ProviderDriverKind } from "@t3tools/contracts";
 import { make as makeClient } from "effect-neopi-rpc/client";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
+import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
@@ -36,16 +38,12 @@ import {
   type ProviderInstance,
 } from "../ProviderDriver.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
-import {
-  haveProviderSnapshotSettingsChanged,
-  makeProviderSnapshotSettingsSource,
-  type ProviderSnapshotSettings,
-} from "../providerUpdateSettings.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("neopi");
 const decodeSettings = Schema.decodeSync(NeoPiSettings);
+const haveSettingsChanged = (previous: NeoPiSettings, next: NeoPiSettings) =>
+  !Equal.equals(previous, next);
 
 export type NeoPiDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
@@ -159,20 +157,12 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         spawn: spawner.spawn,
         makeClient,
       });
-      const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
-      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<NeoPiSettings>>({
-        resolveMaintenance: () =>
-          Effect.succeed(
-            makeManualOnlyProviderMaintenanceCapabilities({
-              provider: DRIVER_KIND,
-              packageName: null,
-            }),
-          ),
-        getSettings: snapshotSettings.getSettings,
-        streamSettings: snapshotSettings.streamSettings,
-        haveSettingsChanged: haveProviderSnapshotSettingsChanged,
+      const snapshot = yield* makeManagedServerProvider<NeoPiSettings>({
+        getSettings: Effect.succeed(effectiveConfig),
+        streamSettings: Stream.empty,
+        haveSettingsChanged,
         initialSnapshot: (settings) =>
-          buildInitialNeoPiProviderSnapshot(settings.provider).pipe(Effect.map(stamp)),
+          buildInitialNeoPiProviderSnapshot(settings).pipe(Effect.map(stamp)),
         checkProvider: Ref.get(retainedCatalog).pipe(
           Effect.flatMap((previous) =>
             checkNeoPiProviderStatus(
@@ -246,6 +236,9 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           probe: capabilityProbe,
           configuration: adapter.getConfiguration,
           observeConfiguration: adapter.observeConfiguration,
+          journal: adapter.readJournal,
+          observeNative: adapter.observeNative,
+          modelsConnection: adapter.getModelsConnection,
         },
       );
       yield* Effect.addFinalizer(() =>

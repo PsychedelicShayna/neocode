@@ -145,6 +145,19 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect("keeps a custom state home out of the live Chromium profile and lock", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(
+          yield* identity.resolveUserDataPath,
+          "/private/neocode/userdata/desktop-profile",
+        );
+      }),
+      { environment: { env: { T3CODE_HOME: "/private/neocode" } }, legacyPathExists: true },
+    ),
+  );
+
   it.effect("keeps using the legacy userData path when it already exists", () =>
     withIdentity(
       Effect.gen(function* () {

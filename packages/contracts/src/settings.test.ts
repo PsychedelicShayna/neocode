@@ -666,18 +666,20 @@ describe("ClientSettings follow-up behavior", () => {
   });
 });
 
-describe("ClientSettings composer collapse", () => {
-  it("collapses on scroll by default and accepts opting out", () => {
-    expect(decodeClientSettings({}).composerCollapseOnScroll).toBe(true);
-    expect(
-      decodeClientSettingsPatch({ composerCollapseOnScroll: false }).composerCollapseOnScroll,
-    ).toBe(false);
-  });
-
-  it("drops the retired blur trigger key", () => {
-    const decoded = decodeClientSettings({ composerCollapseOnBlur: false });
-    expect(decoded.composerCollapseOnScroll).toBe(true);
-    expect(decoded).not.toHaveProperty("composerCollapseOnBlur");
+describe("ClientSettings retired composer collapse preferences", () => {
+  it.each([false, true])("drops collapse preferences saved as %s", (enabled) => {
+    const saved = {
+      composerCollapseOnBlur: enabled,
+      composerCollapseOnScroll: enabled,
+      composerRichTextEnabled: false,
+      sendShortcut: "mod-enter",
+    };
+    for (const decoded of [decodeClientSettings(saved), decodeClientSettingsPatch(saved)]) {
+      expect(decoded).not.toHaveProperty("composerCollapseOnBlur");
+      expect(decoded).not.toHaveProperty("composerCollapseOnScroll");
+      expect(decoded.composerRichTextEnabled).toBe(false);
+      expect(decoded.sendShortcut).toBe("mod-enter");
+    }
   });
 });
 

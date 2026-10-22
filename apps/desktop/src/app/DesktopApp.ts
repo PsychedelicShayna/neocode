@@ -180,6 +180,9 @@ const bootstrap = Effect.gen(function* () {
   yield* installDesktopIpcHandlers();
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
 
+  // Claim the environment before starting a writer, even if another Chromium
+  // profile reached this process through a different Electron instance lock.
+  yield* appActivation.start;
   yield* snapShot.initialize;
 
   if (!settings.localEnvironmentEnabled) {
@@ -245,10 +248,6 @@ const bootstrap = Effect.gen(function* () {
     }
     yield* primaryBackend.start;
     yield* logBootstrapInfo("bootstrap backend start requested");
-    yield* appActivation.start.pipe(
-      Effect.tap(() => logBootstrapInfo("desktop app control socket ready")),
-      Effect.catch((error) => logStartupError("desktop app control socket unavailable", { error })),
-    );
     // Bring up the WSL backend if the user previously enabled it. The
     // primary is already starting; reconcile fires off the WSL register
     // in parallel rather than blocking primary readiness on a possibly

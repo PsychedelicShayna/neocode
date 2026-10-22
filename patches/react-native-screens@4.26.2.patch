@@ -2,37 +2,57 @@ diff --git a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConf
 index fa1b77317f609983ae2434764174072e51130550..270c81c90971b0ff3038b999973dd4d128a9d140 100644
 --- a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt
 +++ b/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderConfigViewManager.kt
-@@ -124,6 +124,34 @@ class ScreenStackHeaderConfigViewManager :
+@@ -124,6 +124,54 @@ class ScreenStackHeaderConfigViewManager :
          config.setTitle(title)
      }
  
-+    // The t3 patch adds these iOS glass-chrome props to the native spec; they have
-+    // no Android implementation, but the codegen-generated interface requires the
-+    // setters to exist. No-ops keep the Android build compiling.
++    // The shared native spec includes iOS-only header props. Codegen requires
++    // Android setters too; report unsupported supplied values instead of
++    // silently dropping header content or actions.
 +    override fun setSubtitle(
 +        config: ScreenStackHeaderConfig,
 +        subtitle: String?,
-+    ) = Unit
++    ) {
++        if (subtitle != null) {
++            android.util.Log.w("[RNScreens]", "subtitle is only supported on iOS")
++        }
++    }
 +
 +    override fun setLargeSubtitle(
 +        config: ScreenStackHeaderConfig,
 +        largeSubtitle: String?,
-+    ) = Unit
++    ) {
++        if (largeSubtitle != null) {
++            android.util.Log.w("[RNScreens]", "largeSubtitle is only supported on iOS")
++        }
++    }
 +
 +    override fun setNavigationItemStyle(
 +        config: ScreenStackHeaderConfig,
 +        navigationItemStyle: String?,
-+    ) = Unit
++    ) {
++        if (navigationItemStyle != null && navigationItemStyle != "navigator") {
++            android.util.Log.w("[RNScreens]", "navigationItemStyle is only supported on iOS")
++        }
++    }
 +
 +    override fun setHeaderCenterBarButtonItems(
 +        config: ScreenStackHeaderConfig,
 +        headerCenterBarButtonItems: ReadableArray?,
-+    ) = Unit
++    ) {
++        if (headerCenterBarButtonItems != null && headerCenterBarButtonItems.size() > 0) {
++            android.util.Log.w("[RNScreens]", "headerCenterBarButtonItems is only supported on iOS")
++        }
++    }
 +
 +    override fun setHeaderToolbarItems(
 +        config: ScreenStackHeaderConfig,
 +        headerToolbarItems: ReadableArray?,
-+    ) = Unit
++    ) {
++        if (headerToolbarItems != null && headerToolbarItems.size() > 0) {
++            android.util.Log.w("[RNScreens]", "headerToolbarItems is only supported on iOS")
++        }
++    }
 +
      override fun setTitleFontFamily(
          config: ScreenStackHeaderConfig,
@@ -41,7 +61,7 @@ diff --git a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderSubv
 index 64f14f0c5ade16eb9519b8780d4ce013f88fbd3a..6cb1d69f97a95759c662a6006a9626925d9fefd9 100644
 --- a/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderSubviewManager.kt
 +++ b/android/src/main/java/com/swmansion/rnscreens/ScreenStackHeaderSubviewManager.kt
-@@ -47,6 +47,12 @@ class ScreenStackHeaderSubviewManager :
+@@ -47,6 +47,16 @@ class ScreenStackHeaderSubviewManager :
          Log.w("[RNScreens]", "hidesSharedBackground prop is not available on Android")
      }
  
@@ -49,7 +69,11 @@ index 64f14f0c5ade16eb9519b8780d4ce013f88fbd3a..6cb1d69f97a95759c662a6006a962692
 +    override fun setIdentifier(
 +        view: ScreenStackHeaderSubview,
 +        identifier: String?,
-+    ) = Unit
++    ) {
++        if (identifier != null) {
++            Log.w("[RNScreens]", "bar button transition identifiers are only supported on iOS")
++        }
++    }
 +
      // synchronousShadowStateUpdatesEnabled is not available on Android atm,
      // however we must override their setters

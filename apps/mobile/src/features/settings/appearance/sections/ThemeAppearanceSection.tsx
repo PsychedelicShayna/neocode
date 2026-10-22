@@ -18,6 +18,7 @@ import {
 import { getMobileUniwindThemeName } from "../../../../lib/mobileThemeRuntime";
 import { cn } from "../../../../lib/cn";
 import { useAppearancePreferences } from "../AppearancePreferencesProvider";
+import { NeoPiThemeSettings } from "./NeoPiThemeSettings";
 
 const APPEARANCE_MODES: ReadonlyArray<{
   readonly id: MobileThemeMode;
@@ -313,12 +314,13 @@ export function ThemeAppearanceSection() {
           ))}
         </View>
       </View>
+      <NeoPiThemeSettings />
 
       <View className="gap-3">
-        <SectionLabel>Themes</SectionLabel>
+        <SectionLabel>Preserved graphical palettes</SectionLabel>
         <View className="flex-row flex-wrap gap-3">
           {MOBILE_THEME_OPTIONS.filter(
-            (theme) => theme.id !== "material-you" || systemColorsAvailable,
+            (theme) => (theme.id === themeIds.dark || theme.id === themeIds.light) && (theme.id !== "material-you" || systemColorsAvailable),
           ).map((theme) => (
             <ThemeCard
               disabled={!isReady}

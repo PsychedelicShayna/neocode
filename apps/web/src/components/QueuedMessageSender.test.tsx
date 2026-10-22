@@ -71,7 +71,6 @@ function enqueue(overrides: Partial<QueuedComposerMessage> = {}) {
       modelSelection,
       runtimeMode: "full-access",
       interactionMode: "default",
-      promptEffort: null,
     },
     queuedAfterToolActivityId: null,
     createdAt: "2026-09-25T00:00:00Z",

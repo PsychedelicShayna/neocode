@@ -1,7 +1,7 @@
 import { APP_BASE_NAME } from "../../lib/mobileBranding";
 import { useAtomValue } from "@effect/atom-react";
 import type { StaticScreenProps } from "@react-navigation/native";
-import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
+import type { EnvironmentId } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useEffect, useRef, useState } from "react";
@@ -16,12 +16,12 @@ import { environmentSession } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useRemoteConnections } from "../../state/use-remote-environment-registry";
 import { ConnectionEnvironmentRow } from "../connection/ConnectionEnvironmentRow";
+import { NeoPiSessionBrowser } from "../threads/NeoPiSessions";
 import { SettingsActionRow } from "./components/SettingsActionRow";
 import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
 import {
   canMaintainEnvironment,
-  canUpdateEnvironmentProvider,
   findEnvironmentUpdate,
   supportsEnvironmentUpdate,
 } from "./environment-maintenance";
@@ -51,7 +51,6 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
   const sessionResult = useAtomValue(environmentSession.sessionStateAtom(environmentId));
   const updateState = useAtomValue(serverEnvironment.updateStateAtom(environmentId));
   const updateServer = useAtomCommand(serverEnvironment.updateServer);
-  const updateProvider = useAtomCommand(serverEnvironment.updateProvider);
   const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders);
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
@@ -69,12 +68,7 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
   const allowed =
     !AsyncResult.isFailure(sessionResult) && canMaintainEnvironment(session, connected);
   const running = updateState.status === "running";
-  const providerBusy =
-    config?.providers.some(
-      (provider) =>
-        provider.updateState?.status === "running" || provider.updateState?.status === "queued",
-    ) ?? false;
-  const disabled = !allowed || pending !== null || running || providerBusy;
+  const disabled = !allowed || pending !== null || running;
   const version = config?.environment.serverVersion;
   const checkedRelease = release?.fromVersion === version ? release : null;
   const capabilities = config?.environment.capabilities;
@@ -129,20 +123,6 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
     );
   }
 
-  function requestProviderUpdate(provider: ServerProvider) {
-    if (disabled || !canUpdateEnvironmentProvider(provider)) return;
-    void run(provider.instanceId, async () => {
-      const result = await updateProvider({
-        environmentId,
-        input: {
-          provider: provider.driver,
-          instanceId: provider.instanceId,
-        },
-      });
-      if (AsyncResult.isFailure(result)) throw squashAtomCommandFailure(result);
-    });
-  }
-
   return (
     <SettingsScreen title={environment?.environmentLabel ?? "Environment"}>
       <ScreenScrollView
@@ -167,6 +147,15 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                 onSetEnabled={connections.onSetEnvironmentEnabled}
                 onUpdate={connections.onUpdateEnvironment}
               />
+            </SettingsSection>
+            <SettingsSection title="NeoPi sessions">
+              <View className="gap-3 p-4">
+                <Text className="text-sm text-foreground-muted">
+                  Discover and resume native sessions across all project folders on this
+                  environment.
+                </Text>
+                <NeoPiSessionBrowser environmentId={environmentId} disabled={!connected} />
+              </View>
             </SettingsSection>
             {!connected ? (
               <Text className="px-2 text-sm text-foreground-muted">
@@ -286,23 +275,7 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                             {provider.installed
                               ? (provider.version ?? "Version unknown")
                               : "Not installed"}
-                            {provider.versionAdvisory?.latestVersion
-                              ? ` · Latest ${provider.versionAdvisory.latestVersion}`
-                              : ""}
                           </Text>
-                          {provider.updateState && provider.updateState.status !== "idle" ? (
-                            <Text
-                              selectable
-                              className={
-                                provider.updateState.status === "failed"
-                                  ? "text-sm text-danger-foreground"
-                                  : "text-sm text-foreground-muted"
-                              }
-                            >
-                              {provider.updateState.message ??
-                                `Update ${provider.updateState.status}`}
-                            </Text>
-                          ) : null}
                           {provider.compatibilityAdvisory?.message ? (
                             <Text selectable className="text-sm text-foreground-muted">
                               {provider.compatibilityAdvisory.message}
@@ -313,22 +286,7 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                               {provider.unavailableReason ?? provider.message}
                             </Text>
                           ) : null}
-                          {provider.versionAdvisory?.status === "behind_latest" &&
-                          !provider.versionAdvisory.canUpdate ? (
-                            <Text className="text-sm text-foreground-muted">
-                              Update this provider on the environment's machine.
-                            </Text>
-                          ) : null}
                         </View>
-                        {canUpdateEnvironmentProvider(provider) ? (
-                          <SettingsActionRow
-                            icon="arrow.up.circle"
-                            label={`Update ${provider.displayName ?? provider.driver}`}
-                            disabled={disabled}
-                            loading={pending === provider.instanceId}
-                            onPress={() => requestProviderUpdate(provider)}
-                          />
-                        ) : null}
                       </View>
                     ))}
                 </SettingsSection>

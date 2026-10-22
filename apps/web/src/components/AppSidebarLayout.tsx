@@ -37,6 +37,7 @@ import { SettingsSidebarNav } from "./settings/SettingsSidebarNav";
 import { ConnectionCatalogRecoveryNotice } from "./desktop/ConnectionCatalogRecoveryNotice";
 import { SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { MainAppLocationTracker } from "./sidebar/mainAppLocation";
+import { NeoPiModelsSidebar } from "./neopi/NeoPiModelsPage";
 import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import { useProjects } from "../state/entities";
 import {
@@ -306,7 +307,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
           collapsible="offcanvas"
           data-app-sidebar=""
           role="navigation"
-          aria-label={isOnSettings ? "Settings" : "Threads"}
+          aria-label={isOnSettings ? "Settings" : pathname === "/models" ? "Models" : "Threads"}
           resizable={{
             maxWidth: sidebarMaximumWidth,
             minWidth: THREAD_SIDEBAR_MIN_WIDTH,
@@ -322,6 +323,8 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
               <SidebarChromeHeader isElectron={isElectron} />
               <SettingsSidebarNav pathname={pathname} />
             </>
+          ) : pathname === "/models" ? (
+            <><SidebarChromeHeader isElectron={isElectron} /><NeoPiModelsSidebar /></>
           ) : legacySidebarEnabled ? (
             <LegacyThreadSidebar />
           ) : (

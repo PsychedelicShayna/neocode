@@ -1,7 +1,6 @@
 import * as Crypto from "effect/Crypto";
 import { Atom } from "effect/unstable/reactivity";
 import {
-  WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
 } from "@t3tools/contracts";
@@ -12,7 +11,6 @@ import { canSnooze } from "./threadSettled.ts";
 import {
   createAtomCommandScheduler,
   createEnvironmentCommand,
-  createEnvironmentRpcCommand,
 } from "./runtime.ts";
 import {
   type ArchiveThreadInput,
@@ -254,12 +252,6 @@ export function createThreadEnvironmentAtoms<R, E>(
     stopSession: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:stop-session",
       execute: (input: StopThreadSessionInput) => stopThreadSession(input),
-      scheduler,
-      concurrency,
-    }),
-    uploadFeedback: createEnvironmentRpcCommand(runtime, {
-      label: "environment-data:commands:thread:upload-feedback",
-      tag: WS_METHODS.providerUploadFeedback,
       scheduler,
       concurrency,
     }),

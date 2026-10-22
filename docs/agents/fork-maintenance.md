@@ -1,12 +1,12 @@
 # Maintaining fork behavior across upstream updates
 
-NeoCode is NeoPi's full graphical frontend, built from upstream T3 Code (`pingdotgg/t3code`). `AGENTS.md` › Fork rule: NeoPi-first, upstream-aware governs placement. Preserve upstream provenance and useful compatibility while keeping the fork's product direction authoritative.
+NeoCode is NeoPi's graphical frontend, built from upstream T3 Code (`pingdotgg/t3code`). `AGENTS.md` › Fork rule governs placement and the NeoPi-only execution boundary. Preserve upstream provenance while keeping the fork's product direction authoritative.
 
 ## Placement of new behavior
 
-Before adding fork behavior, locate the existing owner and inspect extension points and shared utilities. Prefer NeoPi-owned files when they express the complete behavior: `apps/server/src/provider/neopi/`, `apps/server/src/provider/{Layers,Drivers,Services}/NeoPi*`, `packages/effect-neopi-rpc/`, and `*neopi*` client files. Shared registration, defaults, ordering and branding may directly express NeoCode's NeoPi-first identity.
+Before adding fork behavior, locate the existing owner and inspect extension points and shared utilities. Prefer NeoPi-owned files when they express the complete behavior: `apps/server/src/provider/neopi/`, `apps/server/src/provider/{Layers,Drivers,Services}/NeoPi*`, `packages/effect-neopi-rpc/`, and `*neopi*` client files. Shared registration, defaults and branding may directly express NeoCode's identity.
 
-Keep provider mechanics at the adapter boundary or in NeoPi's RPC. Use provider-neutral seams when they fit the existing design, not as a requirement to disguise NeoPi-first product policy. Preserve explicit saved choices, other harness support, storage paths and protocol identifiers; do not add unrelated refactors or reorder unrelated code.
+Keep runtime mechanics at the adapter boundary or in NeoPi's RPC. Reuse shared seams when they fit the existing design. Preserve saved NeoPi choices, readable legacy history, storage paths and protocol identifiers without restoring retired harness execution. Avoid unrelated refactors.
 
 For each upstream file the fork touches, record the reason in the table in `AGENTS.md` › Fork rule. Adding one means adding a line; removing the need means removing it. Missing capabilities belong in NeoPi's RPC (`PsychedelicShayna/neopi`), not in T3 workarounds; file them there with `downstream` and other labels supported by its current tracker policy, rather than copying deselected historical bundles.
 

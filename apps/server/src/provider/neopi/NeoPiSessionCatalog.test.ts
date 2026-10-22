@@ -226,7 +226,6 @@ const harness = (options?: {
         snapshot: {
           getSnapshot: Effect.succeed(snapshot),
           refresh: Effect.succeed(snapshot),
-          resolveMaintenance: () => Effect.die("unused"),
           streamChanges: Stream.empty,
           applyUsageLimits: () => Effect.void,
         },

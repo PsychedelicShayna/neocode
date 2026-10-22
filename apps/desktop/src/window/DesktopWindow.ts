@@ -333,13 +333,14 @@ export const make = Effect.gen(function* () {
   const revealReadyWindows = new WeakSet<Electron.BrowserWindow>();
   let activationEnabled = false;
   let activationRequested = false;
+  let pendingNewWindows = 0;
   // The transient "Connecting to WSL" splash window, tracked separately so it
   // is never mistaken for the real main window.
   const splashWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
   const context = yield* Effect.context<DesktopWindowRuntimeServices>();
   const runFork = Effect.runForkWith(context);
   const runPromise = Effect.runPromiseWith(context);
-  let flushMainWindowBounds: Effect.Effect<void> = Effect.void;
+  const windowBoundsFlushes = new Map<Electron.BrowserWindow, Effect.Effect<void>>();
 
   const dismissConnectingSplash = Effect.gen(function* () {
     const splash = yield* Ref.getAndSet(splashWindowRef, Option.none());
@@ -508,7 +509,7 @@ export const make = Effect.gen(function* () {
         fiber === undefined ? Effect.void : Fiber.join(fiber).pipe(Effect.asVoid),
       ),
     );
-    flushMainWindowBounds = flushBoundsPersist;
+    windowBoundsFlushes.set(window, flushBoundsPersist);
 
     yield* previewManager.setMainWindow(window);
     window.webContents.on("will-attach-webview", (event, webPreferences, params) => {
@@ -651,7 +652,7 @@ export const make = Effect.gen(function* () {
       // released so its remaining repeats cannot reach the next app.
       concealWindow: () => concealPendingQuitWindow(window),
       quit: () => {
-        void runPromise(electronApp.quit);
+        if (!window.isDestroyed()) void runPromise(electronApp.quit);
       },
     });
     window.webContents.on("before-input-event", (event, input) => {
@@ -691,6 +692,7 @@ export const make = Effect.gen(function* () {
     let developmentLoadRetryIndex = 0;
     let developmentLoadRetryFiber: Fiber.Fiber<void, never> | undefined;
     let rendererRecoveryTimestamps: number[] = [];
+    let rendererRecoveryFiber: Fiber.Fiber<void, never> | undefined;
     const clearDevelopmentLoadRetry = () => {
       if (developmentLoadRetryFiber === undefined) {
         return;
@@ -783,7 +785,7 @@ export const make = Effect.gen(function* () {
       // recover by reloading — the renderer rehydrates from the backend,
       // which is unaffected. Recovery attempts are bounded so a renderer
       // that dies immediately on boot cannot reload-loop forever.
-      runFork(
+      rendererRecoveryFiber = runFork(
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis;
           rendererRecoveryTimestamps = rendererRecoveryTimestamps.filter(
@@ -844,6 +846,12 @@ export const make = Effect.gen(function* () {
     window.on("closed", () => {
       clearDevelopmentLoadRetry();
       clearBoundsPersist();
+      runFork(
+        flushBoundsPersist.pipe(
+          Effect.ensuring(Effect.sync(() => windowBoundsFlushes.delete(window))),
+        ),
+      );
+      if (rendererRecoveryFiber !== undefined) runFork(Fiber.interrupt(rendererRecoveryFiber));
       void runPromise(electronWindow.clearMain(Option.some(window)));
     });
 
@@ -883,10 +891,16 @@ export const make = Effect.gen(function* () {
     // ready. In remote-only mode, settings alone must not open a window early.
     activationEnabled = true;
     if (yield* waitingForBackend) return;
+    const existingWindow = yield* currentMainWindow;
     const window = yield* ensureMain;
+    if (Option.isNone(existingWindow) && pendingNewWindows > 0) pendingNewWindows -= 1;
     if (activationRequested && revealReadyWindows.has(window)) {
       yield* electronWindow.reveal(window);
       activationRequested = false;
+    }
+    while (pendingNewWindows > 0) {
+      pendingNewWindows -= 1;
+      yield* createMain;
     }
   }).pipe(Effect.withSpan("desktop.window.createMainIfBackendReady"));
 
@@ -1004,11 +1018,18 @@ export const make = Effect.gen(function* () {
     handleBackendNotReady: Ref.set(backendReadyRef, false).pipe(
       Effect.withSpan("desktop.window.handleBackendNotReady"),
     ),
-    flushMainWindowBounds: Effect.suspend(() => flushMainWindowBounds).pipe(
+    flushMainWindowBounds: Effect.suspend(() =>
+      Effect.forEach(windowBoundsFlushes.values(), (flush) => flush, { discard: true }),
+    ).pipe(
       Effect.withSpan("desktop.window.flushMainWindowBounds"),
     ),
     dispatchMenuAction: Effect.fn("desktop.window.dispatchMenuAction")(function* (action, options) {
       yield* Effect.annotateCurrentSpan({ action });
+      if (action === "new-window") {
+        pendingNewWindows += 1;
+        if (activationEnabled) yield* createMainIfBackendReady;
+        return;
+      }
       yield* dispatchRendererEvent(MENU_ACTION_CHANNEL, action, options);
     }),
     dispatchSnapShotEvent: Effect.fn("desktop.window.dispatchSnapShotEvent")(function* (event) {

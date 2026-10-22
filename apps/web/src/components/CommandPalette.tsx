@@ -78,15 +78,6 @@ import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl"
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { useClientSettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
-import { useCustomThemes } from "../hooks/useCustomThemes";
-import { useEnvironmentThemeDefinitions } from "../hooks/useEnvironmentTheme";
-import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
-import { getThemeDefinition } from "../themePalette";
-import {
-  STANDARD_THEME_CARDS,
-  getThemeCardDefinition,
-  ThemePreviewCircle,
-} from "./settings/ThemePreviewCircles";
 import { readLocalApi } from "../localApi";
 import { desktopLocalBackendId } from "../connection/desktopLocal";
 import { filesystemEnvironment } from "../state/filesystem";
@@ -181,6 +172,7 @@ import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../pr
 import { resolveShortcutCommand, threadJumpIndexFromCommand } from "../keybindings";
 import { CommandDialog, CommandDialogPopup, CommandFooterAction } from "./ui/command";
 import { NeoPiSessionPickerHost, useNeoPiSessionPickerAction } from "./neopi/NeoPiSessionEntry";
+import { useOpenModels } from "./neopi/modelsPageState";
 import { Button } from "./ui/button";
 import { Kbd, KbdGroup } from "./ui/kbd";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -471,6 +463,7 @@ function overlayModeForCommand(command: string | null): SearchOverlayMode | null
 
 export function CommandPalette({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
+  const openModels = useOpenModels();
   const [state, dispatch] = useReducer(reduceCommandPaletteUiState, {
     open: false,
     mode: "command",
@@ -550,17 +543,22 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.preventDefault();
         event.stopPropagation();
         if (event.repeat) return;
-        dispatch({ _tag: "OpenChangeTheme" });
+        setOpen(false);
+        void navigate({ to: "/settings/appearance", hash: "appearance" });
         return;
       }
       if (command === "themeEditor.toggle") {
         event.preventDefault();
         event.stopPropagation();
-        toggleThemeEditorForTheme({
-          theme,
-          themeHalves,
-          initialAppearance: resolvedTheme,
-        });
+        try {
+          toggleThemeEditorForTheme({
+            theme,
+            themeHalves,
+            initialAppearance: resolvedTheme,
+          });
+        } catch {
+          notifyThemeSaveFailure();
+        }
         return;
       }
       if (command === "usage.open") {
@@ -568,6 +566,13 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         setOpen(false);
         void navigate({ to: "/usage" });
+        return;
+      }
+      if (command === "models.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+        openModels();
         return;
       }
       const mode = overlayModeForCommand(command);
@@ -584,6 +589,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     appearanceMode,
     keybindings,
     navigate,
+    openModels,
     previewOpen,
     resolvedTheme,
     setAppearanceMode,
@@ -697,6 +703,7 @@ function OpenCommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
 }) {
   const navigate = useNavigate();
+  const openModels = useOpenModels();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
@@ -786,24 +793,7 @@ function OpenCommandPaletteDialog(props: {
     resolvedTheme,
     appearanceMode,
     setAppearanceMode,
-    setTheme,
-    setThemeHalf,
   } = useTheme();
-  const customThemes = useCustomThemes();
-  const environmentThemes = useEnvironmentThemeDefinitions();
-  const themeCards = useMemo(() => {
-    const seen = new Set<string>();
-    return [
-      ...STANDARD_THEME_CARDS.map((card) => ({ ...card, id: null })),
-      ...[...BUILT_IN_THEMES, ...customThemes, ...environmentThemes]
-        .filter((definition) => {
-          if (seen.has(definition.id)) return false;
-          seen.add(definition.id);
-          return true;
-        })
-        .map(getThemeCardDefinition),
-    ];
-  }, [customThemes, environmentThemes]);
   const providers = useAtomValue(primaryServerProvidersAtom);
   const providerEntryByEnvironmentAndInstanceId = useMemo(() => {
     const map = new Map<string, ProviderInstanceEntry>();
@@ -1904,54 +1894,17 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
-  const changeThemeItem: CommandPaletteSubmenuItem = {
-    kind: "submenu",
+  actionItems.push({
+    kind: "action",
     value: "action:change-theme",
-    searchTerms: ["change theme", "appearance", "colors", "palette"],
-    title: "Change theme",
+    searchTerms: ["change theme", "appearance", "colors", "palette", "NeoPi", "terminal"],
+    title: "Change NeoPi theme",
     icon: <PaletteIcon className={ITEM_ICON_CLASS} />,
-    addonIcon: <PaletteIcon className={ADDON_ICON_CLASS} />,
     shortcutCommand: "theme.select",
-    groups: [
-      {
-        value: "themes",
-        label: "Change theme",
-        items: themeCards.map(({ id, label, previews }) => ({
-          kind: "action",
-          value: id === null ? "theme:standard" : `theme:palette:${id}`,
-          title: label,
-          description: previews.length === 1 ? `For ${previews[0]!.mode} mode` : undefined,
-          searchTerms: [label, "theme", "appearance"],
-          icon: <PaletteIcon className={ITEM_ICON_CLASS} />,
-          titleTrailingContent: (
-            <span className="flex shrink-0 items-center gap-2">
-              {(themeHalves?.[resolvedTheme] ?? getThemeDefinition(theme)?.id ?? null) === id ? (
-                <span className="text-xs text-muted-foreground/70">Current</span>
-              ) : null}
-              <span className="flex items-center gap-1" aria-hidden>
-                {previews.map((preview) => (
-                  <ThemePreviewCircle
-                    key={preview.mode}
-                    colors={preview.colors}
-                    mode={preview.mode}
-                    className="size-3 border-0"
-                  />
-                ))}
-              </span>
-            </span>
-          ),
-          run: async () => {
-            const saved =
-              previews.length === 1 && id !== null
-                ? setThemeHalf(previews[0]!.mode, id)
-                : setTheme(id ?? appearanceMode);
-            if (!saved) notifyThemeSaveFailure();
-          },
-        })),
-      },
-    ],
-  };
-  actionItems.push(changeThemeItem);
+    run: async () => {
+      await navigate({ to: "/settings/appearance", hash: "appearance" });
+    },
+  });
 
   const changeAppearanceItem: CommandPaletteSubmenuItem = {
     kind: "submenu",
@@ -1984,25 +1937,12 @@ function OpenCommandPaletteDialog(props: {
   };
   actionItems.push(changeAppearanceItem);
 
-  useLayoutEffect(() => {
-    if (openIntent?.kind !== "change-theme") return;
-    clearOpenIntent();
-    browseNavigation.invalidate();
-    cloneLookupGeneration.current += 1;
-    setIsRemoteProjectLookingUp(false);
-    setAddProjectCloneFlow(null);
-    setViewStack([]);
-    pushPaletteView({
-      addonIcon: <PaletteIcon className={ADDON_ICON_CLASS} />,
-      groups: [{ value: "themes", label: "Change theme", items: [] }],
-    });
-  }, [browseNavigation, clearOpenIntent, openIntent, pushPaletteView]);
 
   actionItems.push({
     kind: "action",
     value: "action:theme-editor",
     searchTerms: ["theme", "appearance", "colors", "palette", "customize"],
-    title: "Toggle theme editor",
+    title: "Edit graphical palette",
     icon: <PaletteIcon className={ITEM_ICON_CLASS} />,
     shortcutCommand: "themeEditor.toggle",
     run: async () => {
@@ -2041,6 +1981,16 @@ function OpenCommandPaletteDialog(props: {
     run: async () => {
       await navigate({ to: "/usage" });
     },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:models",
+    searchTerms: ["models", "providers", "roles", "effort", "native", "login"],
+    title: "Open Models",
+    icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "models.open",
+    run: async () => { openModels(); },
   });
 
   actionItems.push({
@@ -2123,8 +2073,6 @@ function OpenCommandPaletteDialog(props: {
           addProjectEnvironmentId,
           buildAddProjectRemoteSourceReadiness(sourceControlDiscovery.data),
         )
-      : currentView?.groups[0]?.value === "themes"
-        ? changeThemeItem.groups
         : currentView?.groups[0]?.value === "appearance"
           ? changeAppearanceItem.groups
           : (currentView?.groups ?? rootGroups);

@@ -1,5 +1,4 @@
 import {
-  ANTIGRAVITY_DEFAULT_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
@@ -7,7 +6,6 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
-  type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import {
   type CustomModelDefinition,
@@ -36,7 +34,7 @@ import { sortModelsForProviderInstance } from "./modelOrdering";
 
 const MAX_CUSTOM_MODEL_COUNT = 32;
 export const MAX_CUSTOM_MODEL_LENGTH = 256;
-const DEFAULT_TEXT_GENERATION_INSTANCE_ID = ProviderInstanceId.make("codex");
+const DEFAULT_TEXT_GENERATION_INSTANCE_ID = ProviderInstanceId.make("neopi");
 
 /**
  * Resolve the custom-model list for a given instance, preferring the
@@ -59,7 +57,6 @@ function readInstanceCustomModels(
   instanceId: ProviderInstanceId,
   driverKind: ProviderDriverKind,
 ): ReadonlyArray<CustomModelDefinition> {
-  if (driverKind === "antigravity") return [];
   const instance = settings.providerInstances?.[instanceId];
   const config = instance?.config;
   if (config !== null && typeof config === "object") {
@@ -82,6 +79,7 @@ function readInstanceCustomModels(
 export interface AppModelOption {
   slug: string;
   name: string;
+  description?: string;
   shortName?: string;
   subProvider?: string;
   aliases?: ReadonlyArray<string>;
@@ -90,6 +88,7 @@ export interface AppModelOption {
   isDefault?: boolean;
   isLegacy?: boolean;
   isUnavailable?: boolean;
+  nativeFacts?: ServerProvider["models"][number]["nativeFacts"];
 }
 
 function appendUnavailableDynamicModelSelection(
@@ -99,10 +98,9 @@ function appendUnavailableDynamicModelSelection(
   selectedModel: string | null | undefined,
   hiddenModels: ReadonlyArray<string>,
 ): AppModelOption[] {
-  if (provider !== "opencode" && provider !== "antigravity") return options;
+  if (provider !== "neopi") return options;
   const slug = normalizeCustomModelSlug(selectedModel);
   if (!slug) return options;
-  if (provider === "antigravity" && slug === ANTIGRAVITY_DEFAULT_MODEL) return options;
 
   // A model that exists in the raw catalog can be absent from `options`
   // because the user hid it. Keep that preference authoritative.
@@ -120,11 +118,13 @@ function toAppModelOption(model: ServerProvider["models"][number]): AppModelOpti
     isCustom: model.isCustom,
   };
   if (model.shortName) option.shortName = model.shortName;
+  if (model.description !== undefined) option.description = model.description;
   if (model.subProvider) option.subProvider = model.subProvider;
   if (model.aliases) option.aliases = model.aliases;
   if (model.badge) option.badge = model.badge;
   if (model.isDefault) option.isDefault = true;
   if (model.isLegacy) option.isLegacy = true;
+  if (model.nativeFacts) option.nativeFacts = model.nativeFacts;
   return option;
 }
 
@@ -298,7 +298,10 @@ export function resolveAppModelSelectionForInstance(
   const entry = deriveProviderInstanceEntries(providers).find(
     (candidate) => candidate.instanceId === instanceId,
   );
-  if (!entry) return null;
+  if (!entry || entry.driverKind !== "neopi") return null;
+  // Native selector results can precede the provider catalog refresh. Keep the
+  // exact role or model ID rather than substituting a cached default.
+  if (selectedModel) return selectedModel;
   const options = getAppModelOptionsForInstance(
     settings,
     entry,
@@ -308,17 +311,13 @@ export function resolveAppModelSelectionForInstance(
   if (resolvedSelection) {
     return resolvedSelection;
   }
-  if (
-    resolutionOptions?.preserveUnavailableSelection &&
-    (entry.driverKind === "opencode" || entry.driverKind === "antigravity")
-  ) {
+  if (resolutionOptions?.preserveUnavailableSelection) {
     const unavailableSelection = normalizeCustomModelSlug(selectedModel);
     const hiddenModels = readInstanceModelPreferences(settings, entry.instanceId).hiddenModels;
     if (
       unavailableSelection &&
       !hiddenModels.includes(unavailableSelection) &&
-      resolveSelectableModel(entry.driverKind, selectedModel, entry.models) === null &&
-      (entry.driverKind !== "antigravity" || unavailableSelection !== ANTIGRAVITY_DEFAULT_MODEL)
+      resolveSelectableModel(entry.driverKind, selectedModel, entry.models) === null
     ) {
       return unavailableSelection;
     }
@@ -339,6 +338,7 @@ export function getCustomModelOptionsByInstance(
 ): ReadonlyMap<ProviderInstanceId, ReadonlyArray<ModelEsque>> {
   const out = new Map<ProviderInstanceId, ReadonlyArray<ModelEsque>>();
   for (const entry of deriveProviderInstanceEntries(providers)) {
+    if (entry.driverKind !== "neopi") continue;
     out.set(
       entry.instanceId,
       getAppModelOptionsForInstance(
@@ -351,51 +351,6 @@ export function getCustomModelOptionsByInstance(
   return out;
 }
 
-/**
- * Drop the opencode "plan" agent option from a stored model selection.
- * Used when legacy plan mode is turned off so server-side text-generation
- * tasks (title, branch, PR) cannot keep dispatching the plan agent.
- */
-export function withoutPlanAgentSelection(
-  selection: ModelSelection | null | undefined,
-): ModelSelection | null | undefined {
-  if (!selection?.options) {
-    return selection;
-  }
-  const options = selection.options.filter(
-    (option) => !(option.id === "agent" && option.value === "plan"),
-  );
-  if (options.length === selection.options.length) {
-    return selection;
-  }
-  return createModelSelection(selection.instanceId, selection.model, options);
-}
-
-// The dropdown hides the opencode "plan" agent while legacy plan mode is off,
-// but the persisted text-generation selections are only healed when the toggle
-// flips. Users who already have plan mode off and a stored "plan" selection
-// never trip the toggle handler, so resolve the heal once per settings load.
-export function resolvePlanAgentHealPatch(input: {
-  readonly planModeEnabled: boolean;
-  readonly textGenerationModelSelection: ModelSelection | null | undefined;
-  readonly sourceControlWriterModelSelection: ModelSelection | null | undefined;
-}): ServerSettingsPatch | null {
-  if (input.planModeEnabled) {
-    return null;
-  }
-  const healedText = withoutPlanAgentSelection(input.textGenerationModelSelection);
-  const healedSourceControl = withoutPlanAgentSelection(input.sourceControlWriterModelSelection);
-  const patch: ServerSettingsPatch = {
-    ...(healedText && healedText !== input.textGenerationModelSelection
-      ? { textGenerationModelSelection: healedText }
-      : {}),
-    ...(healedSourceControl && healedSourceControl !== input.sourceControlWriterModelSelection
-      ? { sourceControlWriterModelSelection: healedSourceControl }
-      : {}),
-  };
-  return Object.keys(patch).length > 0 ? patch : null;
-}
-
 export function resolveAppModelSelectionState(
   settings: UnifiedSettings,
   providers: ReadonlyArray<ServerProvider>,
@@ -405,7 +360,7 @@ export function resolveAppModelSelectionState(
     model: DEFAULT_TEXT_GENERATION_MODEL,
   };
   const supportedProviders = providers.filter(
-    (provider) => provider.supportsTextGeneration !== false,
+    (provider) => provider.driver === "neopi" && provider.supportsTextGeneration !== false,
   );
   const entries = deriveProviderInstanceEntries(supportedProviders);
   const selectedEntry = entries.find(
@@ -434,7 +389,6 @@ export function resolveAppModelSelectionState(
       model,
       models: entry.models,
       modelOptions: selectedEntry ? selection.options : undefined,
-      planModeEnabled: settings.planModeEnabled,
     });
 
     return createModelSelection(entry.instanceId, model, modelOptionsForDispatch);

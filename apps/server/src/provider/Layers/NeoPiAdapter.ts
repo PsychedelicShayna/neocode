@@ -4,12 +4,13 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   TurnId,
+  NeoPiModelsError,
   type NeoPiSettings,
   type ProviderRuntimeEvent,
   type ProviderSession,
   type ThreadId,
 } from "@t3tools/contracts";
-import type { SpawnFn } from "effect-neopi-rpc/client";
+import { make as makeModelsClient, type SpawnFn, type UiRequestFrame } from "effect-neopi-rpc/client";
 import type {
   NeoPiChatMode,
   NeoPiInteractionMode,
@@ -22,6 +23,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as PubSub from "effect/PubSub";
+import * as RcMap from "effect/RcMap";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -51,6 +53,7 @@ import { NEOPI_CAPABILITIES } from "../neopi/NeoPiCompatibility.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import { makeNeoPiHostToolBridge, type NeoPiHostToolBridge } from "../neopi/NeoPiHostToolBridge.ts";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "../neopi/NeoPiSessionRuntime.ts";
+import { readNeoPiJournalPeer, sameNeoPiJournalIdentity } from "../neopi/NeoPiJournalReader.ts";
 import { readNeoPiSessionConfiguration } from "../neopi/NeoPiSessionConfiguration.ts";
 import {
   groupNeoPiHistory,
@@ -63,6 +66,8 @@ import type {
   NeoPiSessionRuntimeShape,
 } from "../neopi/NeoPiRuntimeTypes.ts";
 import type { NeoPiAdapterShape } from "../Services/NeoPiAdapter.ts";
+import { makeNeoPiModelsConnection } from "../neopi/NeoPiModelsConnection.ts";
+import { parseNeoPiLaunchArguments } from "../neopi/NeoPiLaunchArgs.ts";
 
 const PROVIDER = ProviderDriverKind.make("neopi");
 const record = (value: unknown): Record<string, unknown> =>
@@ -147,6 +152,20 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
     PubSub.shutdown,
   );
   const sessions = new Map<ThreadId, Session>();
+  const modelsUi = yield* Effect.acquireRelease(PubSub.unbounded<{ threadId: ThreadId; frame: UiRequestFrame }>(), PubSub.shutdown);
+  const configurationClients = yield* RcMap.make({
+    lookup: (cwd: string) => Effect.gen(function* () {
+      const extra = yield* parseNeoPiLaunchArguments(options.settings.launchArgs);
+      const client = yield* makeModelsClient({
+        spawn: options.spawn, command: options.binary, cwd,
+        env: { ...options.environment, ...(options.settings.profile ? { OMP_PROFILE: options.settings.profile } : {}) },
+        args: ["--mode", "rpc-ui", "--cwd", cwd, "--no-session", "--no-tools", "--no-skills", "--no-rules", "--no-title", ...extra],
+      });
+      return yield* makeNeoPiModelsConnection(client);
+    }).pipe(Effect.mapError(cause => new NeoPiModelsError({ message: cause.message }))),
+    idleTimeToLive: "30 seconds",
+    capacity: 4,
+  });
   const incarnationId = NodeCrypto.randomUUID();
   let eventSequence = 0;
   const stamp = (now: string): Pick<MapCtx, "now" | "newEventId"> => ({
@@ -171,6 +190,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
     new ProviderAdapterRequestError({ provider: PROVIDER, method, detail: cause.message, cause });
   const processFrame = (session: Session, frame: NeoPiRuntimeFrame) =>
     Effect.gen(function* () {
+      if (frame.type === "extension_ui_request" && typeof frame.loginId === "string") {
+        yield* PubSub.publish(modelsUi, { threadId: session.session.threadId, frame: frame as UiRequestFrame });
+        return;
+      }
       const data = record(frame);
       const turnId = frame.turnId ?? session.activeTurnId;
       const ctx = context(session, DateTime.formatIso(yield* DateTime.now), turnId);
@@ -819,6 +842,80 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         );
       }),
     readThread,
+    observeNative: (threadId) =>
+      Effect.gen(function* () {
+        const session = sessions.get(threadId);
+        if (!session?.runtime.observeNative || !session.runtime.nativeRequest) return undefined;
+        const runtime = session.runtime;
+        const status = yield* SubscriptionRef.get(runtime.state);
+        if (status === "stopped" || status === "failed") return undefined;
+        const generation = runtime.processGeneration;
+        const events = yield* session.runtime.observeNative;
+        return {
+          ownership: runtime.capabilities.has(NEOPI_CAPABILITIES.controlAttached) ? "terminal" as const : "gui" as const,
+          capabilities: runtime.capabilities,
+          events,
+          request: (command: { readonly type: string; readonly [key: string]: unknown }) => Effect.gen(function* () {
+            if (sessions.get(threadId) !== session || runtime.processGeneration !== generation)
+              return yield* Effect.fail(new Error("The native runtime was replaced. Reconnect before issuing commands."));
+            return yield* session.runtime.nativeRequest!(command);
+          }),
+        };
+      }),
+    readJournal: (threadId, expected, paging) =>
+      Effect.gen(function* () {
+        const session = sessions.get(threadId);
+        if (!session) return undefined;
+        const runtime = session.runtime;
+        const status = yield* SubscriptionRef.get(runtime.state);
+        if (status === "stopped" || status === "failed") return undefined;
+        if (status !== "ready" && status !== "running")
+          return { status: "unavailable" as const, reason: "The NeoPi connection is transitioning. Retry after it settles." };
+        const generation = runtime.processGeneration;
+        const cursorIdentity = Effect.gen(function* () {
+          const cursor = yield* SubscriptionRef.get(runtime.cursor);
+          const file = yield* fs.realPath(cursor.sessionFile).pipe(Effect.option);
+          return file._tag === "Some"
+            ? { sessionId: cursor.sessionId, sessionFile: file.value }
+            : undefined;
+        });
+        const beforeIdentity = yield* cursorIdentity;
+        if (!beforeIdentity || !sameNeoPiJournalIdentity(beforeIdentity, expected))
+          return { status: "error" as const, code: "stale_cursor", message: "The bound native session changed. Restart this view." };
+        const result = yield* readNeoPiJournalPeer(runtime, expected, paging, (file) => fs.realPath(file));
+        const afterStatus = yield* SubscriptionRef.get(runtime.state);
+        const afterIdentity = yield* cursorIdentity;
+        if (
+          sessions.get(threadId) !== session ||
+          runtime.processGeneration !== generation ||
+          (afterStatus !== "ready" && afterStatus !== "running") ||
+          !afterIdentity || !sameNeoPiJournalIdentity(afterIdentity, expected)
+        )
+          return { status: "error" as const, code: "stale_cursor", message: "The native connection changed during this read. Restart this view." };
+        return result;
+      }),
+    getModelsConnection: (cwd, threadId, expected) => Effect.gen(function* () {
+      if (!threadId) return yield* RcMap.get(configurationClients, cwd);
+      const session = sessions.get(threadId);
+      if (!session || !expected || !session.runtime.subscribeConfigurationChanges)
+        return yield* new NeoPiModelsError({ message: "The bound native session is not connected." });
+      const generation = session.runtime.processGeneration;
+      const validate = Effect.gen(function* () {
+        if (sessions.get(threadId) !== session || session.runtime.processGeneration !== generation)
+          return yield* new NeoPiModelsError({ message: "The bound native runtime changed. Reopen Models." });
+        const snapshot = yield* readNeoPiSessionConfiguration(session.runtime, expected).pipe(
+          Effect.mapError(cause => new NeoPiModelsError({ message: cause.message })),
+        );
+        if (snapshot.status !== "available") return yield* new NeoPiModelsError({ message: snapshot.reason });
+      });
+      yield* validate;
+      const changes = yield* session.runtime.subscribeConfigurationChanges;
+      return {
+        capabilities: session.runtime.capabilities, request: session.runtime.request, respondUi: session.runtime.respondUi,
+        ui: Stream.fromPubSub(modelsUi).pipe(Stream.filter(entry => entry.threadId === threadId), Stream.map(entry => entry.frame)),
+        changes: Stream.fromEffectRepeat(PubSub.take(changes)), validate,
+      };
+    }),
     observeConfiguration: (threadId, expected) =>
       Effect.gen(function* () {
         const session = sessions.get(threadId);

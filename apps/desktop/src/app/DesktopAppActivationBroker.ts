@@ -11,6 +11,7 @@ interface PendingActivation {
   readonly resolve: (response: DesktopAppActivationResponse) => void;
   readonly timeout: ReturnType<typeof setTimeout>;
   dispatched: boolean;
+  rendererId: number | undefined;
 }
 
 type RendererSender = (request: DesktopAppActivationRequest) => void;
@@ -34,7 +35,8 @@ export class DesktopAppActivationBroker {
   readonly #pending = new Map<string, PendingActivation>();
   readonly #requestTimeoutMs: number;
   readonly #activate: () => void;
-  #renderer: RendererSender | null = null;
+  readonly #renderers = new Map<number, RendererSender>();
+  #rendererId: number | undefined;
   #closed = false;
 
   constructor(input: { readonly requestTimeoutMs: number; readonly activate: () => void }) {
@@ -69,6 +71,7 @@ export class DesktopAppActivationBroker {
         resolve,
         timeout,
         dispatched: false,
+        rendererId: undefined,
       });
     });
 
@@ -77,15 +80,24 @@ export class DesktopAppActivationBroker {
     return response;
   }
 
-  registerRenderer(send: RendererSender): void {
-    this.#renderer = send;
+  registerRenderer(send: RendererSender, rendererId = 0): void {
+    this.#renderers.set(rendererId, send);
+    this.selectRenderer(rendererId);
+  }
+
+  selectRenderer(rendererId: number): void {
+    if (!this.#renderers.has(rendererId)) return;
+    this.#rendererId = rendererId;
     this.#flush();
   }
 
-  clearRenderer(): void {
-    this.#renderer = null;
+  clearRenderer(rendererId = 0): void {
+    this.#renderers.delete(rendererId);
+    if (this.#rendererId === rendererId) {
+      this.#rendererId = this.#renderers.keys().next().value;
+    }
     for (const pending of this.#pending.values()) {
-      if (pending.dispatched) {
+      if (pending.dispatched && pending.rendererId === rendererId) {
         this.#settle(
           failure(
             pending.request.requestId,
@@ -95,9 +107,11 @@ export class DesktopAppActivationBroker {
         );
       }
     }
+    this.#flush();
   }
 
-  complete(response: DesktopAppActivationResponse): void {
+  complete(response: DesktopAppActivationResponse, rendererId = 0): void {
+    if (this.#pending.get(response.requestId)?.rendererId !== rendererId) return;
     this.#settle(response);
   }
 
@@ -113,7 +127,8 @@ export class DesktopAppActivationBroker {
 
   close(): void {
     this.#closed = true;
-    this.#renderer = null;
+    this.#renderers.clear();
+    this.#rendererId = undefined;
     for (const pending of this.#pending.values()) {
       this.#settle(
         failure(
@@ -126,18 +141,22 @@ export class DesktopAppActivationBroker {
   }
 
   #flush(): void {
-    const renderer = this.#renderer;
-    if (renderer === null) return;
+    const rendererId = this.#rendererId;
+    if (rendererId === undefined) return;
+    const renderer = this.#renderers.get(rendererId);
+    if (renderer === undefined) return;
     if ([...this.#pending.values()].some((pending) => pending.dispatched)) return;
 
     for (const pending of this.#pending.values()) {
       if (pending.dispatched) continue;
       try {
         pending.dispatched = true;
+        pending.rendererId = rendererId;
         renderer(pending.request);
       } catch {
         pending.dispatched = false;
-        this.#renderer = null;
+        pending.rendererId = undefined;
+        this.clearRenderer(rendererId);
       }
       return;
     }

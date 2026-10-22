@@ -1,99 +1,32 @@
 # Provider constraints
 
-Orchestration records intent and state without knowing which provider runs a thread. Provider
-protocols, account ownership, permissions, and capabilities belong at the
-[adapter boundary](../../apps/server/src/provider/Services/ProviderAdapter.ts). Normalize there
-instead of spreading provider checks through reactors and clients.
+NeoPi is the only execution runtime. Keep its protocols, process ownership,
+permissions, and capabilities at the
+[adapter boundary](../../apps/server/src/provider/Services/ProviderAdapter.ts),
+not in reactors or client-specific workarounds.
 
-A driver kind identifies an integration; an instance identifies one configuration and account
-lifecycle. Route work by instance, so two accounts using the same driver do not share mutable
-session or catalog state.
+An instance identifies one executable/profile/environment configuration. Route by
+instance so mutable session and catalog state cannot leak between configurations.
+Inference-provider IDs such as `openai-codex`, `anthropic`, and `cursor` belong to
+NeoPi's model catalog. They must not be interpreted as execution-driver choices.
 
-## Process and account isolation
+## Legacy identities remain readable, not executable
 
-T3-managed OpenCode chat uses one server per thread. Its MCP registrations are directory-scoped, while
-T3's MCP connection is thread-scoped. Sharing a chat server between threads in one directory would
-let them replace each other's connection. Catalog and text-generation work can share the
-[instance-owned helper](../../apps/server/src/provider/OpenCodeServerOwner.ts), which closes
-after an idle period. External OpenCode servers remain externally owned and can require an
-external restart to pick up configuration changes.
+The [driver registry](../../apps/server/src/provider/builtInDrivers.ts) ships only
+NeoPi. Open wire identifiers and old settings decoders remain because removing
+them would discard stored configuration or make history unreadable.
 
-OpenCode also stores persistent approval grants per directory. Automatic full-access replies use
-`once` so they cannot widen a supervised thread's permissions on a shared external server.
-See the [adapter](../../apps/server/src/provider/Layers/OpenCodeAdapter.ts).
+A saved session's runtime identity wins over a draft model choice. Legacy records
+are read-only; switching a picker must never reinterpret their history as NeoPi
+history. Only fresh defaults fall back to an enabled native configuration. The
+[shared classification](../../packages/shared/src/serverSettings.ts) is used by
+clients, command admission, and restart recovery.
 
-Antigravity separates account profiles per instance while sharing installed executables across the
-environment. It forces file-based credential storage because the native macOS keychain entry would
-otherwise be shared across instances. The launch environment removes ambient Google credentials,
-so an instance cannot silently use another account or billing project. The agent also resolves
-its user-global skill directories under that profile, so the profile links those two directories
-back to the user's real `~/.gemini`; MCP servers, hooks, and rules there stay out of the profile.
-See [profile isolation](../../apps/server/src/provider/antigravityAuthSupport.ts).
+NeoPi owns inference credentials, account selection, models, and roles. Do not
+replace a missing native capability with another CLI's credentials or a GUI-owned
+account store.
 
-The [Antigravity installer](../../apps/server/src/provider/AntigravityInstallation.ts) outlives
-client connections and provider-instance rebuilds. Releases are immutable, with an atomic pointer
-selecting the version for new processes. Running processes hold leases on their version. Updates
-and removal must respect those leases instead of replacing executables under a running agent.
-
-## Setup must not happen as a health-check side effect
-
-Opening a provider session can start MCP servers, run hooks, or launch a login browser.
-[Grok probes](../../apps/server/src/provider/Layers/GrokProvider.ts) avoid authentication and
-session creation for this reason. Antigravity likewise reserves authenticated catalog sessions for
-explicit setup or model refresh; background checks use initialization only.
-
-[Antigravity sign-in](../../apps/server/src/provider/AntigravityAuth.ts) belongs to the initiating
-T3 auth session. The client carries the return URL back to the environment because the provider's
-loopback listener may be on another machine. Forward only the callback for the owned pending flow;
-a successful callback HTTP request is not proof that provider authentication finished. The native
-process owns token exchange and storage.
-
-Antigravity sign-out closes admission to new processes and stops existing processes before clearing account
-metadata. Otherwise a helper or resumed session could retain the old account. Cached model lists
-do not establish current access, and an authoritative empty catalog must clear the old list.
-
-Antigravity text-generation helpers deny tool requests, but native hooks and MCP configuration can
-run before the prompt. They reject profiles with such configuration before launch. Prompt
-instructions and tool denial do not create a native sandbox.
-See [helper constraints](../../apps/server/src/textGeneration/AntigravityTextGeneration.ts).
-
-## Provider updates run only through the owning installer
-
-A one-click update is offered only when the resolved executable's path proves which installer owns
-it. Homebrew and npm are proven by the real path (symlinks followed): a versioned keg or cask under
-`brew --prefix`, or `<prefix>/lib/node_modules/<pkg>/` (Windows: the shim beside `node_modules`).
-Native installer layouts and the global bin directories of pnpm, Bun, and Vite+ may match on either
-the resolved path or its real target, since those installers place real files or their own symlinks
-there. Cursor and Grok are the exception: their only updater is the CLI itself, which detects its
-own installer, so any resolved executable runs `<binary> update`. Anything unproven stays
-manual-only but still reports the version gap. npm updates pin
-`--prefix` because the `npm` on `PATH` can belong to a different Node than the one that owns the
-provider. Homebrew
-compares against `brew info` since casks trail npm by hours; native installs share npm's version
-train, so the registry stays authoritative for them.
-See the [resolver](../../apps/server/src/provider/providerMaintenance.ts).
-
-Ownership is cached per instance and re-read immediately before an update runs. The
-[runner](../../apps/server/src/provider/providerMaintenanceRunner.ts) refuses when the lock key
-changed since the advisory, and reports success only when the refreshed provider is still installed
-with a readable, current version.
-
-## Protocol traps
-
-Codex async questions arrive as notifications and are answered with a new user message. There is
-no pending RPC response to send. Blocking questions still use the request/response path. The
-[adapter](../../apps/server/src/provider/Layers/CodexAdapter.ts) distinguishes them; the
-[decider](../../apps/server/src/orchestration/decider.ts) records an async answer and its user
-message together.
-
-An async question can outlive the turn or a server restart. The engine reads that request's
-durable activity before resolving it because the in-memory command snapshot omits old activities.
-Do not infer that a request has disappeared merely because it is outside the recent window.
-
-Capabilities must describe what the provider can actually do. Antigravity can capture workspace
-checkpoints but cannot roll back its conversation. The [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)
-therefore rejects revert before touching files. Native permission and question option IDs must
-also survive normalization; a display label is not necessarily a valid reply.
+## Native session ownership
 
 NeoPi/OMP (oh-my-pi compatible) uses JSONL `rpc-ui` with a required negotiated
 protocol-v2 transport. The `ready` handshake determines optional features;
@@ -134,5 +67,5 @@ file-bearing messages, and an image-only server can fail the entire environment'
 replaying one such event. Rollouts and downgrades must account for persisted history as well as
 current client support.
 
-Model classification has its own [manifest constraints](./model-manifest.md). Assistant-reference
-handling is documented under [citations](./assistant-citations.md).
+Assistant-reference handling is documented under
+[citations](./assistant-citations.md).

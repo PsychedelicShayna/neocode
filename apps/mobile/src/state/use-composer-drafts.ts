@@ -56,6 +56,8 @@ import {
 } from "./thread-outbox-model";
 import { flushThreadOutbox, threadOutboxManager } from "./thread-outbox";
 import { composerDraftEnvironmentId } from "../lib/composerAttachmentUploadQueue";
+import { bindNativeComposerDraft, syncNativeComposerDrafts } from "./native-composer-draft-state";
+import { NativeTreeDraft, emptyNativeTreeDraft } from "./native-tree-draft";
 
 const COMPOSER_DRAFTS_SCHEMA_VERSION = 1;
 const COMPOSER_DRAFTS_DIRECTORY = "composer-drafts";
@@ -326,6 +328,9 @@ export interface ComposerDraft {
   readonly context?: OrchestrationMessageContext;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly importedShareIds?: ReadonlyArray<string>;
+  /** Canonical native-file draft behind this thread alias. */
+  readonly nativeSessionKey?: string;
+  readonly nativeTree?: NativeTreeDraft;
   readonly modelSelection?: ModelSelection;
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: ProviderInteractionMode;
@@ -388,6 +393,8 @@ const ComposerDraftSchema = Schema.Struct({
   context: Schema.optional(PersistedComposerContextSchema),
   attachments: Schema.Array(DraftComposerAttachmentSchema),
   importedShareIds: Schema.optional(Schema.Array(Schema.String)),
+  nativeSessionKey: Schema.optional(Schema.String),
+  nativeTree: Schema.optional(NativeTreeDraft),
   modelSelection: Schema.optional(ModelSelectionSchema),
   runtimeMode: Schema.optional(RuntimeModeSchema),
   interactionMode: Schema.optional(ProviderInteractionModeSchema),
@@ -546,6 +553,8 @@ function isEmptyDraft(draft: ComposerDraft): boolean {
     draft.modelSelection === undefined &&
     draft.runtimeMode === undefined &&
     draft.interactionMode === undefined &&
+    draft.nativeSessionKey === undefined &&
+    draft.nativeTree === undefined &&
     draft.workspaceSelection === undefined
   );
 }
@@ -1238,12 +1247,53 @@ function updateComposerDrafts(
   update: (current: Record<string, ComposerDraft>) => Record<string, ComposerDraft>,
 ): void {
   const current = appAtomRegistry.get(composerDraftsAtom);
-  const next = update(current);
+  const next = syncNativeComposerDrafts(current, update(current));
   if (next === current) {
     return;
   }
   appAtomRegistry.set(composerDraftsAtom, next);
   schedulePersistComposerState();
+}
+
+const requestedNativeDraftBindings = new Map<string, string>();
+export async function bindComposerDraftToNativeSession(
+  draftKey: string,
+  nativeKey: string,
+): Promise<void> {
+  requestedNativeDraftBindings.set(draftKey, nativeKey);
+  ensureComposerDraftsLoaded();
+  if (loadPromise !== null) await loadPromise;
+  if (requestedNativeDraftBindings.get(draftKey) !== nativeKey) return;
+  updateComposerDrafts((current) => bindNativeComposerDraft(current, draftKey, nativeKey));
+}
+
+/** A native navigation result replaces content, while local settings and file-scoped persistence survive. */
+export function replaceComposerDraftFromNative(
+  draftKey: string,
+  content: ComposerDraftContent,
+): void {
+  updateComposerDrafts((current) => {
+    const previous = normalizeDraft(current[draftKey]);
+    return withComposerDraft(current, draftKey, {
+      ...previous,
+      text: content.text,
+      attachments: content.attachments,
+      context: content.context,
+    });
+  });
+}
+
+export function updateNativeTreeDraft(
+  draftKey: string,
+  update: (draft: NativeTreeDraft) => NativeTreeDraft,
+): void {
+  updateComposerDrafts((current) => {
+    const previous = normalizeDraft(current[draftKey]);
+    return withComposerDraft(current, draftKey, {
+      ...previous,
+      nativeTree: update(previous.nativeTree ?? emptyNativeTreeDraft()),
+    });
+  });
 }
 
 export function setStickyComposerModelSelection(modelSelection: ModelSelection): void {

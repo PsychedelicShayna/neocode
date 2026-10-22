@@ -1,287 +1,239 @@
 import {
-  ANTIGRAVITY_DEFAULT_MODEL,
+  EnvironmentId,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
-  type ServerProvider,
+  ThreadId,
+  type NeoPiModelSelectorFacts,
+  type NeoPiModelSelectorItem,
+  type NeoPiModelSelectorResult,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import {
-  adjacentModelPickerProvider,
-  resolveModelPickerSelectedModel,
-  shouldIncludeModelPickerOption,
-  shouldOfferModelPickerSetup,
-} from "./ModelPickerContent";
+  nativeSelectorRequests,
+  nativeSelectorTarget,
+  nativeSwitcherFactCells,
+  nativeSwitcherModels,
+} from "./neopiModelSwitcher";
+import { modelPickerModelKey, parseModelPickerModelKey } from "./modelPickerKeys";
 
-function entry(status: ServerProvider["status"], driver = "opencode") {
-  return deriveProviderInstanceEntries([
-    {
-      instanceId: ProviderInstanceId.make(`${driver}_work`),
-      driver: ProviderDriverKind.make(driver),
-      enabled: true,
-      installed: true,
-      version: null,
-      status,
-      auth: { status: "authenticated" },
-      checkedAt: "2026-08-28T00:00:00.000Z",
-      models: [],
-      slashCommands: [],
-      skills: [],
-    },
-  ])[0]!;
-}
-
-describe("shouldIncludeModelPickerOption", () => {
-  it.each(["ready", "error"] as const)(
-    "never offers the internal Antigravity default marker as a model when %s",
-    (status) => {
-      const providerEntry = entry(status, "antigravity");
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: ANTIGRAVITY_DEFAULT_MODEL,
-            name: ANTIGRAVITY_DEFAULT_MODEL,
-            isUnavailable: true,
-          },
-          activeInstanceId: providerEntry.instanceId,
-          activeModel: ANTIGRAVITY_DEFAULT_MODEL,
-        }),
-      ).toBe(false);
-    },
-  );
-
-  it.each([
-    ["opencode", "error"],
-    ["opencode", "warning"],
-    ["antigravity", "error"],
-    ["antigravity", "warning"],
-  ] as const)(
-    "keeps only the active synthetic %s row when the provider status is %s",
-    (driver, status) => {
-      const providerEntry = entry(status, driver);
-      const activeInstanceId = providerEntry.instanceId;
-      const activeModel = "missing-model";
-
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: activeModel,
-            name: activeModel,
-            isUnavailable: true,
-          },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(true);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: { slug: "stale/model", name: "Stale model" },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(false);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: {
-            slug: "other/missing",
-            name: "Other missing",
-            isUnavailable: true,
-          },
-          activeInstanceId,
-          activeModel,
-        }),
-      ).toBe(false);
-      expect(
-        shouldIncludeModelPickerOption({
-          entry: providerEntry,
-          option: { slug: activeModel, name: activeModel, isUnavailable: true },
-          activeInstanceId: ProviderInstanceId.make(`${driver}_personal`),
-          activeModel,
-        }),
-      ).toBe(false);
-    },
-  );
+const instanceId = ProviderInstanceId.make("neopi-work");
+const otherInstanceId = ProviderInstanceId.make("neopi-personal");
+const facts: NeoPiModelSelectorFacts = {
+  intelligence: null,
+  ttftMs: null,
+  tokensPerSecond: null,
+  contextWindow: null,
+  effectiveContextWindow: null,
+  inputCostPerMillion: null,
+  outputCostPerMillion: null,
+  performanceSource: null,
+  serviceTier: null,
+};
+const item = (
+  selector: string,
+  overrides: Partial<NeoPiModelSelectorItem> = {},
+): NeoPiModelSelectorItem => ({
+  selector,
+  provider: "custom-route",
+  id: selector,
+  name: selector,
+  resolvedSelector: selector,
+  facts,
+  ...overrides,
 });
-
-describe("resolveModelPickerSelectedModel", () => {
-  it("follows the catalog default for the marker but keeps an explicit native model", () => {
-    const driverKind = ProviderDriverKind.make("antigravity");
-    const previousOptions = [
-      { slug: "gemini-fast", name: "Gemini Fast", aliases: [ANTIGRAVITY_DEFAULT_MODEL] },
-      { slug: "gemini-pro", name: "Gemini Pro" },
-    ];
-    const nextOptions = [
-      { slug: "gemini-fast", name: "Gemini Fast" },
-      { slug: "gemini-pro", name: "Gemini Pro", aliases: [ANTIGRAVITY_DEFAULT_MODEL] },
-    ];
-
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: previousOptions,
-      })?.slug,
-    ).toBe("gemini-fast");
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: nextOptions,
-      })?.slug,
-    ).toBe("gemini-pro");
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind,
-        model: "gemini-fast",
-        options: nextOptions,
-      })?.slug,
-    ).toBe("gemini-fast");
+const result = (
+  items: ReadonlyArray<NeoPiModelSelectorItem>,
+  roles: ReadonlyArray<NeoPiModelSelectorItem> = [],
+): NeoPiModelSelectorResult => ({ items, roles, error: null });
+const entries = deriveProviderInstanceEntries(
+  [instanceId, otherInstanceId].map((instanceId) => ({
+    instanceId,
+    driver: ProviderDriverKind.make("neopi"),
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready" as const,
+    auth: { status: "authenticated" as const },
+    checkedAt: "2026-10-22T00:00:00.000Z",
+    models: [],
+    slashCommands: [],
+    skills: [],
+  })),
+);
+const rows = (
+  results: ReadonlyMap<ProviderInstanceId, NeoPiModelSelectorResult>,
+  activeModel = "",
+  includeUnavailableSelection = false,
+) =>
+  nativeSwitcherModels({
+    entries,
+    results,
+    activeInstanceId: instanceId,
+    activeModel,
+    includeUnavailableSelection,
   });
 
-  it("does not guess the default from the first model in a catalog", () => {
-    expect(
-      resolveModelPickerSelectedModel({
-        driverKind: ProviderDriverKind.make("antigravity"),
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: [{ slug: "gemini-fast", name: "Gemini Fast" }],
-      }),
-    ).toBeUndefined();
-  });
-});
-
-describe("shouldOfferModelPickerSetup", () => {
-  const availableModel = { slug: "gemini-3.1-pro", name: "Gemini 3.1 Pro" };
-
-  it("offers setup before an Antigravity account has models", () => {
-    expect(shouldOfferModelPickerSetup(entry("error", "antigravity"), [])).toBe(true);
-  });
-
-  it("offers setup after sign-out even if a model remains cached", () => {
-    const providerEntry = entry("ready", "antigravity");
-    expect(
-      shouldOfferModelPickerSetup(
-        {
-          ...providerEntry,
-          snapshot: { ...providerEntry.snapshot, auth: { status: "unauthenticated" } },
-        },
-        [availableModel],
-      ),
-    ).toBe(true);
-  });
-
-  it("offers setup when the only model is an unavailable saved selection", () => {
-    expect(
-      shouldOfferModelPickerSetup(entry("ready", "antigravity"), [
-        { ...availableModel, isUnavailable: true },
+describe("native model selector consumers", () => {
+  it("preserves native ranked order and opaque selector IDs without a second name filter", () => {
+    const models = rows(
+      new Map([
+        [
+          instanceId,
+          result([
+            item("custom-route/Zed.V2:blue", { name: "Zed" }),
+            item("custom-route/Alpha:Exact", { name: "Alpha" }),
+          ]),
+        ],
       ]),
-    ).toBe(true);
-  });
-
-  it("does not offer setup for a ready account with available models", () => {
-    expect(shouldOfferModelPickerSetup(entry("ready", "antigravity"), [availableModel])).toBe(
-      false,
     );
-  });
-
-  it("does not restore a disabled provider while its status snapshot is stale", () => {
+    expect(models.map((model) => model.slug)).toEqual([
+      "custom-route/Zed.V2:blue",
+      "custom-route/Alpha:Exact",
+    ]);
     expect(
-      shouldOfferModelPickerSetup({ ...entry("error", "antigravity"), enabled: false }, []),
-    ).toBe(false);
+      parseModelPickerModelKey(modelPickerModelKey(models[0]!.instanceId, models[0]!.slug)),
+    ).toEqual({ instanceId, slug: "custom-route/Zed.V2:blue" });
   });
 
-  it("keeps providers without integrated setup on their existing path", () => {
-    expect(shouldOfferModelPickerSetup(entry("error", "codex"), [])).toBe(false);
-  });
-
-  it("uses the environment's setup capability for other drivers", () => {
-    const providerEntry = entry("error", "custom_driver");
+  it("selects the role alias on its original instance instead of its resolved concrete model", () => {
+    const models = rows(
+      new Map([
+        [
+          instanceId,
+          result(
+            [],
+            [
+              item("@review", {
+                resolvedSelector: "custom-route/first",
+                description: "Review the change",
+              }),
+            ],
+          ),
+        ],
+        [
+          otherInstanceId,
+          result([], [item("@review", { resolvedSelector: "custom-route/second" })]),
+        ],
+      ]),
+    );
+    expect(models.map((model) => [model.slug, model.group, model.resolvedSelector])).toEqual([
+      ["@review", "Roles", "custom-route/first"],
+      ["@review", "Roles", "custom-route/second"],
+    ]);
+    expect(models[0]?.description).toBe("Review the change");
     expect(
-      shouldOfferModelPickerSetup(
-        {
-          ...providerEntry,
-          snapshot: {
-            ...providerEntry.snapshot,
-            setup: { canAuthenticate: true, canInstall: false },
-          },
-        },
-        [],
+      models.map((model) =>
+        parseModelPickerModelKey(modelPickerModelKey(model.instanceId, model.slug)),
       ),
-    ).toBe(true);
-  });
-});
-
-describe("adjacentModelPickerProvider", () => {
-  const codex = entry("ready", "codex");
-  const claude = entry("ready", "claudeAgent");
-  const unavailable = entry("error");
-  const input = {
-    entries: [codex, unavailable, claude],
-    disabledInstanceIds: undefined,
-    selectableUnavailableInstanceIds: undefined,
-  };
-
-  it("wraps through favorites and ready instances, skipping unavailable providers", () => {
-    expect(
-      adjacentModelPickerProvider({ ...input, selectedInstanceId: codex.instanceId, direction: 1 }),
-    ).toBe(claude.instanceId);
-    expect(
-      adjacentModelPickerProvider({ ...input, selectedInstanceId: "favorites", direction: -1 }),
-    ).toBe(claude.instanceId);
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: claude.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
+    ).toEqual([
+      { instanceId, slug: "@review" },
+      { instanceId: otherInstanceId, slug: "@review" },
+    ]);
   });
 
-  it("keeps thread locks and the selected unavailable catalog", () => {
+  it("uses effective context and nullable native facts, preserving genuine zero costs", () => {
+    const models = rows(
+      new Map([
+        [
+          instanceId,
+          result([
+            item("custom-route/model", {
+              facts: {
+                ...facts,
+                intelligence: 43,
+                tokensPerSecond: 118,
+                contextWindow: 200000,
+                effectiveContextWindow: 120000,
+                inputCostPerMillion: 0,
+                outputCostPerMillion: 15,
+                performanceSource: "measured",
+                serviceTier: "priority",
+              },
+            }),
+          ]),
+        ],
+      ]),
+    );
+    expect(nativeSwitcherFactCells(models[0]!)).toEqual([
+      "43",
+      "Unknown",
+      "~118",
+      "120K",
+      "$0",
+      "$15",
+    ]);
+    expect(nativeSwitcherFactCells({ slug: "local/unknown", name: "Unknown" })).toEqual(
+      Array(6).fill("Unknown"),
+    );
     expect(
-      adjacentModelPickerProvider({
-        ...input,
-        disabledInstanceIds: new Set([claude.instanceId]),
-        selectedInstanceId: codex.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectableUnavailableInstanceIds: new Set([unavailable.instanceId]),
-        selectedInstanceId: codex.instanceId,
-        direction: 1,
-      }),
-    ).toBe(unavailable.instanceId);
+      nativeSwitcherFactCells({
+        slug: "local/catalog-only",
+        name: "Catalog",
+        selectorFacts: { ...facts, contextWindow: 200000 },
+      })[3],
+    ).toBe("Unknown");
   });
 
-  it("handles an empty catalog and a removed selection in either direction", () => {
+  it("does not substitute catalog models after native errors or an empty enabled scope", () => {
+    const models = rows(
+      new Map([
+        [instanceId, { ...result([item("private/hidden")]), error: "Invalid native query" }],
+      ]),
+      "private/saved:Exact",
+      true,
+    );
+    expect(models.map((model) => [model.slug, model.isUnavailable])).toEqual([
+      ["private/saved:Exact", true],
+    ]);
+    expect(rows(new Map())).toEqual([]);
+    expect(rows(new Map(), "saved/model", false)).toEqual([]);
+    expect(nativeSwitcherFactCells(models[0]!)).toEqual(Array(6).fill("Unknown"));
+  });
+
+  it("queries only the matching connected instance with the thread, and others with project context", () => {
+    const projectId = ProjectId.make("project");
+    const threadId = ThreadId.make("thread");
+    const context = {
+      environmentId: EnvironmentId.make("remote"),
+      projectId,
+      connectedThread: { threadId, providerInstanceId: instanceId },
+    };
+    expect(nativeSelectorTarget(context, instanceId)).toEqual({
+      providerInstanceId: instanceId,
+      projectId,
+      threadId,
+    });
+    expect(nativeSelectorTarget(context, otherInstanceId)).toEqual({
+      providerInstanceId: otherInstanceId,
+      projectId,
+    });
     expect(
-      adjacentModelPickerProvider({
-        ...input,
-        entries: [],
-        selectedInstanceId: codex.instanceId,
-        direction: -1,
-      }),
-    ).toBe("favorites");
+      nativeSelectorTarget({ environmentId: context.environmentId, projectId }, instanceId),
+    ).toEqual({ providerInstanceId: instanceId, projectId });
+    expect(nativeSelectorTarget({ environmentId: context.environmentId }, instanceId)).toEqual({
+      providerInstanceId: instanceId,
+    });
+  });
+
+  it("queries only enabled, available native instances in the supplied scope", () => {
+    const source = entries[0]!;
+    const scopedEntries = [
+      source,
+      { ...source, instanceId: ProviderInstanceId.make("disabled"), enabled: false },
+      { ...source, instanceId: ProviderInstanceId.make("unavailable"), isAvailable: false },
+      { ...source, instanceId: ProviderInstanceId.make("error"), status: "error" as const },
+      {
+        ...source,
+        instanceId: ProviderInstanceId.make("other"),
+        driverKind: ProviderDriverKind.make("codex"),
+      },
+    ];
     expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: unavailable.instanceId,
-        direction: 1,
-      }),
-    ).toBe("favorites");
-    expect(
-      adjacentModelPickerProvider({
-        ...input,
-        selectedInstanceId: unavailable.instanceId,
-        direction: -1,
-      }),
-    ).toBe(claude.instanceId);
+      nativeSelectorRequests({ environmentId: EnvironmentId.make("remote") }, scopedEntries).map(
+        (request) => request.target.providerInstanceId,
+      ),
+    ).toEqual([source.instanceId]);
   });
 });

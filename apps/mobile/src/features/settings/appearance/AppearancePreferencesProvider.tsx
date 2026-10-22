@@ -28,6 +28,8 @@ import { isSystemColorsAvailable, readSystemColorPalettes } from "../../../lib/m
 import { materialYouPaletteToMobileThemeVariables } from "../../../lib/materialYouTheme";
 import { getMobileThemeRuntimeVariables } from "../../../lib/mobileThemeVariables";
 import type { MobileThemeVariables } from "../../../lib/mobileTheme";
+import { useMobileNativeTheme } from "../../../state/neopiThemes";
+import { neoPiMobileThemeVariables } from "../../../lib/mobileTheme";
 import {
   createMobileThemePairPatch,
   createMobileThemeSelectionPatch,
@@ -78,6 +80,7 @@ const AppearancePreferencesContext = createContext<AppearancePreferencesContextV
 export function AppearancePreferencesProvider(props: { readonly children: ReactNode }) {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const nativeTheme = useMobileNativeTheme();
   const systemColorScheme = useColorScheme() === "dark" ? "dark" : "light";
   const storedPreferences = AsyncResult.isSuccess(preferencesResult)
     ? preferencesResult.value
@@ -115,6 +118,9 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
   }, []);
   const themeVariablesByAppearance = useMemo(() => {
     const resolve = (appearance: MobileThemeAppearance) => {
+      if (nativeTheme.follow && nativeTheme.snapshot) {
+        return neoPiMobileThemeVariables(appearance, nativeTheme.snapshot.selection[appearance].colors);
+      }
       const base = getMobileThemeRuntimeVariables(themeIds[appearance], appearance, Platform.OS);
       return themeIds[appearance] === "material-you" && systemColorPalettes
         ? materialYouPaletteToMobileThemeVariables(
@@ -125,7 +131,7 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
         : base;
     };
     return { light: resolve("light"), dark: resolve("dark") };
-  }, [themeIds, systemColorPalettes]);
+  }, [themeIds, systemColorPalettes, nativeTheme.follow, nativeTheme.snapshot]);
   const themeVariables = themeVariablesByAppearance[themeAppearance];
   const activeThemeName = getMobileUniwindThemeName(themeId, themeAppearance);
   const { baseFontSize, codeFontSize, codeWordBreak, terminalFontSize } = preferences;
@@ -199,7 +205,7 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
         value,
       );
       selectedThemeIdsRef.current = resolveMobileThemeIds(patch);
-      updateThemePreferences(patch);
+      updateThemePreferences({ ...patch, nativeThemeFollow: false });
     },
     [themeAppearance, updateThemePreferences],
   );
@@ -208,7 +214,7 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
     (value: MobileThemeId) => {
       const patch = createMobileThemePairPatch(value);
       selectedThemeIdsRef.current = resolveMobileThemeIds(patch);
-      updateThemePreferences(patch);
+      updateThemePreferences({ ...patch, nativeThemeFollow: false });
     },
     [updateThemePreferences],
   );

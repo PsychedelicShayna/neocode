@@ -52,8 +52,8 @@ describe("isProviderInstancePickerReady", () => {
   it("rejects a disabled instance even while its last probe status is ready", () => {
     const [entry] = deriveProviderInstanceEntries([
       provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: "codex",
+        provider: ProviderDriverKind.make("neopi"),
+        instanceId: "neopi",
         enabled: false,
       }),
     ]);
@@ -64,26 +64,38 @@ describe("isProviderInstancePickerReady", () => {
 
   it("accepts an enabled, available, ready instance", () => {
     const [entry] = deriveProviderInstanceEntries([
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi" }),
     ]);
 
     expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
+  });
+  it("rejects a legacy runtime even when an older server reports it ready", () => {
+    const [entry] = deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+    ]);
+    expect(entry && isProviderInstancePickerReady(entry)).toBe(false);
   });
 });
 
 describe("isProviderInstancePickerVisible", () => {
   it("keeps enabled instances in the rail and removes disabled instances", () => {
     const [enabledEntry, disabledEntry] = deriveProviderInstanceEntries([
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi" }),
       provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claudeAgent",
+        provider: ProviderDriverKind.make("neopi"),
+        instanceId: "native-work",
         enabled: false,
       }),
     ]);
 
     expect(enabledEntry && isProviderInstancePickerVisible(enabledEntry)).toBe(true);
     expect(disabledEntry && isProviderInstancePickerVisible(disabledEntry)).toBe(false);
+  });
+  it("does not expose legacy runtimes on the picker rail", () => {
+    const [entry] = deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "legacy" }),
+    ]);
+    expect(entry && isProviderInstancePickerVisible(entry)).toBe(false);
   });
 });
 
@@ -279,178 +291,34 @@ describe("sortProviderInstanceEntries", () => {
 });
 
 describe("resolveSelectableProviderInstance", () => {
-  it("returns the requested instance when it is enabled and available", () => {
-    const requested = ProviderInstanceId.make("claude_work");
-    const providers = [
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
-      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: requested }),
-    ];
+  const native = (instanceId = "neopi", overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {}) => provider({ provider: ProviderDriverKind.make("neopi"), instanceId, models: [model("openai-codex/current")], ...overrides });
 
-    expect(resolveSelectableProviderInstance(providers, requested)).toBe(requested);
+  it("keeps an explicit native instance and its probe error", () => {
+    const requested = ProviderInstanceId.make("personal");
+    expect(resolveSelectableProviderInstance([native(), native(requested, { status: "error" })], requested)).toBe(requested);
   });
-
-  it("prefers the ready NeoPi default over wire-first providers and custom instances", () => {
-    const providers = [
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi_work",
-        models: [model("native-work-model")],
-      }),
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi",
-        models: [model("native-default")],
-      }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBe("neopi");
-    expect(
-      resolveSelectableProviderInstance(providers, ProviderInstanceId.make("removed_instance")),
-    ).toBe("neopi");
-    expect(
-      resolveSelectableProviderInstance(providers, ProviderInstanceId.make("neopi_work")),
-    ).toBe("neopi_work");
-    expect(resolveSelectableProviderInstance(providers, ProviderInstanceId.make("codex"))).toBe(
-      "codex",
-    );
+  it("prefers the native default before custom configurations", () => {
+    expect(resolveSelectableProviderInstance([native("work"), native()], undefined)).toBe("neopi");
   });
-
-  it.each([
-    { enabled: false },
-    { availability: "unavailable" as const },
-    { status: "error" as const },
-    { status: "warning" as const },
-  ])("keeps a healthy fallback when NeoPi is not ready: %j", (state) => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi",
-        models: [model("native-default")],
-        ...state,
-      }),
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBe("codex");
+  it.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"])("never selects the removed %s runtime", (driver) => {
+    const legacy = provider({ provider: ProviderDriverKind.make(driver), instanceId: driver, models: [model("saved")] });
+    expect(resolveSelectableProviderInstance([legacy], legacy.instanceId)).toBeUndefined();
+    expect(resolveSelectableProviderInstance([legacy, native()], legacy.instanceId)).toBe("neopi");
   });
-
-  it("can choose a ready custom NeoPi instance when the default cannot start", () => {
-    const providers = [
-      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi",
-        status: "error",
-      }),
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi_work",
-        models: [model("native-work-model")],
-      }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBe("neopi_work");
+  it.each([{ enabled: false }, { availability: "unavailable" as const }, { status: "error" as const }, { models: [] }])("uses another ready native configuration when the default cannot start: %j", (state) => {
+    expect(resolveSelectableProviderInstance([native("neopi", state), native("work")], undefined)).toBe("work");
   });
-
-  it("falls back to the first enabled and available instance", () => {
-    const disabled = ProviderInstanceId.make("codex");
-    const fallback = ProviderInstanceId.make("claudeAgent");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: disabled,
-        enabled: false,
-      }),
-      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: fallback }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, disabled)).toBe(fallback);
+  it("prefers a ready native instance over a pending probe", () => {
+    expect(resolveSelectableProviderInstance([native("neopi", { status: "warning" }), native("work")], undefined)).toBe("work");
   });
-
-  it("prefers a ready instance over an enabled one whose driver cannot start", () => {
-    const notInstalled = ProviderInstanceId.make("codex");
-    const ready = ProviderInstanceId.make("claudeAgent");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: notInstalled,
-        status: "error",
-      }),
-      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: ready }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBe(ready);
+  it("can select an unprobed native configuration without inventing an errored one", () => {
+    expect(resolveSelectableProviderInstance([native("neopi", { status: "error" }), native("work", { status: "warning" })], undefined)).toBe("work");
+    expect(resolveSelectableProviderInstance([native("neopi", { status: "error" })], undefined)).toBeUndefined();
   });
-
-  it("prefers an unprobed (warning) instance over one whose probe errored", () => {
-    const notInstalled = ProviderInstanceId.make("codex");
-    const unprobed = ProviderInstanceId.make("claudeAgent");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: notInstalled,
-        status: "error",
-      }),
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: unprobed,
-        status: "warning",
-      }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBe(unprobed);
+  it("returns no fresh choice when every native configuration is disabled or unavailable", () => {
+    expect(resolveSelectableProviderInstance([native("neopi", { enabled: false }), native("work", { availability: "unavailable" })], ProviderInstanceId.make("removed"))).toBeUndefined();
   });
-
-  it("keeps a requested instance even when its probe errored", () => {
-    const requested = ProviderInstanceId.make("codex");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: requested,
-        status: "error",
-      }),
-      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, requested)).toBe(requested);
-  });
-
-  it("does not invent an errored instance as a new-user default", () => {
-    const notInstalled = ProviderInstanceId.make("codex");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: notInstalled,
-        status: "error",
-      }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, undefined)).toBeUndefined();
-  });
-
-  it("does not return disabled, unavailable, or unknown instances when none are sendable", () => {
-    const disabled = ProviderInstanceId.make("codex");
-    const unavailable = ProviderInstanceId.make("claudeAgent");
-    const unknown = ProviderInstanceId.make("removed_instance");
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: disabled,
-        enabled: false,
-      }),
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: unavailable,
-        availability: "unavailable",
-      }),
-    ];
-
-    expect(resolveSelectableProviderInstance(providers, disabled)).toBeUndefined();
-    expect(resolveSelectableProviderInstance(providers, unavailable)).toBeUndefined();
-    expect(resolveSelectableProviderInstance(providers, unknown)).toBeUndefined();
-  });
-});
+});;
 
 describe("getDefaultProviderInstanceModel", () => {
   it("uses the instance's own models, not the default instance of the kind", () => {
@@ -507,157 +375,32 @@ describe("getDefaultProviderInstanceModel", () => {
 });
 
 describe("resolveDefaultProviderModelSelection", () => {
-  it("uses a healthy alternative when NeoPi has no model to seed a new thread", () => {
-    const providers = [
-      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi", models: [] }),
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: "codex",
-        models: [model("codex-default", false, true)],
-      }),
-    ];
-    expect(resolveDefaultProviderModelSelection(providers, null)).toEqual({
-      instanceId: "codex",
-      model: "codex-default",
-    });
-
-    const saved = { instanceId: ProviderInstanceId.make("neopi"), model: "saved-custom-model" };
-    expect(resolveDefaultProviderModelSelection(providers, saved)).toBe(saved);
+  const native = (instanceId = "neopi", overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {}) => provider({ provider: ProviderDriverKind.make("neopi"), instanceId, models: [model("openai-codex/current", false, true)], ...overrides });
+  it("uses another native configuration when the default catalog is empty", () => {
+    expect(resolveDefaultProviderModelSelection([native("neopi", { models: [] }), native("work")], null)).toEqual({ instanceId: "work", model: "openai-codex/current" });
   });
-  it.each([
-    ["codex", "codex", "gpt-5.6"],
-    ["claudeAgent", "claudeAgent", "claude-fable-5"],
-    ["cursor", "cursor", "composer-2"],
-  ])("uses the only available %s instance", (driver, instanceId, modelSlug) => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make(driver),
-        instanceId,
-        models: [model(modelSlug, false, true)],
-      }),
-    ];
-
-    expect(resolveDefaultProviderModelSelection(providers, null)).toEqual({
-      instanceId,
-      model: modelSlug,
-    });
+  it("keeps an explicit native selection including saved inference options", () => {
+    const stored = { instanceId: ProviderInstanceId.make("work"), model: "anthropic/saved", options: [{ id: "thinking", value: "high" }] };
+    expect(resolveDefaultProviderModelSelection([native(), native("work")], stored)).toBe(stored);
   });
-
-  it("preserves a valid stored selection including its options", () => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claudeAgent",
-        models: [model("claude-opus-4-8")],
-      }),
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi",
-        models: [model("neopi-default", false, true)],
-      }),
-    ];
-    const stored = {
-      instanceId: ProviderInstanceId.make("claudeAgent"),
-      model: "custom-model",
-      options: [{ id: "effort", value: "high" }],
-    };
-
-    expect(resolveDefaultProviderModelSelection(providers, stored)).toBe(stored);
+  it("replaces an obsolete runtime default without rewriting the stored object", () => {
+    const stored = { instanceId: ProviderInstanceId.make("codex"), model: "saved", options: [{ id: "reasoningEffort", value: "high" }] };
+    const legacy = provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex", models: [model("saved")] });
+    expect(resolveDefaultProviderModelSelection([legacy, native()], stored)).toEqual({ instanceId: "neopi", model: "openai-codex/current" });
+    expect(stored.instanceId).toBe("codex");
+    expect(stored.model).toBe("saved");
   });
-
-  it("replaces a stale stored instance with ready NeoPi and its own default model", () => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: "codex",
-        status: "warning",
-        models: [model("gpt-5.6")],
-      }),
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claudeAgent",
-        models: [model("claude-opus-4-8", false, true)],
-      }),
-    ];
-    providers.push(
-      provider({
-        provider: ProviderDriverKind.make("neopi"),
-        instanceId: "neopi",
-        models: [model("neopi-default", false, true)],
-      }),
-    );
-
-    expect(
-      resolveDefaultProviderModelSelection(providers, {
-        instanceId: ProviderInstanceId.make("removed-provider"),
-        model: "stale-model",
-      }),
-    ).toEqual({ instanceId: "neopi", model: "neopi-default" });
+  it("resets a missing native instance to the fallback instance's own model", () => {
+    expect(resolveDefaultProviderModelSelection([native()], { instanceId: ProviderInstanceId.make("removed"), model: "anthropic/stale" })).toEqual({ instanceId: "neopi", model: "openai-codex/current" });
   });
-
-  it.each([{ enabled: false }, { availability: "unavailable" as const }])(
-    "replaces an unavailable stored instance deterministically",
-    (requestedState) => {
-      const providers = [
-        provider({
-          provider: ProviderDriverKind.make("codex"),
-          instanceId: "codex",
-          models: [model("gpt-5.6")],
-          ...requestedState,
-        }),
-        provider({
-          provider: ProviderDriverKind.make("claudeAgent"),
-          instanceId: "claudeAgent",
-          models: [model("claude-opus-4-8", false, true)],
-        }),
-      ];
-
-      expect(
-        resolveDefaultProviderModelSelection(providers, {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5.6",
-        }),
-      ).toEqual({ instanceId: "claudeAgent", model: "claude-opus-4-8" });
-    },
-  );
-
-  it("returns no selection for empty, disabled, unavailable, or error-only profiles", () => {
+  it.each([{ enabled: false }, { availability: "unavailable" as const }])("replaces an unavailable native default with a ready native configuration: %j", (state) => {
+    expect(resolveDefaultProviderModelSelection([native("neopi", state), native("work")], { instanceId: ProviderInstanceId.make("neopi"), model: "saved" })).toEqual({ instanceId: "work", model: "openai-codex/current" });
+  });
+  it("returns no selection for empty or unsupported catalogs", () => {
     expect(resolveDefaultProviderModelSelection([], null)).toBeNull();
-    expect(
-      resolveDefaultProviderModelSelection(
-        [
-          provider({
-            provider: ProviderDriverKind.make("codex"),
-            instanceId: "codex",
-            enabled: false,
-          }),
-        ],
-        null,
-      ),
-    ).toBeNull();
-    expect(
-      resolveDefaultProviderModelSelection(
-        [
-          provider({
-            provider: ProviderDriverKind.make("codex"),
-            instanceId: "codex",
-            availability: "unavailable",
-          }),
-        ],
-        null,
-      ),
-    ).toBeNull();
-    expect(
-      resolveDefaultProviderModelSelection(
-        [
-          provider({
-            provider: ProviderDriverKind.make("codex"),
-            instanceId: "codex",
-            status: "error",
-          }),
-        ],
-        null,
-      ),
-    ).toBeNull();
+    for (const state of [{ enabled: false }, { availability: "unavailable" as const }, { status: "error" as const }, { models: [] }]) {
+      expect(resolveDefaultProviderModelSelection([native("neopi", state)], null)).toBeNull();
+    }
+    expect(resolveDefaultProviderModelSelection([provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent", models: [model("saved")] })], null)).toBeNull();
   });
-});
+});;

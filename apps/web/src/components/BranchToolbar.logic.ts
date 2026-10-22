@@ -67,13 +67,8 @@ export function shouldShowComposerContextStrip(input: {
   hasActiveProject: boolean;
   isGitRepo: boolean;
   showEnvironmentIndicator: boolean;
-  /** A collapsed composer's controls currently fit in their measured strip host. */
-  hostsRestingComposerControls: boolean;
 }): boolean {
-  return (
-    input.hasActiveProject &&
-    (input.isGitRepo || input.showEnvironmentIndicator || input.hostsRestingComposerControls)
-  );
+  return input.hasActiveProject && (input.isGitRepo || input.showEnvironmentIndicator);
 }
 
 // Labels collapse to icons when the strip's content no longer fits. A small

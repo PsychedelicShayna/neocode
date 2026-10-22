@@ -62,7 +62,7 @@ function normalizeSelectionOptions(
       };
 }
 
-/** Whether a known Antigravity or NeoPi selection needs setup or a different model. */
+/** Whether the native runtime or selected model is unavailable. */
 export function isModelSelectionUnavailable(
   config: T3ServerConfig | null | undefined,
   selection: ModelSelection | null | undefined,
@@ -76,22 +76,18 @@ export function isModelSelectionUnavailable(
   const driver =
     provider?.driver ?? config.settings?.providerInstances[selection.instanceId]?.driver;
   return (
-    (driver === "antigravity" || driver === "neopi") &&
+    driver !== "neopi" ||
     (!provider ||
       !provider.enabled ||
       !provider.installed ||
       provider.auth.status === "unauthenticated" ||
       provider.availability === "unavailable" ||
-      (driver === "neopi" && (provider.status === "error" || provider.status === "disabled")) ||
+      provider.status === "error" || provider.status === "disabled" ||
       !provider.models.some((model) => model.slug === selection.model))
   );
 }
 
-/**
- * Keep Antigravity selections when setup or catalog changes make them
- * unavailable. Other providers fall through to the server default when they
- * are disabled, missing, or signed out. Without config, keep stored selections.
- */
+/** Keep usable native selections; never reinterpret a retired runtime as NeoPi. */
 export function resolveSelectableModelSelection(
   config: T3ServerConfig | null | undefined,
   selection: ModelSelection | null,
@@ -104,21 +100,19 @@ export function resolveSelectableModelSelection(
   );
   const driver =
     provider?.driver ?? config.settings?.providerInstances[selection.instanceId]?.driver;
-  if (driver === "antigravity") {
-    return selection;
-  }
-  return provider &&
+  return driver === "neopi" &&
+    provider &&
     provider.enabled &&
     provider.installed &&
+    provider.availability !== "unavailable" &&
     provider.auth.status !== "unauthenticated"
     ? selection
     : null;
 }
 
 /**
- * Reject legacy models for implicit defaults, except Antigravity selections,
- * which must not silently change after a catalog update. Explicit picks in
- * the settings sheet are unaffected.
+ * Reject retired native models for implicit defaults. Explicit saved choices
+ * remain visible until the user selects another model.
  */
 export function resolveDefaultableModelSelection(
   config: T3ServerConfig | null | undefined,
@@ -130,7 +124,7 @@ export function resolveDefaultableModelSelection(
   }
   const provider = config.providers.find((candidate) => candidate.instanceId === usable.instanceId);
   const model = provider?.models.find((candidate) => candidate.slug === usable.model);
-  return provider?.driver !== "antigravity" && model?.isLegacy === true ? null : usable;
+  return model?.isLegacy === true ? null : usable;
 }
 
 export function resolveNewTaskModelSelection(input: {
@@ -139,21 +133,23 @@ export function resolveNewTaskModelSelection(input: {
   readonly stickySelection: ModelSelection | null;
   readonly modelOptions: ReadonlyArray<ModelOption>;
 }): ModelSelection | null {
+  const nativeSelection = (selection: ModelSelection | null) =>
+    selection !== null && input.modelOptions.some(
+      (option) => option.providerDriver === "neopi" && option.selection.instanceId === selection.instanceId,
+    ) ? selection : null;
   const explicitSelection =
-    input.draftSelection ?? input.projectDefaultSelection ?? input.stickySelection;
+    nativeSelection(input.draftSelection) ??
+    nativeSelection(input.projectDefaultSelection) ??
+    nativeSelection(input.stickySelection);
   if (explicitSelection) return explicitSelection;
 
   const hasReadyOption = input.modelOptions.some(
-    (option) => option.isReady && !option.isUnavailable,
+    (option) => option.providerDriver === "neopi" && option.isReady && !option.isUnavailable,
   );
   const isUsable = (option: ModelOption) =>
-    !option.isUnavailable && (!hasReadyOption || option.isReady === true);
+    option.providerDriver === "neopi" && !option.isUnavailable &&
+    (!hasReadyOption || option.isReady === true);
   return (
-    input.modelOptions.find(
-      (option) => option.providerDriver === "neopi" && option.isDefault && isUsable(option),
-    )?.selection ??
-    input.modelOptions.find((option) => option.providerDriver === "neopi" && isUsable(option))
-      ?.selection ??
     input.modelOptions.find((option) => option.isDefault && isUsable(option))?.selection ??
     input.modelOptions.find(isUsable)?.selection ??
     null
@@ -168,13 +164,12 @@ export function buildModelOptions(
 
   for (const provider of config?.providers ?? []) {
     if (
+      provider.driver !== "neopi" ||
       !provider.enabled ||
       !provider.installed ||
       provider.auth.status === "unauthenticated" ||
-      ((provider.driver === "antigravity" || provider.driver === "neopi") &&
-        provider.availability === "unavailable") ||
-      (provider.driver === "neopi" &&
-        (provider.status === "error" || provider.status === "disabled"))
+      provider.availability === "unavailable" ||
+      provider.status === "error" || provider.status === "disabled"
     ) {
       continue;
     }
@@ -210,10 +205,7 @@ export function buildModelOptions(
     if (existing) {
       options.set(key, {
         ...existing,
-        selection:
-          existing.providerDriver === "antigravity"
-            ? fallbackModelSelection
-            : normalizeSelectionOptions(fallbackModelSelection, existing.capabilities),
+        selection: normalizeSelectionOptions(fallbackModelSelection, existing.capabilities),
       });
     } else {
       const provider = config?.providers.find(
@@ -225,6 +217,7 @@ export function buildModelOptions(
       );
       const providerDriver =
         provider?.driver ?? instanceConfig?.driver ?? fallbackModelSelection.instanceId;
+      if (providerDriver !== "neopi") return [...options.values()];
       const providerLabel = providerDisplayLabel({
         driver: providerDriver,
         displayName: provider?.displayName ?? instanceConfig?.displayName,

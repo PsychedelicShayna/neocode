@@ -1178,7 +1178,7 @@ export function ThemeEditorPanel({
       >
         <div className="flex min-w-0 flex-1 items-baseline gap-2">
           <h2 className="shrink-0 truncate text-sm font-medium">
-            {isEditing ? "Edit theme" : "Create theme"}
+            {isEditing ? "Edit graphical palette" : "Create graphical palette"}
           </h2>
           {isMinimized ? null : (
             <p className="truncate text-xs text-muted-foreground">
@@ -1186,7 +1186,7 @@ export function ThemeEditorPanel({
                 ? "Select an element · Esc to cancel"
                 : selectedRole
                   ? `${isAdvanced ? (getThemeEditorColorFamily(selectedRole)?.label ?? getThemeRoleLabel(selectedRole)) : getThemeRoleLabel(selectedRole)} · ${usageCount ?? 0} ${usageCount === 1 ? "use" : "uses"}`
-                  : "Select a color below"}
+                  : "Graphical palette only. Native themes are unchanged."}
             </p>
           )}
         </div>

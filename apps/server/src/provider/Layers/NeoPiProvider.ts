@@ -101,15 +101,6 @@ const fromProbe = (
       ...(input.message ? { message: input.message } : {}),
     },
   }),
-  versionAdvisory: {
-    status: "unknown",
-    currentVersion: input.version ?? null,
-    latestVersion: null,
-    updateCommand: "npi update",
-    canUpdate: false,
-    checkedAt,
-    message: "Update NeoPi manually with the CLI that owns this installation.",
-  },
   ...(input.compatibilityAdvisory ? { compatibilityAdvisory: input.compatibilityAdvisory } : {}),
 });
 

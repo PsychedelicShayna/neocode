@@ -52,22 +52,22 @@ const protectedFlags = new Set([
   "--new-session",
 ]);
 
+export const parseNeoPiLaunchArguments = Effect.fn("parseNeoPiLaunchArguments")(function* (launchArgs?: string) {
+  const extra = tokenizeCliArgs(launchArgs);
+  for (const arg of extra) {
+    if (arg === "--") break;
+    const flag = arg.split("=", 1)[0] ?? arg;
+    if (flag.startsWith("--session") || protectedFlags.has(flag))
+      return yield* new NeoPiRuntimeError({ code: "settings", flag, message: `NeoPi launch arguments may not override ${flag}` });
+  }
+  return extra;
+});
+
 export const buildNeoPiLaunchPlan = (
   input: NeoPiLaunchInput,
 ): Effect.Effect<NeoPiLaunchPlan, NeoPiRuntimeError> =>
   Effect.gen(function* () {
-    const extra = tokenizeCliArgs(input.launchArgs);
-    for (const arg of extra) {
-      if (arg === "--") break;
-      const flag = arg.split("=", 1)[0] ?? arg;
-      if (flag.startsWith("--session") || protectedFlags.has(flag)) {
-        return yield* new NeoPiRuntimeError({
-          code: "settings",
-          flag,
-          message: `NeoPi launch arguments may not override ${flag}`,
-        });
-      }
-    }
+    const extra = yield* parseNeoPiLaunchArguments(input.launchArgs);
     // A saved cursor always retains its original directory, even after shared
     // sessions become available on a newer peer.
     const sessionDir =

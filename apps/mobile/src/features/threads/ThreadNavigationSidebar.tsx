@@ -1,3 +1,4 @@
+import { NeoPiModelsEntry } from "./NeoPiModelsScreen";
 import { useAndroidControlSizing } from "../../components/useAndroidControlSizing";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { computeThreadMoveAvailability } from "./threadOrder";
@@ -958,6 +959,7 @@ function ThreadNavigationSidebarPane(
           }}
         />
         <View className="flex-1">
+          <NeoPiModelsEntry />
           <SwipeableScrollGateProvider enabled={swipeEnabled}>
             <GestureDetector gesture={sidebarScrollGesture}>
               <LegendList
@@ -1102,6 +1104,7 @@ function ThreadNavigationSidebarPane(
               <SidebarHeaderActions onOpenSettings={props.onOpenSettings} />
             </View>
           </View>
+          <NeoPiModelsEntry />
 
           <View className="mx-4 mt-[9px] h-[38px] flex-row items-center gap-1.5 rounded-xl bg-sidebar-search pr-2.5 pl-[11px]">
             <SymbolView

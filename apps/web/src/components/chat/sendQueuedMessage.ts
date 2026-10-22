@@ -6,7 +6,6 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
-import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
 
 import { buildMessageContext, terminalContextReference } from "../../lib/composerContextRecords";
 import { removeInlineContextReference } from "../../lib/composerContextReferences";
@@ -94,10 +93,7 @@ export async function sendQueuedMessage(
         message.prompt,
       )
       .trim();
-    const text = applyClaudePromptEffortPrefix(
-      prompt || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
-      sendSettings.promptEffort,
-    );
+    const text = prompt || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT;
 
     assertFilesAllowed();
     const useUploads = readConfig()?.environment.capabilities.attachmentUploads === true;

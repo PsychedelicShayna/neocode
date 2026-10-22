@@ -1,0 +1,20 @@
+// Gradle init script, used only by build-mobile-apk.mjs. Credentials stay in the environment.
+gradle.beforeProject { project ->
+    project.pluginManager.withPlugin('com.android.application') {
+        project.extensions.getByName('androidComponents').finalizeDsl { android ->
+            def required = { String name ->
+                def value = System.getenv(name)
+                if (value == null || value.trim().isEmpty()) {
+                    throw new GradleException("Missing ${name}; refusing debug-signed distribution")
+                }
+                value
+            }
+            def signing = android.signingConfigs.create('neocodeSideload')
+            signing.storeFile = new File(required('NEOCODE_ANDROID_KEYSTORE'))
+            signing.storePassword = required('NEOCODE_ANDROID_STORE_PASSWORD')
+            signing.keyAlias = required('NEOCODE_ANDROID_KEY_ALIAS')
+            signing.keyPassword = required('NEOCODE_ANDROID_KEY_PASSWORD')
+            android.buildTypes.getByName('release').signingConfig = signing
+        }
+    }
+}

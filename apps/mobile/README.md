@@ -1,18 +1,26 @@
 # NeoCode mobile
 
-> [!WARNING]
-> NeoCode mobile is built from upstream T3 Code and is not distributed as a fork mobile app yet. Build it from source to try it.
+NeoCode uses the existing T3 Code mobile application with fork-owned package IDs.
+Android distribution is a signed, self-contained APK installed with ADB. It does not use
+the upstream Play Store listing or Expo OTA project.
 
 ## Quickstart
 
 > [!NOTE]
 > Uses native modules so using Expo Go is not supported. You need to use the Expo Dev Client.
 
-This app has three variants:
+The three variants can coexist with each other and with upstream T3 Code:
 
-- `development`: Expo dev client, installable side-by-side as `NeoCode Dev`
-- `preview`: persistent internal preview build, installable side-by-side as `NeoCode Preview`
-- `production`: store/release build as `NeoCode`
+| Variant       | Application ID                                | URL scheme        |
+| ------------- | --------------------------------------------- | ----------------- |
+| `development` | `io.github.psychedelicshayna.neocode.dev`     | `neocode-dev`     |
+| `preview`     | `io.github.psychedelicshayna.neocode.preview` | `neocode-preview` |
+| `production`  | `io.github.psychedelicshayna.neocode`         | `neocode`         |
+
+The iOS bundle IDs use the same values unless a Personal Team build explicitly overrides
+its identifier. No upstream Apple team, associated domain, EAS owner, project ID, channel
+or store submission target is configured. Expo updates are disabled for every variant,
+even if an old environment sets `T3CODE_MOBILE_UPDATES_ENABLED=1`.
 
 Run commands from `apps/mobile`.
 
@@ -119,38 +127,164 @@ node ../../scripts/mobile-native-static-check.ts
 
 The native lint task runs SwiftLint for Swift plus ktlint and detekt for Kotlin. Missing native tools are reported as warnings and skipped locally. CI installs the default toolset from `apps/mobile/Brewfile` before running the native checks.
 
-## EAS Builds
+## Android APK and ADB
 
-Preview and production variants use Expo fingerprinting so OTA updates only reach binaries with matching native dependencies, config plugins, and patches. CI uses the `preview:dev` profile to reuse a compatible native build when possible.
+Use Node 24.13.1 or newer within Node 24, the repository's `vp` CLI and installed workspace
+dependencies from `vp i`. The lockfile currently selects Expo 57 and React Native 0.86.3.
+Native compilation requires JDK 17, Android SDK platform 36, build-tools 36.0.0,
+NDK 27.1.12297006 and CMake, with ReactAndroid requesting 3.30.5. Set `JAVA_HOME` and
+`ANDROID_HOME` explicitly. The checked-in
+Gradle wrapper downloads its pinned Gradle version if needed. The APK script does not
+install JS dependencies, SDK packages globally, or anything on a device.
 
-The development variant uses `appVersion` to avoid recalculating the native fingerprint for each Metro launch manifest. `MOBILE_VERSION_POLICY` can override either default. If you distribute a custom Release build with the development identity and publish OTA updates to it, set `MOBILE_VERSION_POLICY=fingerprint` for both its build and updates. Changing the runtime policy requires a native rebuild for OTA matching; an existing dev client can still load local Metro bundles.
+Metro bundles the shared workspace packages from TypeScript source. Relative imports
+in those packages must use the source file extension, not an emitted `.js` path.
 
-For preview or production EAS environments, set `T3CODE_CLERK_PUBLISHABLE_KEY`,
-`T3CODE_CLERK_JWT_TEMPLATE`, and `T3CODE_RELAY_URL`
-as EAS environment variables. Expo config maps the canonical values into the mobile build.
+The Shiki native dependency links its packaged Android ABI library. A host
+`libonig.so` is not an Android build prerequisite and must not enter the APK link.
 
-Create a PR preview dev-client build manually:
-
-```bash
-vp run eas:ios:preview:dev
-```
-
-Create a cloud dev-client build:
-
-```bash
-vp run eas:ios:dev
-```
-
-Create a persistent preview build:
+Keep a dedicated release keystore outside the checkout and back it up. All future APK
+updates must use that same signing key. To create one once:
 
 ```bash
-vp run eas:ios:preview
+mkdir -p "$HOME/.local/share/neocode-signing"
+keytool -genkeypair -keystore "$HOME/.local/share/neocode-signing/release.jks" \
+  -alias neocode -keyalg RSA -keysize 4096 -validity 10000
 ```
 
-Android equivalents:
+From the repository root, set these variables in a private shell. Do not put passwords
+in command arguments, source control or a PR:
 
 ```bash
-vp run eas:android:dev
-vp run eas:android:preview:dev
-vp run eas:android:preview
+export JAVA_HOME=/path/to/jdk-17
+export ANDROID_HOME="$HOME/Android/Sdk"
+export NEOCODE_ANDROID_KEYSTORE="$HOME/.local/share/neocode-signing/release.jks"
+export NEOCODE_ANDROID_KEY_ALIAS=neocode
+read -rs -p 'Keystore password: ' NEOCODE_ANDROID_STORE_PASSWORD; echo
+export NEOCODE_ANDROID_STORE_PASSWORD
+read -rs -p 'Key password: ' NEOCODE_ANDROID_KEY_PASSWORD; echo
+export NEOCODE_ANDROID_KEY_PASSWORD
+node scripts/build-mobile-apk.mjs --version-code 1 \
+  --output "$HOME/.cache/neocode-apk/neocode-1.apk"
 ```
+
+The script regenerates only the ignored `apps/mobile/android` directory, bundles the JS
+into a Release APK, signs it with the supplied key, verifies the signature with
+`apksigner`, and writes an adjacent SHA-256 file. It refuses tracked native files and
+missing signing credentials. It does not fall back to Expo's debug release key.
+No Metro, EAS login or store account is needed. This is a reproducible build procedure,
+not a promise that separate builds produce byte-identical APKs.
+
+The default APK includes arm64-v8a, armeabi-v7a and x86_64. For a known arm64 device,
+add `--architectures arm64-v8a`. Android 7/API 24 is the minimum. Run builds through the
+workspace's polite relay and exclusive heavy lock on the owner's machine.
+
+Only after the owner identifies and authorizes the target:
+
+```bash
+adb devices -l
+adb -s <authorized-serial> install -r "$HOME/.cache/neocode-apk/neocode-1.apk"
+adb -s <authorized-serial> shell am start -a android.intent.action.VIEW \
+  -d 'neocode://' io.github.psychedelicshayna.neocode
+```
+
+For the next APK, increase `--version-code`, keep the same application ID and signing
+key, then use `install -r` again. This preserves NeoCode's app-private connection catalog,
+credentials, preferences and drafts. A signing mismatch is an error to resolve with the
+original key, not a reason to uninstall or clear data. Never uninstall upstream T3 Code.
+
+### Pairing and preserving existing connections
+
+The new package has a separate Android sandbox. Upstream connections and private data stay
+where they are; they do not migrate automatically. Do not use `pm clear`, uninstall,
+copy private app databases, or assume Android backup bridges these packages.
+
+Keep upstream installed. In NeoCode, open Settings, Connections, Add environment and
+scan or paste a fresh pairing URL issued by the same server. Re-enter the existing
+direct/tailnet server URL and display label intentionally. For relay connections,
+the deployment needs its own configured relay and authentication credentials.
+Never copy a consumed pairing token or a refresh token between application sandboxes.
+Threads, projects and native NeoPi journals remain on the connected environment, not
+in the APK. Re-pairing to that environment restores their visibility without replacing them.
+
+For an explicit pairing-link import, the QR/paste flow understands both `neocode://`
+and upstream `t3code://` wrappers carrying `pairingUrl`. NeoCode registers only its own
+URL schemes, so upstream links still open upstream rather than being hijacked.
+
+### Native runtime compatibility and proof
+
+Settings, Connections, the environment detail page has Resume NeoPi session. Discovery
+includes all native project folders and shows terminal ownership and attachability.
+At least one project must exist in that environment to supply discovery context.
+The server resolves the selected session's real cwd and project when resuming; mobile
+does not move a session into that context project.
+
+Open Models from Home, Settings, the thread sidebar, or a chat's session-configuration panel.
+The page uses NeoPi's native model catalog and role definitions. It supports global
+and project-scoped role assignments, fixed/inherited/automatic effort, ordered effort
+rules, provider API keys, native login prompts and account removal. NeoPi resolves
+selectors and rejects conflicting edits; mobile does not run a second model resolver.
+The chat's configuration panel remains a read-only snapshot with explicit Refresh.
+
+The main conversation reads the canonical native branch, including history before
+compaction or context resets. Use Load older native entries to page backward. Session
+tree inspects the complete append-only journal across branches; load older journal
+pages to reach earlier forks. Messages, reasoning, tool payloads, images, summaries,
+reset markers and unknown native records remain inspectable.
+
+Navigate from an entry to restore a user draft or select another branch without
+deleting its future. Summary instructions and reopened ask answers stay with that
+native file. Saving a replacement answer does not immediately continue the agent:
+review the rebuilt branch, then acknowledge Resume. Starting a stopped native owner
+for navigation requires the separate explicit action. Unsent local drafts survive
+file switches; a pre-attachment draft retained beside an existing native draft has
+its own restore action.
+
+Unavailable features, server errors, native stream gaps and discovery diagnostics
+are displayed, never treated as successful empty history. Local outbox messages are
+marked separately from native history.
+
+Usage, NeoPi stats opens the actual native stats document for the chosen environment
+and NeoPi runtime. NeoPi owns its session analysis, traces, indexing and errors.
+Mobile does not recalculate or combine its statistics. The Limits tab keeps live quota
+pools, reset actions, environment filtering and pull-to-refresh.
+
+Native stats requires the compatible server's authenticated `/api/neopi-stats` routes
+and NeoPi's hosted stats support. A missing capability or disconnected environment is an
+explicit error, never a fallback to the old transcript-derived Usage page. Requests use
+the existing cookie/bearer/DPoP connection transport. Credentials do not enter the WebView.
+Expo's streaming fetch carries live updates and trace bodies; document MessagePorts
+cross the native boundary through a local adapter with the shared path allowlist,
+backpressure and cancellation. Closing the view releases its server-owned stats process.
+
+This client requires a compatible NeoCode server with the native session journal,
+live conversation, tree-navigation and Models contracts, plus a NeoPi runtime
+implementing those capabilities. It is not a client for arbitrary upstream server
+versions. Terminal handoff has no mobile control; use NeoPi on the host for that
+action. iOS widgets and native header chrome are not Android features. Android uses
+its existing Material controls.
+
+The screens patch targets 4.26.2. Its Kotlin managers implement the generated setters
+for `subtitle`, `largeSubtitle`, `navigationItemStyle`, `headerCenterBarButtonItems`,
+`headerToolbarItems` and header-subview `identifier`. These props describe iOS chrome,
+not Android functionality. Android logs unsupported supplied values instead of silently
+discarding them. Older 4.25.2 patch instructions about missing setters are obsolete.
+Do not reuse an old `node_modules` tree after the patch hash changes.
+
+Source changes are not device proof. Before accepting #145, retain the signed APK and
+checksum, record its signing certificate and ABI, install it on the authorized target,
+and capture startup, pairing, existing-project visibility, native discovery/resume,
+Models edits and login cancellation, live native history, branch navigation and
+re-answer acknowledgement, native stats and traces, disconnect/error handling, quota
+limits and an in-place update with connections intact.
+Record the tested NeoCode commit and NeoPi version. Neither a successful compile nor
+an emulator-only screenshot establishes physical-device compatibility.
+
+## EAS
+
+The optional EAS profiles build internal binaries without upstream channels or submission
+targets. Local APK builds above are the supported sideload path. EAS will require a newly
+created, maintainer-owned project before use; no project ID or owner is invented here.
+Do not run inherited mobile production/OTA workflows against upstream credentials.
+Enabling OTA distribution later requires an explicit fork-owned update service and a
+native rebuild. This client never downloads upstream replacement bundles.

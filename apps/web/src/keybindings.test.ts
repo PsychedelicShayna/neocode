@@ -34,6 +34,24 @@ import {
   type ShortcutEventLike,
 } from "./keybindings";
 
+it.each([
+  ["p", "modelPicker.toggle"],
+  ["m", "models.open"],
+] as const)("keeps Alt-%s native navigation distinct", (key, command) => {
+  const input = event({ key, altKey: true });
+  assert.strictEqual(
+    resolveShortcutCommand(input, DEFAULT_RESOLVED_KEYBINDINGS, {
+      platform: "Linux",
+      context: { terminalFocus: false },
+    }),
+    command,
+  );
+  assert.isNull(resolveShortcutCommand(input, DEFAULT_RESOLVED_KEYBINDINGS, {
+    platform: "Linux",
+    context: { terminalFocus: true },
+  }));
+});
+
 function event(overrides: Partial<ShortcutEventLike> = {}): ShortcutEventLike {
   return {
     key: "j",

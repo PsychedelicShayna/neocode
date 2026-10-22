@@ -39,6 +39,7 @@ const isNeoPiRole = (value: unknown): value is NeoPiRole => {
     value.alias.length > 0 &&
     typeof value.name === "string" &&
     value.name.length > 0 &&
+    isOptionalString(value.description) &&
     isOptionalString(value.tag) &&
     isOptionalString(value.section) &&
     (value.source === "builtin" || value.source === "configured") &&
@@ -46,7 +47,7 @@ const isNeoPiRole = (value: unknown): value is NeoPiRole => {
     Array.isArray(value.patterns) &&
     value.patterns.every((pattern) => typeof pattern === "string") &&
     isResolvedRole(value.resolved) &&
-    typeof value.hidden === "boolean"
+    (value.hidden === undefined || typeof value.hidden === "boolean")
   );
 };
 
@@ -134,24 +135,52 @@ function modelCapabilities(
   });
 }
 
+/** Only catalog facts cross this boundary; measured performance needs a native RPC source. */
+function nativeModelFacts(model: RpcModel | null): ServerProviderModel["nativeFacts"] {
+  if (!model) return undefined;
+  const finite = (value: unknown, positive = false): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && (positive ? value > 0 : value >= 0)
+      ? value
+      : undefined;
+  const cost = asRecord(model.cost);
+  const intelligence = finite(model.int);
+  const tokensPerSecond = finite(model.tps, true);
+  const contextWindow = finite(model.contextWindow, true);
+  const inputCostPerMillion = finite(cost?.input);
+  const outputCostPerMillion = finite(cost?.output);
+  const facts = {
+    ...(intelligence !== undefined ? { intelligence } : {}),
+    ...(tokensPerSecond !== undefined ? { tokensPerSecond } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(inputCostPerMillion !== undefined ? { inputCostPerMillion } : {}),
+    ...(outputCostPerMillion !== undefined ? { outputCostPerMillion } : {}),
+  };
+  return Object.keys(facts).length ? facts : undefined;
+}
+
 function toServerProviderRoleModels(
   result: GetRolesResult,
   catalog: ReadonlyMap<string, RpcModel>,
   fastModeEnabled: boolean,
 ): ReadonlyArray<ServerProviderModel> {
   return result.roles.flatMap((role): ServerProviderModel[] => {
-    if (role.hidden === true) return [];
     const slug = `@${role.id}`;
     return [
       {
         slug,
         name: role.name,
+        ...(role.description !== undefined ? { description: role.description } : {}),
         shortName: role.tag || role.id,
         subProvider: NEOPI_ROLE_PICKER_GROUP,
         ...(role.resolved?.provider ? { quotaProvider: role.resolved.provider } : {}),
         aliases: slug === role.alias ? [role.id] : [role.id, role.alias],
         isCustom: false,
         ...(result.activeRole === role.id ? { isDefault: true } : {}),
+        nativeFacts: nativeModelFacts(
+          role.resolved
+            ? (catalog.get(`${role.resolved.provider}/${role.resolved.modelId}`) ?? null)
+            : null,
+        ),
         capabilities: modelCapabilities(
           role.resolved
             ? (catalog.get(`${role.resolved.provider}/${role.resolved.modelId}`) ?? null)
@@ -181,11 +210,13 @@ export function toServerProviderModels(
       {
         slug,
         name: typeof model.name === "string" && model.name ? model.name : (model.id as string),
+        ...(typeof model.description === "string" ? { description: model.description } : {}),
         shortName: model.id as string,
         subProvider: model.provider as string,
         quotaProvider: model.provider as string,
         isCustom: false,
         ...(currentSlug === slug && !roleResult?.activeRole ? { isDefault: true } : {}),
+        nativeFacts: nativeModelFacts(model),
         capabilities: modelCapabilities(model, currentSlug === slug ? fastModeEnabled : undefined),
       },
     ];

@@ -16,8 +16,6 @@ import type {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
-  ProviderUploadFeedbackInput,
-  ProviderUploadFeedbackResult,
   ThreadId,
   ProviderTurnStartResult,
   TurnId,
@@ -142,12 +140,6 @@ export interface ProviderAdapterShape<TError> {
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
-  /**
-   * Upload a thread to the provider when the adapter supports feedback.
-   */
-  readonly uploadFeedback?: (
-    input: ProviderUploadFeedbackInput,
-  ) => Effect.Effect<ProviderUploadFeedbackResult, TError>;
 
   /**
    * Stop all sessions owned by this adapter.

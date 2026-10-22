@@ -21,7 +21,6 @@ function makeMessage(prompt: string): Omit<QueuedComposerMessage, "id"> {
       modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
       runtimeMode: "full-access",
       interactionMode: "default",
-      promptEffort: null,
     },
     queuedAfterToolActivityId: null,
     createdAt: "2026-09-11T00:00:00.000Z",

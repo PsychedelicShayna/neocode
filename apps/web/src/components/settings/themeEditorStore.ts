@@ -1,4 +1,6 @@
 import { create } from "zustand";
+import { setFollowNeoPiTheme } from "../../neopiThemePreference";
+import { setNeoPiThemePalette } from "../../hooks/useTheme";
 
 import {
   getThemeDefinition,
@@ -56,6 +58,8 @@ export function toggleThemeEditorForTheme(input: {
     return;
   }
 
+  setFollowNeoPiTheme(false);
+  setNeoPiThemePalette(null);
   const baseThemeId = getThemeDefinition(input.theme)?.id ?? null;
   const activeThemeId = input.themeHalves?.[input.initialAppearance] ?? baseThemeId;
   const seedThemeId = activeThemeId ? (getThemeDefinition(activeThemeId)?.id ?? null) : null;

@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import type * as Electron from "electron";
 
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import * as ElectronDialog from "../../electron/ElectronDialog.ts";
@@ -50,9 +51,10 @@ describe("window capture IPC", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeedSome({ webContents: { id: 7 } }),
-          } as ElectronWindow.ElectronWindow["Service"]),
+          Layer.mock(ElectronWindow.ElectronWindow)({
+            fromWebContentsId: () =>
+              Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+          }),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             previewConfig: () =>
               Effect.sync(() => {
@@ -86,9 +88,10 @@ describe("window capture IPC", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeedSome({ webContents: { id: 7 } }),
-          } as ElectronWindow.ElectronWindow["Service"]),
+          Layer.mock(ElectronWindow.ElectronWindow)({
+            fromWebContentsId: () =>
+              Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+          }),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             state: Effect.succeed({
               linuxBackend: "niri",
@@ -119,9 +122,10 @@ describe("window capture IPC", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeedSome({ webContents: { id: 7 } }),
-          } as ElectronWindow.ElectronWindow["Service"]),
+          Layer.mock(ElectronWindow.ElectronWindow)({
+            fromWebContentsId: () =>
+              Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+          }),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             state: Effect.succeed({ linuxBackend: "niri" }),
             previewConfig: (_: unknown, selected: string) =>
@@ -153,16 +157,14 @@ describe("window capture IPC", () => {
     let received: unknown;
     const webContents = { id: 7, getZoomFactor: () => 1.25 };
     const layer = Layer.mergeAll(
-      Layer.succeed(
-        ElectronWindow.ElectronWindow,
-        ElectronWindow.ElectronWindow.of({
-          main: Effect.succeedSome({
+      Layer.mock(ElectronWindow.ElectronWindow)({
+        fromWebContentsId: () =>
+          Effect.succeedSome({
             getBounds: () => ({ x: 100, y: 80, width: 1_000, height: 700 }),
             getContentBounds: () => ({ x: 100, y: 118, width: 1_000, height: 662 }),
             webContents,
-          }),
-        } as ElectronWindow.ElectronWindow["Service"]),
-      ),
+          } as Electron.BrowserWindow),
+      }),
       Layer.succeed(
         DesktopSnapShot.DesktopSnapShot,
         DesktopSnapShot.DesktopSnapShot.of({
@@ -215,12 +217,9 @@ describe("window capture IPC", () => {
     let includeAccessibility: boolean | undefined;
     const webContents = { id: 7 };
     const layer = Layer.mergeAll(
-      Layer.succeed(
-        ElectronWindow.ElectronWindow,
-        ElectronWindow.ElectronWindow.of({
-          main: Effect.succeedSome({ webContents }),
-        } as ElectronWindow.ElectronWindow["Service"]),
-      ),
+      Layer.mock(ElectronWindow.ElectronWindow)({
+        fromWebContentsId: () => Effect.succeedSome({ webContents } as Electron.BrowserWindow),
+      }),
       Layer.succeed(
         DesktopSnapShot.DesktopSnapShot,
         DesktopSnapShot.DesktopSnapShot.of({
@@ -251,11 +250,11 @@ describe("window capture IPC", () => {
       assert.equal((error as { readonly _tag: string })._tag, "SnapShotIpcUnauthorizedSenderError");
       assert.equal((error as Error).message, "Snapshot request was rejected.");
     }).pipe(
-      Effect.provideService(
-        ElectronWindow.ElectronWindow,
-        ElectronWindow.ElectronWindow.of({
-          main: Effect.succeedSome({ webContents: { id: 7 } }),
-        } as ElectronWindow.ElectronWindow["Service"]),
+      Effect.provide(
+        Layer.mock(ElectronWindow.ElectronWindow)({
+          fromWebContentsId: () =>
+            Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+        }),
       ),
       Effect.provideService(DesktopSnapShot.DesktopSnapShot, null as never),
     ),
@@ -274,9 +273,10 @@ describe("window capture IPC", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
-          Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeedSome({ webContents: { id: 7 } }),
-          } as ElectronWindow.ElectronWindow["Service"]),
+          Layer.mock(ElectronWindow.ElectronWindow)({
+            fromWebContentsId: () =>
+              Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+          }),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             setup: (action: string) =>
               Effect.sync(() => {
@@ -290,12 +290,10 @@ describe("window capture IPC", () => {
 
   it.effect("checks shortcut availability for a trusted renderer", () => {
     const layer = Layer.mergeAll(
-      Layer.succeed(
-        ElectronWindow.ElectronWindow,
-        ElectronWindow.ElectronWindow.of({
-          main: Effect.succeedSome({ webContents: { id: 7 } }),
-        } as ElectronWindow.ElectronWindow["Service"]),
-      ),
+      Layer.mock(ElectronWindow.ElectronWindow)({
+        fromWebContentsId: () =>
+          Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+      }),
       Layer.succeed(
         DesktopSnapShot.DesktopSnapShot,
         DesktopSnapShot.DesktopSnapShot.of({
@@ -315,12 +313,10 @@ describe("window capture IPC", () => {
   it.effect("suppresses the active shortcut for a trusted renderer", () => {
     let suppressed = false;
     const layer = Layer.mergeAll(
-      Layer.succeed(
-        ElectronWindow.ElectronWindow,
-        ElectronWindow.ElectronWindow.of({
-          main: Effect.succeedSome({ webContents: { id: 7 } }),
-        } as ElectronWindow.ElectronWindow["Service"]),
-      ),
+      Layer.mock(ElectronWindow.ElectronWindow)({
+        fromWebContentsId: () =>
+          Effect.succeedSome({ webContents: { id: 7 } } as Electron.BrowserWindow),
+      }),
       Layer.succeed(
         DesktopSnapShot.DesktopSnapShot,
         DesktopSnapShot.DesktopSnapShot.of({

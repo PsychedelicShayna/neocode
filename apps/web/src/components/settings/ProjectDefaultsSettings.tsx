@@ -6,7 +6,6 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
-import { useNavigate } from "@tanstack/react-router";
 
 import { getCustomModelOptionsByInstance } from "../../modelSelection";
 import {
@@ -55,7 +54,6 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
   const { scope, target, targets, connectedEnvironments } = useSettingsScope();
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
-  const navigate = useNavigate();
   const { environments } = useEnvironments();
   const representative = target
     ? environments.find((environment) => environment.environmentId === target.environmentId)
@@ -112,7 +110,8 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
         !entry?.enabled ||
         !entry.isAvailable ||
         entry.driverKind !== sourceEntry?.driverKind ||
-        !options?.some((option) => option.slug === model && !option.isUnavailable)
+        ((entry.driverKind !== "neopi" || candidate.environmentId !== target?.environmentId || candidate.projectId !== target?.projectId) &&
+          !options?.some((option) => option.slug === model && !option.isUnavailable))
       ) {
         return `This model is unavailable on ${environment?.label ?? "a selected environment"}. Select that environment to choose its model separately.`;
       }
@@ -158,6 +157,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
           <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             <ProviderModelPicker
               activeInstanceId={selection.instanceId}
+              selectorContext={{ environmentId: target?.environmentId ?? null, ...(target?.projectId ? { projectId: target.projectId } : {}) }}
               model={selection.model}
               lockedProvider={null}
               instanceEntries={entries}
@@ -165,13 +165,6 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
               triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
               {...(mixedModel ? { triggerLabel: "Mixed" } : {})}
               getModelDisabledReason={modelDisabledReason}
-              onOpenProviderSetup={(instanceId) => {
-                if (representative)
-                  void navigate({
-                    to: "/settings/providers",
-                    search: { environmentId: representative.environmentId, instanceId },
-                  });
-              }}
               onInstanceModelChange={(instanceId, model) =>
                 setModel(createModelSelection(instanceId, model))
               }

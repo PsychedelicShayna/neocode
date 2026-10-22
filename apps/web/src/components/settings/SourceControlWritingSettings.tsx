@@ -1,7 +1,5 @@
-import { useNavigate } from "@tanstack/react-router";
 import { useRef, useState } from "react";
 import type {
-  ProviderInstanceId,
   ServerSettings,
   SourceControlWritingStyleMode,
 } from "@t3tools/contracts";
@@ -60,8 +58,7 @@ const MODE_OPTIONS: Record<SourceControlWritingStyleMode, { label: string; descr
 export function SourceControlWritingSettingsSection() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
-  const navigate = useNavigate();
-  const { environment, connectedEnvironments, targets } = useSettingsScope();
+  const { environment, target, connectedEnvironments, targets } = useSettingsScope();
   // The representative supplies the provider list; a model choice is checked
   // against every target before it fans out.
   const environmentId = environment?.environmentId ?? null;
@@ -300,6 +297,7 @@ export function SourceControlWritingSettingsSection() {
               {usesDedicatedModel && canEnableDedicatedModel ? (
                 <ProviderModelPicker
                   activeInstanceId={activeSelection.instanceId}
+                  selectorContext={{ environmentId, ...(target?.projectId ? { projectId: target.projectId } : {}) }}
                   model={activeSelection.model}
                   lockedProvider={null}
                   instanceEntries={instanceEntries}
@@ -307,16 +305,6 @@ export function SourceControlWritingSettingsSection() {
                   triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
                   triggerAriaLabel="Source control writer model"
                   {...(mixedWriterModel ? { triggerLabel: "Mixed" } : {})}
-                  {...(environmentId
-                    ? {
-                        onOpenProviderSetup: (instanceId: ProviderInstanceId) => {
-                          void navigate({
-                            to: "/settings/providers",
-                            search: { environmentId, instanceId },
-                          });
-                        },
-                      }
-                    : {})}
                   getModelDisabledReason={writerModelDisabledReason}
                   onInstanceModelChange={(instanceId, model) => {
                     const reason = writerModelDisabledReason(instanceId, model);

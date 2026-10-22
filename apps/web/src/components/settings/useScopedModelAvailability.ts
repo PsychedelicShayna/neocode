@@ -20,7 +20,7 @@ export function useScopedModelDisabledReason(
   settings: UnifiedSettings,
   entries: readonly ProviderInstanceEntry[],
 ) {
-  const { targets } = useSettingsScope();
+  const { target, targets } = useSettingsScope();
   const { environments } = useEnvironments();
   return useCallback(
     (instanceId: ProviderInstanceId, model: string): string | null => {
@@ -43,13 +43,14 @@ export function useScopedModelDisabledReason(
           !entry?.enabled ||
           !entry.isAvailable ||
           entry.driverKind !== sourceEntry?.driverKind ||
-          !options?.some((option) => option.slug === model && !option.isUnavailable)
+          ((entry.driverKind !== "neopi" || candidate.environmentId !== target?.environmentId || candidate.projectId !== target?.projectId) &&
+            !options?.some((option) => option.slug === model && !option.isUnavailable))
         ) {
           return `This model is unavailable on ${environment?.label ?? "a selected environment"}. Select that environment to choose its model separately.`;
         }
       }
       return null;
     },
-    [entries, environments, settings, targets],
+    [entries, environments, settings, target, targets],
   );
 }

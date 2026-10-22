@@ -44,6 +44,8 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.providerAuthSubscribe
   | typeof WS_METHODS.providerInstallSubscribe
   | typeof WS_METHODS.neopiSessionsWatchConfiguration
+  | typeof WS_METHODS.neopiModelsWatch
+  | typeof WS_METHODS.neopiModelsAuthWatch
   | typeof ORCHESTRATION_WS_METHODS.subscribeShell
   | typeof ORCHESTRATION_WS_METHODS.subscribeThread
   | typeof WS_METHODS.subscribeAuthAccess

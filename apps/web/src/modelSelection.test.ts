@@ -66,6 +66,23 @@ function settingsWithProviderInstances(): UnifiedSettings {
   };
 }
 
+describe("native selector selection before catalog refresh", () => {
+  it("keeps native role and virtual IDs on the chosen instance without substituting a cached default", () => {
+    const instanceId = ProviderInstanceId.make("neopi-work");
+    const providers = [
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId, models: ["cached/default"] }),
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi-personal", models: ["personal/default"] }),
+    ];
+    for (const selector of ["@new-project-role", "custom-route/virtual/Review.V2:Exact"]) {
+      expect(resolveAppModelSelectionForInstance(instanceId, DEFAULT_UNIFIED_SETTINGS, providers, selector)).toBe(selector);
+      expect(resolveAppModelSelectionState({
+        ...DEFAULT_UNIFIED_SETTINGS,
+        textGenerationModelSelection: createModelSelection(instanceId, selector),
+      }, providers)).toEqual(createModelSelection(instanceId, selector));
+    }
+  });
+});
+
 describe("legacy model selection fallback", () => {
   it("uses NeoPi's default instead of carrying a disabled provider's model across drivers", () => {
     const providers = [

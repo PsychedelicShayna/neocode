@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./neopi-models": {
+      "types": "./src/neopiModels.ts",
+      "default": "./src/neopiModels.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

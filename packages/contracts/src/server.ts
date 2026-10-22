@@ -69,6 +69,7 @@ export type ServerProviderAuth = typeof ServerProviderAuth.Type;
 export const ServerProviderModel = Schema.Struct({
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
+  description: Schema.optional(Schema.String),
   shortName: Schema.optional(TrimmedNonEmptyString),
   subProvider: Schema.optional(TrimmedNonEmptyString),
   /**
@@ -82,6 +83,17 @@ export const ServerProviderModel = Schema.Struct({
   isCustom: Schema.Boolean,
   isDefault: Schema.optional(Schema.Boolean),
   isLegacy: Schema.optional(Schema.Boolean),
+  /** Facts reported by the native catalog. Omitted values are unknown. */
+  nativeFacts: Schema.optional(
+    Schema.Struct({
+      intelligence: Schema.optional(Schema.Number),
+      ttftMs: Schema.optional(Schema.Number),
+      tokensPerSecond: Schema.optional(Schema.Number),
+      contextWindow: Schema.optional(Schema.Number),
+      inputCostPerMillion: Schema.optional(Schema.Number),
+      outputCostPerMillion: Schema.optional(Schema.Number),
+    }),
+  ),
   capabilities: Schema.NullOr(ModelCapabilities),
 });
 export type ServerProviderModel = typeof ServerProviderModel.Type;

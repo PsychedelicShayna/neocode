@@ -56,6 +56,19 @@ messages while disconnected. Uploads resume when you reconnect. Drafts and queue
 messages survive app restarts. Signing out of T3 Connect keeps that work on your
 device until you sign back into the same account.
 
+## Switch models
+
+On web and desktop, click the current model to open the native model switcher.
+Choose a NeoPi inference provider or Roles, or filter by provider, model ID or
+display name. The list shows the native catalog's intelligence, context and
+per-million-token prices. Catalog throughput is an estimate. A question mark
+means the native source has not supplied that fact, including measured TTFT.
+Saved selections that are no longer available stay visible.
+
+Use the arrow keys and Enter to select, or click a model. Escape dismisses the
+switcher without changing the draft. This is the quick session switcher, separate
+from the Models management page.
+
 ## Custom models
 
 On web and desktop, use Settings → Providers → **Models** to add an unlisted model with a custom

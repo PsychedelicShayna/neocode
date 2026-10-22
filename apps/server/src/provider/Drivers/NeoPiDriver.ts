@@ -246,6 +246,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           probe: capabilityProbe,
           configuration: adapter.getConfiguration,
           observeConfiguration: adapter.observeConfiguration,
+          modelsConnection: adapter.getModelsConnection,
         },
       );
       yield* Effect.addFinalizer(() =>

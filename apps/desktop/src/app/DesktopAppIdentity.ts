@@ -48,6 +48,14 @@ const normalizeCommitHash = (value: string): Option.Option<string> => {
 export const resolveUserDataPath = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
+  // A custom backend home is a separate profile, including Chromium storage and
+  // Electron's instance lock. Keep the default profile's legacy path unchanged.
+  if (
+    environment.path.resolve(environment.baseDir) !==
+    environment.path.resolve(environment.homeDirectory, ".t3")
+  ) {
+    return environment.path.resolve(environment.stateDir, "desktop-profile");
+  }
   const legacyPath = environment.path.join(
     environment.appDataDirectory,
     environment.legacyUserDataDirName,

@@ -10,9 +10,10 @@ export const setReady = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.DESKTOP_APP_ACTIVATION_READY_CHANNEL,
   payload: Schema.Boolean,
   result: Schema.Void,
-  handler: Effect.fn("desktop.ipc.appActivation.setReady")(function* (ready) {
+  handler: Effect.fn("desktop.ipc.appActivation.setReady")(function* (ready, event) {
+    if (event === undefined) return;
     const activation = yield* DesktopAppActivation.DesktopAppActivation;
-    yield* activation.setRendererReady(ready);
+    yield* activation.setRendererReady(ready, event.sender.id);
   }),
 });
 
@@ -20,8 +21,9 @@ export const complete = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.DESKTOP_APP_ACTIVATION_COMPLETE_CHANNEL,
   payload: DesktopAppActivationResponse,
   result: Schema.Void,
-  handler: Effect.fn("desktop.ipc.appActivation.complete")(function* (response) {
+  handler: Effect.fn("desktop.ipc.appActivation.complete")(function* (response, event) {
+    if (event === undefined) return;
     const activation = yield* DesktopAppActivation.DesktopAppActivation;
-    yield* activation.complete(response);
+    yield* activation.complete(response, event.sender.id);
   }),
 });

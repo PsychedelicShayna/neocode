@@ -1,9 +1,20 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import { isCurrentPreviewRuntimeTab, previewRuntimeTabId } from "./previewRuntimeTabId";
 
 describe("previewRuntimeTabId", () => {
+  it("does not reuse another renderer's native webview identity", async () => {
+    const ref = {
+      environmentId: EnvironmentId.make("environment-a"),
+      threadId: ThreadId.make("thread-a"),
+    };
+    const firstWindowId = previewRuntimeTabId(ref, "epoch-a", "tab_1");
+    vi.resetModules();
+    const secondWindow = await import("./previewRuntimeTabId");
+    expect(secondWindow.previewRuntimeTabId(ref, "epoch-a", "tab_1")).not.toBe(firstWindowId);
+  });
+
   it("scopes process-local tab ids to their environment, thread, and server epoch", () => {
     const base = {
       environmentId: EnvironmentId.make("environment-a"),

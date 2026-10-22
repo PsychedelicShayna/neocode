@@ -14,6 +14,22 @@ You need an installed, authenticated provider before starting a thread. You can
 launch NeoCode and configure providers afterwards. NeoPi is enabled by default;
 explicit saved provider and model choices are preserved.
 
+## Desktop windows
+
+Use **File > New Window** or `Ctrl+Alt+N`, `Cmd+Alt+N` on macOS, to open another
+NeoCode window. Windows in the same profile share their environment connection,
+backend and running sessions. Launching the app again still raises the most
+recently used window.
+
+Close a window to leave the others running. **Quit** exits the application and
+stops its local backend. Closing the last window also exits on Linux and Windows;
+on macOS, reopen it from the Dock or **File > New Window**.
+
+A separate `T3CODE_HOME` creates a separate desktop profile, including its browser
+storage and instance lock. It does not reuse the default profile's saved browser
+connections. Use another window, not another profile pointed at the same state,
+when you want to work with the same local sessions.
+
 ## Upstream command line
 
 ```bash

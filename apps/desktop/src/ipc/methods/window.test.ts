@@ -153,6 +153,23 @@ describe("getLocalEnvironmentBootstraps", () => {
 });
 
 describe("getWindowFullscreenState", () => {
+  it.effect("reads the caller's state rather than another focused window", () =>
+    getWindowFullscreenState
+      .handler({ returnValue: undefined, sender: { id: 42 } })
+      .pipe(
+        Effect.tap((fullscreen) => Effect.sync(() => assert.isFalse(fullscreen))),
+        Effect.provide(
+          Layer.mock(ElectronWindow.ElectronWindow)({
+            currentMainOrFirst: Effect.succeedSome({ isFullScreen: () => true } as Electron.BrowserWindow),
+            fromWebContentsId: (id) =>
+              id === 42
+                ? Effect.succeedSome({ isFullScreen: () => false } as Electron.BrowserWindow)
+                : Effect.succeedNone,
+          }),
+        ),
+      ),
+  );
+
   it.effect("reads the current native window state", () => {
     const window = { isFullScreen: () => true } as Electron.BrowserWindow;
 
@@ -204,7 +221,7 @@ describe("pasteAsText", () => {
       }).pipe(
         Effect.provide(
           Layer.mock(ElectronWindow.ElectronWindow)({
-            main: Effect.succeedSome(window),
+            fromWebContentsId: () => Effect.succeedSome(window),
           }),
         ),
       );

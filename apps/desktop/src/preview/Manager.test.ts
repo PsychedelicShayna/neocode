@@ -2394,7 +2394,51 @@ describe("PreviewManager", () => {
     ),
   );
 
-  effectIt.effect("ignores close events from replaced main windows", () =>
+  effectIt.effect("releases a destroyed window's guest without detaching another window", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const capturePage = async () => ({
+          toJPEG: () => Buffer.from("frame"),
+          getSize: () => ({ width: 1280, height: 720 }),
+        });
+        const firstHost = makeTestHostWebContents();
+        const secondHost = makeTestHostWebContents();
+        const firstGuest = makeTestPreviewWebContents(capturePage, 42, firstHost);
+        const secondGuest = makeTestPreviewWebContents(capturePage, 43, secondHost);
+        let destroyFirst: (() => void) | undefined;
+        vi.mocked(firstGuest.on).mockImplementation(((event: string, listener: () => void) => {
+          if (event === "destroyed") destroyFirst = listener;
+          return firstGuest;
+        }) as typeof firstGuest.on);
+        fromId.mockImplementation((id) => id === 42 ? firstGuest : secondGuest);
+        for (const host of [firstHost, secondHost]) {
+          yield* manager.setMainWindow({
+            isDestroyed: () => false,
+            once: vi.fn(),
+            webContents: host,
+          } as never);
+        }
+        yield* manager.createTab("first-window");
+        yield* manager.createTab("second-window");
+        yield* manager.registerWebview("first-window", 42);
+        yield* manager.registerWebview("second-window", 43);
+        const closed = yield* Deferred.make<void>();
+        yield* manager.subscribeStateChanges((tabId, state) =>
+          tabId === "first-window" && state.webContentsId === null
+            ? Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+        expect(destroyFirst).toBeDefined();
+        destroyFirst?.();
+        yield* Deferred.await(closed);
+        yield* manager.zoomIn("second-window");
+        expect(Exit.isFailure(yield* Effect.exit(manager.zoomIn("first-window")))).toBe(true);
+        expect(secondGuest.setZoomFactor).toHaveBeenCalled();
+      }),
+    ),
+  );
+
+  effectIt.effect("keeps capture running when one of two main windows closes", () =>
     withManager((manager) =>
       Effect.gen(function* () {
         let closeFirstWindow: (() => void) | undefined;
@@ -2421,12 +2465,13 @@ describe("PreviewManager", () => {
           webContents: { setBackgroundThrottling: replacementWindowThrottling },
         } as never);
 
-        closeFirstWindow?.();
         yield* manager.startRecording("tab_replaced_window_close");
-        expect(firstWindowThrottling).not.toHaveBeenCalled();
+        expect(firstWindowThrottling.mock.calls).toEqual([[false]]);
+        closeFirstWindow?.();
         expect(replacementWindowThrottling.mock.calls).toEqual([[false]]);
         yield* manager.stopRecording("tab_replaced_window_close");
         expect(replacementWindowThrottling.mock.calls).toEqual([[false], [true]]);
+        expect(firstWindowThrottling.mock.calls).toEqual([[false]]);
       }),
     ),
   );

@@ -186,6 +186,14 @@ export const make = Effect.gen(function* () {
       {
         label: "File",
         submenu: [
+          {
+            label: "New Window",
+            accelerator: "CmdOrCtrl+Alt+N",
+            click: () => {
+              runMenuEffect("new-window", dispatchMenuAction("new-window"));
+            },
+          },
+          { type: "separator" },
           ...(environment.platform === "darwin"
             ? []
             : [
@@ -196,7 +204,10 @@ export const make = Effect.gen(function* () {
                 },
                 { type: "separator" as const },
               ]),
-          { role: environment.platform === "darwin" ? "close" : "quit" },
+          { role: "close" },
+          ...(environment.platform === "darwin"
+            ? []
+            : [{ type: "separator" as const }, { role: "quit" as const }]),
         ],
       },
       {

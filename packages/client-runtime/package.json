@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./state/neopiStats": {
+      "types": "./src/state/neopiStats.ts",
+      "default": "./src/state/neopiStats.ts"
+    },
+    "./neopi-stats-bridge": {
+      "types": "./src/neopi-stats-bridge.ts",
+      "default": "./src/neopi-stats-bridge.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

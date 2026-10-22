@@ -2,7 +2,6 @@ import {
   AuthOrchestrationOperateScope,
   type AuthSessionState,
   type ExecutionEnvironmentCapabilities,
-  type ServerProvider,
 } from "@t3tools/contracts";
 import {
   cliReleaseChannelOf,
@@ -29,20 +28,6 @@ export function supportsEnvironmentUpdate(
   );
 }
 
-export function canUpdateEnvironmentProvider(provider: ServerProvider) {
-  const compatibility = provider.compatibilityAdvisory?.latestVersionStatus;
-  return (
-    provider.installed &&
-    provider.availability !== "unavailable" &&
-    provider.versionAdvisory?.status === "behind_latest" &&
-    provider.versionAdvisory.canUpdate &&
-    provider.versionAdvisory.latestVersion !== null &&
-    compatibility !== "broken" &&
-    compatibility !== "unsupported" &&
-    provider.updateState?.status !== "running" &&
-    provider.updateState?.status !== "queued"
-  );
-}
 
 const Releases = Schema.Array(
   Schema.Struct({

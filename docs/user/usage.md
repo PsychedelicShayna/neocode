@@ -6,33 +6,22 @@ desktop when the terminal is not focused. Customize `usage.open` in
 
 ## Understand your usage
 
-**Usage** combines Codex, Claude Code, Grok Build, OpenCode, Antigravity, and Cursor history from your connected
-environments. It shows token use, cache savings, model breakdowns, and estimated API-equivalent
-cost. These estimates are not your subscription bill.
+**Usage** reads NeoPi session history from your connected environments. It shows
+tokens, cache savings, model breakdowns, and estimated API-equivalent cost.
+These estimates are not your subscription bill.
 
-Totals depend on the history available on each server. Grok turns without a saved completed-turn
-record are missing from the totals.
+Local archive readers also retain totals from older Codex, Claude Code, Grok,
+OpenCode, and Antigravity history. Reading those files does not launch or
+authenticate another runtime. Their saved history locations remain readable,
+including locations saved before the NeoPi-only cutover.
 
-OpenCode reads its SQLite database and older JSON history. Antigravity reads local conversation
-databases, including T3-managed profiles. Set `OPENCODE_DATA_DIR` or `ANTIGRAVITY_DATA_DIR` on the
-server to read a different data directory; comma-separated paths read multiple directories.
+Cursor inference usage recorded by NeoPi is included like any other native
+backend. NeoCode no longer reads Cursor CLI credentials, calls its account
+dashboard, or requests Keychain access for that login.
 
-Cursor reads account usage from Cursor's dashboard API using the CLI login saved on the server.
-This includes headless T3 sessions and desktop usage across machines; the same account counts
-once across connected environments. Without an accessible CLI login, T3 shows a
-notice instead of incomplete local totals. T3 does not estimate missing tokens from conversation text.
-On macOS, choose **Enable Cursor usage** on Usage to allow T3 to read your existing CLI login
-from Keychain. You can turn it off in **Settings → Providers → Usage providers**. macOS may ask
-you to allow access on the server Mac.
-
-Usage includes each configured account's history, including disabled accounts. Custom homes follow
-the account's home setting or its `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, or `GROK_HOME` environment
-variable. Use absolute paths or `~/` paths in the account's environment settings; relative
-environment paths depend on each project's working directory and cannot be reliably discovered
-by Usage. Accounts sharing a history directory count once.
-
-When your app and server support different providers, usage totals may cover only the providers
-your app understands. Update the app to include newly supported providers.
+Totals depend on the history available on each server. Shared history directories
+count once across connected environments. NeoCode does not estimate missing tokens
+from conversation text.
 
 On web and desktop, use the environment dropdown to filter costs, tokens, and limits. All
 environments are selected by default. The dropdown shows which environments are still scanning;
@@ -64,19 +53,17 @@ the dialog.
 
 ## Track subscription limits
 
-**Usage → Limits** pools every subscription account it can see per provider, so with several Codex
-or Claude accounts across your environments and hubs you read one number per window rather than a
-list. Each window card shows how much of the pool is left and a bar with one segment per account,
-kept in the same column across windows. Accounts are ordered by their 5-hour reset, soonest
-first, or by the first available window when no account reports a 5-hour limit. A gap means the
-account does not report that window. When the provider reports reset times, the card also says
-when the next reset lands and how much it hands back. The hatched
-part of a segment is what that reset restores. Tap a segment or account row for the account's plan,
-where it is signed in, and its reset time. On web, you can hover too. Codex and Claude accounts
-with banked reset credits show a ticket count and the **Use reset** action in the account details.
-Claude resets are not available when the server runs on macOS, where Claude keeps its login in the
-Keychain. On narrow screens, numbered rows below
-the bar show each account's quota, countdown, and credits. Tap a row to open its details.
+**Usage → Limits** shows the subscription windows reported by NeoPi and optional
+usage hubs. Each window shows the available quota, account segments, and reset
+times when the source reports them. Select an account to inspect its details.
+On narrow screens, numbered rows below the bar open the same details.
+
+Missing or unattributable account usage stays unavailable rather than being
+guessed from another login. Sign-in and active-account selection belong to NeoPi.
+NeoCode does not open a retired runtime's login flow to fill in missing data.
+
+Hub accounts that report banked reset credits can expose **Use reset** in their
+details. The hub performs that operation; it does not start another agent runtime.
 
 The same account signed in on more than one environment, or reported by a hub as well, counts once.
 Filter with the environment dropdown to see what a single machine has.
@@ -90,20 +77,9 @@ current model's limits without leaving the conversation. The result opens above 
 closes when you dismiss it or send your next message. It uses the same snapshot as **Usage → Limits**, so it does not run the agent or refresh
 anything. The command is offered only for providers that appear under **Usage → Limits**.
 
-OpenCode Go reports its session, weekly, and monthly allowance when OpenCode runs locally in
-the environment. T3 cannot report limits for external OpenCode servers because their credentials
-belong to the remote server. Cursor reports
-its monthly allowance, including separate Auto and API usage, using the CLI login or
-`CURSOR_AUTH_TOKEN`. On macOS, this includes the default Keychain login after you enable Cursor
-usage. Keychain login is used for limits only with Cursor's default API endpoint. If you configure
-a custom Cursor endpoint, use an explicit token or file-based CLI login for limits.
-
-Grok reports the remaining subscription allowance and reset time for its current billing period
-after signing in with `grok login`. Explicit `XAI_API_KEY` connections and custom authentication
-or endpoint configurations do not report subscription limits.
-
-API-key accounts may not report subscription limits. This also applies to Claude connections
-using a proxy through `ANTHROPIC_AUTH_TOKEN`.
+Subscription windows depend on the inference provider and account type. Some
+API-key backends do not report them. Configure the provider and authenticate in
+NeoPi, then refresh Limits.
 
 ## Connect a CLIProxyAPI hub
 
@@ -113,16 +89,17 @@ environment that will connect to the hub and enter its URL and management key.
 The accounts appear under **Usage → Limits**. Codex accounts show banked reset credits; select an
 account and choose **Use reset** to redeem one. No hub plugin is required.
 
-This connection supplies usage information; configure
-the provider separately to send agent requests through the hub. Remove the hub from the same
-settings section when you no longer need it.
+This connection supplies quota information only. Configure inference routing in
+NeoPi separately. Remove the hub from the same settings section when you no
+longer need it.
 
 ## Subscription usage widget
 
-Add **Subscription usage** from your iOS or Android widget gallery to see remaining Codex and
-Claude quotas. Tap it to open **Usage → Limits**. On iOS, use **Edit Widget** to choose Session,
-Weekly, or both for each provider. Reopen T3 to refresh expired readings. The Android widget
-requires Android 12L or later.
+Add **Subscription usage** from your iOS or Android widget gallery to see the
+OpenAI and Anthropic quota snapshots supplied by connected hubs. Tap it to open
+**Usage → Limits** for the full in-app report. On iOS, use **Edit Widget** to choose
+Session, Weekly, or both. Reopen NeoCode to refresh expired readings. The Android
+widget requires Android 12L or later.
 
 ## Keyboard shortcuts
 

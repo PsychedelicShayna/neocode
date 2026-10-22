@@ -3,6 +3,8 @@ import {
   DEFAULT_MODEL,
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
+  ProviderDriverKind,
+  type OrchestrationCommand,
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -12,6 +14,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
+import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -236,22 +239,22 @@ it.effect.each([
   },
   {
     existing: false,
-    machineModel: "claude-sonnet-4-6",
+    machineModel: "anthropic/current",
     projectModel: null,
     machineMode: "approval-required",
     projectMode: null,
   },
   {
     existing: true,
-    machineModel: "claude-sonnet-4-6",
+    machineModel: "anthropic/current",
     projectModel: null,
     machineMode: "auto",
     projectMode: null,
   },
   {
     existing: true,
-    machineModel: "claude-sonnet-4-6",
-    projectModel: "gpt-5.4",
+    machineModel: "anthropic/current",
+    projectModel: "openai-codex/current",
     machineMode: "full-access",
     projectMode: "auto-accept-edits",
   },
@@ -259,10 +262,10 @@ it.effect.each([
   Effect.gen(function* () {
     const { existing, machineModel, projectModel, machineMode, projectMode } = options;
     const machineSelection = machineModel
-      ? { instanceId: ProviderInstanceId.make("claude-code"), model: machineModel }
+      ? { instanceId: ProviderInstanceId.make("neopi"), model: machineModel }
       : null;
     const projectSelection = projectModel
-      ? { instanceId: ProviderInstanceId.make("codex"), model: projectModel }
+      ? { instanceId: ProviderInstanceId.make("neopi"), model: projectModel }
       : null;
     const dispatchCalls = yield* Ref.make<
       ReadonlyArray<{
@@ -362,11 +365,119 @@ it.effect.each([
       commands.at(-1)?.modelSelection,
       projectSelection ??
         machineSelection ?? {
-          instanceId: ProviderInstanceId.make("codex"),
+          instanceId: ProviderInstanceId.make("neopi"),
           model: DEFAULT_MODEL,
         },
     );
   }),
+);
+
+it.effect.each([
+  {
+    existing: false,
+    nativeGlobal: false,
+    defaultEnabled: true,
+    workEnabled: false,
+    expected: "neopi",
+  },
+  {
+    existing: true,
+    nativeGlobal: true,
+    defaultEnabled: true,
+    workEnabled: false,
+    expected: "neopi",
+  },
+  {
+    existing: false,
+    nativeGlobal: false,
+    defaultEnabled: false,
+    workEnabled: true,
+    expected: "native-work",
+  },
+  {
+    existing: false,
+    nativeGlobal: false,
+    defaultEnabled: false,
+    workEnabled: false,
+    expected: null,
+  },
+] as const)(
+  "bootstrap ignores obsolete runtime preferences without rewriting them: %j",
+  (scenario) =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("bootstrap-legacy-preference");
+      const legacy = { instanceId: ProviderInstanceId.make("saved-codex"), model: "saved-model" };
+      const native = { instanceId: ProviderInstanceId.make("neopi"), model: "anthropic/current" };
+      const commands: OrchestrationCommand[] = [];
+      const project = {
+        id: projectId,
+        title: "Startup",
+        workspaceRoot: "/startup-project",
+        defaultModelSelection: legacy,
+        scripts: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        deletedAt: null,
+      };
+      yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({
+              defaultModelSelection: scenario.nativeGlobal ? native : legacy,
+              providerInstances: {
+                [ProviderInstanceId.make("neopi")]: {
+                  driver: ProviderDriverKind.make("neopi"),
+                  enabled: scenario.defaultEnabled,
+                  config: { profile: "personal" },
+                },
+                [ProviderInstanceId.make("native-work")]: {
+                  driver: ProviderDriverKind.make("neopi"),
+                  enabled: scenario.workEnabled,
+                  config: { profile: "work" },
+                },
+                [legacy.instanceId]: {
+                  driver: ProviderDriverKind.make("codex"),
+                  enabled: true,
+                  config: {},
+                },
+              },
+              projectSettingsOverrides: { [projectId]: { defaultModelSelection: legacy } },
+            }),
+            Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+              getActiveProjectByWorkspaceRoot: () =>
+                Effect.succeed(scenario.existing ? Option.some(project) : Option.none()),
+              getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
+            }),
+            Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return { sequence: commands.length };
+                }),
+            }),
+          ),
+        ),
+        Effect.provideService(ServerConfig.ServerConfig, {
+          cwd: "/startup-project",
+          autoBootstrapProjectFromCwd: true,
+        } as never),
+        Effect.provide(NodeServices.layer),
+      );
+      const created = commands.find((command) => command.type === "thread.create");
+      if (scenario.expected === null) {
+        assert.isUndefined(created);
+      } else {
+        assert.equal(created?.type, "thread.create");
+        if (created?.type === "thread.create") {
+          assert.deepStrictEqual(created.modelSelection, {
+            instanceId: ProviderInstanceId.make(scenario.expected),
+            model: scenario.nativeGlobal ? native.model : DEFAULT_MODEL,
+          });
+        }
+      }
+      assert.deepStrictEqual(project.defaultModelSelection, legacy);
+      assert.deepStrictEqual(legacy, { instanceId: "saved-codex", model: "saved-model" });
+    }),
 );
 
 it.effect(

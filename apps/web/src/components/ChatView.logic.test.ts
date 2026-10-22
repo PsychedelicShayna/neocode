@@ -1,5 +1,4 @@
 import {
-  ANTIGRAVITY_DEFAULT_MODEL,
   CheckpointRef,
   EnvironmentId,
   EventId,
@@ -18,7 +17,7 @@ import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
 
 import type { Thread, ThreadShell, TurnDiffSummary } from "../types";
-import { deriveProviderInstanceEntries, NO_PROVIDER_MODEL_SELECTION } from "../providerInstances";
+import { deriveProviderInstanceEntries } from "../providerInstances";
 import type { CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifact-templates";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
@@ -44,7 +43,6 @@ import {
   deriveLockedProvider,
   dismissBranchMismatchForSession,
   ENVIRONMENT_RECONNECT_WARNING_GRACE_MS,
-  getAntigravitySendBlockReason,
   getStartedThreadModelChangeBlockReason,
   hasEnvironmentReconnectWarningGraceElapsed,
   hasServerAcknowledgedLocalDispatch,
@@ -890,6 +888,11 @@ const readySession = {
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
 
+it("keeps a legacy session's runtime identity authoritative over a new draft choice", () => {
+  const thread = makeThread({ latestTurn: completedTurn, session: { ...readySession, providerName: "claudeAgent" } });
+  expect(deriveLockedProvider({ thread, selectedProvider: "neopi", threadProvider: "saved-legacy", providers: [] })).toBe("claudeAgent");
+});
+
 describe("draft promotion during worktree setup", () => {
   const serverThreadRef = { environmentId, threadId };
 
@@ -1078,349 +1081,48 @@ describe("buildThreadTurnInterruptInput", () => {
 });
 
 describe("resolveComposerProviderSelection", () => {
-  const catalogModels: ServerProvider["models"] = [
-    { slug: "gemini-pro", name: "Gemini Pro", isCustom: false, capabilities: null },
-  ];
+  const models: ServerProvider["models"] = [{ slug: "openai-codex/current", name: "Current", isCustom: false, capabilities: null }];
+  const entry = (driver: string, id = driver, overrides: Partial<ServerProvider> = {}) => deriveProviderInstanceEntries([{
+    driver: ProviderDriverKind.make(driver), instanceId: ProviderInstanceId.make(id), enabled: true,
+    installed: true, status: "ready", auth: { status: "unknown" }, version: null, checkedAt: now,
+    models, slashCommands: [], skills: [], ...overrides,
+  }])[0]!;
 
-  function entry(driver: string, instanceId = driver, overrides: Partial<ServerProvider> = {}) {
-    return deriveProviderInstanceEntries([
-      {
-        driver: ProviderDriverKind.make(driver),
-        instanceId: ProviderInstanceId.make(instanceId),
-        enabled: true,
-        installed: true,
-        status: "ready",
-        auth: { status: "authenticated" },
-        version: null,
-        checkedAt: now,
-        models: [],
-        slashCommands: [],
-        skills: [],
-        ...overrides,
-      },
-    ])[0]!;
-  }
-
-  function importedThread(instanceId: ProviderInstanceId) {
-    return makeThread({
-      modelSelection: { instanceId, model: "default" },
-      messages: [
-        {
-          id: MessageId.make(`import:${instanceId}:session:000000`),
-          role: "user",
-          text: "Continue the imported conversation",
-          turnId: null,
-          createdAt: now,
-          updatedAt: now,
-          streaming: false,
-        },
-      ],
-    });
-  }
-
-  it("chooses ready NeoPi for a fresh draft independently of incoming provider order", () => {
-    const neopi = entry("neopi", "neopi", { models: catalogModels });
-    const selection = resolveComposerProviderSelection({
-      entries: [entry("codex"), neopi],
-      candidateInstanceIds: [],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry).toBe(neopi);
+  it("uses a ready NeoPi instance even when an old runtime arrives first", () => {
+    const native = entry("neopi");
+    expect(resolveComposerProviderSelection({ entries: [entry("codex"), native], candidateInstanceIds: [ProviderInstanceId.make("codex")], lockedProvider: null, lockedInstanceId: null }).selectedProviderEntry).toBe(native);
   });
 
-  it.each([
-    { enabled: false },
-    { availability: "unavailable" as const },
-    { status: "error" as const },
-    { status: "warning" as const },
-  ])("does not let an unready first NeoPi group displace a healthy draft fallback: %j", (state) => {
-    const healthy = entry("codex");
-    const selection = resolveComposerProviderSelection({
-      entries: [entry("neopi", "neopi", state), healthy],
-      candidateInstanceIds: [],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry).toBe(healthy);
-  });
-
-  it.each([
-    ["claudeAgent", "claude_work"],
-    ["codex", "codex_work"],
-    ["ollama", "local_models"],
-  ])("keeps imported %s history selectable through its custom instance", (driver, instanceId) => {
-    const importedEntry = entry(driver, instanceId);
-    const entries = [entry(driver === "codex" ? "claudeAgent" : "codex"), importedEntry];
-    const thread = importedThread(importedEntry.instanceId);
-    const lockedProvider = deriveLockedProvider({
-      thread,
-      selectedProvider: entries[0]!.instanceId,
-      threadProvider: thread.modelSelection.instanceId,
-      providers: entries.map((entry) => entry.snapshot),
-    });
-
-    expect(thread.session).toBeNull();
-    expect(lockedProvider).toBe(driver);
-    expect(
-      resolveComposerProviderSelection({
-        entries,
-        candidateInstanceIds: [thread.modelSelection.instanceId],
-        lockedProvider,
-        lockedInstanceId: thread.modelSelection.instanceId,
-      }).selectedProviderEntry?.instanceId,
-    ).toBe(importedEntry.instanceId);
-  });
-
-  it("keeps the session driver authoritative over instance and draft selections", () => {
-    const selected = entry("claudeAgent", "claude_work");
-    const sessionEntry = entry("ollama", "local_models");
-    const thread = importedThread(selected.instanceId);
-
-    expect(
-      deriveLockedProvider({
-        thread: {
-          ...thread,
-          session: {
-            ...readySession,
-            providerName: sessionEntry.driverKind,
-            providerInstanceId: sessionEntry.instanceId,
-          },
-        },
-        selectedProvider: selected.instanceId,
-        threadProvider: thread.modelSelection.instanceId,
-        providers: [selected.snapshot, sessionEntry.snapshot],
-      }),
-    ).toBe(sessionEntry.driverKind);
-  });
-
-  it.each(["missing", "disabled"] as const)(
-    "does not move imported history to another driver when its instance is %s",
-    (state) => {
-      const imported = entry("claudeAgent", "claude_work", { enabled: false });
-      const other = entry("codex");
-      const entries = state === "missing" ? [other] : [other, imported];
-      const thread = importedThread(imported.instanceId);
-      const lockedProvider = deriveLockedProvider({
-        thread,
-        selectedProvider: other.instanceId,
-        threadProvider: thread.modelSelection.instanceId,
-        providers: entries.map((entry) => entry.snapshot),
-      });
-
-      expect(lockedProvider).not.toBeNull();
-      expect(
-        resolveComposerProviderSelection({
-          entries,
-          candidateInstanceIds: [other.instanceId, imported.instanceId],
-          lockedProvider,
-          lockedInstanceId: imported.instanceId,
-        }).selectedProviderEntry,
-      ).toBeUndefined();
-    },
-  );
-
-  it("leaves a new draft free to select a different driver", () => {
-    const original = entry("claudeAgent", "claude_work");
-    const selected = entry("codex", "codex_work");
-    expect(
-      deriveLockedProvider({
-        thread: makeThread({
-          modelSelection: { instanceId: original.instanceId, model: "default" },
-        }),
-        selectedProvider: selected.instanceId,
-        threadProvider: original.instanceId,
-        providers: [original.snapshot, selected.snapshot],
-      }),
-    ).toBeNull();
-  });
-
-  it("uses the custom instance's capability instead of the default instance", () => {
-    const defaultEntry = entry("antigravity", "antigravity", {
-      showInteractionModeToggle: true,
-    });
-    const customEntry = entry("antigravity", "google_work", {
-      showInteractionModeToggle: false,
-    });
-    const selection = resolveComposerProviderSelection({
-      entries: [defaultEntry, customEntry],
-      candidateInstanceIds: [customEntry.instanceId],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry?.instanceId).toBe(customEntry.instanceId);
-    expect(
-      resolveComposerInteractionMode({
-        provider: selection.selectedProviderEntry?.snapshot,
-        planModeEnabled: true,
-        interactionMode: "plan",
-      }),
-    ).toEqual({ enabled: false, interactionMode: "default" });
-  });
-
-  it("uses the fallback provider's plan capability after the draft's instance is disabled", () => {
-    const disabledEntry = entry("antigravity", "antigravity", {
-      enabled: false,
-      showInteractionModeToggle: false,
-    });
-    const fallbackEntry = entry("codex");
-    const selection = resolveComposerProviderSelection({
-      entries: [disabledEntry, fallbackEntry],
-      candidateInstanceIds: [disabledEntry.instanceId],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry?.instanceId).toBe(fallbackEntry.instanceId);
-    expect(
-      resolveComposerInteractionMode({
-        provider: selection.selectedProviderEntry?.snapshot,
-        planModeEnabled: true,
-        interactionMode: "plan",
-      }),
-    ).toEqual({ enabled: true, interactionMode: "plan" });
-  });
-
-  it("keeps a signed-out selection instead of silently switching providers", () => {
-    const signedOutEntry = entry("antigravity", "google_work", {
-      status: "error",
-      auth: { status: "unauthenticated" },
-      models: catalogModels,
-    });
-    const selection = resolveComposerProviderSelection({
-      entries: [entry("neopi"), signedOutEntry],
-      candidateInstanceIds: [signedOutEntry.instanceId],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry?.instanceId).toBe(signedOutEntry.instanceId);
-    expect(
-      getAntigravitySendBlockReason(selection.selectedProviderEntry?.snapshot, "gemini-pro"),
-    ).toBe("Sign in to Antigravity in provider settings before sending.");
-  });
-
-  it("blocks sends until the selected Antigravity profile is installed", () => {
-    const provider = entry("antigravity", "google_work", {
-      installed: false,
-      models: catalogModels,
-    }).snapshot;
-
-    expect(getAntigravitySendBlockReason(provider, "gemini-pro")).toBe(
-      "Install Antigravity in provider settings before sending.",
-    );
-  });
-
-  it("lets Antigravity check saved credentials when resuming after a restart", () => {
-    const provider = entry("antigravity", "google_work", {
-      status: "warning",
-      auth: { status: "unknown" },
-      models: [],
-    }).snapshot;
-
-    expect(getAntigravitySendBlockReason(provider, "gemini-pro")).toBeNull();
-    expect(getAntigravitySendBlockReason(provider, ANTIGRAVITY_DEFAULT_MODEL)).toBeNull();
-    expect(
-      getAntigravitySendBlockReason({ ...provider, models: catalogModels }, "gemini-pro"),
-    ).toBeNull();
-    expect(getAntigravitySendBlockReason(provider, "")).toBe(
-      "Choose an Antigravity model before sending.",
-    );
-  });
-
-  it("blocks saved model sends until Antigravity loads its account catalog", () => {
-    expect(getAntigravitySendBlockReason(entry("antigravity").snapshot, "gemini-pro")).toBe(
-      "Refresh Antigravity models in provider settings before sending.",
-    );
-  });
-
-  it("blocks an empty Antigravity selection after the catalog has loaded", () => {
-    const provider = entry("antigravity", "google_work", { models: catalogModels }).snapshot;
-
-    expect(getAntigravitySendBlockReason(provider, "")).toBe(
-      "Choose an Antigravity model before sending.",
-    );
-  });
-
-  it("blocks a saved model that a ready catalog no longer lists", () => {
-    const provider = entry("antigravity", "google_work", {
-      status: "ready",
-      models: catalogModels,
-    }).snapshot;
-
-    expect(getAntigravitySendBlockReason(provider, "saved-model-not-in-current-catalog")).toBe(
-      "That Antigravity model is no longer available. Choose another model.",
-    );
-    expect(getAntigravitySendBlockReason(provider, "gemini-pro")).toBeNull();
-  });
-
-  it("allows a saved native model to retry after a provider error without changing it", () => {
-    const provider = entry("antigravity", "google_work", {
-      status: "error",
-      models: catalogModels,
-    }).snapshot;
-
-    expect(
-      getAntigravitySendBlockReason(provider, "saved-model-not-in-current-catalog"),
-    ).toBeNull();
-  });
-
-  it("keeps existing send behavior for other providers", () => {
-    const provider = entry("codex", "codex", {
-      installed: false,
-      auth: { status: "unknown" },
-      models: [],
-    }).snapshot;
-
-    expect(getAntigravitySendBlockReason(provider, "gpt-model")).toBeNull();
-  });
-
-  it("does not continue an existing Antigravity thread in another profile after deletion", () => {
-    const missingInstanceId = ProviderInstanceId.make("google_work");
-    const selection = resolveComposerProviderSelection({
-      entries: [entry("antigravity")],
-      candidateInstanceIds: [missingInstanceId],
-      lockedProvider: ProviderDriverKind.make("antigravity"),
-      lockedInstanceId: missingInstanceId,
-    });
-
+  it("does not reinterpret legacy history as a NeoPi session", () => {
+    const legacy = entry("claudeAgent", "saved-work");
+    const selection = resolveComposerProviderSelection({ entries: [legacy, entry("neopi")], candidateInstanceIds: [legacy.instanceId], lockedProvider: legacy.driverKind, lockedInstanceId: legacy.instanceId });
     expect(selection.selectedProviderEntry).toBeUndefined();
-    expect(selection.unavailableProviderInstanceId).toBe(missingInstanceId);
+    expect(selection.unavailableProviderInstanceId).toBe(legacy.instanceId);
   });
 
-  it("does not treat the empty draft placeholder as a provider setup target", () => {
-    const selection = resolveComposerProviderSelection({
-      entries: [entry("antigravity", "antigravity", { enabled: false })],
-      candidateInstanceIds: [NO_PROVIDER_MODEL_SELECTION.instanceId],
-      lockedProvider: null,
-      lockedInstanceId: null,
-    });
-
-    expect(selection.selectedProviderEntry).toBeUndefined();
-    expect(selection.unavailableProviderInstanceId).toBeUndefined();
-  });
-
-  it("keeps the session's continuation group when another instance was selected", () => {
-    const sessionEntry = entry("antigravity", "google_work", {
-      enabled: false,
-      continuation: { groupKey: "work-profile" },
-    });
-    const anotherEntry = entry("antigravity", "google_personal", {
-      continuation: { groupKey: "personal-profile" },
-    });
-    const selection = resolveComposerProviderSelection({
-      entries: [sessionEntry, anotherEntry],
-      candidateInstanceIds: [anotherEntry.instanceId, sessionEntry.instanceId],
-      lockedProvider: ProviderDriverKind.make("antigravity"),
-      lockedInstanceId: sessionEntry.instanceId,
-    });
-
+  it("does not offer an enabled old runtime when no NeoPi instance is ready", () => {
+    const selection = resolveComposerProviderSelection({ entries: [entry("codex"), entry("neopi", "neopi", { enabled: false })], candidateInstanceIds: [], lockedProvider: null, lockedInstanceId: null });
     expect(selection.selectedProviderEntry).toBeUndefined();
   });
-});
+
+  it("uses another ready NeoPi configuration when an obsolete draft choice cannot run", () => {
+    const personal = entry("neopi", "personal");
+    const selection = resolveComposerProviderSelection({ entries: [entry("neopi", "neopi", { status: "error" }), personal], candidateInstanceIds: [ProviderInstanceId.make("removed")], lockedProvider: null, lockedInstanceId: null });
+    expect(selection.selectedProviderEntry).toBe(personal);
+  });
+
+  it("does not move a native session to a different instance without continuation identity", () => {
+    const selection = resolveComposerProviderSelection({ entries: [entry("neopi", "other")], candidateInstanceIds: [ProviderInstanceId.make("removed")], lockedProvider: ProviderDriverKind.make("neopi"), lockedInstanceId: ProviderInstanceId.make("removed") });
+    expect(selection.selectedProviderEntry).toBeUndefined();
+  });
+
+  it("keeps an established native continuation group authoritative", () => {
+    const original = entry("neopi", "original", { enabled: false, continuation: { groupKey: "native-profile" } });
+    const compatible = entry("neopi", "compatible", { continuation: { groupKey: "native-profile" } });
+    const unrelated = entry("neopi", "other", { continuation: { groupKey: "other-profile" } });
+    expect(resolveComposerProviderSelection({ entries: [original, unrelated, compatible], candidateInstanceIds: [unrelated.instanceId], lockedProvider: ProviderDriverKind.make("neopi"), lockedInstanceId: original.instanceId }).selectedProviderEntry).toBe(compatible);
+  });
+});;
 
 describe("resolveComposerInteractionMode", () => {
   it("resets a restored plan draft when the selected instance does not support plan mode", () => {

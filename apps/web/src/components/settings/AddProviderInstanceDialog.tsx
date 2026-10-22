@@ -14,7 +14,6 @@ import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hook
 import { cn } from "../../lib/utils";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Button } from "../ui/button";
-import { ACPRegistryIcon, Gemini, GithubCopilotIcon, PiAgentIcon, type Icon } from "../Icons";
 import { Dialog } from "../ui/dialog";
 import { Badge } from "../ui/badge";
 import { Input } from "../ui/input";
@@ -42,8 +41,8 @@ const PROVIDER_ACCENT_SWATCHES = [
 
 /**
  * Normalize a user-provided label into a slug suffix for the instance id.
- * The full id is formed by prefixing the driver slug — e.g. label "Work" on
- * driver "codex" becomes `codex_work`. Output is trimmed to 48 chars so the
+ * The full id is formed by prefixing the NeoPi driver slug, so label "Work"
+ * becomes `neopi_work`. Output is trimmed to 48 chars so the
  * final composed id stays under the 64-char slug cap enforced by
  * `ProviderInstanceId` in `@t3tools/contracts`.
  */
@@ -65,34 +64,6 @@ const INSTANCE_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 const DEFAULT_DRIVER_OPTION = DRIVER_OPTIONS[0]!;
 const DEFAULT_DRIVER_KIND = DEFAULT_DRIVER_OPTION.value;
 const EMPTY_CONFIG_DRAFT: Record<string, unknown> = {};
-interface ComingSoonDriverOption {
-  readonly value: ProviderDriverKind;
-  readonly label: string;
-  readonly icon: Icon;
-}
-
-const COMING_SOON_DRIVER_OPTIONS: readonly ComingSoonDriverOption[] = [
-  {
-    value: ProviderDriverKind.make("githubCopilot"),
-    label: "Github Copilot",
-    icon: GithubCopilotIcon,
-  },
-  {
-    value: ProviderDriverKind.make("gemini"),
-    label: "Gemini",
-    icon: Gemini,
-  },
-  {
-    value: ProviderDriverKind.make("acpRegistry"),
-    label: "ACP Registry",
-    icon: ACPRegistryIcon,
-  },
-  {
-    value: ProviderDriverKind.make("piAgent"),
-    label: "Pi Agent",
-    icon: PiAgentIcon,
-  },
-];
 
 /**
  * Validate an instance id against the same slug rules the server applies in
@@ -229,8 +200,8 @@ export function AddProviderInstanceDialog({
           title="Add provider instance"
           description={
             <>
-              Configure an additional provider instance on {environmentLabel} — for example, a
-              second Codex install pointed at a different workspace.
+              Configure an additional NeoPi instance on {environmentLabel}, such as a separate
+              profile or executable.
             </>
           }
         >
@@ -276,27 +247,6 @@ export function AddProviderInstanceDialog({
                         {option.badgeLabel}
                       </Badge>
                     ) : null}
-                  </RadioPrimitive.Root>
-                );
-              })}
-              {COMING_SOON_DRIVER_OPTIONS.map((option) => {
-                const IconComponent = option.icon;
-                return (
-                  <RadioPrimitive.Root
-                    key={option.value}
-                    value={option.value}
-                    disabled
-                    className={cn(
-                      "relative flex cursor-not-allowed items-center gap-3 rounded-lg bg-card/60 px-3 py-3 text-left opacity-64 outline-none ring-1 ring-black/5 dark:bg-white/2 dark:ring-white/5",
-                    )}
-                  >
-                    <IconComponent className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-                      {option.label}
-                    </span>
-                    <Badge variant="warning" size="sm">
-                      Coming Soon
-                    </Badge>
                   </RadioPrimitive.Root>
                 );
               })}

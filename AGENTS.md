@@ -6,7 +6,7 @@
 
 # NeoCode
 
-NeoCode is NeoPi's full graphical frontend, built from upstream T3 Code (`pingdotgg/t3code`). NeoPi is the primary harness, not an optional integration added to upstream's product. Other harnesses remain supported.
+NeoCode is NeoPi's graphical frontend, built from upstream T3 Code (`pingdotgg/t3code`). NeoPi is its only execution harness. Inference providers and model roles come from NeoPi.
 
 Keep NeoPi authoritative for session state and harness configuration. Extend its shared RPC/control capabilities rather than duplicating harness logic in the GUI. Preserve upstream copyright and attribution, existing data directories, protocol identifiers and saved user choices.
 
@@ -54,7 +54,7 @@ We need to be on the same page with terminology. When communicating, use this la
 - **we, us, and maintainers** mean PsychedelicShayna and the contributors building NeoCode; upstream authors maintain T3 Code.
 - **user** means the person using NeoCode to direct coding agents.
 - **agent** means the coding agent a user runs inside NeoCode. Depending on context, that may also include you.
-- **provider** means the agent runtime or harness NeoCode talks to: primarily NeoPi, with other harnesses available.
+- **provider** in retained runtime contracts means a NeoPi runtime instance. In model and authentication interfaces it means an inference provider exposed by NeoPi.
 - **client** means the web, desktop, or mobile UI.
 - **environment** means one running T3 server and the machine, filesystem, provider credentials, and state it owns.
 - **project** means an environment-local workspace record rooted at a directory.
@@ -90,7 +90,7 @@ The most common defect in this repo is a change that works on the path you teste
 
 - **Entry points.** A behavior reachable from the chat view is usually also reachable from Settings, the command palette, and a keybinding. Fixing one is not fixing the feature.
 - **Clients.** Web, desktop (wraps web, adds Electron shell/IPC), and mobile (React Native, separate navigation). Shared logic lives in `packages/client-runtime`
-- **Providers.** Codex, Claude, Cursor, Grok, OpenCode, and Antigravity each have an adapter. Provider-shaped features need a decision per adapter, even if the decision is "not supported here".
+- **Native runtime.** Verify owned and terminal-attached NeoPi sessions. Keep retired-harness history readable without restoring its execution adapters.
 - **Contracts.** Anything crossing the wire is typed in `packages/contracts`. Change the schema and the server, web, mobile, and desktop all follow.
 - **Reverse states.** If you added a way in, add the way out and the way to see it. Snooze needs unsnooze. Close needs reopen. A one-way door is a bug.
 - **Connection modes.** Local, remote/relay, and tunnel behave differently. Multi-device and multi-environment cases are real.
@@ -167,7 +167,7 @@ Most code changes do not need an internal documentation change. Agents can read 
 
 ## How it works
 
-Clients send typed WebSocket requests. The server turns them into _commands_, a pure _decider_ turns commands into persisted _events_, and a _projector_ derives the read model the UI renders. Provider CLIs run as subprocesses; per-provider _adapters_ translate their native protocols into orchestration events. Side effects run in queue-backed _reactors_ that emit _receipts_ when milestones land. Each turn ends with a _checkpoint_, a hidden git ref, so the app can diff and restore.
+Clients send typed WebSocket requests. The server turns commands into persisted events and projects application metadata for the UI. The NeoPi adapter translates the native runtime protocol; NeoPi owns session execution and configuration. Side effects run in queue-backed reactors that emit receipts when milestones land. Git checkpoints support workspace diff and restore separately from native conversation history.
 
 Full glossary with file links: `docs/internals/glossary.md`
 
@@ -194,12 +194,12 @@ Full glossary with file links: `docs/internals/glossary.md`
 - Browser and computer-use verification follows [Verifying](#verifying): the operator owns its Xvfb+i3 session and MAY kill the owner's launched NeoCode instance and relaunch it there. Her real database stays off-limits; anything else on her real display still needs her authorization.
 - Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
 
-## Fork rule: NeoPi-first, upstream-aware
+## Fork rule: NeoPi-only, upstream-aware
 
-NeoCode is a distinct product built from upstream T3 Code (`pingdotgg/t3code`), with NeoPi as its primary, enabled-by-default harness. Preserve upstream attribution and useful compatibility without treating upstream's product identity or defaults as the fork's mandate. Keep existing storage paths, protocol identifiers and explicit saved settings compatible.
+NeoCode is a distinct product built from upstream T3 Code (`pingdotgg/t3code`), with NeoPi as its only execution harness. Preserve upstream attribution, existing storage paths, protocol identifiers and saved user data. Retired-harness history remains readable; it does not authorize restoring retired execution paths.
 
 - Keep provider mechanics in their existing owned files (`apps/server/src/provider/neopi/`, `apps/server/src/provider/{Layers,Drivers,Services}/NeoPi*`, `packages/effect-neopi-rpc/`, and `*neopi*` client files) when those express the complete behavior.
-- Shared product defaults, provider ordering and branding may directly express NeoCode's NeoPi-first identity. Reuse existing seams, preserve other harness support and explicit saved choices, and avoid unrelated refactors or generic machinery invented only to hide product policy.
+- Shared product defaults and branding may directly express NeoCode's identity. Reuse existing seams and preserve saved NeoPi choices. Inference-provider support belongs to NeoPi, not a fixed GUI inventory.
 - Missing harness capabilities belong in NeoPi's RPC (`PsychedelicShayna/neopi`), not GUI workarounds. File them there with `downstream` and other labels supported by its tracker policy.
 - Every upstream file the fork touches is listed below with the reason. Adding one means adding a line. Fewer is better; remove lines when a seam can move back into NeoPi-owned code.
 

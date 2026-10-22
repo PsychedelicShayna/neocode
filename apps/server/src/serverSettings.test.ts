@@ -81,6 +81,27 @@ const recordProviderUsage = (provider: string, instanceId: string | null = provi
   });
 
 it.layer(NodeServices.layer)("server settings", (it) => {
+  it.effect("respects an explicit disabled native default when finding a text-generation fallback", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const defaultId = ProviderInstanceId.make("neopi");
+      const workId = ProviderInstanceId.make("native-work");
+      const legacyId = ProviderInstanceId.make("saved-codex");
+      const next = yield* service.updateSettings({
+        providerInstances: {
+          [defaultId]: { driver: ProviderDriverKind.make("neopi"), enabled: false, config: { profile: "personal" } },
+          [workId]: { driver: ProviderDriverKind.make("neopi"), enabled: true, config: { profile: "work" } },
+          [legacyId]: { driver: ProviderDriverKind.make("codex"), enabled: true, config: {} },
+        },
+        textGenerationModelSelection: { instanceId: legacyId, model: "saved-model" },
+      });
+      assert.equal(next.textGenerationModelSelection.instanceId, workId);
+      assert.equal(next.providerInstances[defaultId]?.enabled, false);
+      assert.deepEqual(next.providerInstances[defaultId]?.config, { profile: "personal" });
+      assert.deepEqual(next.providerInstances[workId]?.config, { profile: "work" });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("preserves context when reading a provider environment secret fails", () => {
     const platformCause = PlatformError.systemError({
       _tag: "PermissionDenied",
@@ -350,10 +371,10 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           },
         },
         textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
+          instanceId: ProviderInstanceId.make("neopi"),
           model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
           options: createModelSelection(
-            ProviderInstanceId.make("codex"),
+            ProviderInstanceId.make("neopi"),
             DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
             [
               { id: "reasoningEffort", value: "high" },
@@ -383,7 +404,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepEqual(
         next.textGenerationModelSelection,
         createModelSelection(
-          ProviderInstanceId.make("codex"),
+          ProviderInstanceId.make("neopi"),
           DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
           [
             { id: "reasoningEffort", value: "high" },
@@ -471,42 +492,23 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     ).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("preserves model when switching providers via textGenerationModelSelection", () =>
+  it.effect("keeps model backends and options when switching NeoPi instances", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-
-      // Start with Claude text generation selection
+      const personal = ProviderInstanceId.make("personal");
+      const work = ProviderInstanceId.make("work");
       yield* serverSettings.updateSettings({
-        providers: { codex: { enabled: true }, claudeAgent: { enabled: true } },
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          model: "claude-sonnet-4-6",
-          options: createModelSelection(
-            ProviderInstanceId.make("claudeAgent"),
-            "claude-sonnet-4-6",
-            [{ id: "effort", value: "high" }],
-          ).options!,
+        providerInstances: {
+          [personal]: { driver: ProviderDriverKind.make("neopi"), enabled: true, config: { profile: "personal" } },
+          [work]: { driver: ProviderDriverKind.make("neopi"), enabled: true, config: { profile: "work" } },
         },
+        textGenerationModelSelection: { instanceId: personal, model: "anthropic/current", options: [{ id: "reasoningEffort", value: "high" }, { id: "fastMode", value: true }] },
       });
-
-      // Switch to Codex — the stale Claude "effort" in options must not
-      // cause the update to lose the selected model.
-      const next = yield* serverSettings.updateSettings({
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5.4",
-          options: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
-            { id: "reasoningEffort", value: "high" },
-          ]).options!,
-        },
-      });
-
-      assert.deepEqual(
-        next.textGenerationModelSelection,
-        createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.4", [
-          { id: "reasoningEffort", value: "high" },
-        ]),
-      );
+      const selection = { instanceId: work, model: "openai-codex/current", options: [{ id: "reasoningEffort", value: "low" }] };
+      const next = yield* serverSettings.updateSettings({ textGenerationModelSelection: selection });
+      assert.deepEqual(next.textGenerationModelSelection, selection);
+      assert.deepEqual(next.providerInstances[personal]?.config, { profile: "personal" });
+      assert.deepEqual(next.providerInstances[work]?.config, { profile: "work" });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -517,7 +519,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const next = yield* serverSettings.updateSettings({
         providerInstances: {
           [ProviderInstanceId.make("claude_openrouter")]: {
-            driver: ProviderDriverKind.make("claudeAgent"),
+            driver: ProviderDriverKind.make("neopi"),
             enabled: true,
             config: { customModels: ["openai/gpt-5.5"] },
           },
@@ -544,13 +546,13 @@ it.layer(NodeServices.layer)("server settings", (it) => {
 
         const next = yield* serverSettings.updateSettings({
           providers: {
-            claudeAgent: {
+            neopi: {
               enabled: false,
             },
           },
           providerInstances: {
             [instanceId]: {
-              driver: ProviderDriverKind.make("claudeAgent"),
+              driver: ProviderDriverKind.make("neopi"),
               enabled: true,
               config: { customModels: ["openai/gpt-5.5"] },
             },
@@ -568,29 +570,21 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("preserves enabled text generation selections for non-built-in drivers", () =>
+  it.effect("preserves unknown runtime settings while using NeoPi for text generation", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
       const instanceId = ProviderInstanceId.make("openrouter_text");
-
-      const next = yield* serverSettings.updateSettings({
-        providerInstances: {
-          [instanceId]: {
-            driver: ProviderDriverKind.make("openrouter"),
-            enabled: true,
-            config: { customModels: ["openai/gpt-5.5"] },
-          },
-        },
-        textGenerationModelSelection: {
-          instanceId,
-          model: "openai/gpt-5.5",
-        },
-      });
-
-      assert.deepEqual(next.textGenerationModelSelection, {
-        instanceId,
-        model: "openai/gpt-5.5",
-      });
+      const selection = { instanceId, model: "openai/gpt-5.5" };
+      const legacy = { driver: ProviderDriverKind.make("openrouter"), enabled: true, config: { customModels: [selection.model] } };
+      const next = yield* serverSettings.updateSettings({ providerInstances: { [instanceId]: legacy }, textGenerationModelSelection: selection });
+      assert.deepEqual(next.textGenerationModelSelection, DEFAULT_SERVER_SETTINGS.textGenerationModelSelection);
+      assert.deepEqual(next.providerInstances[instanceId], legacy);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const persisted = JSON.parse(yield* fileSystem.readFileString(serverConfig.settingsPath));
+      assert.deepEqual(persisted.textGenerationModelSelection, selection);
+      assert.deepEqual(persisted.providerInstances[instanceId], legacy);
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -610,7 +604,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         yield* serverSettings.updateSettings({
           providerInstances: {
             [instanceId]: {
-              driver: ProviderDriverKind.make("codex"),
+              driver: ProviderDriverKind.make("neopi"),
               enabled: true,
               config: {},
             },
@@ -621,7 +615,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         const next = yield* serverSettings.updateSettings({
           providerInstances: {
             [instanceId]: {
-              driver: ProviderDriverKind.make("codex"),
+              driver: ProviderDriverKind.make("neopi"),
               enabled: false,
               config: {},
             },
@@ -648,7 +642,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         const restored = yield* serverSettings.updateSettings({
           providerInstances: {
             [instanceId]: {
-              driver: ProviderDriverKind.make("codex"),
+              driver: ProviderDriverKind.make("neopi"),
               enabled: true,
               config: {},
             },
@@ -806,8 +800,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const serverConfig = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-      // The Providers UI writes providerInstances only, so the legacy providers
-      // map decodes to defaults where codex is enabled and listed first.
+      // Obsolete provider settings are still readable, but cannot become a
+      // text-generation fallback merely because an older build enabled them.
       yield* fileSystem.writeFileString(
         serverConfig.settingsPath,
         '{"providerInstances":{"codex":{"driver":"codex","enabled":false,"config":{}}}}',
@@ -815,7 +809,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
 
       const settings = yield* serverSettings.getSettings;
 
-      assert.equal(settings.textGenerationModelSelection.instanceId, "claudeAgent");
+      assert.equal(settings.textGenerationModelSelection.instanceId, "neopi");
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -1400,31 +1394,28 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
       const serverConfig = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const instanceId = ProviderInstanceId.make("codex_terminal");
+      const instanceId = ProviderInstanceId.make("neopi_terminal");
 
       yield* serverSettings.updateSettings({
         providerInstances: {
           [instanceId]: {
-            driver: ProviderDriverKind.make("codex"),
+            driver: ProviderDriverKind.make("neopi"),
             environment: [
               { name: "OPENROUTER_API_KEY", value: "sk-terminal-secret", sensitive: true },
+              { name: "OMP_PROFILE", value: "work", sensitive: false },
             ],
-            config: { homePath: "~/.codex-terminal" },
+            config: { profile: "work" },
           },
         },
       });
 
-      const environment = yield* resolveProviderInstanceTerminalEnvironment({
-        serverSettings,
-        path,
-        rawProviderInstanceId: instanceId,
-        env: undefined,
-      });
+      const environment = yield* resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId: instanceId,
+      env: undefined, });
       const persisted = yield* fileSystem.readFileString(serverConfig.settingsPath);
 
       assert.equal(environment.OPENROUTER_API_KEY, "sk-terminal-secret");
-      assert.match(environment.CODEX_HOME ?? "", /[\\/][.]codex-terminal$/);
+      assert.equal(environment.OMP_PROFILE, "work");
+      assert.equal(environment.CODEX_HOME, undefined);
       assert.notInclude(persisted, "sk-terminal-secret");
       assert.include(persisted, '"valueRedacted": true');
     }).pipe(Effect.provide(makeServerSettingsLayer())),

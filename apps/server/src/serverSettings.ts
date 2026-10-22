@@ -12,8 +12,6 @@
  */
 import {
   DEFAULT_TEXT_GENERATION_MODEL,
-  DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
-  DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectScript,
@@ -21,7 +19,6 @@ import {
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
   type UsageLimitSourceConfig,
-  ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
   ServerSettings,
@@ -355,26 +352,21 @@ function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings
 }
 
 function fallbackTextGenerationProvider(settings: ServerSettings): ServerSettings {
-  // Same precedence as isModelSelectionProviderEnabled: an explicit provider
-  // instance wins over the legacy providers map, which decodes to defaults
-  // (codex enabled) when the Providers UI has only written providerInstances.
-  const fallbackEntry = Object.entries(settings.providers).find(([driver, provider]) => {
-    const instance = settings.providerInstances[ProviderInstanceId.make(driver)];
-    return instance === undefined ? provider.enabled : resolveProviderInstanceEnabled(instance);
-  });
-  const fallback = fallbackEntry ? ProviderDriverKind.make(fallbackEntry[0]) : undefined;
-  if (!fallback) {
-    return settings;
-  }
+  const explicit = Object.entries(settings.providerInstances).find(
+    ([, instance]) => instance.driver === "neopi" && resolveProviderInstanceEnabled(instance),
+  );
+  const defaultInstance = settings.providerInstances[ProviderInstanceId.make("neopi")];
+  const defaultEnabled = defaultInstance === undefined
+    ? settings.providers.neopi.enabled
+    : defaultInstance.driver === "neopi" && resolveProviderInstanceEnabled(defaultInstance);
+  const instanceId = explicit?.[0] ?? (defaultEnabled ? "neopi" : undefined);
+  if (instanceId === undefined) return settings;
 
   return {
     ...settings,
     textGenerationModelSelection: {
-      instanceId: ProviderInstanceId.make(fallback),
-      model:
-        DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[fallback] ??
-        DEFAULT_MODEL_BY_PROVIDER[fallback] ??
-        DEFAULT_TEXT_GENERATION_MODEL,
+      instanceId: ProviderInstanceId.make(instanceId),
+      model: DEFAULT_TEXT_GENERATION_MODEL,
     } satisfies ModelSelection,
   };
 }

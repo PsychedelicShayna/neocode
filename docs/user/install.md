@@ -1,7 +1,7 @@
 # Install NeoCode
 
-NeoCode runs coding agents on your computer and lets you control them from its
-desktop, web, or mobile app. Set up the machine where the agents will work first.
+NeoCode is a desktop, web, and mobile frontend for NeoPi. Set up NeoPi on the
+machine where your sessions will run first.
 
 Download this fork from [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases).
 For a source checkout, follow the [development guide](../operations/development.md).
@@ -10,9 +10,8 @@ not NeoCode. Existing `t3` commands, data directories and deep links retain thei
 
 ## Requirements
 
-You need an installed, authenticated provider before starting a thread. You can
-launch NeoCode and configure providers afterwards. NeoPi is enabled by default;
-explicit saved provider and model choices are preserved.
+You need NeoPi and an available inference provider before starting a thread.
+NeoCode can open before NeoPi is configured. Existing NeoPi settings are preserved.
 
 ## Upstream command line
 
@@ -97,10 +96,9 @@ close the source app and launch the packaged app again.
 
 ### Windows Subsystem for Linux
 
-Choose a WSL distro in **Settings → Connections** to run agents and projects
-there. Install the provider CLIs inside that distro. T3 Code installs its own
-server runtime there automatically; the first launch after an app update can
-take longer.
+Choose a WSL distro in **Settings → Connections** to run sessions and projects
+there. Install NeoPi inside that distro. NeoCode installs its server runtime
+there automatically; the first launch after an app update can take longer.
 
 ### Open a project from a terminal
 
@@ -129,29 +127,24 @@ component stack that store crash reports leave out. Copy the report and paste it
 into a GitHub issue. Error messages can quote values from the app, so read it over
 before sharing.
 
-## Providers
+## NeoPi
 
-Open **Settings → Providers** in the web or desktop app, select the environment,
-and enable the provider you want. Installation, login, and configuration belong
-to that environment's machine, even when you connect from a phone or another
-computer.
+Open **Settings → Providers** in the web or desktop app and select the environment
+to configure its NeoPi executable. On Linux, the NeoPi-enabled AppImage includes
+`npi`; elsewhere install `npi` or a compatible `omp` CLI. Configure inference
+providers, authentication, and models in NeoPi.
 
-Fresh installations enable only NeoPi and list it first. Enable other harnesses
-in Settings when you want to use them. Existing enabled harnesses stay enabled,
-including choices saved before provider toggles were written explicitly.
-New threads prefer a ready NeoPi instance when no saved provider/model choice
-applies; an enabled, ready alternative remains available when NeoPi is not usable.
-Project defaults and saved selections are preserved.
+NeoCode runs only NeoPi. OpenAI Codex, Anthropic, Cursor, and other inference
+providers exposed by NeoPi remain available. They are model backends, not separate
+NeoCode agent runtimes.
 
-| Provider    | Install and authenticate                                                                                                                                    |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Codex       | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.                                                                       |
-| Claude      | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`.                                                                |
-| Cursor      | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                                                                                       |
-| Grok Build  | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                                                                                          |
-| OpenCode    | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                                                                                    |
-| NeoPi       | On Linux, the NeoPi-enabled AppImage includes `npi`; elsewhere install the NeoPi `npi` CLI or a compatible `omp` CLI. Configure authentication in that CLI. |
-| Antigravity | Install and sign in with Google from T3 Code's provider settings.                                                                                           |
+Saved conversations from other runtimes remain in the database and can still be
+read, renamed, or archived. Their history is read-only and cannot be resumed as a
+NeoPi session. New threads ignore obsolete runtime defaults and use an available
+NeoPi instance without changing the old conversations.
+
+Setup does not scan or import Claude Code or Codex projects. Add a project folder
+explicitly from the workspace, or use **Resume NeoPi session** for native history.
 
 NeoPi automatically checks `npi-nightly`, then `npi`, the desktop app's bundled
 `npi` (when available), and `omp` for session-catalog support. A version string
@@ -238,32 +231,10 @@ refused without replacing the thread; the error includes the native session path
 for continuing safely in NeoPi. Pre-v2 native journals must first be continued
 in NeoPi to persist durable entry identities.
 
-Other provider CLIs must be on the server's `PATH`. If T3 Code cannot find one, set its
-**Binary path** in provider settings, especially when using a version manager.
-Cursor's executable is `cursor-agent`, although its login command is
-`agent login`. Antigravity can use its managed runtime without a `PATH` entry.
-
-T3 Code warns when a provider version has known compatibility problems with your
-release. Check **Settings → Providers** on that environment for the recommended
-version or range. When its package manager supports installing a specific version,
-you can install the recommendation there. Otherwise use the provider's installer
-on the environment's machine. An unlisted version is unverified.
-
-When a provider CLI is behind its latest release, its provider card shows the
-available version. **Update now** appears only when T3 Code can tell which
-installer owns the CLI (its own update command, Homebrew, or a global npm, pnpm,
-bun, or Vite+ install) and runs that installer. Otherwise update the CLI the same
-way you installed it. Homebrew installs compare against the version Homebrew
-offers, which can trail the npm release by a few hours.
-
-Add another provider instance for a separate account or configuration. Each
-instance can have its own environment variables, such as API keys or a custom
-base URL. Mark secret values as sensitive; after saving, T3 Code does not display
-their original values.
-
-For provider-specific setup and accounts, see [Codex](./providers-codex.md),
-[Claude](./providers-claude.md), [OpenCode](./providers-opencode.md), and
-[Antigravity](./providers-antigravity.md).
+Add another NeoPi instance for a separate profile or executable configuration.
+Each instance can have its own environment variables. Mark secret values as
+sensitive; NeoCode does not display their original values after saving.
+NeoPi upgrades and inference-provider sign-in remain in NeoPi, not NeoCode.
 
 ## Next steps
 

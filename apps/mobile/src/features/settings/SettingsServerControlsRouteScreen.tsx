@@ -423,18 +423,6 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                     </SettingsSection>
                   ) : null}
                   <SettingsSection title="Updates">
-                    <FanoutSwitchRow
-                      icon="arrow.clockwise"
-                      label="Check provider updates"
-                      subtitle={
-                        projectSelected
-                          ? "Environment-wide setting. Select All projects to change it."
-                          : "Check installed provider CLIs for newer versions."
-                      }
-                      value={uniform("enableProviderUpdateChecks")}
-                      disabled={disabledFor("enableProviderUpdateChecks")}
-                      onValueChange={(value) => write({ enableProviderUpdateChecks: value })}
-                    />
                     <View className="border-t border-border-subtle">
                       <FanoutSwitchRow
                         icon="arrow.uturn.forward"

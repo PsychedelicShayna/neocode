@@ -103,13 +103,6 @@ export function buildComposerSlashCommandItems(input: {
     if (command.name === USAGE_LIMITS_COMMAND.name && input.offersUsageLimits && !input.hasThread) {
       continue;
     }
-    if (
-      !input.hasThread &&
-      input.selectedProviderStatus?.driver === "codex" &&
-      command.name === "feedback"
-    ) {
-      continue;
-    }
     items.push({
       id: `pcmd:${command.name}`,
       type: "provider-slash-command",

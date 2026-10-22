@@ -1,5 +1,4 @@
 import {
-  ANTIGRAVITY_DEFAULT_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -65,74 +64,31 @@ describe("ProviderModelPicker", () => {
     expect(markup).not.toContain("Unavailable");
   });
 
-  it.each(["", ANTIGRAVITY_DEFAULT_MODEL])(
-    "shows a choice prompt before Antigravity has an account catalog for %s",
-    (model) => {
-      const markup = renderPicker({
-        instanceId: "antigravity",
-        driver: "antigravity",
-        model,
-        options: [],
-      });
+  it("shows a choice prompt before the native catalog has a selection", () => {
+    const markup = renderPicker({
+      instanceId: "neopi",
+      driver: "neopi",
+      model: "",
+      options: [],
+    });
+    expect(markup).toContain("Choose model");
+  });
 
-      expect(markup).toContain("Choose model");
-      expect(markup).not.toContain(ANTIGRAVITY_DEFAULT_MODEL);
-    },
-  );
+  it("keeps the selected native model label when the catalog no longer contains it", () => {
+    const markup = renderPicker({
+      instanceId: "neopi",
+      driver: "neopi",
+      model: "openai-codex/missing-model",
+      options: [{ slug: "anthropic/fallback", name: "Fallback model" }],
+    });
+    expect(markup).toContain("openai-codex/missing-model");
+    expect(markup).not.toContain("Fallback model");
+  });
 
-  it.each([{ aliases: [ANTIGRAVITY_DEFAULT_MODEL] }, { isDefault: true }])(
-    "shows the actual default model for an Antigravity marker with %j",
-    (defaultMetadata) => {
-      const markup = renderPicker({
-        instanceId: "google_work",
-        driver: "antigravity",
-        model: ANTIGRAVITY_DEFAULT_MODEL,
-        options: [
-          { slug: "gemini-fast", name: "Gemini Fast" },
-          { slug: "gemini-pro", name: "Gemini Pro", ...defaultMetadata },
-        ],
-      });
-
-      expect(markup).toContain("Gemini Pro");
-      expect(markup).not.toContain("Gemini Fast");
-      expect(markup).not.toContain(ANTIGRAVITY_DEFAULT_MODEL);
-    },
-  );
-
-  it.each(["opencode", "antigravity"])(
-    "keeps the selected model label when the %s account catalog does not contain it",
-    (driver) => {
-      const markup = renderPicker({
-        instanceId: "team_runtime",
-        driver,
-        model: "missing-model",
-        options: [{ slug: "fallback", name: "Fallback model" }],
-      });
-
-      expect(markup).toContain("missing-model");
-      expect(markup).not.toContain("Fallback model");
-    },
-  );
-
-  it.each(["codex", "claudeAgent", "cursor", "grok", "neopi"])(
-    "uses the first option label for a missing %s model",
-    (driver) => {
-      const markup = renderPicker({
-        instanceId: `${driver}_work`,
-        driver,
-        model: "missing-model",
-        options: [{ slug: "fallback-model", name: "Fallback model" }],
-      });
-
-      expect(markup).toContain("Fallback model");
-      expect(markup).not.toContain(">missing-model<");
-    },
-  );
-
-  it("prefers a matching model for OpenCode", () => {
+  it("prefers a matching native model", () => {
     const markup = renderPicker({
       instanceId: "custom_runtime",
-      driver: "opencode",
+      driver: "neopi",
       model: "openrouter/selected",
       options: [
         { slug: "openrouter/fallback", name: "Fallback model" },
@@ -144,17 +100,17 @@ describe("ProviderModelPicker", () => {
     expect(markup).not.toContain("Fallback model");
   });
 
-  it("uses the first option when the active instance entry is missing", () => {
+  it("keeps the saved model label when the active instance entry is missing", () => {
     const markup = renderPicker({
       instanceId: "missing_instance",
-      driver: "opencode",
+      driver: "neopi",
       model: "missing-model",
       options: [{ slug: "fallback-model", name: "Fallback model" }],
       includeEntry: false,
     });
 
-    expect(markup).toContain("Fallback model");
-    expect(markup).not.toContain(">missing-model<");
+    expect(markup).not.toContain("Fallback model");
+    expect(markup).toContain(">missing-model<");
   });
 
   it("keeps instance initials visible in the resting trigger", () => {

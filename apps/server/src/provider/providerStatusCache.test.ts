@@ -14,6 +14,7 @@ import * as Logger from "effect/Logger";
 import {
   hydrateCachedProvider,
   isCachedProviderCorrelated,
+  orderProviderSnapshots,
   readProviderStatusCache,
   resolveProviderStatusCachePath,
   writeProviderStatusCache,
@@ -23,6 +24,12 @@ const emptyCapabilities = createModelCapabilities({ optionDescriptors: [] });
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
+
+it("orders NeoPi before readable legacy snapshots", () => {
+  const native = makeProvider(ProviderDriverKind.make("neopi"));
+  const legacy = makeProvider(CODEX_DRIVER);
+  assert.deepStrictEqual(orderProviderSnapshots([legacy, native]), [native, legacy]);
+});
 
 const makeProvider = (
   provider: ProviderDriverKind,

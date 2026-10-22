@@ -2,22 +2,18 @@
 
 import { PlusIcon, XIcon } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { ProviderDriverKind, ServerProviderModel } from "@t3tools/contracts";
+import type { ServerProviderModel } from "@t3tools/contracts";
 import type { CustomModelDefinition } from "@t3tools/shared/model";
 
-import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import {
-  DESCRIPTOR_PRESETS_BY_KIND,
   type CustomModelDraft,
   type EditorChoice,
   type EditorDescriptor,
-  choiceFromPreset,
   definitionFromDraft,
-  descriptorFromPreset,
   descriptorsFromCapabilities,
   draftFromDefinition,
   emptyEditorChoice,
@@ -25,12 +21,10 @@ import {
   validateDraft,
 } from "./customModelEditor.logic";
 
-const CUSTOM_ID_VALUE = "__custom__";
 const START_FROM_NONE = "__none__";
 
 interface CustomModelEditorProps {
   readonly instanceId: string;
-  readonly driverKind: ProviderDriverKind | null;
   readonly entry: CustomModelDefinition;
   /** Built-in models whose descriptors can be copied as a starting point. */
   readonly builtInModels: ReadonlyArray<ServerProviderModel>;
@@ -45,7 +39,6 @@ interface CustomModelEditorProps {
  */
 export function CustomModelEditor({
   instanceId,
-  driverKind,
   entry,
   builtInModels,
   onSave,
@@ -53,10 +46,6 @@ export function CustomModelEditor({
 }: CustomModelEditorProps) {
   const [draft, setDraft] = useState<CustomModelDraft>(() => draftFromDefinition(entry));
   const [error, setError] = useState<string | null>(null);
-  const presets = useMemo(
-    () => (driverKind ? (DESCRIPTOR_PRESETS_BY_KIND[driverKind] ?? []) : []),
-    [driverKind],
-  );
   const startFromCandidates = useMemo(
     () => builtInModels.filter((model) => (model.capabilities?.optionDescriptors?.length ?? 0) > 0),
     [builtInModels],
@@ -104,26 +93,6 @@ export function CustomModelEditor({
     setDraft((current) => ({ ...current, descriptors: [...current.descriptors, descriptor] }));
   };
 
-  // Selecting a preset id replaces the descriptor's label/type/choices so the
-  // usual values are one click away; "Custom…" leaves the row blank to type into.
-  const applyPresetId = (descriptor: EditorDescriptor, value: string | null) => {
-    if (value === null) return;
-    if (value === CUSTOM_ID_VALUE) {
-      updateDescriptor(descriptor.key, { id: "" });
-      return;
-    }
-    const preset = presets.find((candidate) => candidate.id === value);
-    if (!preset) return;
-    updateDescriptor(descriptor.key, {
-      id: preset.id,
-      label: preset.label,
-      type: preset.type,
-      choices: (preset.choices ?? []).map(choiceFromPreset),
-      currentBooleanValue: undefined,
-      description: undefined,
-    });
-  };
-
   const handleStartFrom = (slug: string | null) => {
     if (slug === null || slug === START_FROM_NONE) return;
     const model = startFromCandidates.find((candidate) => candidate.slug === slug);
@@ -132,7 +101,7 @@ export function CustomModelEditor({
     setDraft((current) => ({
       ...current,
       reasoning: model.capabilities?.reasoning,
-      descriptors: descriptorsFromCapabilities(model.capabilities, driverKind),
+      descriptors: descriptorsFromCapabilities(model.capabilities),
     }));
   };
 
@@ -144,9 +113,6 @@ export function CustomModelEditor({
     }
     onSave(definitionFromDraft(draft));
   };
-
-  const idSelectValue = (descriptor: EditorDescriptor) =>
-    presets.some((preset) => preset.id === descriptor.id) ? descriptor.id : CUSTOM_ID_VALUE;
 
   const renderChoice = (descriptor: EditorDescriptor, choice: EditorChoice) => (
     <div key={choice.key} className="flex items-center gap-2">
@@ -203,41 +169,16 @@ export function CustomModelEditor({
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="w-14 shrink-0 text-2xs text-muted-foreground">Option {index + 1}</span>
-        {presets.length > 0 ? (
-          <Select
-            value={idSelectValue(descriptor)}
-            onValueChange={(value) => applyPresetId(descriptor, value)}
-          >
-            <SelectTrigger size="compact" className="w-40" aria-label="Option id">
-              <SelectValue>
-                {idSelectValue(descriptor) === CUSTOM_ID_VALUE ? "Custom…" : descriptor.id}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="start" alignItemWithTrigger={false}>
-              {presets.map((preset) => (
-                <SelectItem key={preset.id} value={preset.id}>
-                  <span className="flex items-baseline gap-2">
-                    <code className="font-mono text-xs">{preset.id}</code>
-                    <span className="text-muted-foreground">{preset.label}</span>
-                  </span>
-                </SelectItem>
-              ))}
-              <SelectItem value={CUSTOM_ID_VALUE}>Custom…</SelectItem>
-            </SelectPopup>
-          </Select>
-        ) : null}
-        {idSelectValue(descriptor) === CUSTOM_ID_VALUE ? (
-          <Input
-            size="compact"
-            value={descriptor.id}
-            onChange={(event) => updateDescriptor(descriptor.key, { id: event.target.value })}
-            placeholder="optionId"
-            font="mono"
-            className="w-36"
-            spellCheck={false}
-            aria-label="Option id"
-          />
-        ) : null}
+        <Input
+          size="compact"
+          value={descriptor.id}
+          onChange={(event) => updateDescriptor(descriptor.key, { id: event.target.value })}
+          placeholder="optionId"
+          font="mono"
+          className="w-36"
+          spellCheck={false}
+          aria-label="Option id"
+        />
         <Input
           size="compact"
           value={descriptor.label}
@@ -346,23 +287,6 @@ export function CustomModelEditor({
         ) : null}
         {draft.descriptors.map(renderDescriptor)}
         <div className="flex flex-wrap gap-1">
-          {presets
-            .filter(
-              (preset) => !draft.descriptors.some((descriptor) => descriptor.id === preset.id),
-            )
-            .map((preset) => (
-              <Button
-                key={preset.id}
-                type="button"
-                size="xs"
-                variant="ghost-muted"
-                className={cn("-ml-2 first:ml-0")}
-                onClick={() => addDescriptor(descriptorFromPreset(preset))}
-              >
-                <PlusIcon className="size-3" />
-                {preset.label}
-              </Button>
-            ))}
           <Button
             type="button"
             size="xs"

@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import {
-  createComposerScrollGestureState,
-  recordComposerScrollGestureEvent,
-} from "./composerScrollGesture";
 import { isTimelineScrollTarget } from "./timelineScrollTarget";
 
 class ScrollElement extends EventTarget {
@@ -118,25 +114,5 @@ describe("timeline scroll targets", () => {
     expect(targetsTimeline(new EventTarget(), timeline, -30)).toBe(false);
     expect(targetsTimeline(null, timeline, -30)).toBe(false);
     expect(targetsTimeline(content, timeline, 0)).toBe(false);
-  });
-
-  it("does not accumulate nested scrolling toward composer collapse", () => {
-    const { timeline, group, content } = setup();
-    const state = createComposerScrollGestureState();
-    const record = (target: ScrollElement, now: number, deltaPx: number) =>
-      recordComposerScrollGestureEvent(state, {
-        now,
-        deltaPx,
-        collapseThresholdPx: 24,
-        collapseEligible: targetsTimeline(target, timeline, -deltaPx),
-        canScrollInGestureDirection: timeline.scrollTop > 0,
-        scrollsTowardLogicalEnd: false,
-      });
-
-    expect(record(timeline, 0, 20)).toBe(false);
-    expect(record(content, 20, 30)).toBe(false);
-    group.scrollTop = 0;
-    expect(record(content, 40, 10)).toBe(false);
-    expect(record(content, 60, 14)).toBe(true);
   });
 });

@@ -6,6 +6,10 @@ include a skill when the task needs more context.
 Messages can contain up to 120,000 characters. Longer drafts stay in the composer
 so you can shorten them or split them into several messages.
 
+On web and desktop, scroll inside the composer to reach the rest of a long draft
+or its attachments. Scrolling the conversation leaves the draft and its controls
+in place.
+
 Pasting 32 KiB or more of text adds that fragment as a text-file attachment so
 the agent can inspect it without filling the model context. A smaller paste also
 becomes an attachment when inserting it would exceed the message limit. On a

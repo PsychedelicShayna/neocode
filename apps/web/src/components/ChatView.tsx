@@ -374,7 +374,7 @@ import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { resolveTimelineIsAtEnd, worktreeSetupAgentStarted } from "./chat/MessagesTimeline.logic";
-import { resolveComposerTimelineInset, resolveScrollToEndClearance } from "./composerFooterLayout";
+import { resolveScrollToEndClearance } from "./composerFooterLayout";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { expandedImageKey, type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -407,13 +407,7 @@ import {
   shouldOfferResumeCompaction,
 } from "./chat/ContextWindowMeter.logic";
 import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "../lib/contextWindow";
-import {
-  DRAFT_HERO_TRANSITION_ANIMATION_ID,
-  DRAFT_HERO_TRANSITION_EASING,
-  MOBILE_COMPOSER_VIEW_TRANSITION_NAME,
-  MOBILE_DRAFT_HEADLINE_VIEW_TRANSITION_NAME,
-  runMobileComposerTransition,
-} from "./chat/draftHeroTransition";
+import { MOBILE_DRAFT_HEADLINE_VIEW_TRANSITION_NAME } from "./chat/draftHeroTransition";
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   agentControlledBrowserCloseConfirmation,
@@ -540,79 +534,6 @@ const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_USAGE_LIMIT_SOURCES: UsageLimitSourceSnapshots = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
-function useDraftHeroLayoutTransition(
-  isDraftHeroState: boolean,
-  animationsActive: boolean,
-  animationDurationMs: number,
-) {
-  const transitionGroupRef = useRef<HTMLDivElement | null>(null);
-  const composerAnchorRef = useRef<HTMLDivElement | null>(null);
-  const previousStateRef = useRef(isDraftHeroState);
-  const previousComposerRectRef = useRef<DOMRect | null>(null);
-  const animationRef = useRef<Animation | null>(null);
-  const attachTransitionGroupRef = (element: HTMLDivElement | null) => {
-    transitionGroupRef.current = element;
-  };
-  const attachComposerAnchorRef = (element: HTMLDivElement | null) => {
-    composerAnchorRef.current = element;
-  };
-  const captureComposerRect = () => {
-    previousComposerRectRef.current = composerAnchorRef.current?.getBoundingClientRect() ?? null;
-  };
-
-  useLayoutEffect(() => {
-    const transitionGroup = transitionGroupRef.current;
-    const nextComposerRect = composerAnchorRef.current?.getBoundingClientRect() ?? null;
-    const stateChanged = previousStateRef.current !== isDraftHeroState;
-    const mobileComposerTransitionActive =
-      typeof document !== "undefined" &&
-      document.documentElement.dataset.mobileComposerRouteTransition === "true";
-
-    animationRef.current?.cancel();
-    animationRef.current = null;
-
-    const previousComposerRect = previousComposerRectRef.current;
-    if (
-      stateChanged &&
-      animationsActive &&
-      !mobileComposerTransitionActive &&
-      transitionGroup &&
-      previousComposerRect &&
-      nextComposerRect &&
-      typeof transitionGroup.animate === "function"
-    ) {
-      const translateX = previousComposerRect.left - nextComposerRect.left;
-      const translateY = previousComposerRect.top - nextComposerRect.top;
-      if (Math.abs(translateX) >= 0.5 || Math.abs(translateY) >= 0.5) {
-        const animation = transitionGroup.animate(
-          [
-            { transform: `translate3d(${translateX}px, ${translateY}px, 0)` },
-            { transform: "translate3d(0, 0, 0)" },
-          ],
-          {
-            duration: animationDurationMs,
-            easing: DRAFT_HERO_TRANSITION_EASING,
-          },
-        );
-        animation.id = DRAFT_HERO_TRANSITION_ANIMATION_ID;
-        animationRef.current = animation;
-        void animation.finished
-          .catch(() => undefined)
-          .then(() => {
-            if (animationRef.current !== animation) {
-              return;
-            }
-            animationRef.current = null;
-          });
-      }
-    }
-
-    previousStateRef.current = isDraftHeroState;
-    previousComposerRectRef.current = nextComposerRect;
-  }, [animationDurationMs, animationsActive, isDraftHeroState]);
-
-  return [attachTransitionGroupRef, attachComposerAnchorRef, captureComposerRect] as const;
-}
 const PreviewPanel = lazy(() =>
   import("./preview/PreviewPanel").then((module) => ({ default: module.PreviewPanel })),
 );
@@ -1668,9 +1589,6 @@ export default function ChatView(props: ChatViewProps) {
   const composerRef = useComposerHandleContext() ?? localComposerRef;
   const branchToolbarRef = useRef<BranchToolbarHandle>(null);
   const pasteAsTextShortcutUntilRef = useRef(0);
-  const [restingComposerControlsHost, setRestingComposerControlsHost] =
-    useState<HTMLDivElement | null>(null);
-  const [restingComposerControlsVisible, setRestingComposerControlsVisible] = useState(false);
   const citeAssistantText = useCallback(
     (citation: AssistantCitation, sourceAnchor: AssistantCitationSourceAnchor) => {
       const inserted = composerRef.current?.citeAssistantText(citation, sourceAnchor) ?? false;
@@ -1781,18 +1699,11 @@ export default function ChatView(props: ChatViewProps) {
     LastInvokedScriptByProjectSchema,
   );
   const legendListRef = useRef<LegendListRef | null>(null);
-  const getTimelineScrollableNode = useCallback(
-    () => legendListRef.current?.getScrollableNode() ?? null,
-    [],
-  );
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
-  // Space the timeline keeps clear above its end. Tracks the overlay while the
-  // composer is expanded and holds that height while it rests, so the resting
-  // composer never exposes rows that its expansion will cover.
+  // Reserve the docked composer's height without resizing the history viewport.
   const [composerTimelineInset, setComposerTimelineInset] = useState(0);
   const composerTimelineInsetRef = useRef(0);
-  const composerRestingRef = useRef(false);
-  // The last overlay height the composer published for its settled layout.
+  // The most recent measurement also positions the scroll-to-end control.
   const composerOverlayHeightRef = useRef(0);
   const [scrollToEndClearance, setScrollToEndClearance] = useState(0);
   const isAtEndRef = useRef(true);
@@ -1800,9 +1711,6 @@ export default function ChatView(props: ChatViewProps) {
     () => resolveTimelineIsAtEnd(legendListRef.current?.getState()) ?? isAtEndRef.current,
     [],
   );
-  // Whether the timeline's rows extend past the viewport above the composer.
-  // The composer only rests when there is reading space to give back.
-  const [timelineOverflows, setTimelineOverflows] = useState(false);
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const fanoutStateAtom = draftFanoutStateAtom(routeThreadKey);
@@ -3613,15 +3521,6 @@ export default function ChatView(props: ChatViewProps) {
     // hero headline would paint over it.
     hasWorktreeSetupCard: worktreeSetup !== null,
   });
-  const [
-    attachDraftHeroTransitionGroupRef,
-    attachDraftHeroComposerAnchorRef,
-    captureDraftHeroComposerRect,
-  ] = useDraftHeroLayoutTransition(
-    isDraftHeroState,
-    panelAnimationsActive,
-    panelAnimationDurationMs,
-  );
 
   const gitCwd = activeProject
     ? projectScriptCwd({
@@ -3736,20 +3635,10 @@ export default function ChatView(props: ChatViewProps) {
     }
   }, [environmentId, gitStatusCwd, liveIsGitRepo]);
   const isGitRepo = liveIsGitRepo ?? recallCheckoutIsRepo(environmentId, gitStatusCwd) ?? true;
-  // Keep a hidden, off-flow strip mounted for existing threads so the composer
-  // can measure whether its relocated controls fit. The visible chrome remains
-  // content-driven: Git/environment context or controls that actually fit.
-  const mountComposerContextStrip = shouldShowComposerContextStrip({
-    hasActiveProject: activeProject !== null,
-    isGitRepo,
-    showEnvironmentIndicator: showComposerEnvironmentIndicator,
-    hostsRestingComposerControls: routeKind === "server",
-  });
   const showComposerContextStrip = shouldShowComposerContextStrip({
     hasActiveProject: activeProject !== null,
     isGitRepo,
     showEnvironmentIndicator: showComposerEnvironmentIndicator,
-    hostsRestingComposerControls: routeKind === "server" && restingComposerControlsVisible,
   });
   const terminalShortcutLabelOptions = useMemo(
     () => ({
@@ -5361,7 +5250,6 @@ export default function ChatView(props: ChatViewProps) {
   );
   const handlePageScrollStart = useEffectEvent((key: PageScrollKey) => {
     timelineScrollIntentRef.current = key === "PageUp" ? "away-from-end" : "toward-end";
-    composerRef.current?.collapseForTimelineScrollKey(key);
     if ((key === "PageUp" && timelineRealContentOverflowsViewport()) || !isTimelineAtLogicalEnd()) {
       cancelTimelineLiveFollowForUserNavigation();
     }
@@ -5470,9 +5358,6 @@ export default function ChatView(props: ChatViewProps) {
             return;
           if (event.deltaY > 0) {
             timelineScrollIntentRef.current = "toward-end";
-            if (isAtEndRef.current) {
-              composerRef.current?.restoreAfterTimelineReachedEnd();
-            }
           } else if (event.deltaY < 0) {
             timelineScrollIntentRef.current = "away-from-end";
           }
@@ -5541,7 +5426,6 @@ export default function ChatView(props: ChatViewProps) {
               timelineScrollIntentRef.current = "away-from-end";
               if (contentScrollsUp()) {
                 handleManualNavigation();
-                composerRef.current?.collapseForTimelineScrollKey(event.key);
               }
               break;
             case "PageDown":
@@ -5550,10 +5434,6 @@ export default function ChatView(props: ChatViewProps) {
               timelineScrollIntentRef.current = "toward-end";
               if (viewportIsAwayFromEnd()) {
                 handleManualNavigation();
-              }
-              composerRef.current?.collapseForTimelineScrollKey(event.key);
-              if (isTimelineAtLogicalEnd()) {
-                composerRef.current?.restoreAfterTimelineReachedEnd();
               }
               break;
             default:
@@ -5586,7 +5466,7 @@ export default function ChatView(props: ChatViewProps) {
       }
       removeListeners?.();
     };
-  }, [activeThread?.id, isTimelineAtLogicalEnd, timelineRealContentOverflowsViewport]);
+  }, [activeThread?.id, timelineRealContentOverflowsViewport]);
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
     // Anchored-end space can be remeasured when the turn completes. Once the
@@ -5634,10 +5514,6 @@ export default function ChatView(props: ChatViewProps) {
     requestAnimationFrame(() => positionAnchor(12));
   }, []);
 
-  const onToolOutputCollapsedAtEnd = useCallback(() => {
-    composerRef.current?.restoreAfterTimelineReachedEnd();
-  }, []);
-
   const onIsAtEndChange = useCallback((isAtEnd: boolean) => {
     if (
       !isAtEnd &&
@@ -5650,9 +5526,6 @@ export default function ChatView(props: ChatViewProps) {
     if (isAtEndRef.current === isAtEnd) return;
     isAtEndRef.current = isAtEnd;
     if (isAtEnd) {
-      if (timelineScrollIntentRef.current === "toward-end") {
-        composerRef.current?.restoreAfterTimelineReachedEnd();
-      }
       timelineScrollModeRef.current = "following-end";
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
       setTimelineLiveFollowEnabled(true);
@@ -5914,30 +5787,15 @@ export default function ChatView(props: ChatViewProps) {
       const nextHeight = Math.ceil(height);
       if (nextHeight <= 0) return;
       composerOverlayHeightRef.current = nextHeight;
-      const nextInset = resolveComposerTimelineInset({
-        currentInset: composerTimelineInsetRef.current,
-        overlayHeight: nextHeight,
-        isResting: composerRestingRef.current,
-      });
-      if (composerTimelineInsetRef.current !== nextInset) {
-        composerTimelineInsetRef.current = nextInset;
-        setComposerTimelineInset(nextInset);
+      if (composerTimelineInsetRef.current !== nextHeight) {
+        composerTimelineInsetRef.current = nextHeight;
+        setComposerTimelineInset(nextHeight);
       }
       publishScrollToEndClearance(nextHeight);
     },
     [publishScrollToEndClearance],
   );
-  // The composer reports its resting flag from a layout effect, which runs
-  // before this component's own layout effects and before any resize
-  // observation, so every measurement below sees the flag for its layout.
-  // Only the flag is stored here: the stored height still belongs to the
-  // previous layout, and the composer publishes the new layout's height
-  // itself once it has measured it.
-  const onComposerRestingChange = useCallback((resting: boolean) => {
-    composerRestingRef.current = resting;
-  }, []);
-  // A held reservation belongs to the previous thread's draft. Rebuild it from
-  // this thread's overlay so a tall draft elsewhere does not pad this one.
+  // Remeasure on a thread switch without changing the history viewport itself.
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
     composerTimelineInsetRef.current = 0;
@@ -5960,12 +5818,7 @@ export default function ChatView(props: ChatViewProps) {
       resizeObserver.disconnect();
     };
   }, [composerOverlayElement, publishComposerOverlayHeight]);
-  // The pill mounts and unmounts in the same commits that expand or rest the
-  // composer, and a fast fling lands there while the previous resting tween
-  // still pins the overlay at its old height. Measuring the overlay here would
-  // publish that stale height against the new resting flag, drop the timeline
-  // reservation, and yank the scroll position. The pill only needs its
-  // clearance, so it reuses the height the composer last published.
+  // The pill can mount without a resize. Reuse the last measured dock height.
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
     publishScrollToEndClearance(composerOverlayHeightRef.current);
@@ -7865,25 +7718,7 @@ export default function ChatView(props: ChatViewProps) {
       }) &&
       activeThreadKey
     ) {
-      let resolveDockStarted: (() => void) | undefined;
-      const dockStarted = new Promise<void>((resolve) => {
-        resolveDockStarted = resolve;
-      });
-      const dockTransition = runMobileComposerTransition(
-        () => {
-          flushSync(() => {
-            captureDraftHeroComposerRect();
-            setDockedDraftHeroThreadKey(activeThreadKey);
-          });
-          resolveDockStarted?.();
-        },
-        {
-          active: panelAnimationsActive,
-          durationMs: panelAnimationDurationMs,
-        },
-      );
-      void dockTransition.catch(() => resolveDockStarted?.());
-      await dockStarted;
+      flushSync(() => setDockedDraftHeroThreadKey(activeThreadKey));
     }
 
     const attachmentCapabilitiesBeforeDispatch = readLiveAttachmentCapabilities();
@@ -9889,8 +9724,6 @@ export default function ChatView(props: ChatViewProps) {
                 contentInsetEndAdjustment={composerTimelineInset}
                 liveFollowEnabled={!paintOnlyDisplayedTimeline && timelineLiveFollowEnabled}
                 onIsAtEndChange={onIsAtEndChange}
-                onContentOverflowChange={setTimelineOverflows}
-                onToolOutputCollapsedAtEnd={onToolOutputCollapsedAtEnd}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
                 cancelPositionRestoreRef={cancelPositionRestoreRef}
                 hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
@@ -9916,7 +9749,6 @@ export default function ChatView(props: ChatViewProps) {
                     aria-label="Scroll to end"
                     onPointerDown={(event) => event.preventDefault()}
                     onClick={() => {
-                      composerRef.current?.restoreAfterTimelineReachedEnd();
                       scrollToEnd(true);
                     }}
                     className="pointer-events-auto"
@@ -9930,27 +9762,20 @@ export default function ChatView(props: ChatViewProps) {
               )}
             </div>
 
-            {/* Input bar — centered hero while a draft has no messages, docked at the bottom otherwise */}
+            {/* The composer stays on the chat frame edge, including empty drafts. */}
             <div
               ref={setComposerOverlayElement}
               inert={isRevertingCheckpoint}
               data-chat-composer-overlay="true"
-              className={
-                isDraftHeroState
-                  ? "pointer-events-none absolute inset-0 z-20 flex items-center"
-                  : "pointer-events-none absolute inset-x-0 bottom-0 z-20 pt-1.5 sm:pt-2"
-              }
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-20"
             >
-              <div
-                ref={attachDraftHeroTransitionGroupRef}
-                className="w-full ps-(--workspace-gutter-start) pe-(--workspace-gutter-end)"
-              >
+              <div className="w-full">
                 <div
                   data-chat-composer-stack="true"
-                  className="group/composer-stack pointer-events-auto relative z-10 mx-auto w-full max-w-(--chat-max-width)"
+                  className="group/composer-stack pointer-events-auto relative z-10 w-full"
                 >
                   {isDraftHeroState ? (
-                    <div className="absolute inset-x-0 bottom-full z-0">
+                    <div className="pointer-events-none absolute inset-x-0 bottom-full z-0 px-4">
                       <div
                         className="pb-8 group-has-data-[composer-shoulder-tab]/composer-stack:pb-4"
                         style={
@@ -9969,17 +9794,10 @@ export default function ChatView(props: ChatViewProps) {
                       </div>
                     </div>
                   ) : null}
-                  <div
-                    className="relative"
-                    style={
-                      forceExpandedMobileComposer
-                        ? { viewTransitionName: MOBILE_COMPOSER_VIEW_TRANSITION_NAME }
-                        : undefined
-                    }
-                  >
+                  <div className="relative">
                     <ComposerSurface.Shell contextStrip={showComposerContextStrip}>
                       <ComposerSurface.Host>
-                        <div ref={attachDraftHeroComposerAnchorRef} className="relative z-10">
+                        <div className="relative z-10">
                           <ChatComposer
                             multipleModelSelections={multipleModelSelections}
                             supportsMultipleModels={
@@ -10004,7 +9822,6 @@ export default function ChatView(props: ChatViewProps) {
                             promptHistoryMessages={timelineMessages}
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
-                            forceExpandedOnMobile={forceExpandedMobileComposer && isDraftHeroState}
                             projectSelectionRequired={isLocalDraftThread && activeProject === null}
                             phase={phase}
                             isConnecting={isConnecting}
@@ -10069,16 +9886,6 @@ export default function ChatView(props: ChatViewProps) {
                             pullRequestRepository={
                               supportsPullRequests ? activeProjectRepository : null
                             }
-                            restingControlsHost={restingComposerControlsHost}
-                            restingControlsHaveLeadingContext={
-                              isGitRepo || showComposerEnvironmentIndicator
-                            }
-                            onRestingControlsVisibilityChange={setRestingComposerControlsVisible}
-                            getTimelineScrollableNode={getTimelineScrollableNode}
-                            isTimelineAtLogicalEnd={isTimelineAtLogicalEnd}
-                            timelineOverflows={timelineOverflows}
-                            onComposerOverlayHeightChange={publishComposerOverlayHeight}
-                            onRestingChange={onComposerRestingChange}
                             promptRef={promptRef}
                             composerImagesRef={composerImagesRef}
                             composerFilesRef={composerFilesRef}
@@ -10121,7 +9928,7 @@ export default function ChatView(props: ChatViewProps) {
                           data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}
                           className="relative z-0"
                         >
-                          {mountComposerContextStrip && (
+                          {showComposerContextStrip && (
                             <div className="pointer-events-auto">
                               <BranchToolbar
                                 forceNewWorktree={multipleModelSelections !== null}
@@ -10157,18 +9964,12 @@ export default function ChatView(props: ChatViewProps) {
                                     : undefined
                                 }
                                 availableEnvironments={logicalProjectEnvironments}
-                                composerControlsHostRef={setRestingComposerControlsHost}
-                                contextStripVisible={showComposerContextStrip}
                               />
                             </div>
                           )}
                         </div>
                       </div>
                     </ComposerSurface.Shell>
-                    <div
-                      aria-hidden
-                      className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
-                    />
                   </div>
                 </div>
               </div>

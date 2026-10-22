@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./neopi-conversation": {
+      "types": "./src/neopiConversation.ts",
+      "default": "./src/neopiConversation.ts"
+    },
+    "./state/neopi-conversation": {
+      "types": "./src/state/neopiConversation.ts",
+      "default": "./src/state/neopiConversation.ts"
+    },
     "./device/stream": {
       "types": "./src/device/stream.ts",
       "default": "./src/device/stream.ts"

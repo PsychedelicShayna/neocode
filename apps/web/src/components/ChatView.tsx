@@ -218,6 +218,8 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
+import { NeoPiJournalPanel } from "./neopi/NeoPiJournalPanel";
+import { NeoPiConversation } from "./neopi/NeoPiConversation";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
@@ -2882,6 +2884,9 @@ export default function ChatView(props: ChatViewProps) {
     providerStatuses.find(
       (status) => status.instanceId === activeThread?.session?.providerInstanceId,
     ) ?? activeProviderStatus;
+  const nativeConversationBound =
+    isServerThread && (conversationProviderStatus?.driver === "neopi" ||
+      selectedProvider === "neopi" || activeThread?.session?.providerName === "neopi");
   const supportsConversationRollback =
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
@@ -4565,6 +4570,10 @@ export default function ChatView(props: ChatViewProps) {
   const addAgentsSurface = useCallback(() => {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
+  }, [activeThreadRef]);
+  const addNativeHistorySurface = useCallback(() => {
+    if (!activeThreadRef) return;
+    useRightPanelStore.getState().open(activeThreadRef, "native-history");
   }, [activeThreadRef]);
   const supportsThreadPullRequests =
     serverConfig?.environment.capabilities.threadPullRequests === true;
@@ -9625,6 +9634,8 @@ export default function ChatView(props: ChatViewProps) {
       />
     ) : renderedRightPanelSurface?.kind === "pull-requests" && activeThreadRef ? (
       <ThreadPullRequestsPanel threadRef={activeThreadRef} />
+    ) : renderedRightPanelSurface?.kind === "native-history" ? (
+      <NeoPiJournalPanel key={activeThreadKey} threadRef={activeThreadRef} cwd={activeThreadWorktreePath ?? activeProject?.workspaceRoot} />
     ) : renderedRightPanelSurface?.kind === "agents" ? (
       <AgentsPanel
         model={agentPanelModel}
@@ -9820,6 +9831,16 @@ export default function ChatView(props: ChatViewProps) {
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
+              {nativeConversationBound && activeThreadRef ? (
+                <NeoPiConversation
+                  key={`${activeThreadKey}:${activeThread.session?.providerInstanceId ?? "unstarted"}`}
+                  threadRef={activeThreadRef}
+                  cwd={gitCwd ?? undefined}
+                  composerInset={composerTimelineInset}
+                  onOpenTree={addNativeHistorySurface}
+                  ownerStatus={activeThread.session?.status}
+                />
+              ) : (
               <MessagesTimeline
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
                 citationHistoryLoading={threadDetailLoading}
@@ -9905,9 +9926,10 @@ export default function ChatView(props: ChatViewProps) {
                 )}
                 onRemoveQueuedMessage={onRemoveQueuedMessage}
               />
+              )}
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
-              {showScrollToBottom && (
+              {!nativeConversationBound && showScrollToBottom && (
                 <div
                   className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
                   style={{ bottom: scrollToEndClearance + 4 }}
@@ -10296,6 +10318,7 @@ export default function ChatView(props: ChatViewProps) {
           agentsAvailable
           deviceAvailable={activeThreadRef !== null}
           liveAgentCount={agentPanelModel.liveCount}
+          nativeHistory={isServerThread && selectedProvider === "neopi" ? { onOpen: addNativeHistorySurface } : undefined}
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -10353,6 +10376,7 @@ export default function ChatView(props: ChatViewProps) {
             agentsAvailable
             deviceAvailable={activeThreadRef !== null}
             liveAgentCount={agentPanelModel.liveCount}
+            nativeHistory={isServerThread && selectedProvider === "neopi" ? { onOpen: addNativeHistorySurface } : undefined}
           >
             {rightPanelContent}
           </RightPanelTabs>

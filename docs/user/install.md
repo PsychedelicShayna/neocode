@@ -199,12 +199,11 @@ imported history before opening the thread. Reopening an already-bound, stopped
 thread restores new terminal turns into that same thread without duplicating
 earlier messages. An active NeoCode thread opens without replacing its history.
 
-If the session is still open in a terminal, NeoCode attaches to that terminal's
-process instead of opening a second writer: messages you send from NeoCode run
-there. Turns started directly in the terminal are not mirrored live; close the
-terminal session and reopen its bound row to restore them. While attached, use
-the terminal to change modes, model settings, or compact history; NeoCode cannot
-change those owner-controlled settings.
+NeoCode follows the native session's selected branch in the main conversation,
+including turns started in its terminal. GUI turns use the existing NeoPi send
+path. Opening a conversation never takes ownership from the terminal or starts a
+second writer. The conversation header distinguishes attached input, terminal
+observation, stopped history and reconnecting state.
 
 To inspect the connected session's model and role configuration, open **NeoPi
 session configuration** in the thread header. It shows the native session
@@ -215,12 +214,42 @@ or effort changes. Following stops when you close the inspector or turn it off.
 Role-definition changes may still need Refresh. Opening the inspector does not
 start a stopped session or change the terminal's settings.
 
+The main conversation reads NeoPi's canonical journal, not an imported SQL
+transcript. Compaction, context-reset and branch-summary boundaries stay visible,
+and **Load older native entries** reaches history before them without a fixed
+history limit. Live messages remain provisional until NeoPi confirms their
+durable journal identities. A reconnect reads a fresh branch and never resends a
+prompt. Unknown entry types and extension content remain available as canonical
+JSON alongside native text, images, reasoning and tool records.
+
+Choose **Session tree**, or **Native history** in the right panel, to inspect
+alternate branches. Filter tools and system events, search loaded entries, and
+load older pages until the point you want is available. Selecting a row only
+inspects it. **Navigate here** runs NeoPi's same-file tree command. It preserves
+alternate futures, restores a selected user request and its ordered images to
+the composer, and can carry a native summary into the chosen branch.
+
+Selecting an old native ask result can reopen its questions without moving the
+branch. Save a new answer to create a sibling answer, wait for the conversation
+to rebuild, then choose **Resume after rebuilt transcript**. Reopened answers and
+pending continuation acknowledgements survive closing the panel. You can keep
+the saved answer without resuming. Cancel before saving leaves the original
+branch intact. Navigation and summary failures remain visible in the panel;
+they are not reported as successful leaf changes.
+
+Stopped history is read through NeoPi's read-only journal command. To navigate a
+stopped session, choose **Start stopped native session and navigate**. This starts
+its native owner without sending a prompt. Navigation requires
+`session_tree_navigation`; live following requires `session_journal_events`, and
+complete paging requires `session_journal`. Missing native support is reported
+explicitly. NeoCode does not substitute a partial SQL transcript.
+
 To go the other way, use **Continue in terminal** in a NeoPi thread's header:
 NeoCode stops its NeoPi process and copies the command that reopens the same
 native session in `npi`. If the terminal still owns the session, NeoCode only
 detaches and explains which process keeps it open instead of offering a resume
-command. After terminal continuation, close that session and use **Resume NeoPi
-session** again to return to the same NeoCode thread with its new turns.
+command. The native conversation reports that detached state while it observes
+the terminal. Refresh or reconnect to observe the current owner again.
 
 Discovery and attachment need `session_catalog` and `control_pipe`; restoration
 and handoff also require `session_history_identity`. Capability errors identify

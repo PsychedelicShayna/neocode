@@ -559,7 +559,7 @@ it.live("does not invoke session catalog commands unless the capability was adve
 );
 
 it.live(
-  "drops terminal-originated turns and relaunches the session file after the owner pipe exits",
+  "publishes external native identities without SQL turns and relaunches after owner exit",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -598,8 +598,22 @@ it.live(
             if (frame.type === "t3.session.exited") yield* Deferred.succeed(exited, undefined);
           }),
         ).pipe(Effect.forkScoped);
+        const native = yield* runtime.observeNative!;
+        const persisted = yield* Deferred.make<void>();
+        const nativeFrames: Array<Record<string, unknown>> = [];
+        yield* Stream.runForEach(native, (frame) => Effect.gen(function* () {
+          nativeFrames.push(frame);
+          if (frame.type === "message_persisted") yield* Deferred.succeed(persisted, undefined);
+        })).pipe(Effect.forkScoped);
         yield* runtime.start;
         yield* fixture.pipe.emit({ type: "agent_start" });
+        yield* fixture.pipe.emit({ type: "message_start", messageId: "msg-external", message: { role: "assistant", content: [] } });
+        yield* fixture.pipe.emit({ type: "message_update", messageId: "msg-external", assistantMessageEvent: { type: "text_delta", delta: "terminal" } });
+        yield* fixture.pipe.emit({ type: "message_end", messageId: "msg-external", message: { role: "assistant", content: [{ type: "text", text: "terminal" }] } });
+        yield* fixture.pipe.emit({ type: "message_persisted", sessionId: "s1", sessionFile: attachedCursor.sessionFile, leafId: "entry-external", messageId: "msg-external", entryId: "entry-external" });
+        yield* Deferred.await(persisted);
+        NodeAssert.deepEqual(nativeFrames.filter((frame) => typeof frame.messageId === "string").map((frame) => frame.messageId), ["msg-external", "msg-external", "msg-external", "msg-external"]);
+        NodeAssert.equal(nativeFrames.some((frame) => "turnId" in frame), false);
         yield* fixture.pipe.emit({ type: "agent_end", messages: [] });
         yield* fixture.pipe.finish(null);
         yield* Deferred.await(exited);

@@ -78,6 +78,8 @@ export interface NeoPiRpcClientOptions {
   /** Applies to command/response only, not the prompt lifecycle. Default 30s. */
   readonly requestTimeoutMs?: number;
   readonly stderrTailBytes?: number;
+  /** A consuming observer may bound stdout read-ahead. Full queues backpressure the pipe. */
+  readonly eventQueueCapacity?: number;
   readonly onTransportReady?: (transport: NeoPiRpcTransport) => Effect.Effect<void>;
 }
 
@@ -203,7 +205,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   );
 
   const outbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const events = yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>();
+  const events = options.eventQueueCapacity === undefined
+    ? yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>()
+    : yield* Queue.bounded<SessionEventFrame, Cause.Done<void>>(options.eventQueueCapacity);
   const uiRequests = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
   const hostToolCalls = yield* Queue.unbounded<
     HostToolCallFrame | HostToolCancelFrame,
@@ -238,12 +242,14 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       }
       pending.clear();
       for (const prompt of prompts.values()) {
-        yield* Queue.offer(events, {
+        // Failure must settle requests even when the bounded event consumer has
+        // stopped. Prompt outcomes and process exit remain separate receipts.
+        yield* Effect.sync(() => Queue.offerUnsafe(events, {
           type: "t3.prompt.failed",
           id: prompt.id,
           error: error.message,
           code: error.code,
-        }).pipe(Effect.ignore);
+        }));
         yield* completePrompt(prompt, {
           kind: "rejected",
           error: error.message,
@@ -339,7 +345,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               if (result.kind === "reply") return result.value;
             }
           })
-        : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
+        : cmd.type === "navigate_tree"
+          ? awaitReply
+          : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
       return yield* wait.pipe(
         Effect.catchTag("TimeoutError", () =>
           Effect.fail(

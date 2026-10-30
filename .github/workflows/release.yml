@@ -59,6 +59,7 @@ jobs:
       sha: ${{ steps.metadata.outputs.sha }}
       tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
+      channel: ${{ steps.metadata.outputs.channel }}
       prerelease: ${{ steps.metadata.outputs.prerelease }}
       publish: ${{ steps.schedule.outputs.publish }}
     steps:
@@ -113,6 +114,7 @@ jobs:
             echo "sha=$sha"
             echo "tag=$tag"
             echo "version=$version"
+            echo "channel=$channel"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
 
@@ -198,8 +200,7 @@ jobs:
     with:
       version: ${{ needs.fork_metadata.outputs.version }}
       ref: ${{ needs.fork_metadata.outputs.sha }}
-      # Installer-only assets; fork releases do not publish updater manifests.
-      release_channel: preview
+      release_channel: ${{ needs.fork_metadata.outputs.channel }}
       relay_client_tracing: false
       clerk_publishable_key: ""
       clerk_jwt_template: ""
@@ -221,7 +222,7 @@ jobs:
     with:
       version: ${{ needs.fork_metadata.outputs.version }}
       ref: ${{ needs.fork_metadata.outputs.sha }}
-      release_channel: preview
+      release_channel: ${{ needs.fork_metadata.outputs.channel }}
       relay_client_tracing: false
       clerk_publishable_key: ""
       clerk_jwt_template: ""
@@ -259,6 +260,36 @@ jobs:
           pattern: cli-*
           path: release-assets
           merge-multiple: true
+      - name: Prepare fork updater manifests
+        shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ needs.fork_metadata.outputs.channel }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob extglob
+          if [[ "$RELEASE_CHANNEL" == preview ]]; then
+            # Keep the same non-updating preview boundary as the upstream lane.
+            updater_files=(release-assets/!(builder-debug).yml release-assets/*.blockmap)
+            if [[ ${#updater_files[@]} -ne 0 ]]; then
+              printf 'Preview releases must not carry updater metadata, found: %s\n' "${updater_files[*]}" >&2
+              exit 1
+            fi
+          else
+            channel=latest
+            [[ "$RELEASE_CHANNEL" != nightly ]] || channel=nightly
+            # The reusable build suffixes Windows metadata for multi-arch
+            # merging. This fork ships only x64: use the existing single-arch
+            # release path, restoring the name electron-updater requests.
+            test -s "release-assets/${channel}-linux.yml"
+            test -s "release-assets/${channel}-win-x64.yml"
+            mv "release-assets/${channel}-win-x64.yml" "release-assets/${channel}.yml"
+            if [[ "$RELEASE_CHANNEL" == nightly ]]; then
+              # GitHubProvider retries latest-linux.yml within the SAME selected
+              # nightly tag. Stable checks resolve GitHub's latest stable release,
+              # never this prerelease; this fallback does not move stable's feed.
+              cp release-assets/nightly-linux.yml release-assets/latest-linux.yml
+            fi
+          fi
       - name: Publish without replacing any release or tag
         shell: bash
         env:

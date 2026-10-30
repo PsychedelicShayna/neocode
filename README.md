@@ -4,15 +4,37 @@ NeoCode is NeoPi's graphical frontend, built from upstream [T3 Code](https://git
 
 Saved conversations from retired harnesses remain readable. New work runs through NeoPi.
 
-## Upstream
-
-T3 Code provides the foundation for the web, desktop and mobile clients. Its authors retain their copyright and attribution; NeoCode develops as a distinct open-source project centered on NeoPi.
-
 ## Installation
 
-Download [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases), then follow [Install and first run](docs/user/install.md) for platform details and provider setup. For a source checkout, use the [development guide](docs/operations/development.md).
+Download the desktop app from [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases).
+Choose a stable release, or a **Pre-release** if you want nightly builds. The fork
+currently publishes Linux x64 AppImage/`.deb` and unsigned Windows x64 installers;
+upstream T3 Code installers, npm packages and package-manager entries are not NeoCode.
 
-Configure the NeoPi executable and profile in Settings → NeoCore. Upstream T3 Code installers and package-manager entries install upstream T3 Code, not this fork.
+On Linux, download the `NeoCode-…-x86_64.AppImage` asset, open a terminal in its
+download folder, and use its exact filename in both commands:
+
+```bash
+chmod +x ./NeoCode-<version>-x86_64.AppImage
+./NeoCode-<version>-x86_64.AppImage
+```
+
+Replace `<version>` with the downloaded release's full version. Debian/Ubuntu
+users can install that release's `.deb` with `sudo apt install ./NeoCode-<version>-amd64.deb`.
+On Windows, use the release's `NeoCode-…-x64.exe`; it is unsigned, so review the
+download source and security warning before deciding whether to run it.
+
+Then follow [Install and first run](docs/user/install.md#neopi) to download NeoPi
+and select its executable in **Settings → NeoCore**. Ordinary fork releases do not
+bundle NeoPi; a separately labeled NeoPi-enabled Linux build can. Models and
+provider authentication are managed through NeoPi. For a source checkout, use the
+[development guide](docs/operations/development.md).
+
+## Upstream
+
+T3 Code provides the foundation for the web, desktop and mobile clients. Its
+authors retain their copyright and attribution; NeoCode develops as a distinct
+open-source project centered on NeoPi.
 
 ## Some notes
 

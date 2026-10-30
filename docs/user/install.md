@@ -1,17 +1,60 @@
 # Install NeoCode
 
-NeoCode is a desktop, web, and mobile frontend for NeoPi. Set up NeoPi on the
-machine where your sessions will run first.
+NeoCode is NeoPi's graphical frontend. Install NeoCode on your computer and
+NeoPi on the machine where your sessions will run.
 
-Download this fork from [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases).
-For a source checkout, follow the [development guide](../operations/development.md).
-The T3 Code installers and package-manager entries below install upstream T3 Code,
+Download from [NeoCode releases](https://github.com/PsychedelicShayna/neocode/releases).
+Choose a stable release or, for nightly builds, a release marked **Pre-release**.
+The fork currently publishes Linux x64 and unsigned Windows x64 builds, not
+macOS or app-store releases. For a source checkout or another platform, follow
+the [development guide](../operations/development.md).
+
+Upstream T3 Code installers and package-manager entries install upstream T3 Code,
 not NeoCode. Existing `t3` commands, data directories and deep links retain their names.
 
 ## Requirements
 
 You need NeoPi and an available inference provider before starting a thread.
 NeoCode can open before NeoPi is configured. Existing NeoPi settings are preserved.
+
+## Download and run the desktop app
+
+### Linux x64
+
+Download the `NeoCode-…-x86_64.AppImage` asset from your chosen release. In a
+terminal, change to its download folder and replace `<version>` below with the
+full version in the downloaded filename:
+
+```bash
+chmod +x ./NeoCode-<version>-x86_64.AppImage
+./NeoCode-<version>-x86_64.AppImage
+```
+
+The executable-bit step is required before launching a freshly downloaded
+AppImage. Keep the file in a location you control; moving or deleting it changes
+the path you use to start the app.
+
+On Debian or Ubuntu, download the release's `NeoCode-…-amd64.deb` instead:
+
+```bash
+sudo apt install ./NeoCode-<version>-amd64.deb
+```
+
+The package retains the `t3code` package and desktop identities for compatibility;
+it is not a side-by-side installation of upstream T3 Code. `.deb` updates need a
+working password prompt. If an update cannot install, download the new `.deb`
+from the fork and install it with the same command.
+
+### Windows x64
+
+Download and run the release's `NeoCode-…-x64.exe` NSIS installer. Fork Windows
+builds are unsigned, so Windows may show an unknown-publisher or SmartScreen
+warning. Check that the file came from `PsychedelicShayna/neocode` and review the
+warning before choosing whether to proceed; do not disable system protections.
+
+The release includes `SHA256SUMS` for checking downloaded assets. Download it from
+the same release as your installer. NeoPi is a separate runtime; configure it
+using the [NeoPi steps below](#neopi) before starting work.
 
 ## Desktop windows
 
@@ -56,72 +99,26 @@ effective context budget; missing facts show Unknown. Searching requires a
 native executable advertising `model_selector`. Query errors are shown in the
 picker instead of falling back to a different search.
 
-## Upstream command line
+## Command line
 
-```bash
-curl -fsSL https://t3.codes/install.sh | sh
-```
+For the fork's standalone server, download the matching `t3-…-linux-x64.tar.gz`
+or `t3-…-win32-x64.zip` from the same
+[NeoCode release](https://github.com/PsychedelicShayna/neocode/releases).
+Extract the whole archive and keep `client/`, `node_modules/` and
+`resource-monitor/` alongside `t3` (`t3.exe` on Windows). These are NeoCode
+archives even though the executable keeps its compatibility name.
 
-On Windows, in PowerShell:
+Run `./t3` on Linux or `.\t3.exe` in Windows PowerShell from the extracted
+directory to start the server and open the web app. Use `./t3 serve` or
+`.\t3.exe serve` to start without opening a browser. Add that directory to your
+`PATH` if you want to use `t3` from another folder. Run `t3 --help` for the full
+reference.
 
-```powershell
-irm https://t3.codes/install.ps1 | iex
-```
+The upstream `t3.codes` install scripts, `npx t3`, Winget, Homebrew and AUR
+packages fetch upstream T3 Code, not NeoCode. Do not use them to install or
+update this fork.
 
-This puts `t3` in `~/.local/bin`. If your shell reports `command not found`
-afterwards, that directory is not on your `PATH` yet; the installer prints the
-line to add. Set `T3CODE_CHANNEL=nightly` to install the nightly train, or
-`T3CODE_VERSION` to pin an exact version.
-
-| Task                                             | Command                                                   |
-| ------------------------------------------------ | --------------------------------------------------------- |
-| Start the server and open the web app            | `t3`                                                      |
-| Start the server without a browser               | `t3 serve`                                                |
-| Keep it running in the background (macOS, Linux) | `t3 service install` ([details](./background-service.md)) |
-| Move to the newest release                       | `t3 update`                                               |
-| Remove it again                                  | `t3 uninstall`                                            |
-
-Run `t3 --help` for the full reference.
-
-To try T3 Code once without installing it, run `npx t3@latest` instead (needs
-Node.js for `npx`).
-
-### Intel Macs
-
-There is no `t3` executable for Intel Macs (the desktop app is available). To
-run a server there, build it from source with Node.js 24 and `vp`
-([Install vp](https://github.com/pingdotgg/t3code#install-vp)):
-
-```bash
-git clone https://github.com/pingdotgg/t3code
-cd t3code && vp i && vp run build:desktop
-node apps/server/dist/bin.mjs
-```
-
-`t3 update` and the background service do not apply to a server run this way;
-update it with `git pull` and a rebuild.
-
-## Upstream desktop app
-
-Download a release from [GitHub Releases](https://github.com/pingdotgg/t3code/releases),
-or use a package manager:
-
-| Platform           | Install                            |
-| ------------------ | ---------------------------------- |
-| Windows            | `winget install T3Tools.T3Code`    |
-| macOS              | `brew install --cask t3-code`      |
-| Debian, Ubuntu     | `sudo apt install ./T3-Code-*.deb` |
-| Arch Linux         | `yay -S t3code-bin`                |
-| Arch Linux nightly | `yay -S t3code-nightly-bin`        |
-
-The `.deb` updates itself like the other desktop builds. It asks for your
-password to install each update. If your desktop has no password prompt, the
-update fails. Download the new `.deb` and install it the same way.
-
-The [NeoPi-enabled Linux AppImage](https://github.com/PsychedelicShayna/neocode/releases)
-includes `npi` and runs it without a separate installation. To use its terminal
-agent, run `./T3-Code-npi.AppImage --npi --help` (or replace `--help` with any
-`npi` arguments). Authenticate through **Models**, or use the native `npi` login.
+## Desktop integration
 
 On Linux, packaged NeoCode claims the `t3code:` login callback handler. Starting
 a source build normally leaves the installed handler unchanged. To use a built
@@ -156,13 +153,13 @@ Pass a path, such as `t3 app ../my-project`, to open another directory. It requi
 the desktop app, so a standalone server or an SSH session is not enough. If the
 command cannot reach the app, start or update the desktop app and try again.
 
-## Mobile app
+## Mobile
 
-Install T3 Code from the
-[App Store](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824) or
-[Google Play](https://play.google.com/store/apps/details?id=com.t3tools.t3code).
-The phone connects to a server on another machine. Follow
-[remote access](./remote-access.md) to link it through T3 Connect or a pairing URL.
+The NeoCode fork does not currently publish mobile store builds. Upstream
+[T3 Code for iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824)
+and [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)
+are upstream products, not NeoCode downloads. Source mobile setup is described
+in the [mobile README](../../apps/mobile/README.md).
 
 If the app crashes during launch, open Settings → Diagnostics on the next launch
 that succeeds. It lists startup crashes from the last 7 days with the error and
@@ -174,8 +171,28 @@ before sharing.
 
 Open **Settings → NeoCore** in the web or desktop app to enable NeoPi and configure
 its executable, profile and environment. These controls remain available even
-when the Models page cannot read the native catalog. On Linux, the NeoPi-enabled
-AppImage includes `npi`; elsewhere install NeoPi nightly or stable.
+when the Models page cannot read the native catalog.
+
+1. Download NeoPi for the machine that runs your sessions from
+   [NeoPi releases](https://github.com/PsychedelicShayna/neopi/releases), following
+   that release's installation instructions. Extract an archive before selecting
+   the executable; **Binary path** needs the actual `npi` executable, not its
+   download archive or the NeoCode AppImage.
+2. Make `npi` available on that machine's `PATH`, or enter its full executable
+   path in **Settings → NeoCore → Binary path**. On Linux, an unpacked executable
+   may need `chmod +x /path/to/npi`. A GUI launched from the desktop can have a
+   different `PATH` from your terminal; use the full path if discovery cannot
+   find it. For WSL, install and select the executable inside the chosen distro.
+3. Select **Profile** if you use an `OMP_PROFILE`, then open **Models** to
+   configure NeoPi's inference providers and model roles.
+
+Ordinary fork release builds do not bundle NeoPi. A Linux build explicitly
+distributed as NeoPi-enabled can include it at `resources/bin/npi` inside the
+application. NeoCode discovers that copy automatically; do not copy an
+AppImage's temporary mount path into **Binary path**. Such a build also runs its
+bundled terminal agent with `./NeoCode-<version>-x86_64.AppImage --npi --help`
+(replace the filename with that build's exact name). The NeoCode `t3` server
+archive is not a NeoPi executable.
 
 Use **Settings → Models** to inspect native inference providers, authentication,
 models and roles. Catalog limits that NeoPi does not know are shown as **Unknown**;
@@ -353,4 +370,4 @@ Upgrade the NeoPi executable separately; Models manages provider sign-in through
 - [Permission modes](./permission-modes.md): choose when agents ask before acting.
 - [Remote access](./remote-access.md): connect from another device.
 - [Running in the background](./background-service.md): keep a Linux or macOS host available.
-- [Updating T3 Code](./updating.md): update the app and connected servers.
+- [Updating NeoCode](./updating.md): update the app and connected servers.

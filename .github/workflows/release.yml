@@ -269,7 +269,48 @@ jobs:
         run: |
           set -euo pipefail
           existing="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")"
-          args=(--target "$RELEASE_SHA" --title "NeoCode $RELEASE_TAG" --generate-notes)
+          cat > "$RUNNER_TEMP/neocode-install-notes.md" <<'EOF'
+          ## Install NeoCode
+
+          Download the assets from **this NeoCode release**, not upstream T3 Code.
+          This release provides Linux x64 and unsigned Windows x64 builds; it does
+          not provide macOS or mobile installers.
+
+          ### Linux x64
+
+          Download `NeoCode-…-x86_64.AppImage`. In its download folder, replace
+          `<version>` with the full version in that asset's filename, then run:
+
+          ```bash
+          chmod +x ./NeoCode-<version>-x86_64.AppImage
+          ./NeoCode-<version>-x86_64.AppImage
+          ```
+
+          On Debian/Ubuntu, you can instead download `NeoCode-…-amd64.deb` and run
+          `sudo apt install ./NeoCode-<version>-amd64.deb`. The package retains the
+          `t3code` identity; it is not a side-by-side upstream installation.
+
+          ### Windows x64
+
+          Download and run `NeoCode-…-x64.exe`. This NSIS installer is **unsigned**:
+          verify its source and review any unknown-publisher or SmartScreen warning
+          before deciding whether to proceed. Do not disable system protections.
+          `SHA256SUMS` on this release lists the downloadable assets' checksums.
+
+          ### Set up NeoPi
+
+          NeoCode is the frontend; these builds do not bundle the NeoPi runtime.
+          Download [NeoPi](https://github.com/PsychedelicShayna/neopi/releases) for
+          the machine running your sessions, then put its executable on `PATH` or
+          select the full executable path in **Settings → NeoCore → Binary path**.
+          Configure inference providers and model roles in **Models**.
+          The `t3-…` archives here are NeoCode server/CLI archives, not NeoPi.
+          See [Install and first run](https://github.com/PsychedelicShayna/neocode/blob/nightly/docs/user/install.md)
+          for extraction, executable discovery and optional bundled-build details.
+
+          ---
+          EOF
+          args=(--target "$RELEASE_SHA" --title "NeoCode $RELEASE_TAG" --generate-notes --notes-file "$RUNNER_TEMP/neocode-install-notes.md")
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/* ]]; then
             args+=(--verify-tag)
           elif [[ -n "$existing" ]]; then

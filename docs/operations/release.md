@@ -45,13 +45,56 @@ Local tests cannot prove those published bytes before that release exists.
 
 The fork reuses `release-desktop.yml` on hosted Ubuntu and Windows x64 runners:
 Linux AppImage and `.deb`, unsigned Windows NSIS installer, both platform CLI
-archives, and `SHA256SUMS`. Windows embeds the Linux CLI archive for WSL.
+archives, updater metadata for stable/nightly, and `SHA256SUMS` covering every
+published asset. Windows embeds the Linux CLI archive for WSL.
 No signing secrets are passed; Windows may show an unrecognized-publisher warning.
-Updater manifests are not published, so these releases are installed manually.
+Stable and nightly desktop builds use the GitHub updater feed in
+`PsychedelicShayna/neocode`, never the upstream repository. Preview builds stay
+manual-only: they carry no update feed, and the publisher rejects updater
+manifests or blockmaps on that channel.
 They do not bundle the separate NeoPi executable; install NeoPi separately for
 that provider. No upstream npm, AUR, production relay, Vercel, Discord, or
 version-bump publisher runs in the fork. T3 Connect production configuration
 is not bundled. The upstream release pipeline below remains separate.
+
+### Fork desktop feed assets
+
+The resolved fork channel is passed unchanged to both desktop build jobs.
+The build config derives its GitHub publish channel from the packaged version:
+stable uses `latest`, nightly uses `nightly`, and preview omits publishing.
+The reusable workflow collects generated manifests and blockmaps only for the
+updating channels. The fork publishes:
+
+| Channel | Linux x64 metadata                               | Windows x64 metadata | GitHub release           |
+| ------- | ------------------------------------------------ | -------------------- | ------------------------ |
+| Stable  | `latest-linux.yml`                               | `latest.yml`         | Stable, marked latest    |
+| Nightly | `nightly-linux.yml`, `latest-linux.yml` fallback | `nightly.yml`        | Prerelease, never latest |
+| Preview | None                                             | None                 | Prerelease, never latest |
+
+`electron-builder` 26.15.6 generates only the configured channel for GitHub;
+`generateUpdatesFilesForAllChannels` does not add a `latest` alias there.
+Linux manifests list the AppImage and `.deb` with their SHA-512 hashes.
+The reusable Windows collection temporarily suffixes its manifest with
+`-win-x64`; the fork's single-architecture publish step restores the canonical
+filename before checksumming and uploading. Those suffixed names are not feeds
+the installed updater can request.
+
+The extra nightly `latest-linux.yml` is a byte-for-byte copy on that same
+nightly release, not a stable-channel publication. In `electron-updater` 6.8.9,
+`GitHubProvider` first selects the nightly tag, then requests `nightly-linux.yml`;
+on failure it retries `latest-linux.yml` under the **same tag**. Stable checks
+disable prereleases and select GitHub's latest stable release instead. The
+fallback therefore does not redirect stable users onto nightly. Windows keeps
+its canonical channel filename without an additional fallback alias.
+
+After a normal post-merge release, verify the public assets under
+`https://github.com/PsychedelicShayna/neocode/releases/download/<tag>/<filename>`,
+their `SHA256SUMS`, and every installer URL/hash named in each manifest.
+Also inspect the packaged `resources/app-update.yml` for the fork owner/repo
+and expected channel. Do not retag or replace older installer-only releases:
+they remain without feeds. An update check needs a newly published feed-bearing
+release; a stable rebuild with only different `+build` metadata still has equal
+SemVer precedence and is not a new desktop update.
 
 ## Upstream release workflow
 

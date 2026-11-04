@@ -26,6 +26,7 @@
         "scripts/evaluate-thread-titles.ts",
         "scripts/measure-pr-preview.ts",
         "scripts/neopi-mock-rpc-agent.ts",
+        "scripts/update-test-shard-weights.ts",
         "src/provider/testFixtures/*.mjs",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.

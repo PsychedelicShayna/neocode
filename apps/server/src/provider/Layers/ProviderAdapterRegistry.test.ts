@@ -91,7 +91,7 @@ const fakeCursorAdapter: ProviderInstance["adapter"] = {
 };
 
 const makeFakeInstance = (
-  driverKindString: "codex" | "claudeAgent" | "cursor" | "opencode",
+  driverKindString: "codex" | "claudeAgent" | "cursor" | "opencode" | "neopi",
   adapter: ProviderInstance["adapter"],
 ): ProviderInstance => {
   const driverKind = ProviderDriverKind.make(driverKindString);
@@ -120,6 +120,7 @@ const fakeInstances: ReadonlyArray<ProviderInstance> = [
   makeFakeInstance("claudeAgent", fakeClaudeAdapter),
   makeFakeInstance("opencode", fakeOpenCodeAdapter),
   makeFakeInstance("cursor", fakeCursorAdapter),
+  makeFakeInstance("neopi", undefined),
 ];
 
 const fakeInstanceRegistryLayer = Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
@@ -171,6 +172,15 @@ it.layer(layer)("ProviderAdapterRegistryLive", (it) => {
         defaultInstanceIdForDriver(CURSOR_DRIVER),
       ]);
     }));
+  it("rejects native-only execution without hiding its instance metadata", () =>
+    Effect.gen(function* () {
+      const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
+      const nativeId = defaultInstanceIdForDriver(ProviderDriverKind.make("neopi"));
+      const result = yield* Effect.result(registry.getByInstance(nativeId));
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure._tag, "ProviderUnsupportedError");
+      const info = yield* registry.getInstanceInfo(nativeId);
+      assert.equal(info.driverKind, "neopi");
+      assert.equal((yield* registry.listInstances()).includes(nativeId), false);
+    }));
 });
-
-;

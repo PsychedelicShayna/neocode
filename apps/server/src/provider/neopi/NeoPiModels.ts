@@ -22,7 +22,6 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { ServerConfig } from "../../config.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
-import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { neoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 
@@ -38,7 +37,6 @@ const modelError = (cause: unknown) =>
           ? { code: cause.code }
           : {}),
       });
-const Cursor = Schema.Struct({ sessionId: Schema.String, sessionFile: Schema.String });
 interface AuthFlow {
   readonly connection: NeoPiModelsConnection;
   readonly state: SubscriptionRef.SubscriptionRef<NeoPiModelsAuthState>;
@@ -348,9 +346,13 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
 ) {
   const instances = yield* ProviderInstanceRegistry;
   const snapshots = yield* ProjectionSnapshotQuery;
-  const directory = yield* ProviderSessionDirectory;
   const serverConfig = yield* ServerConfig;
   const connection = Effect.fnUntraced(function* (target: NeoPiModelsTarget) {
+    if ("threadId" in target)
+      return yield* new NeoPiModelsError({
+        message:
+          "Archived thread configuration is unavailable. Choose a connected native session or project configuration.",
+      });
     if (target.sessionFile !== undefined) {
       if (!nativeSessionConnection)
         return yield* new NeoPiModelsError({
@@ -367,43 +369,14 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
       return yield* new NeoPiModelsError({
         message: "This native NeoPi instance is unavailable. Check NeoCore settings.",
       });
-    let projectId = target.projectId;
     let cwd = serverConfig.cwd;
-    let expected: { sessionId: string; sessionFile: string } | undefined;
-    let hasThreadWorktree = false;
-    if (target.threadId) {
-      const binding = yield* directory.getBinding(target.threadId);
-      const thread = yield* snapshots.getThreadShellById(target.threadId);
-      if (
-        Option.isNone(binding) ||
-        Option.isNone(thread) ||
-        binding.value.status !== "running" ||
-        binding.value.providerInstanceId !== target.providerInstanceId
-      )
-        return yield* new NeoPiModelsError({
-          message:
-            "The selected thread has no matching connected native session. Reopen Models from a connected thread or choose project configuration.",
-        });
-      if (target.projectId && target.projectId !== thread.value.projectId)
-        return yield* new NeoPiModelsError({
-          message: "The selected thread's project changed. Reopen Models from that thread.",
-        });
-      expected = yield* Schema.decodeUnknownEffect(Cursor)(binding.value.resumeCursor).pipe(
-        Effect.mapError(modelError),
-      );
-      projectId = thread.value.projectId;
-      if (thread.value.worktreePath) {
-        cwd = thread.value.worktreePath;
-        hasThreadWorktree = true;
-      }
-    }
-    if (projectId && !hasThreadWorktree) {
-      const project = yield* snapshots.getProjectShellById(projectId);
+    if (target.projectId) {
+      const project = yield* snapshots.getProjectShellById(target.projectId);
       if (Option.isNone(project))
         return yield* new NeoPiModelsError({ message: "The selected project no longer exists." });
       cwd = project.value.workspaceRoot;
     }
-    const native = yield* source.modelsConnection(cwd, target.threadId, expected);
+    const native = yield* source.modelsConnection(cwd);
     return native;
   }, Effect.mapError(modelError));
   const auth = yield* makeNativeModelsAuth(connection);

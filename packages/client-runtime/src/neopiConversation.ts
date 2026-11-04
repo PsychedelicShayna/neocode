@@ -1,4 +1,8 @@
-import type { NeoPiJournalEntry, NeoPiJournalPage } from "@t3tools/contracts";
+import type {
+  NeoPiJournalEntry,
+  NeoPiJournalPage,
+  NeoPiJournalStreamEvent,
+} from "@t3tools/contracts";
 
 export interface NativeIdentity {
   readonly sessionId: string;
@@ -200,4 +204,120 @@ export function nativeNavigationGuards(identity: NativeIdentity) {
     expectedSessionFile: identity.sessionFile,
     expectedLeafId: identity.leafId,
   };
+}
+
+const record = (value: unknown): Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+export interface NativeConversationFeed {
+  readonly conversation: NativeConversation;
+  readonly connection: Extract<NeoPiJournalStreamEvent, { type: "connection" }> | null;
+  readonly busy: boolean | null;
+}
+export const emptyNativeConversationFeed = (): NativeConversationFeed => ({
+  conversation: emptyNativeConversation(),
+  connection: null,
+  busy: null,
+});
+
+export function applyNativeConversationEvent(
+  feed: NativeConversationFeed,
+  event: NeoPiJournalStreamEvent,
+): NativeConversationFeed {
+  const state = feed.conversation;
+  if (event.type === "connection")
+    return {
+      connection: event,
+      busy:
+        event.status === "connected" && typeof event.state?.isStreaming === "boolean"
+          ? event.state.isStreaming
+          : null,
+      conversation:
+        event.status === "connected"
+          ? state
+          : reduceNativeConversation(state, { type: "disconnect" }),
+    };
+  if (event.type === "snapshot")
+    return { ...feed, conversation: reduceNativeConversation(state, event) };
+  const frame = event.event;
+  if (frame.type === "agent_start") return { ...feed, busy: true };
+  if (frame.type === "agent_end") return { ...feed, busy: false };
+  let conversation = state;
+  if (
+    typeof frame.sessionId === "string" &&
+    (typeof frame.sessionFile === "string" || frame.sessionFile === null) &&
+    (typeof frame.leafId === "string" || frame.leafId === null)
+  ) {
+    const identity: NativeIdentity = {
+      sessionId: frame.sessionId,
+      sessionFile: frame.sessionFile,
+      leafId: frame.leafId,
+    };
+    if (
+      (frame.type === "message_start" ||
+        frame.type === "message_update" ||
+        frame.type === "message_end") &&
+      !sameNativeSession(state.identity, identity)
+    )
+      return feed;
+    if (frame.type === "journal_state") {
+      // A reconnect boundary can predate the page already rendered by the client.
+      // Recover durable IDs without moving that hydrated branch backwards.
+      if (frame.reason !== "snapshot" || !sameNativeSession(state.identity, identity))
+        conversation = reduceNativeConversation(state, { type: "identity", identity });
+      if (frame.reason === "snapshot" && Array.isArray(frame.messageEntryIds)) {
+        const messageEntryIds = frame.messageEntryIds.flatMap((value) => {
+          const pair = record(value);
+          return typeof pair.messageId === "string" && typeof pair.entryId === "string"
+            ? [{ messageId: pair.messageId, entryId: pair.entryId }]
+            : [];
+        });
+        conversation = reduceNativeConversation(conversation, {
+          type: "persistence_snapshot",
+          identity,
+          messageEntryIds,
+        });
+      }
+    }
+    if (frame.type === "journal_entry") {
+      const entry = record(frame.entry);
+      if (
+        typeof entry.id === "string" &&
+        typeof entry.type === "string" &&
+        typeof entry.timestamp === "string" &&
+        (typeof entry.parentId === "string" || entry.parentId === null)
+      )
+        conversation = reduceNativeConversation(state, {
+          type: "entry",
+          identity,
+          entry: entry as NeoPiJournalEntry,
+        });
+    }
+    if (
+      frame.type === "message_persisted" &&
+      typeof frame.messageId === "string" &&
+      typeof frame.entryId === "string"
+    )
+      conversation = reduceNativeConversation(state, {
+        type: "persisted",
+        identity,
+        messageId: frame.messageId,
+        entryId: frame.entryId,
+      });
+  }
+  if (
+    (frame.type === "message_start" ||
+      frame.type === "message_update" ||
+      frame.type === "message_end") &&
+    typeof frame.messageId === "string"
+  ) {
+    conversation = reduceNativeConversation(state, {
+      type: "message",
+      messageId: frame.messageId,
+      message: record(frame.message),
+    });
+    if (frame.snapshot === true) return { ...feed, conversation, busy: true };
+  }
+  return conversation === state ? feed : { ...feed, conversation };
 }

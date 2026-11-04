@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { NeoPiNativeModel } from "./neopiModels.ts";
+import { NeoPiModelsTarget, NeoPiNativeModel } from "./neopiModels.ts";
 
 const model = {
   provider: "native-provider",
@@ -49,5 +49,15 @@ describe("native Models catalog contract", () => {
     ]) {
       expect(decode(input)._tag).toBe("None");
     }
+  });
+});
+
+describe("native Models target", () => {
+  it("rejects an archived SQL thread target instead of treating it as global configuration", () => {
+    const decoded = Schema.decodeUnknownOption(NeoPiModelsTarget)({
+      providerInstanceId: "neopi",
+      threadId: "saved-sql-thread",
+    });
+    expect(decoded._tag).toBe("None");
   });
 });

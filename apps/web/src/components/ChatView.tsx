@@ -208,8 +208,6 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
-import { NeoPiJournalPanel } from "./neopi/NeoPiJournalPanel";
-import { NeoPiConversation } from "./neopi/NeoPiConversation";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
@@ -1897,6 +1895,14 @@ export default function ChatView(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  useEffect(() => {
+    if (!activeThreadRef) return;
+    for (const surface of rightPanelState.surfaces) {
+      if (surface.kind === "native-history") {
+        useRightPanelStore.getState().closeSurface(activeThreadRef, surface.id);
+      }
+    }
+  }, [activeThreadRef, rightPanelState.surfaces]);
   const activePreviewState = useThreadPreviewState(activeThreadRef);
   const activePreviewServerEpoch = activePreviewState.serverEpoch;
   const resolvePreviewRuntimeTabId = useMemo(
@@ -2751,15 +2757,11 @@ export default function ChatView(props: ChatViewProps) {
     providerStatuses.find(
       (status) => status.instanceId === activeThread?.session?.providerInstanceId,
     ) ?? activeProviderStatus;
-  const nativeConversationBound =
-    isServerThread &&
-    (conversationProviderStatus?.driver === "neopi" ||
-      selectedProvider === "neopi" ||
-      activeThread?.session?.providerName === "neopi");
   const supportsConversationRollback =
+    !isServerThread &&
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
-  const phase = derivePhase(activeThread?.session ?? null);
+  const phase = derivePhase(isServerThread ? null : (activeThread?.session ?? null));
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const latestCheckpointCompletedAt = activeThread?.checkpoints.at(-1)?.completedAt ?? null;
   const workspaceMutationId = useMemo(() => {
@@ -2786,8 +2788,8 @@ export default function ChatView(props: ChatViewProps) {
     [agentSessionLive, threadActivities],
   );
   const { approvals: pendingApprovals, userInputs: pendingUserInputs } = useMemo(
-    () => derivePendingRequests(threadActivities),
-    [threadActivities],
+    () => derivePendingRequests(isServerThread ? EMPTY_ACTIVITIES : threadActivities),
+    [isServerThread, threadActivities],
   );
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const activePendingRequestKey = JSON.stringify([
@@ -4430,10 +4432,6 @@ export default function ChatView(props: ChatViewProps) {
   const addAgentsSurface = useCallback(() => {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
-  }, [activeThreadRef]);
-  const addNativeHistorySurface = useCallback(() => {
-    if (!activeThreadRef) return;
-    useRightPanelStore.getState().open(activeThreadRef, "native-history");
   }, [activeThreadRef]);
   const supportsThreadPullRequests =
     serverConfig?.environment.capabilities.threadPullRequests === true;
@@ -9302,12 +9300,6 @@ export default function ChatView(props: ChatViewProps) {
       />
     ) : renderedRightPanelSurface?.kind === "pull-requests" && activeThreadRef ? (
       <ThreadPullRequestsPanel threadRef={activeThreadRef} />
-    ) : renderedRightPanelSurface?.kind === "native-history" ? (
-      <NeoPiJournalPanel
-        key={activeThreadKey}
-        threadRef={activeThreadRef}
-        cwd={activeThreadWorktreePath ?? activeProject?.workspaceRoot}
-      />
     ) : renderedRightPanelSurface?.kind === "agents" ? (
       <AgentsPanel
         model={agentPanelModel}
@@ -9437,8 +9429,6 @@ export default function ChatView(props: ChatViewProps) {
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
             activeThreadTitle={activeThread.title}
             isServerThread={isServerThread}
-            runtimeMode={runtimeMode}
-            onRuntimeModeChange={handleRuntimeModeChange}
             activeProject={activeProject}
             activeProjectScripts={activeProjectScripts}
             preferredScriptId={
@@ -9502,105 +9492,92 @@ export default function ChatView(props: ChatViewProps) {
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
-              {nativeConversationBound && activeThreadRef ? (
-                <NeoPiConversation
-                  key={`${activeThreadKey}:${activeThread.session?.providerInstanceId ?? "unstarted"}`}
-                  threadRef={activeThreadRef}
-                  cwd={gitCwd ?? undefined}
-                  composerInset={composerTimelineInset}
-                  onOpenTree={addNativeHistorySurface}
-                  ownerStatus={activeThread.session?.status}
-                />
-              ) : (
-                <MessagesTimeline
-                  citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
-                  citationHistoryLoading={threadDetailLoading}
-                  {...(!paintOnlyDisplayedTimeline
-                    ? {
-                        onCiteAssistantText: citeAssistantText,
-                        agentPanelModel,
-                        onOpenAgents: addAgentsSurface,
-                        onUseArtifactTemplate: useArtifactTemplate,
-                        ...(activeProject ? { onRunShellCommand: runShellCommand } : {}),
-                      }
-                    : {})}
-                  isWorking={!paintOnlyDisplayedTimeline && isWorking}
-                  isPreparingWorktree={!paintOnlyDisplayedTimeline && isPreparingWorktree}
-                  isCompacting={!paintOnlyDisplayedTimeline && isCompacting}
-                  activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
-                  worktreeSetup={paintOnlyDisplayedTimeline ? null : worktreeSetup}
-                  onCancelWorktreeSetup={onCancelWorktreeSetup}
-                  {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
-                  {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
-                  listRef={legendListRef}
-                  timelineEntries={displayedTimeline.entries}
-                  latestTurn={paintOnlyDisplayedTimeline ? null : activeLatestTurn}
-                  runningTurnId={paintOnlyDisplayedTimeline ? null : activeRunningTurnId}
-                  turnDiffSummaries={
-                    paintOnlyDisplayedTimeline
-                      ? EMPTY_HELD_TURN_DIFF_SUMMARIES
-                      : activeThread.checkpoints
-                  }
-                  activeThreadEnvironmentId={
-                    displayedThreadRef?.environmentId ?? activeThread.environmentId
-                  }
-                  routeThreadKey={displayedTimelineKey}
-                  displayThreadKey={displayedTimelineKey}
-                  onOpenTurnDiff={paintOnlyDisplayedTimeline ? noopHeldTurnDiff : onOpenTurnDiff}
-                  supportsConversationRollback={
-                    !paintOnlyDisplayedTimeline && supportsConversationRollback
-                  }
-                  onRevertToTurnCount={
-                    paintOnlyDisplayedTimeline ? noopHeldRevert : onRevertTimelineTurn
-                  }
-                  isRevertingCheckpoint={!paintOnlyDisplayedTimeline && isRevertingCheckpoint}
-                  onImageExpand={onExpandTimelineImage}
-                  onFileOpen={paintOnlyDisplayedTimeline ? noopHeldAttachment : openFileAttachment}
-                  onFileDownload={
-                    paintOnlyDisplayedTimeline ? noopHeldAttachment : downloadFileAttachment
-                  }
-                  markdownCwd={
-                    paintOnlyDisplayedTimeline
-                      ? (heldPaintContext?.markdownCwd ?? undefined)
-                      : (gitCwd ?? undefined)
-                  }
-                  resolvedTheme={resolvedTheme}
-                  timestampFormat={timestampFormat}
-                  workspaceRoot={
-                    paintOnlyDisplayedTimeline
-                      ? (heldPaintContext?.workspaceRoot ?? undefined)
-                      : activeWorkspaceRoot
-                  }
-                  skills={
-                    activeProviderStatus
-                      ? resolveProviderSkillsForCwd(activeProviderStatus, gitCwd)
-                      : EMPTY_PROVIDER_SKILLS
-                  }
-                  anchorMessageId={paintOnlyDisplayedTimeline ? null : timelineAnchorMessageId}
-                  onAnchorReady={onTimelineAnchorReady}
-                  contentInsetEndAdjustment={composerTimelineInset}
-                  liveFollowEnabled={!paintOnlyDisplayedTimeline && timelineLiveFollowEnabled}
-                  onIsAtEndChange={onIsAtEndChange}
-                  onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
-                  cancelPositionRestoreRef={cancelPositionRestoreRef}
-                  hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
-                  topFadeEnabled={!hasTimelineTopBanner}
-                  loadEarlier={paintOnlyDisplayedTimeline ? null : loadEarlierTurns}
-                  queuedMessages={
-                    paintOnlyDisplayedTimeline ? EMPTY_QUEUED_MESSAGES : queuedMessages
-                  }
-                  onSteerQueuedMessage={onSteerQueuedMessage}
-                  steerQueuedMessageShortcutLabel={shortcutLabelForCommand(
-                    keybindings,
-                    "thread.steerQueuedMessage",
-                    { context: { terminalFocus: false } },
-                  )}
-                  onRemoveQueuedMessage={onRemoveQueuedMessage}
-                />
-              )}
+              <MessagesTimeline
+                citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
+                citationHistoryLoading={threadDetailLoading}
+                {...(!paintOnlyDisplayedTimeline
+                  ? {
+                      onCiteAssistantText: citeAssistantText,
+                      agentPanelModel,
+                      onOpenAgents: addAgentsSurface,
+                      onUseArtifactTemplate: useArtifactTemplate,
+                      ...(activeProject ? { onRunShellCommand: runShellCommand } : {}),
+                    }
+                  : {})}
+                isWorking={!paintOnlyDisplayedTimeline && isWorking}
+                isPreparingWorktree={!paintOnlyDisplayedTimeline && isPreparingWorktree}
+                isCompacting={!paintOnlyDisplayedTimeline && isCompacting}
+                activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
+                worktreeSetup={paintOnlyDisplayedTimeline ? null : worktreeSetup}
+                onCancelWorktreeSetup={onCancelWorktreeSetup}
+                {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
+                {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
+                listRef={legendListRef}
+                timelineEntries={displayedTimeline.entries}
+                latestTurn={paintOnlyDisplayedTimeline ? null : activeLatestTurn}
+                runningTurnId={paintOnlyDisplayedTimeline ? null : activeRunningTurnId}
+                turnDiffSummaries={
+                  paintOnlyDisplayedTimeline
+                    ? EMPTY_HELD_TURN_DIFF_SUMMARIES
+                    : activeThread.checkpoints
+                }
+                activeThreadEnvironmentId={
+                  displayedThreadRef?.environmentId ?? activeThread.environmentId
+                }
+                routeThreadKey={displayedTimelineKey}
+                displayThreadKey={displayedTimelineKey}
+                onOpenTurnDiff={paintOnlyDisplayedTimeline ? noopHeldTurnDiff : onOpenTurnDiff}
+                supportsConversationRollback={
+                  !paintOnlyDisplayedTimeline && supportsConversationRollback
+                }
+                onRevertToTurnCount={
+                  paintOnlyDisplayedTimeline ? noopHeldRevert : onRevertTimelineTurn
+                }
+                isRevertingCheckpoint={!paintOnlyDisplayedTimeline && isRevertingCheckpoint}
+                onImageExpand={onExpandTimelineImage}
+                onFileOpen={paintOnlyDisplayedTimeline ? noopHeldAttachment : openFileAttachment}
+                onFileDownload={
+                  paintOnlyDisplayedTimeline ? noopHeldAttachment : downloadFileAttachment
+                }
+                markdownCwd={
+                  paintOnlyDisplayedTimeline
+                    ? (heldPaintContext?.markdownCwd ?? undefined)
+                    : (gitCwd ?? undefined)
+                }
+                resolvedTheme={resolvedTheme}
+                timestampFormat={timestampFormat}
+                workspaceRoot={
+                  paintOnlyDisplayedTimeline
+                    ? (heldPaintContext?.workspaceRoot ?? undefined)
+                    : activeWorkspaceRoot
+                }
+                skills={
+                  activeProviderStatus
+                    ? resolveProviderSkillsForCwd(activeProviderStatus, gitCwd)
+                    : EMPTY_PROVIDER_SKILLS
+                }
+                anchorMessageId={paintOnlyDisplayedTimeline ? null : timelineAnchorMessageId}
+                onAnchorReady={onTimelineAnchorReady}
+                contentInsetEndAdjustment={composerTimelineInset}
+                liveFollowEnabled={!paintOnlyDisplayedTimeline && timelineLiveFollowEnabled}
+                onIsAtEndChange={onIsAtEndChange}
+                onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                cancelPositionRestoreRef={cancelPositionRestoreRef}
+                hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
+                topFadeEnabled={!hasTimelineTopBanner}
+                loadEarlier={paintOnlyDisplayedTimeline ? null : loadEarlierTurns}
+                queuedMessages={paintOnlyDisplayedTimeline ? EMPTY_QUEUED_MESSAGES : queuedMessages}
+                onSteerQueuedMessage={onSteerQueuedMessage}
+                steerQueuedMessageShortcutLabel={shortcutLabelForCommand(
+                  keybindings,
+                  "thread.steerQueuedMessage",
+                  { context: { terminalFocus: false } },
+                )}
+                onRemoveQueuedMessage={onRemoveQueuedMessage}
+              />
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
-              {!nativeConversationBound && showScrollToBottom && (
+              {showScrollToBottom && (
                 <div
                   className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
                   style={{ bottom: scrollToEndClearance + 4 }}
@@ -9953,11 +9930,6 @@ export default function ChatView(props: ChatViewProps) {
           agentsAvailable
           deviceAvailable={activeThreadRef !== null}
           liveAgentCount={agentPanelModel.liveCount}
-          nativeHistory={
-            isServerThread && selectedProvider === "neopi"
-              ? { onOpen: addNativeHistorySurface }
-              : undefined
-          }
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -10016,11 +9988,6 @@ export default function ChatView(props: ChatViewProps) {
             agentsAvailable
             deviceAvailable={activeThreadRef !== null}
             liveAgentCount={agentPanelModel.liveCount}
-            nativeHistory={
-              isServerThread && selectedProvider === "neopi"
-                ? { onOpen: addNativeHistorySurface }
-                : undefined
-            }
           >
             {rightPanelContent}
           </RightPanelTabs>

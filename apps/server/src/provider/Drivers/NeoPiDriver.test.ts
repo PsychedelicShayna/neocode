@@ -40,6 +40,7 @@ it.layer(testLayer)("NeoPiDriver", (it) => {
           expect(snapshot.status).toBe("error");
           expect(snapshot.message).toContain("/nonexistent/t3-neopi-cli");
           expect(snapshot.displayName).toBe("NeoPi/OMP");
+          expect(instance.adapter).toBeUndefined();
         }),
       ),
   );

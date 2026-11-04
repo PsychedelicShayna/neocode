@@ -1,5 +1,8 @@
 import type { ProviderInstance } from "../ProviderDriver.ts";
-import type { NeoPiAdapterShape } from "../Services/NeoPiAdapter.ts";
+import type { NeoPiModelsError } from "@t3tools/contracts";
+import type * as Effect from "effect/Effect";
+import type * as Scope from "effect/Scope";
+import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 
 /** Last completed handshake, retained while refresh is in flight or fails. */
 export interface NeoPiCapabilityProbe {
@@ -16,11 +19,10 @@ export interface NeoPiSessionCatalogSource {
   /** The same mutable capability set refreshed by the driver's RPC probe. */
   readonly capabilities: ReadonlySet<string>;
   readonly probe: NeoPiCapabilityProbe;
-  readonly configuration?: NeoPiAdapterShape["getConfiguration"];
-  readonly observeConfiguration?: NeoPiAdapterShape["observeConfiguration"];
-  readonly journal?: NeoPiAdapterShape["readJournal"];
-  readonly observeNative?: NeoPiAdapterShape["observeNative"];
-  readonly modelsConnection?: NeoPiAdapterShape["getModelsConnection"];
+  /** Scoped configuration-only native process; never a SQL thread/session binding. */
+  readonly modelsConnection?: (
+    cwd: string,
+  ) => Effect.Effect<NeoPiModelsConnection, NeoPiModelsError, Scope.Scope>;
 }
 
 const sources = new WeakMap<ProviderInstance, NeoPiSessionCatalogSource>();

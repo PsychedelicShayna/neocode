@@ -12,7 +12,6 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeNeoPiTextGeneration } from "../../textGeneration/NeoPiTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
 import {
   buildInitialNeoPiProviderSnapshot,
   checkNeoPiProviderStatus,
@@ -26,11 +25,13 @@ import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import { neoPiBinarySelectionPatch } from "../neopi/NeoPiBinarySelection.ts";
 import { neoPiUsageProviderId } from "../neopi/NeoPiModelCatalog.ts";
 import { makeNeoPiDiscoveryProbe } from "../neopi/NeoPiDiscoveryProbe.ts";
-import { makeNeoPiHostToolBridge } from "../neopi/NeoPiHostToolBridge.ts";
+import { makeNeoPiConfigurationConnections } from "../neopi/NeoPiModelsConnection.ts";
+import { readNeoPiLiveUsage } from "../neopi/NeoPiLiveUsage.ts";
 import {
   registerNeoPiSessionCatalogSource,
   unregisterNeoPiSessionCatalogSource,
   type NeoPiCapabilityProbe,
+  type NeoPiSessionCatalogSource,
 } from "../neopi/NeoPiSessionCatalogSource.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -138,19 +139,22 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         spawn: spawner.spawn,
         hub: discovery,
       });
-      const adapter = yield* makeNeoPiAdapter({
-        settings: effectiveConfig,
-        instanceId,
+      const modelsConnection = yield* makeNeoPiConfigurationConnections({
         binary,
-        cwd: serverConfig.cwd,
-        t3Home: serverConfig.baseDir,
-        attachmentsDir: serverConfig.attachmentsDir,
         environment: env,
+        profile: config.profile,
+        launchArgs: config.launchArgs,
         spawn: spawner.spawn,
-        discovery,
-        sharedSessionCapabilities,
-        makeHostBridge: makeNeoPiHostToolBridge,
       });
+      const source: NeoPiSessionCatalogSource = {
+        binary,
+        env,
+        profile: config.profile,
+        launchArgs: config.launchArgs,
+        capabilities: sharedSessionCapabilities,
+        probe: capabilityProbe,
+        modelsConnection,
+      };
       const textGeneration = makeNeoPiTextGeneration({
         binary,
         env,
@@ -195,7 +199,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
               profile: config.profile,
               cwd: serverConfig.cwd,
               environment: env,
-              getLiveUsage: adapter.getLiveUsage,
+              getLiveUsage: (provider) => readNeoPiLiveUsage(source, provider),
               ...(previous ? { previous } : {}),
             }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
             yield* publishSnapshot({ ...probed, usageLimits });
@@ -220,7 +224,6 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           accentColor,
           enabled,
           snapshot,
-          adapter,
           textGeneration,
           snapshotForCwd: (cwd) =>
             Effect.flatMap(snapshot.getSnapshot, (base) =>
@@ -228,19 +231,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
             ).pipe(Effect.provideService(FileSystem.FileSystem, fs)),
           invalidateCaches: commandProbe.invalidate,
         } satisfies ProviderInstance,
-        {
-          binary,
-          env,
-          profile: config.profile,
-          launchArgs: config.launchArgs,
-          capabilities: sharedSessionCapabilities,
-          probe: capabilityProbe,
-          configuration: adapter.getConfiguration,
-          observeConfiguration: adapter.observeConfiguration,
-          journal: adapter.readJournal,
-          observeNative: adapter.observeNative,
-          modelsConnection: adapter.getModelsConnection,
-        },
+        source,
       );
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => unregisterNeoPiSessionCatalogSource(instance)),

@@ -25,14 +25,13 @@ import {
   type ProviderAdapterRegistryShape,
 } from "../Services/ProviderAdapterRegistry.ts";
 
-
 const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(function* () {
   const registry = yield* ProviderInstanceRegistry;
 
   const getByInstance: ProviderAdapterRegistryShape["getByInstance"] = (instanceId) =>
     registry.getInstance(instanceId).pipe(
       Effect.flatMap((instance) =>
-        instance === undefined
+        instance?.adapter === undefined
           ? Effect.fail(
               new ProviderUnsupportedError({
                 provider: instanceId,
@@ -64,7 +63,11 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
 
   const listInstances: ProviderAdapterRegistryShape["listInstances"] = () =>
     registry.listInstances.pipe(
-      Effect.map((instances) => instances.map((instance) => instance.instanceId)),
+      Effect.map((instances) =>
+        instances
+          .filter((instance) => instance.adapter !== undefined)
+          .map((instance) => instance.instanceId),
+      ),
     );
 
   return {

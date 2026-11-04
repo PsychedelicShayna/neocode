@@ -28,6 +28,7 @@ import { NeoPiJournalContent } from "./NeoPiJournalContent";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
 import { NativeSessionTree } from "./NativeSessionTree";
 import { NativeCommandOutput } from "./NativeCommandOutput";
+import { NeoPiTerminalHandoff } from "./NeoPiTerminalHandoff";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
@@ -416,6 +417,7 @@ export function NativeSessionView({ target }: { target: NativeSessionTarget }) {
         >
           Debug
         </Button>
+        <NeoPiTerminalHandoff target={target} connected={feed.connected} />
         <Button
           size="sm"
           variant="ghost"

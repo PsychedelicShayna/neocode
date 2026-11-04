@@ -21,6 +21,7 @@ import {
 } from "./NeoPiNativeSessions.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import { updateNativeModelsConfiguration } from "./NeoPiModels.ts";
+import { readNeoPiLiveUsage } from "./NeoPiLiveUsage.ts";
 
 const instanceId = ProviderInstanceId.make("native-profile");
 const otherId = ProviderInstanceId.make("other-profile");
@@ -54,6 +55,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       aborts: 0,
       acceptedPrompts: 0,
       modelRuleRequests: 0,
+      usageRequests: [] as string[],
+      ownerPid: null as number | null,
       profileValid: true,
       blockSnapshot: false,
       startupDialog: false,
@@ -72,15 +75,16 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       sessionFile: native.sessionFile,
       leafId: native.entries.at(-1)?.id ?? null,
     });
+    const source = {
+      binary: "/fixture/npi",
+      env: {} as Record<string, string>,
+      profile: "fixture",
+      capabilities: new Set(["session_catalog"]),
+      probe: { status: "compatible" as const, version: "fixture" },
+    };
     const profile = (id: ProviderInstanceId): NeoPiNativeProfile => ({
       providerInstanceId: id,
-      source: {
-        binary: "/fixture/npi",
-        env: {},
-        profile: String(id),
-        capabilities: new Set(["session_catalog"]),
-        probe: { status: "compatible", version: "fixture" },
-      },
+      source,
       validate: Effect.suspend(() =>
         native.profileValid
           ? Effect.void
@@ -99,7 +103,22 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       canonicalize: (file) => Effect.succeed(file.replace("/alias/", "/native/")),
       preparePrompt: (input) =>
         prepareNeoPiNativePrompt(input, "/unused").pipe(Effect.provide(NodeFileSystem.layer)),
-      catalog: () => Effect.succeed([]),
+      catalog: () =>
+        Effect.succeed(
+          native.ownerPid === null
+            ? []
+            : [
+                {
+                  path: native.sessionFile,
+                  id: native.sessionId,
+                  cwd: native.cwd,
+                  title: null,
+                  modified: "2026-10-28T00:00:00Z",
+                  messageCount: native.entries.length,
+                  inUse: { pid: native.ownerPid },
+                },
+              ],
+        ),
       connect: (_profile, input, publish) =>
         Effect.gen(function* () {
           if (native.connections !== 0)
@@ -129,6 +148,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
               "session_journal",
               "session_journal_events",
               "models_configuration",
+              "get_usage",
             ]),
             exit,
             request: (command) =>
@@ -161,6 +181,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                     native.acceptedPrompts++;
                     native.streaming = true;
                     return { userEntryId: "native-admission" };
+                  case "get_usage":
+                    native.usageRequests.push(String(command.provider));
+                    return { provider: command.provider, redact: command.redact };
                   case "abort":
                     native.aborts++;
                     native.streaming = false;
@@ -196,11 +219,11 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
               method: "confirm",
               title: "Native confirmation",
             });
-          return { client, attachment, cwd: "/workspace-free", readState: Effect.sync(state) };
+          return { client, attachment, cwd: native.cwd, readState: Effect.sync(state) };
         }),
     };
     const service = yield* makeNeoPiNativeSessionsWith(dependencies);
-    return { native, service, dependencies, profileChanges, disconnected };
+    return { native, service, dependencies, profileChanges, disconnected, source };
   });
 
 const snapshot = (
@@ -215,6 +238,91 @@ const snapshot = (
   );
 
 describe("canonical native session lifecycle", () => {
+  it.effect(
+    "hands off only the connected canonical native file with a quoted terminal command",
+    () =>
+      Effect.gen(function* () {
+        const { native, source, service } = yield* fixture();
+        const ref = { ...originalRef, sessionFile: "/alias/session's file.jsonl" };
+        native.cwd = "/work/owner's project";
+        source.binary = "/bin/owner's npi";
+        source.env.OMP_PROFILE = "owner's profile";
+        yield* service.open(ref);
+        const result = yield* service.handoff(ref);
+        assert.deepEqual(result, {
+          sessionFile: "/native/session's file.jsonl",
+          sessionId: "native-id",
+          cwd: "/work/owner's project",
+          command:
+            "cd '/work/owner'\\''s project' && OMP_PROFILE='owner'\\''s profile' '/bin/owner'\\''s npi' --session '/native/session'\\''s file.jsonl'",
+        });
+        assert.equal(native.starts, 1);
+        assert.equal(native.disposals, 1);
+        assert.equal(native.connections, 0);
+        assert.equal(native.aborts, 1);
+        assert.equal((yield* Effect.result(service.modelsConnection(ref)))._tag, "Failure");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("detaches handoff observers without aborting or killing a terminal owner", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      native.ownerPid = 42;
+      yield* service.open(originalRef);
+      const result = yield* Effect.result(service.handoff(originalRef));
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure.code, "session_in_use");
+        assert.match(result.failure.message, /PID 42/);
+      }
+      assert.equal(native.detaches, 1);
+      assert.equal(native.running, true);
+      assert.equal(native.aborts, 0);
+      assert.equal(native.disposals, 0);
+      assert.equal(native.starts, 1);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not implicitly open or release another profile during handoff", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      const missing = yield* Effect.result(service.handoff(originalRef));
+      assert.equal(missing._tag, "Failure");
+      assert.equal(native.starts, 0);
+      yield* service.open(originalRef);
+      const conflict = yield* Effect.result(
+        service.handoff({ ...originalRef, providerInstanceId: otherId }),
+      );
+      assert.equal(conflict._tag, "Failure");
+      if (conflict._tag === "Failure") assert.equal(conflict.failure.code, "profile_conflict");
+      assert.equal(native.disposals, 0);
+      assert.equal(native.connections, 1);
+      native.sessionFile = "/native/switched.jsonl";
+      native.sessionId = "switched";
+      const changed = yield* Effect.result(service.handoff(originalRef));
+      assert.equal(changed._tag, "Failure");
+      if (changed._tag === "Failure") assert.equal(changed.failure.code, "session_changed");
+      assert.equal(native.disposals, 0);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "reads usage from the direct native owner only for its configured source lifetime",
+    () =>
+      Effect.gen(function* () {
+        const { native, service, source } = yield* fixture();
+        assert.equal(yield* readNeoPiLiveUsage(source, "provider"), undefined);
+        yield* service.open(originalRef);
+        assert.deepEqual(yield* readNeoPiLiveUsage(source, "provider"), {
+          provider: "provider",
+          redact: true,
+        });
+        assert.equal(yield* readNeoPiLiveUsage({ ...source }, "other"), undefined);
+        yield* service.close({ ref: originalRef });
+        assert.equal(yield* readNeoPiLiveUsage(source, "provider"), undefined);
+        assert.deepEqual(native.usageRequests, ["provider"]);
+      }).pipe(Effect.scoped),
+  );
   it.effect(
     "keeps native invalid-pattern diagnostics through the canonical connected Models path",
     () =>

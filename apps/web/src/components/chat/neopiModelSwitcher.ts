@@ -5,7 +5,6 @@ import type {
   NeoPiModelsTarget,
   ProjectId,
   ProviderInstanceId,
-  ThreadId,
 } from "@t3tools/contracts";
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import type { ModelEsque } from "./providerIconUtils";
@@ -13,7 +12,6 @@ import type { ModelEsque } from "./providerIconUtils";
 export interface NativeSelectorContext {
   environmentId: EnvironmentId | null;
   projectId?: ProjectId;
-  connectedThread?: { threadId: ThreadId; providerInstanceId: ProviderInstanceId };
   connectedSession?: { sessionFile: string; providerInstanceId: ProviderInstanceId };
 }
 
@@ -24,13 +22,9 @@ export function nativeSelectorTarget(
   return {
     providerInstanceId,
     ...(context.projectId ? { projectId: context.projectId } : {}),
-    ...(context.connectedSession
-      ? context.connectedSession.providerInstanceId === providerInstanceId
-        ? { sessionFile: context.connectedSession.sessionFile }
-        : {}
-      : context.connectedThread?.providerInstanceId === providerInstanceId
-        ? { threadId: context.connectedThread.threadId }
-        : {}),
+    ...(context.connectedSession?.providerInstanceId === providerInstanceId
+      ? { sessionFile: context.connectedSession.sessionFile }
+      : {}),
   };
 }
 

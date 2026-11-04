@@ -106,6 +106,15 @@ export const NeoPiNativeSessionsCloseInput = NeoPiNativeSessionsWatchInput;
 export type NeoPiNativeSessionsCloseInput = typeof NeoPiNativeSessionsCloseInput.Type;
 export const NeoPiNativeSessionsCloseResult = Schema.Struct({ closed: Schema.Boolean });
 export type NeoPiNativeSessionsCloseResult = typeof NeoPiNativeSessionsCloseResult.Type;
+export const NeoPiNativeSessionsHandoffInput = NeoPiNativeSessionsWatchInput;
+export type NeoPiNativeSessionsHandoffInput = typeof NeoPiNativeSessionsHandoffInput.Type;
+export const NeoPiNativeSessionsHandoffResult = Schema.Struct({
+  sessionFile: Schema.String,
+  sessionId: Schema.String,
+  cwd: Schema.String,
+  command: Schema.String,
+});
+export type NeoPiNativeSessionsHandoffResult = typeof NeoPiNativeSessionsHandoffResult.Type;
 export class NeoPiNativeSessionsError extends Schema.TaggedError<NeoPiNativeSessionsError>()(
   "NeoPiNativeSessionsError",
   { message: Schema.String, code: Schema.optional(Schema.String) },

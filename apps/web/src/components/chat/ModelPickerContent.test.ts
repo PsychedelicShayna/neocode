@@ -3,7 +3,6 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
-  ThreadId,
   type NeoPiModelSelectorFacts,
   type NeoPiModelSelectorItem,
   type NeoPiModelSelectorResult,
@@ -192,18 +191,18 @@ describe("native model selector consumers", () => {
     expect(nativeSwitcherFactCells(models[0]!)).toEqual(Array(6).fill("Unknown"));
   });
 
-  it("queries only the matching connected instance with the thread, and others with project context", () => {
+  it("queries only the matching connected instance with the session, and others with project context", () => {
     const projectId = ProjectId.make("project");
-    const threadId = ThreadId.make("thread");
+    const sessionFile = "/sessions/connected.jsonl";
     const context = {
       environmentId: EnvironmentId.make("remote"),
       projectId,
-      connectedThread: { threadId, providerInstanceId: instanceId },
+      connectedSession: { sessionFile, providerInstanceId: instanceId },
     };
     expect(nativeSelectorTarget(context, instanceId)).toEqual({
       providerInstanceId: instanceId,
       projectId,
-      threadId,
+      sessionFile,
     });
     expect(nativeSelectorTarget(context, otherInstanceId)).toEqual({
       providerInstanceId: otherInstanceId,
@@ -217,7 +216,7 @@ describe("native model selector consumers", () => {
     });
   });
 
-  it("keeps canonical native session targets separate from project and legacy thread targets", () => {
+  it("keeps canonical native session targets separate from project targets", () => {
     const projectId = ProjectId.make("project");
     const context = {
       environmentId: EnvironmentId.make("remote"),
@@ -226,7 +225,6 @@ describe("native model selector consumers", () => {
         providerInstanceId: instanceId,
         sessionFile: "/sessions/canonical.jsonl",
       },
-      connectedThread: { providerInstanceId: otherInstanceId, threadId: ThreadId.make("legacy") },
     };
     expect(nativeSelectorTarget(context, instanceId)).toEqual({
       providerInstanceId: instanceId,

@@ -14,18 +14,13 @@ export function useNeoPiModelSelector(
   query: string,
 ) {
   const read = useAtomCommand(neopiModels.querySelector, { reportFailure: false });
-  const { environmentId, projectId, connectedThread, connectedSession } = context;
-  const threadId = connectedThread?.threadId;
-  const threadInstanceId = connectedThread?.providerInstanceId;
+  const { environmentId, projectId, connectedSession } = context;
   const sessionFile = connectedSession?.sessionFile;
   const sessionInstanceId = connectedSession?.providerInstanceId;
   const request = useMemo(() => {
     const targetContext: NativeSelectorContext = {
       environmentId,
       ...(projectId ? { projectId } : {}),
-      ...(threadId && threadInstanceId
-        ? { connectedThread: { threadId, providerInstanceId: threadInstanceId } }
-        : {}),
       ...(sessionFile && sessionInstanceId
         ? { connectedSession: { sessionFile, providerInstanceId: sessionInstanceId } }
         : {}),
@@ -37,16 +32,7 @@ export function useNeoPiModelSelector(
       requests,
       query,
     };
-  }, [
-    environmentId,
-    projectId,
-    threadId,
-    threadInstanceId,
-    sessionFile,
-    sessionInstanceId,
-    entries,
-    query,
-  ]);
+  }, [environmentId, projectId, sessionFile, sessionInstanceId, entries, query]);
   const [snapshot, setSnapshot] = useState<{
     key: string;
     results: ReadonlyMap<ProviderInstanceId, NeoPiModelSelectorResult>;

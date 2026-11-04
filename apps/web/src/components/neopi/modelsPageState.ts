@@ -18,6 +18,11 @@ export interface ModelsSearch {
 }
 type ModelsSearchUpdate = { [Key in keyof ModelsSearch]?: string | undefined };
 export function validateModelsSearch(raw: Record<string, unknown>): ModelsSearch {
+  if (raw.thread !== undefined || raw.threadId !== undefined) {
+    throw new Error(
+      "SQL thread-targeted Models links are archived. Open Models from a native session or Settings.",
+    );
+  }
   return Object.fromEntries(
     ["environment", "instance", "project", "sessionFile", "section"].flatMap((key) =>
       typeof raw[key] === "string" && raw[key] !== "" ? [[key, raw[key]]] : [],

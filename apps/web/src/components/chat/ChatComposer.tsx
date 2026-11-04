@@ -1,4 +1,4 @@
-import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
+import { LEGACY_THREAD_READ_ONLY_REASON } from "@t3tools/shared/serverSettings";
 import { workspaceResourceId } from "@t3tools/client-runtime/environment";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
@@ -236,8 +236,7 @@ import {
 } from "~/state/pullRequests";
 import { useEnvironmentQuery } from "~/state/query";
 import { useDebouncedValue } from "~/state/queries";
-import { NeoPiSessionModelPicker } from "../neopi/NeoPiSessionModelPicker";
-import { NeoPiSessionStatus } from "../neopi/NeoPiSessionStatus";
+import { ProviderModelPicker } from "./ProviderModelPicker";
 import { type ComposerCommandItem, ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
@@ -1402,15 +1401,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // back once the catalog lands.
   const providerCatalogPending = noProviderAvailable && !providerCatalogKnown;
   const showProviderUnavailable = noProviderAvailable && !providerCatalogPending;
-  const runtimeReadOnlyReason =
-    routeKind === "server" && activeThreadModelSelection
-      ? getThreadRuntimeReadOnlyReason({
-          modelSelection: activeThreadModelSelection,
-          session: activeThread?.session ?? null,
-          settings,
-          providers: providerStatuses,
-        })
-      : null;
+  const runtimeReadOnlyReason = routeKind === "server" ? LEGACY_THREAD_READ_ONLY_REASON : null;
   const providerSetupInstanceId = noProviderAvailable
     ? (unavailableProviderInstanceId ??
       (lockedProvider === null
@@ -1478,7 +1469,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => selectedProviderEntry?.snapshot ?? null,
     [selectedProviderEntry],
   );
-  const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
+  const compactCommandAvailable =
+    routeKind !== "server" && providerSupportsManualCompaction(selectedProviderEntry);
   const selectedProviderSkills = selectedProviderStatus
     ? resolveProviderSkillsForCwd(selectedProviderStatus, gitCwd)
     : [];
@@ -3311,6 +3303,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   }, [isMobileViewport, routeKind, submitComposer]);
   const compactThreadContext = useCallback(() => {
     if (
+      runtimeReadOnlyReason !== null ||
       compactDisabled ||
       noProviderAvailable ||
       activePendingApproval !== null ||
@@ -3324,6 +3317,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     onCompactContext?.();
   }, [
+    runtimeReadOnlyReason,
     activePendingApproval,
     activeThreadId,
     compactDisabled,
@@ -4201,23 +4195,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     </ComposerControl>
   ) : legacy ? (
     <>
-      <NeoPiSessionModelPicker
-        threadRef={isServerThread ? legacyThreadRef : null}
+      <ProviderModelPicker
         isComposerOwned
         selectorContext={{
           environmentId,
           ...((activeThread?.projectId ?? pullRequestProjectId)
             ? { projectId: (activeThread?.projectId ?? pullRequestProjectId)! }
-            : {}),
-          ...(routeKind === "server" &&
-          activeThread?.session?.providerInstanceId &&
-          ["ready", "running", "interrupted"].includes(activeThread.session.status)
-            ? {
-                connectedThread: {
-                  threadId: activeThread.id,
-                  providerInstanceId: activeThread.session.providerInstanceId,
-                },
-              }
             : {}),
         }}
         disabled={providerCatalogPending || isSendBusy}
@@ -4275,7 +4258,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           onProviderModelSelect?.(instanceId, model);
         }}
       />
-      <NeoPiSessionStatus threadRef={isServerThread ? legacyThreadRef : null} />
 
       <>
         {restingBlockDefs.map((def, index) => {
@@ -5245,6 +5227,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             </ComposerBanner.Attachment>
           ) : null}
           {legacy &&
+          runtimeReadOnlyReason === null &&
           showComposerTopDrawer &&
           (!isTasksDrawerOpen || hasBlockingComposerTopDrawer) ? (
             <ComposerBanner.Attachment>
@@ -5782,6 +5765,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                   : "Ask anything, @tag files/folders, $use skills, or / for commands"
                     }
                     disabled={
+                      runtimeReadOnlyReason !== null ||
                       isConnecting ||
                       isComposerApprovalState ||
                       projectSelectionRequired ||
@@ -5879,41 +5863,45 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       </Tooltip>
                     </>
                   ) : null}
-                  <ComposerFooterPrimaryActions
-                    compact={isComposerPrimaryActionsCompact}
-                    activeContextWindow={
-                      selectedProvider !== "neopi" && settings.contextWindowMeterEnabled
-                        ? activeContextWindow
-                        : null
-                    }
-                    reserveContextWindowMeter={reserveContextWindowMeter}
-                    activeThreadModelDisplayName={activeThreadModelDisplayName}
-                    pendingAction={pendingPrimaryAction}
-                    isRunning={phase === "running"}
-                    showPlanFollowUpPrompt={
-                      pendingUserInputs.length === 0 && showPlanFollowUpPrompt
-                    }
-                    promptHasText={prompt.trim().length > 0}
-                    isSendBusy={isSendBusy}
-                    sendDisabledReason={sendDisabledReason}
-                    isConnecting={isConnecting}
-                    isEnvironmentUnavailable={
-                      environmentUnavailable !== null ||
-                      noProviderAvailable ||
-                      projectSelectionRequired
-                    }
-                    isPreparingWorktree={isPreparingWorktree}
-                    hasSendableContent={composerSendState.hasSendableContent}
-                    preserveComposerFocusOnPointerDown={isMobileViewport}
-                    onPreviousPendingQuestion={() => onPreviousActivePendingUserInputQuestion?.()}
-                    onInterrupt={handleInterruptPrimaryAction}
-                    onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
-                    compactDisabled={
-                      compactDisabled || noProviderAvailable || isSendBusy || isConnecting
-                    }
-                    compactDisabledReason={resolvedCompactDisabledReason}
-                    {...(compactCommandAvailable ? { onCompactContext: compactThreadContext } : {})}
-                  />
+                  {runtimeReadOnlyReason === null ? (
+                    <ComposerFooterPrimaryActions
+                      compact={isComposerPrimaryActionsCompact}
+                      activeContextWindow={
+                        selectedProvider !== "neopi" && settings.contextWindowMeterEnabled
+                          ? activeContextWindow
+                          : null
+                      }
+                      reserveContextWindowMeter={reserveContextWindowMeter}
+                      activeThreadModelDisplayName={activeThreadModelDisplayName}
+                      pendingAction={pendingPrimaryAction}
+                      isRunning={phase === "running"}
+                      showPlanFollowUpPrompt={
+                        pendingUserInputs.length === 0 && showPlanFollowUpPrompt
+                      }
+                      promptHasText={prompt.trim().length > 0}
+                      isSendBusy={isSendBusy}
+                      sendDisabledReason={sendDisabledReason}
+                      isConnecting={isConnecting}
+                      isEnvironmentUnavailable={
+                        environmentUnavailable !== null ||
+                        noProviderAvailable ||
+                        projectSelectionRequired
+                      }
+                      isPreparingWorktree={isPreparingWorktree}
+                      hasSendableContent={composerSendState.hasSendableContent}
+                      preserveComposerFocusOnPointerDown={isMobileViewport}
+                      onPreviousPendingQuestion={() => onPreviousActivePendingUserInputQuestion?.()}
+                      onInterrupt={handleInterruptPrimaryAction}
+                      onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
+                      compactDisabled={
+                        compactDisabled || noProviderAvailable || isSendBusy || isConnecting
+                      }
+                      compactDisabledReason={resolvedCompactDisabledReason}
+                      {...(compactCommandAvailable
+                        ? { onCompactContext: compactThreadContext }
+                        : {})}
+                    />
+                  ) : null}
                 </div>
               </div>
             )}

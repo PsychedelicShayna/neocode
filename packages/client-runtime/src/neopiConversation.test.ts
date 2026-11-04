@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { NeoPiJournalEntry, NeoPiJournalPage } from "@t3tools/contracts";
 import {
+  applyNativeConversationEvent,
+  emptyNativeConversationFeed,
   emptyNativeConversation,
   nativeNavigationGuards,
   reduceNativeConversation,
 } from "./neopiConversation.ts";
-import {
-  applyNativeConversationEvent,
-  emptyNativeConversationFeed,
-} from "./state/neopiConversation.ts";
 
 const identity = {
   sessionId: "native-session",

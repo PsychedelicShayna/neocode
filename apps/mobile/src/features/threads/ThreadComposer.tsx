@@ -1,4 +1,4 @@
-import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
+import { LEGACY_THREAD_READ_ONLY_REASON } from "@t3tools/shared/serverSettings";
 import { APP_BASE_NAME } from "../../lib/mobileBranding";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
@@ -321,12 +321,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       : "Send";
   const currentModelSelection = props.selectedThread.modelSelection;
   const currentRuntimeMode = props.selectedThread.runtimeMode;
-  const runtimeReadOnlyReason = getThreadRuntimeReadOnlyReason({
-    modelSelection: props.selectedThread.modelSelection,
-    session: props.selectedThread.session,
-    settings: props.serverConfig?.settings,
-    providers: props.serverConfig?.providers,
-  });
+  const runtimeReadOnlyReason = LEGACY_THREAD_READ_ONLY_REASON;
   const modelUnavailable =
     props.connectionState === "connected" &&
     isModelSelectionUnavailable(props.serverConfig, currentModelSelection);
@@ -895,7 +890,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 ) : null}
               </View>
             ) : null}
-            {!isExpanded ? (
+            {!runtimeReadOnlyReason && !isExpanded ? (
               <View className="flex-row items-center">
                 <ComposerDictationStartAction
                   state={voiceInput.state}
@@ -924,20 +919,24 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
             {isExpanded ? <View className="h-1" /> : null}
           </ComposerDictationDraftContent>
           <Animated.View
-            accessibilityElementsHidden={!isToolbarVisible}
+            accessibilityElementsHidden={!isToolbarVisible || !!runtimeReadOnlyReason}
             collapsable={false}
-            importantForAccessibility={isToolbarVisible ? "auto" : "no-hide-descendants"}
+            importantForAccessibility={
+              isToolbarVisible && !runtimeReadOnlyReason ? "auto" : "no-hide-descendants"
+            }
             layout={COMPOSER_LAYOUT_TRANSITION}
-            pointerEvents={isToolbarVisible ? "auto" : "none"}
+            pointerEvents={isToolbarVisible && !runtimeReadOnlyReason ? "auto" : "none"}
             style={
-              isExpanded
-                ? undefined
-                : {
-                    position: "absolute",
-                    bottom: 2,
-                    left: 0,
-                    right: 0,
-                  }
+              runtimeReadOnlyReason
+                ? { display: "none" }
+                : isExpanded
+                  ? undefined
+                  : {
+                      position: "absolute",
+                      bottom: 2,
+                      left: 0,
+                      right: 0,
+                    }
             }
           >
             <ComposerDictationToolbar

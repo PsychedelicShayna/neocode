@@ -2,7 +2,6 @@ import {
   type EnvironmentId,
   type ProjectScript,
   type ResolvedKeybindingsConfig,
-  type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -49,12 +48,8 @@ import { cn } from "~/lib/utils";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import { Button } from "../ui/button";
 import { Menu, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
-import { NeoPiTerminalHandoff } from "../neopi/NeoPiTerminalHandoff";
-import { NeoPiSessionConfiguration } from "../neopi/NeoPiSessionConfiguration";
 
 interface ChatHeaderProps {
-  runtimeMode: RuntimeMode;
-  onRuntimeModeChange: (mode: RuntimeMode) => void;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   draftId?: DraftId;
@@ -108,8 +103,6 @@ export const ChatHeader = memo(function ChatHeader({
   activeThreadId,
   draftId,
   activeThreadTitle,
-  runtimeMode,
-  onRuntimeModeChange,
   isServerThread,
   activeProject,
   activeProjectScripts,
@@ -447,12 +440,6 @@ export const ChatHeader = memo(function ChatHeader({
           )}
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
-      <NeoPiTerminalHandoff threadRef={isServerThread ? activeThreadRef : null} />
-      <NeoPiSessionConfiguration
-        threadRef={isServerThread ? activeThreadRef : null}
-        runtimeMode={runtimeMode}
-        onRuntimeModeChange={onRuntimeModeChange}
-      />
       <div
         ref={headerActionsRef}
         data-chat-header-actions
@@ -467,8 +454,7 @@ export const ChatHeader = memo(function ChatHeader({
         <Menu open={actionsCollapsed && actionsOpen} onOpenChange={setActionsOpen}>
           <MenuTrigger
             className={
-              actionsCollapsed &&
-              (activeProjectScripts || (activeProjectName && gitCwd))
+              actionsCollapsed && (activeProjectScripts || (activeProjectName && gitCwd))
                 ? undefined
                 : "hidden"
             }

@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { ProjectId, ThreadId } from "./baseSchemas.ts";
+import { ProjectId } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const NeoPiModelsScope = Schema.Literals(["global", "project"]);
@@ -7,8 +7,7 @@ export const NeoPiModelsTarget = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   sessionFile: Schema.optional(Schema.String),
   projectId: Schema.optional(ProjectId),
-  threadId: Schema.optional(ThreadId),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type NeoPiModelsTarget = typeof NeoPiModelsTarget.Type;
 export const NeoPiModelSelectorQuery = Schema.Struct({
   target: NeoPiModelsTarget,

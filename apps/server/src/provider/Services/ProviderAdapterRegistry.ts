@@ -32,10 +32,9 @@ export interface ProviderInstanceRoutingInfo {
 export interface ProviderAdapterRegistryShape {
   /**
    * Resolve the adapter for a specific instance id. Returns
-   * `ProviderUnsupportedError` if no such instance is currently registered
-   * (which covers "never configured" *and* "configured but the driver is
-   * unavailable in this build" — both surface the same failure to callers
-   * that expect a working adapter).
+   * `ProviderUnsupportedError` if the instance is unavailable or intentionally
+   * has no legacy adapter. Native-only runtimes remain discoverable through
+   * `ProviderInstanceRegistry` without joining SQL-backed session execution.
    */
   readonly getByInstance: (
     instanceId: ProviderInstanceId,
@@ -46,8 +45,8 @@ export interface ProviderAdapterRegistryShape {
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderUnsupportedError>;
 
   /**
-   * List all live instance ids. Excludes unavailable/shadow instances —
-   * callers of this method want something they can pass to `getByInstance`.
+   * List only instance ids with a real legacy adapter. Discovery-only and
+   * native-only instances cannot be passed to `getByInstance`.
    */
   readonly listInstances: () => Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
 

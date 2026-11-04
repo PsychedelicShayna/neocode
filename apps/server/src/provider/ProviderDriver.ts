@@ -84,7 +84,8 @@ export interface ProviderInstance {
     ProviderConsumeResetCreditOutcome,
     ProviderDriverError
   >;
-  readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+  /** Absent for runtimes that own execution outside the legacy SQL session engine. */
+  readonly adapter?: ProviderAdapterShape<ProviderAdapterError>;
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
 }
 

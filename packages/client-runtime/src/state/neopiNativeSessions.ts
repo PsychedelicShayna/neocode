@@ -361,6 +361,14 @@ export function createNativeSessionAtoms<R, E>(
           registry.refresh(list({ environmentId: target.environmentId, input: {} })),
         ),
     }),
+    handoff: createEnvironmentRpcCommand(runtime, {
+      label: "native-sessions:handoff",
+      tag: WS_METHODS.neopiNativeSessionsHandoff,
+      onSuccess: (target, registry) =>
+        Effect.sync(() =>
+          registry.refresh(list({ environmentId: target.environmentId, input: {} })),
+        ),
+    }),
     watch,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
   };

@@ -21,17 +21,6 @@ import {
   FilesystemBrowseError,
 } from "./filesystem.ts";
 import {
-  NeoPiSessionError,
-  NeoPiSessionListInput,
-  NeoPiSessionListResult,
-  NeoPiSessionResumeInput,
-  NeoPiSessionResumeResult,
-  NeoPiSessionHandoffInput,
-  NeoPiSessionHandoffResult,
-  NeoPiSessionConfigurationInput,
-  NeoPiSessionConfigurationResult,
-} from "./neopiSessions.ts";
-import {
   NeoPiNativeSessionsError,
   NeoPiNativeSessionsListInput,
   NeoPiNativeSessionsListResult,
@@ -42,19 +31,11 @@ import {
   NeoPiNativeSessionsStreamEvent,
   NeoPiNativeSessionsCloseInput,
   NeoPiNativeSessionsCloseResult,
+  NeoPiNativeSessionsHandoffInput,
+  NeoPiNativeSessionsHandoffResult,
   NeoPiNativeSessionsGetDiffPreviewInput,
   NeoPiNativeSessionsGetDiffFileContentsInput,
 } from "./neopiNativeSessions.ts";
-import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
-import {
-  NeoPiWatchJournalInput,
-  NeoPiJournalStreamEvent,
-  NeoPiNavigateTreeInput,
-  NeoPiResumeTreeInput,
-  NeoPiTreeOperationResult,
-  NeoPiTreeResumeResult,
-  NeoPiTreeCancelResult,
-} from "./neopiNativeConversation.ts";
 import {
   NeoPiThemesInput,
   NeoPiThemesConfiguration,
@@ -324,18 +305,9 @@ export const WS_METHODS = {
   neopiNativeSessionsRequest: "neopiNativeSessions.request",
   neopiNativeSessionsWatch: "neopiNativeSessions.watch",
   neopiNativeSessionsClose: "neopiNativeSessions.close",
+  neopiNativeSessionsHandoff: "neopiNativeSessions.handoff",
   neopiNativeSessionsGetDiffPreview: "neopiNativeSessions.getDiffPreview",
   neopiNativeSessionsGetDiffFileContents: "neopiNativeSessions.getDiffFileContents",
-  neopiSessionsList: "neopiSessions.list",
-  neopiSessionsResume: "neopiSessions.resume",
-  neopiSessionsHandoff: "neopiSessions.handoff",
-  neopiSessionsConfiguration: "neopiSessions.configuration",
-  neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
-  neopiSessionsJournal: "neopiSessions.journal",
-  neopiSessionsWatchJournal: "neopiSessions.watchJournal",
-  neopiSessionsNavigateTree: "neopiSessions.navigateTree",
-  neopiSessionsResumeTree: "neopiSessions.resumeTree",
-  neopiSessionsCancelNavigation: "neopiSessions.cancelNavigation",
   neopiThemesRead: "neopiThemes.read",
   neopiThemesPalette: "neopiThemes.palette",
   neopiModelsRead: "neopiModels.read",
@@ -939,28 +911,6 @@ const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
   error: Schema.Union([FilesystemBrowseError, EnvironmentAuthorizationError]),
 });
 
-const WsNeoPiWatchJournalRpc = Rpc.make(WS_METHODS.neopiSessionsWatchJournal, {
-  payload: NeoPiWatchJournalInput,
-  success: NeoPiJournalStreamEvent,
-  error: EnvironmentAuthorizationError,
-  stream: true,
-});
-const WsNeoPiNavigateTreeRpc = Rpc.make(WS_METHODS.neopiSessionsNavigateTree, {
-  payload: NeoPiNavigateTreeInput,
-  success: NeoPiTreeOperationResult,
-  error: EnvironmentAuthorizationError,
-});
-const WsNeoPiResumeTreeRpc = Rpc.make(WS_METHODS.neopiSessionsResumeTree, {
-  payload: NeoPiResumeTreeInput,
-  success: NeoPiTreeResumeResult,
-  error: EnvironmentAuthorizationError,
-});
-const WsNeoPiCancelNavigationRpc = Rpc.make(WS_METHODS.neopiSessionsCancelNavigation, {
-  payload: NeoPiWatchJournalInput,
-  success: NeoPiTreeCancelResult,
-  error: EnvironmentAuthorizationError,
-});
-
 const NeoPiNativeSessionsRpcError = Schema.Union([
   NeoPiNativeSessionsError,
   EnvironmentAuthorizationError,
@@ -991,6 +941,11 @@ const WsNeoPiNativeSessionsCloseRpc = Rpc.make(WS_METHODS.neopiNativeSessionsClo
   success: NeoPiNativeSessionsCloseResult,
   error: NeoPiNativeSessionsRpcError,
 });
+const WsNeoPiNativeSessionsHandoffRpc = Rpc.make(WS_METHODS.neopiNativeSessionsHandoff, {
+  payload: NeoPiNativeSessionsHandoffInput,
+  success: NeoPiNativeSessionsHandoffResult,
+  error: NeoPiNativeSessionsRpcError,
+});
 const NeoPiNativeReviewRpcError = Schema.Union([
   ReviewDiffPreviewError,
   NeoPiNativeSessionsError,
@@ -1013,39 +968,6 @@ const WsNeoPiNativeSessionsGetDiffFileContentsRpc = Rpc.make(
   },
 );
 
-const WsNeoPiSessionsListRpc = Rpc.make(WS_METHODS.neopiSessionsList, {
-  payload: NeoPiSessionListInput,
-  success: NeoPiSessionListResult,
-  error: Schema.Union([NeoPiSessionError, EnvironmentAuthorizationError]),
-});
-const WsNeoPiSessionsResumeRpc = Rpc.make(WS_METHODS.neopiSessionsResume, {
-  payload: NeoPiSessionResumeInput,
-  success: NeoPiSessionResumeResult,
-  error: Schema.Union([NeoPiSessionError, EnvironmentAuthorizationError]),
-});
-const WsNeoPiSessionsHandoffRpc = Rpc.make(WS_METHODS.neopiSessionsHandoff, {
-  payload: NeoPiSessionHandoffInput,
-  success: NeoPiSessionHandoffResult,
-  error: Schema.Union([NeoPiSessionError, EnvironmentAuthorizationError]),
-});
-const WsNeoPiSessionsConfigurationRpc = Rpc.make(WS_METHODS.neopiSessionsConfiguration, {
-  payload: NeoPiSessionConfigurationInput,
-  success: NeoPiSessionConfigurationResult,
-  error: Schema.Union([NeoPiSessionError, EnvironmentAuthorizationError]),
-});
-
-const WsNeoPiSessionsWatchConfigurationRpc = Rpc.make(WS_METHODS.neopiSessionsWatchConfiguration, {
-  payload: NeoPiSessionConfigurationInput,
-  success: NeoPiSessionConfigurationResult,
-  error: Schema.Union([NeoPiSessionError, EnvironmentAuthorizationError]),
-  stream: true,
-});
-
-const WsNeoPiSessionsJournalRpc = Rpc.make(WS_METHODS.neopiSessionsJournal, {
-  payload: NeoPiSessionJournalInput,
-  success: NeoPiSessionJournalResult,
-  error: EnvironmentAuthorizationError,
-});
 const WsNeoPiThemesReadRpc = Rpc.make(WS_METHODS.neopiThemesRead, {
   payload: NeoPiThemesInput,
   success: NeoPiThemesConfiguration,
@@ -1581,18 +1503,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiNativeSessionsRequestRpc,
   WsNeoPiNativeSessionsWatchRpc,
   WsNeoPiNativeSessionsCloseRpc,
+  WsNeoPiNativeSessionsHandoffRpc,
   WsNeoPiNativeSessionsGetDiffPreviewRpc,
   WsNeoPiNativeSessionsGetDiffFileContentsRpc,
-  WsNeoPiSessionsListRpc,
-  WsNeoPiSessionsResumeRpc,
-  WsNeoPiSessionsHandoffRpc,
-  WsNeoPiSessionsConfigurationRpc,
-  WsNeoPiSessionsWatchConfigurationRpc,
-  WsNeoPiSessionsJournalRpc,
-  WsNeoPiWatchJournalRpc,
-  WsNeoPiNavigateTreeRpc,
-  WsNeoPiResumeTreeRpc,
-  WsNeoPiCancelNavigationRpc,
   WsNeoPiThemesReadRpc,
   WsNeoPiThemesPaletteRpc,
   WsNeoPiModelsReadRpc,

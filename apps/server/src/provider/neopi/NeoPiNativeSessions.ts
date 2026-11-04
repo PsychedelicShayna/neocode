@@ -51,6 +51,7 @@ import {
   neoPiSessionCatalogSource,
   type NeoPiSessionCatalogSource,
 } from "./NeoPiSessionCatalogSource.ts";
+import { registerNeoPiUsageConnection } from "./NeoPiLiveUsage.ts";
 
 const CatalogRow = Schema.Struct({
   path: Schema.String,
@@ -94,6 +95,7 @@ const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
 };
 const fail = (message: string, code = "session_unavailable") =>
   new NeoPiNativeSessionsError({ message, code });
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export interface NeoPiNativeProfile {
   readonly providerInstanceId: ProviderInstanceId;
@@ -389,6 +391,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         Effect.provideService(Scope.Scope, scope),
       );
       yield* native.hostTools?.bind(current.ref) ?? Effect.void;
+      yield* registerNeoPiUsageConnection(profile.source, {
+        client: native.client,
+        validate: Effect.gen(function* () {
+          yield* profile.validate;
+          if (current.closed) return yield* fail("This native connection is closed.", "closed");
+        }),
+      }).pipe(Effect.provideService(Scope.Scope, scope));
       yield* Deferred.await(native.client.exit).pipe(
         Effect.flatMap((exit) =>
           finish(
@@ -749,6 +758,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         return Stream.merge(snapshotAndEvents, ui, { haltStrategy: "either" });
       }),
     ).pipe(Stream.mapError(nativeError), Stream.scoped);
+  const release = (session: NativeSession, reason: string) =>
+    Effect.gen(function* () {
+      yield* finish(session, reason);
+      if (session.native.attachment === "owned")
+        yield* session.native.client
+          .request({ type: "abort" })
+          .pipe(Effect.timeoutOption("2 seconds"), Effect.ignore);
+      // EOF disposes an owned RPC runtime; ctl pipe EOF detaches only its control socket.
+      yield* Scope.close(session.scope, Exit.void);
+    });
   const close = (input: {
     ref: NeoPiNativeSessionRef;
   }): Effect.Effect<{ closed: boolean }, NeoPiNativeSessionsError> =>
@@ -763,14 +782,39 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               "This native connection belongs to another configured instance.",
               "profile_conflict",
             );
-          yield* finish(session, "The native connection was explicitly closed.");
-          if (session.native.attachment === "owned")
-            yield* session.native.client
-              .request({ type: "abort" })
-              .pipe(Effect.timeoutOption("2 seconds"), Effect.ignore);
-          // EOF disposes an owned RPC runtime; ctl pipe EOF detaches only its control socket.
-          yield* Scope.close(session.scope, Exit.void);
+          yield* release(session, "The native connection was explicitly closed.");
           return { closed: true };
+        }),
+      );
+    }).pipe(Effect.uninterruptible, Effect.mapError(nativeError));
+  const handoff = (ref: NeoPiNativeSessionRef) =>
+    Effect.gen(function* () {
+      const file = yield* dependencies.canonicalize(ref.sessionFile);
+      return yield* (yield* gate(file)).withPermits(1)(
+        Effect.gen(function* () {
+          const session = yield* requireSession(ref);
+          yield* refresh(session);
+          yield* verifyRef(session, ref);
+          const { sessionId, cwd, profile } = session;
+          yield* release(session, "The native connection was handed off to a terminal.");
+          yield* profile.validate;
+          const rows = yield* dependencies.catalog(profile, undefined, file);
+          for (const row of rows) {
+            if ((yield* dependencies.canonicalize(row.path)) !== file) continue;
+            if (row.inUse)
+              return yield* fail(
+                `This session is still open in the terminal process (PID ${row.inUse.pid}). NeoCode merely detached; close the session in that terminal before resuming it elsewhere.`,
+                "session_in_use",
+              );
+            if (row.id !== sessionId)
+              return yield* fail(
+                "The native session changed during handoff. Select it again.",
+                "session_changed",
+              );
+          }
+          const selectedProfile = profile.source.env.OMP_PROFILE;
+          const command = `cd ${shellQuote(cwd)} && ${selectedProfile ? `OMP_PROFILE=${shellQuote(selectedProfile)} ` : ""}${shellQuote(profile.source.binary)} --session ${shellQuote(file)}`;
+          return { sessionFile: file, sessionId, cwd, command };
         }),
       );
     }).pipe(Effect.uninterruptible, Effect.mapError(nativeError));
@@ -830,7 +874,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         ),
       ),
     ).pipe(Effect.forkIn(lifetime));
-  return { list, open, request, watch, close, modelsConnection, resolveWorkspace };
+  return { list, open, request, watch, close, handoff, modelsConnection, resolveWorkspace };
 });
 
 /** Uses the configured runtime/profile and its existing CLI + RPC/control transports. No SQL bindings. */

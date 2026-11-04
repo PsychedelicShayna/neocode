@@ -77,24 +77,9 @@ export function isModelSelectionProviderEnabled(
   return selection.instanceId === "neopi" && settings.providers.neopi.enabled === true;
 }
 
-/** Stored runtime identity wins over a draft model choice, so old history cannot be reinterpreted. */
-export function getThreadRuntimeReadOnlyReason(input: {
-  readonly modelSelection: ModelSelection;
-  readonly session?: { readonly providerName?: string | null } | null;
-  readonly settings?: Pick<ServerSettings, "providerInstances"> | undefined;
-  readonly providers?: ReadonlyArray<Pick<ServerProvider, "instanceId" | "driver">>;
-}): string | null {
-  const instanceId = input.modelSelection.instanceId;
-  const driver =
-    input.session?.providerName ??
-    input.settings?.providerInstances[instanceId]?.driver ??
-    input.providers?.find((provider) => provider.instanceId === instanceId)?.driver ??
-    (instanceId === "neopi" ? "neopi" : undefined);
-  if (driver === "neopi") return null;
-  return driver
-    ? `This saved thread uses ${driver}. NeoCode only runs NeoPi, so its history is read-only.`
-    : "This saved thread's runtime is unavailable. Its history is read-only.";
-}
+/** Archived SQL conversations never select or own a native execution session. */
+export const LEGACY_THREAD_READ_ONLY_REASON =
+  "This saved conversation is read-only. Open its original NeoPi session from Native sessions, or start a new native conversation.";
 
 export function resolveSourceControlWriterModelSelection(
   settings: ServerSettings,

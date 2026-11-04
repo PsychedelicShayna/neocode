@@ -8,13 +8,13 @@ import type {
 import * as DateTime from "effect/DateTime";
 import type { EnvironmentRpcSuccess, EnvironmentRpcStreamValue } from "./rpc/client.ts";
 import {
+  applyNativeConversationEvent,
   emptyNativeConversation,
   reduceNativeConversation,
   sameNativeSession,
   type NativeConversation,
   type NativeIdentity,
 } from "./neopiConversation.ts";
-import { applyNativeConversationEvent } from "./state/neopiConversation.ts";
 import {
   disconnectNativeSubagents,
   reduceNativeSubagents,

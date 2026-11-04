@@ -91,7 +91,6 @@ import {
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
 import { threadRouteIsHydrating } from "./thread-route-hydration";
-import { NeoPiSessionConfiguration } from "./NeoPiSessions";
 
 function ThreadHeader(
   props: Parameters<typeof useThreadHeaderOptions>[0] & {
@@ -965,9 +964,9 @@ function ThreadRouteContent(
           connectionError={routeConnectionError}
           environmentLabel={selectedEnvironmentConnection?.environmentLabel ?? null}
           selectedThreadFeed={composer.selectedThreadFeed}
-          activeWorkStartedAt={composer.activeWorkStartedAt}
-          isCompacting={composer.isCompacting}
-          creationState={creationState}
+          activeWorkStartedAt={null}
+          isCompacting={false}
+          creationState={null}
           setupWorkingStartedAt={
             composer.activeWorkStartedAt !== null &&
             selectedThreadDetail?.activities.some(
@@ -994,9 +993,9 @@ function ThreadRouteContent(
                 }
               : null
           }
-          activePendingApproval={requests.activePendingApproval}
+          activePendingApproval={null}
           respondingApprovalId={requests.respondingApprovalId}
-          activePendingUserInput={requests.activePendingUserInput}
+          activePendingUserInput={null}
           activePendingUserInputDrafts={requests.activePendingUserInputDrafts}
           activePendingUserInputAnswers={requests.activePendingUserInputAnswers}
           respondingUserInputId={requests.respondingUserInputId}
@@ -1055,18 +1054,6 @@ function ThreadRouteContent(
         onOpenFilesInspector={handleOpenFilesInspector}
         onReturnToThread={props.onReturnToThread}
       />
-      {serverConfig?.providers.some(
-        (provider) =>
-          provider.driver === "neopi" &&
-          provider.instanceId ===
-            (selectedThread.session?.providerInstanceId ??
-              selectedThread.modelSelection.instanceId),
-      ) ? (
-        <NeoPiSessionConfiguration
-          key={`${environmentId}:${threadId}`}
-          threadRef={{ environmentId, threadId: selectedThread.id }}
-        />
-      ) : null}
 
       {renderThreadRouteBody()}
     </>

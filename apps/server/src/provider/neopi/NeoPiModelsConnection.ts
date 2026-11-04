@@ -1,8 +1,15 @@
 import { NeoPiModelsError } from "@t3tools/contracts";
-import type { NeoPiRpcClient, UiRequestFrame } from "effect-neopi-rpc/client";
+import {
+  make as makeClient,
+  type NeoPiRpcClient,
+  type SpawnFn,
+  type UiRequestFrame,
+} from "effect-neopi-rpc/client";
 import * as Effect from "effect/Effect";
 import * as PubSub from "effect/PubSub";
+import * as RcMap from "effect/RcMap";
 import * as Stream from "effect/Stream";
+import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 
 export interface NeoPiModelsConnection {
   readonly capabilities: ReadonlySet<string>;
@@ -40,3 +47,46 @@ export const makeNeoPiModelsConnection = Effect.fn("NeoPiModelsConnection.make")
     validate: Effect.void,
   } satisfies NeoPiModelsConnection;
 });
+
+/** Own only no-session configuration connections, cached by the actual configuration cwd. */
+export const makeNeoPiConfigurationConnections = Effect.fn("NeoPiConfigurationConnections.make")(
+  function* (options: {
+    readonly binary: string;
+    readonly environment: Record<string, string>;
+    readonly profile: string;
+    readonly launchArgs?: string;
+    readonly spawn: SpawnFn;
+  }) {
+    const clients = yield* RcMap.make({
+      lookup: (cwd: string) =>
+        Effect.gen(function* () {
+          const extra = yield* parseNeoPiLaunchArguments(options.launchArgs);
+          const client = yield* makeClient({
+            spawn: options.spawn,
+            command: options.binary,
+            cwd,
+            env: {
+              ...options.environment,
+              ...(options.profile ? { OMP_PROFILE: options.profile } : {}),
+            },
+            args: [
+              "--mode",
+              "rpc-ui",
+              "--cwd",
+              cwd,
+              "--no-session",
+              "--no-tools",
+              "--no-skills",
+              "--no-rules",
+              "--no-title",
+              ...extra,
+            ],
+          });
+          return yield* makeNeoPiModelsConnection(client);
+        }).pipe(Effect.mapError((cause) => new NeoPiModelsError({ message: cause.message }))),
+      idleTimeToLive: "30 seconds",
+      capacity: 4,
+    });
+    return (cwd: string) => RcMap.get(clients, cwd);
+  },
+);

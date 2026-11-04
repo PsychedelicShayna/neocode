@@ -1944,7 +1944,7 @@ function ProviderAccounts({
                         Use this account
                         {!connectedOwner ? (
                           <span className="text-xs text-muted-foreground">
-                            Open from a connected thread
+                            Open from a connected native session
                           </span>
                         ) : null}
                       </MenuItem>

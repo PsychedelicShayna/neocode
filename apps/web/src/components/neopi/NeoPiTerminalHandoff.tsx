@@ -1,4 +1,4 @@
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -7,37 +7,29 @@ import { TerminalIcon } from "lucide-react";
 import { useState } from "react";
 
 import { writeTextToClipboard } from "../../hooks/useCopyToClipboard";
-import { useServerConfigs, useThreadShell } from "../../state/entities";
-import { neopiSessionHandoff } from "../../state/neopiSessions";
+import { nativeSessionAtoms, selectNativeSession } from "../../state/neopiNativeSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 
-export function NeoPiTerminalHandoff({ threadRef }: { threadRef: ScopedThreadRef | null }) {
-  const thread = useThreadShell(threadRef);
-  const configs = useServerConfigs();
-  const handoff = useAtomCommand(neopiSessionHandoff, { reportFailure: false });
+export function NeoPiTerminalHandoff({
+  target,
+  connected,
+}: {
+  target: NativeSessionTarget;
+  connected: boolean;
+}) {
+  const handoff = useAtomCommand(nativeSessionAtoms.handoff, { reportFailure: false });
   const [pending, setPending] = useState(false);
-  const provider =
-    threadRef && thread
-      ? configs
-          .get(threadRef.environmentId)
-          ?.providers.find(
-            (entry) =>
-              entry.instanceId ===
-              (thread.session?.providerInstanceId ?? thread.modelSelection.instanceId),
-          )
-      : null;
-  if (!threadRef || !thread || provider?.driver !== "neopi") return null;
 
   async function continueInTerminal() {
-    if (pending || !threadRef) return;
+    if (pending || !connected) return;
     setPending(true);
     try {
       const result = await handoff({
-        environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId },
+        environmentId: target.environmentId,
+        input: { ref: target.ref },
       });
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) throw squashAtomCommandFailure(result);
@@ -56,6 +48,7 @@ export function NeoPiTerminalHandoff({ threadRef }: { threadRef: ScopedThreadRef
         description: command,
         timeout: 0,
       });
+      selectNativeSession(null);
     } catch (cause) {
       toastManager.add({
         type: "error",
@@ -76,7 +69,7 @@ export function NeoPiTerminalHandoff({ threadRef }: { threadRef: ScopedThreadRef
             size="icon-sm"
             variant="ghost"
             aria-label="Continue in terminal"
-            disabled={pending}
+            disabled={pending || !connected}
             onClick={() => {
               void continueInTerminal();
             }}

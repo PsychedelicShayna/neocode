@@ -23,9 +23,16 @@ interface Dashboard {
   readonly source: NeoPiSessionCatalogSource;
   readonly close: Effect.Effect<void>;
   readonly alive: () => boolean;
+}
+
+interface DashboardEntry {
+  readonly source: NeoPiSessionCatalogSource;
+  readonly opening: Fiber.Fiber<Dashboard, NeoPiRuntimeError>;
   users: number;
   idle: Fiber.Fiber<void> | undefined;
 }
+
+const STATS_IDLE_DEBOUNCE = "30 seconds";
 
 const decodeReady = Schema.decodeUnknownSync(
   Schema.fromJsonString(
@@ -154,8 +161,6 @@ const launch = (source: NeoPiSessionCatalogSource, cwd: string) =>
         source,
         close,
         alive: () => child.exitCode === null && child.signalCode === null && !closed,
-        users: 0,
-        idle: undefined,
       } satisfies Dashboard;
     }),
   );
@@ -164,19 +169,31 @@ const make = Effect.gen(function* () {
   const registry = yield* ProviderInstanceRegistry;
   const config = yield* ServerConfig;
   const lifetime = yield* Effect.scope;
-  const dashboards = new Map<string, Fiber.Fiber<Dashboard, NeoPiRuntimeError>>();
+  const dashboards = new Map<string, DashboardEntry>();
   const launches = yield* Semaphore.make(1);
-  const discard = Effect.fnUntraced(function* (key: string) {
-    const pending = dashboards.get(key);
-    dashboards.delete(key);
-    if (!pending) return;
-    const dashboard = yield* Fiber.join(pending).pipe(Effect.option);
-    if (dashboard._tag === "None") return;
-    if (dashboard.value.idle) yield* Fiber.interrupt(dashboard.value.idle);
-    yield* dashboard.value.close;
+  const stop = Effect.fnUntraced(function* (entry: DashboardEntry) {
+    const idle = entry.idle;
+    entry.idle = undefined;
+    if (idle) yield* Fiber.interrupt(idle);
+    // A cancelled bootstrap still owns its startup. Interrupting it runs
+    // launch's captured-child cleanup rather than waiting for readiness.
+    yield* Fiber.interrupt(entry.opening);
+    const result = yield* Fiber.await(entry.opening);
+    if (result._tag === "Success") yield* result.value.close;
   });
+  const discard = Effect.fnUntraced(function* (key: string, expected?: DashboardEntry) {
+    const entry = yield* launches.withPermits(1)(
+      Effect.sync(() => {
+        const current = dashboards.get(key);
+        if (expected !== undefined && current !== expected) return;
+        dashboards.delete(key);
+        return current;
+      }),
+    );
+    if (entry) yield* stop(entry);
+  }, Effect.uninterruptible);
   yield* Effect.addFinalizer(() =>
-    Effect.forEach(Array.from(dashboards.keys()), discard, { discard: true }),
+    Effect.forEach(Array.from(dashboards.keys()), (key) => discard(key), { discard: true }),
   );
   const changes = yield* registry.subscribeChanges;
   yield* Effect.gen(function* () {
@@ -184,13 +201,7 @@ const make = Effect.gen(function* () {
     const sources = new Set((yield* registry.listInstances).map(neoPiSessionCatalogSource));
     yield* Effect.forEach(
       Array.from(dashboards),
-      ([key, pending]) =>
-        Fiber.join(pending).pipe(
-          Effect.flatMap((dashboard) =>
-            sources.has(dashboard.source) ? Effect.void : discard(key),
-          ),
-          Effect.ignore,
-        ),
+      ([key, entry]) => (sources.has(entry.source) ? Effect.void : discard(key, entry)),
       { discard: true },
     );
   }).pipe(Effect.forever, Effect.forkScoped);
@@ -208,65 +219,62 @@ const make = Effect.gen(function* () {
         message: "The selected NeoPi runtime is unavailable.",
       });
     const key = `${sessionId}/${instanceId}/${viewId}`;
-    const opening = yield* launches.withPermits(1)(
-      Effect.gen(function* () {
-        let pending = dashboards.get(key);
-        if (!pending) {
-          if (!bootstrap)
-            return yield* new NeoPiRuntimeError({
-              code: "closed",
-              message: "This stats view has closed. Reopen Stats.",
-            });
-          pending = yield* launch(source, config.cwd).pipe(
-            Effect.tapError(() =>
-              Effect.sync(() => {
-                if (dashboards.get(key) === pending) dashboards.delete(key);
-              }),
-            ),
-            Effect.forkIn(lifetime, { startImmediately: false, uninterruptible: false }),
-          );
-          dashboards.set(key, pending);
-        }
-        return pending;
-      }).pipe(Effect.uninterruptible),
-    );
-    const dashboard = yield* Fiber.join(opening).pipe(
-      Effect.tapError(() =>
-        Effect.sync(() => {
-          if (dashboards.get(key) === opening) dashboards.delete(key);
+    // Register the lease before awaiting readiness. Otherwise a disconnected
+    // /embed request leaves an ownerless launch outside every release path.
+    const entry = yield* Effect.acquireRelease(
+      launches.withPermits(1)(
+        Effect.gen(function* () {
+          let current = dashboards.get(key);
+          if (!current) {
+            if (!bootstrap)
+              return yield* new NeoPiRuntimeError({
+                code: "closed",
+                message: "This stats view has closed. Reopen Stats.",
+              });
+            const opening = yield* launch(source, config.cwd).pipe(
+              Effect.forkIn(lifetime, { startImmediately: false, uninterruptible: false }),
+            );
+            current = { source, opening, users: 0, idle: undefined };
+            dashboards.set(key, current);
+          }
+          current.users++;
+          if (current.idle) {
+            const idle = current.idle;
+            current.idle = undefined;
+            yield* Fiber.interrupt(idle);
+          }
+          return current;
         }),
       ),
+      (current) =>
+        launches.withPermits(1)(
+          Effect.gen(function* () {
+            current.users--;
+            if (current.users !== 0 || dashboards.get(key) !== current) return;
+            current.idle = yield* Effect.gen(function* () {
+              if (current.users !== 0 || dashboards.get(key) !== current) return;
+              dashboards.delete(key);
+              current.idle = undefined;
+              yield* stop(current);
+            }).pipe(
+              Effect.uninterruptible,
+              Effect.delay(STATS_IDLE_DEBOUNCE),
+              Effect.forkIn(lifetime, { uninterruptible: false }),
+            );
+          }),
+        ),
     );
-    if (dashboard.source !== source || !dashboard.alive()) {
-      yield* discard(key);
+    const dashboard = yield* Fiber.join(entry.opening).pipe(
+      Effect.tapError(() => discard(key, entry)),
+    );
+    if (dashboards.get(key) !== entry || dashboard.source !== source || !dashboard.alive()) {
+      yield* discard(key, entry);
       return yield* new NeoPiRuntimeError({
         code: "closed",
         message: "The NeoPi runtime changed or stopped. Reopen Stats.",
       });
     }
-    return yield* Effect.acquireRelease(
-      Effect.gen(function* () {
-        dashboard.users++;
-        if (dashboard.idle) {
-          yield* Fiber.interrupt(dashboard.idle);
-          dashboard.idle = undefined;
-        }
-        return dashboard;
-      }),
-      () =>
-        Effect.gen(function* () {
-          dashboard.users--;
-          if (dashboard.users === 0 && dashboards.get(key) === opening) {
-            dashboard.idle = yield* Effect.gen(function* () {
-              dashboard.idle = undefined;
-              if (dashboards.get(key) === opening) yield* discard(key);
-            }).pipe(
-              Effect.delay("60 seconds"),
-              Effect.forkIn(lifetime, { uninterruptible: false }),
-            );
-          }
-        }),
-    );
+    return dashboard;
   });
   const release = (instanceId: string, viewId: string, sessionId: string) =>
     discard(`${sessionId}/${instanceId}/${viewId}`);

@@ -2,8 +2,10 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Net from "@t3tools/shared/Net";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
@@ -135,5 +137,84 @@ it.effect("preserves installed status after probes and cleans failed agent activ
     expect(forwards).toBe(1);
     yield* host.stop;
     expect(forwards).toBe(0);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("releases interrupted SSH startups before a retry takes ownership", () =>
+  Effect.gen(function* () {
+    for (const stage of ["readiness", "publication"]) {
+      yield* Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const home = yield* fs.makeTempDirectoryScoped();
+        const paused = yield* Deferred.make<void>();
+        let holdStartup = true;
+        let forwards = 0;
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (command._tag !== "StandardCommand") return yield* Effect.die("Unexpected command");
+            const forwarding = command.args.includes("-N");
+            if (forwarding) {
+              forwards++;
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  forwards--;
+                }),
+              );
+            }
+            const output = JSON.stringify({
+              nodePath: "/node",
+              platforms: [{ platform: "ios", available: true }],
+              hubPort: 1234,
+              helpers: { serveSimAxSettings: null, serveSimCli: null },
+            });
+            return ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(123),
+              stdout: Stream.make(new TextEncoder().encode(output)),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              exitCode: forwarding ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              isRunning: Effect.succeed(forwarding),
+              kill: () => Effect.void,
+              stdin: Sink.drain,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+              unref: Effect.succeed(Effect.void),
+            });
+          }),
+        );
+        const host = yield* SshDeviceHost.make(
+          { id: "test", label: "Test", target: "test.example" },
+          () => Effect.void,
+          (status) =>
+            holdStartup && stage === "publication" && status === "ready"
+              ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Effect.never))
+              : Effect.void,
+        ).pipe(
+          Effect.provide(Layer.mergeAll(ServerConfig.layerTest(home, home), Net.layer)),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              holdStartup && stage === "readiness"
+                ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(HttpClientResponse.fromWeb(request, new Response("ok"))),
+            ),
+          ),
+        );
+        const startup = yield* host.ensureReady(() => Effect.void).pipe(Effect.forkChild);
+        yield* Deferred.await(paused);
+        expect(forwards).toBe(1);
+        yield* Fiber.interrupt(startup);
+        expect(forwards).toBe(0);
+        expect(yield* host.current).toBeNull();
+
+        holdStartup = false;
+        yield* host.ensureReady(() => Effect.void);
+        expect(forwards).toBe(1);
+        expect(yield* host.current).not.toBeNull();
+        yield* host.stop;
+        expect(forwards).toBe(0);
+      }).pipe(Effect.scoped);
+    }
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

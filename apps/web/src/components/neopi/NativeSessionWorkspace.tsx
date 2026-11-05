@@ -245,6 +245,13 @@ export function NativeSessionView({
   );
   const [composerElement, setComposerElement] = useState<HTMLDivElement | null>(null);
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
+  useEffect(() => {
+    const item = expandedImage?.images[expandedImage.index];
+    // Local video expansions mint their own URL; image previews belong to the draft.
+    if (item?.type !== "video" || item.src === null || !item.src.startsWith("blob:")) return;
+    const src = item.src;
+    return () => URL.revokeObjectURL(src);
+  }, [expandedImage]);
   const sendingRef = useRef(false);
   const focusComposer = useCallback(() => composerRef.current?.focusAtEnd(), [composerRef]);
   // The workspace remounts after Models Back; the draft stays in its store.

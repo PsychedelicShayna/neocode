@@ -768,26 +768,32 @@ function NativeMobileDialog({
               {(Array.isArray(question.options) ? question.options : []).map((item, index) => {
                 const option = nativeRecord(item);
                 const label = String(option.label);
+                const description =
+                  typeof option.description === "string" ? option.description.trim() : "";
                 return (
-                  <MaterialButton
-                    key={index}
-                    label={`${answer.selectedOptions.includes(label) ? "✓ " : ""}${label}`}
-                    tone="secondary"
-                    disabled={pending}
-                    onPress={() =>
-                      setAnswers({
-                        ...answers,
-                        [id]: {
-                          ...answer,
-                          selectedOptions: question.multi
-                            ? answer.selectedOptions.includes(label)
-                              ? answer.selectedOptions.filter((value) => value !== label)
-                              : [...answer.selectedOptions, label]
-                            : [label],
-                        },
-                      })
-                    }
-                  />
+                  <View key={index} className="gap-1">
+                    <MaterialButton
+                      label={`${answer.selectedOptions.includes(label) ? "✓ " : ""}${label}`}
+                      tone="secondary"
+                      disabled={pending}
+                      onPress={() =>
+                        setAnswers({
+                          ...answers,
+                          [id]: {
+                            ...answer,
+                            selectedOptions: question.multi
+                              ? answer.selectedOptions.includes(label)
+                                ? answer.selectedOptions.filter((value) => value !== label)
+                                : [...answer.selectedOptions, label]
+                              : [label],
+                          },
+                        })
+                      }
+                    />
+                    {description ? (
+                      <Text className="text-sm text-foreground-muted">{description}</Text>
+                    ) : null}
+                  </View>
                 );
               })}
               <NativeField

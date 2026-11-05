@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { ComposerContextId, EnvironmentId } from "@t3tools/contracts";
 import { formatComposerContextReference } from "@t3tools/shared/composerContextReferences";
 import {
@@ -6,7 +6,41 @@ import {
   type ComposerThreadDraftState,
 } from "../../composerDraftStore";
 import { terminalContextReference } from "../../lib/composerContextRecords";
-import { remainingNativeDraft, remainingNativePersistedDraft } from "./neopiNativeComposer";
+import {
+  captureNativeComposerFocus,
+  remainingNativeDraft,
+  remainingNativePersistedDraft,
+} from "./neopiNativeComposer";
+
+describe("native send focus ownership", () => {
+  it("refocuses the initiating editor while it is still current", () => {
+    const composer = { focusAtEnd: vi.fn() };
+    const refocus = captureNativeComposerFocus({ current: composer });
+    refocus();
+    expect(composer.focusAtEnd).toHaveBeenCalledOnce();
+  });
+
+  it("does not focus a replacement editor after a delayed send", async () => {
+    const previous = { focusAtEnd: vi.fn() };
+    const next = { focusAtEnd: vi.fn() };
+    const ref = { current: previous };
+    const refocus = captureNativeComposerFocus(ref);
+    const completion = Promise.resolve().then(refocus);
+    ref.current = next;
+    await completion;
+    expect(previous.focusAtEnd).not.toHaveBeenCalled();
+    expect(next.focusAtEnd).not.toHaveBeenCalled();
+  });
+
+  it("does nothing after the editor unmounts", () => {
+    const composer = { focusAtEnd: vi.fn() };
+    const ref: { current: typeof composer | null } = { current: composer };
+    const refocus = captureNativeComposerFocus(ref);
+    ref.current = null;
+    refocus();
+    expect(composer.focusAtEnd).not.toHaveBeenCalled();
+  });
+});
 
 const draft = (changes: Partial<ComposerThreadDraftState> = {}): ComposerThreadDraftState => ({
   prompt: "Explain the output",

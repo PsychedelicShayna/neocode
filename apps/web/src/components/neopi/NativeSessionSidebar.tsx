@@ -1,4 +1,4 @@
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useRouter } from "@tanstack/react-router";
 import type { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import { AgentLabel } from "./AgentLabel";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
@@ -12,6 +12,7 @@ import { selectOnboardingProvidersByDriver } from "../../onboarding/providerRead
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
 import { useServerConfigs, useThreadShells } from "../../state/entities";
 import {
+  beginNativeSessionOpen,
   nativeSessionAtoms,
   selectNativeSession,
   useNativeSessionSelection,
@@ -33,19 +34,24 @@ import { NativeEnvironmentAttentionList } from "./NativeSessionAttentionList";
 export function useOpenNativeSession() {
   const open = useAtomCommand(nativeSessionAtoms.open, { reportFailure: false });
   const navigate = useNavigate();
+  const router = useRouter();
   return useCallback(
     async (
       environmentId: EnvironmentId,
       input: { providerInstanceId: ProviderInstanceId; sessionFile?: string; cwd?: string },
     ) => {
+      const isCurrent = beginNativeSessionOpen();
+      const location = router.state.location;
       const response = await open({ environmentId, input });
       if (response._tag === "Failure") throw squashAtomCommandFailure(response);
       const target = { environmentId, ref: response.value.ref };
-      selectNativeSession(target);
-      await navigate({ to: "/" });
+      if (isCurrent() && router.state.location === location) {
+        selectNativeSession(target);
+        await navigate({ to: "/" });
+      }
       return target;
     },
-    [navigate, open],
+    [navigate, open, router],
   );
 }
 

@@ -13,6 +13,10 @@ an existing worktree, use **New thread in this worktree** from the branch toolba
 When you change a new thread's project, T3 Code stays in the current environment
 if that project exists there. Otherwise it selects an environment that has it.
 
+You can switch tabs or open another session while a remote session is still
+opening. Your latest selection stays active; an earlier open finishing or message
+send completing does not move you away from the session you chose.
+
 ### Start in the background
 
 In a desktop browser or the desktop app, press `Cmd+Enter` on macOS or `Ctrl+Enter`

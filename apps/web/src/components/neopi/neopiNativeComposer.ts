@@ -27,6 +27,15 @@ import {
 } from "../../lib/composerContextRecords";
 import { readFileAsDataUrl } from "../ChatView.logic";
 
+/** Capture the initiating editor; an old send must never focus a replacement session's editor. */
+export function captureNativeComposerFocus(ref: {
+  readonly current: { focusAtEnd(): void } | null;
+}): () => void {
+  const composer = ref.current;
+  return () => {
+    if (composer !== null && ref.current === composer) composer.focusAtEnd();
+  };
+}
 const NativeDraftConsumption = Schema.Struct({
   key: Schema.String,
   snapshot: Schema.Unknown,

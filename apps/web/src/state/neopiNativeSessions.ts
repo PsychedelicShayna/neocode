@@ -40,6 +40,15 @@ export const useNativeSessionSelection = create(
     },
   }),
 );
+
+let nativeOpenGeneration = 0;
+/** A pending open may select only until another open or tab mutation supersedes it. */
+export function beginNativeSessionOpen(): () => boolean {
+  const generation = ++nativeOpenGeneration;
+  const selection = useNativeSessionSelection.getState();
+  return () =>
+    generation === nativeOpenGeneration && selection === useNativeSessionSelection.getState();
+}
 /** Selecting opens the session's tab when it has none. */
 export const selectNativeSession = (target: NativeSessionTarget) =>
   useNativeSessionSelection.setState((state) => ({

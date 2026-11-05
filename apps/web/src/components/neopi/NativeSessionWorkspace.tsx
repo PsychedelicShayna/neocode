@@ -96,7 +96,11 @@ import {
   toggleNativeThinkingVisibility,
   useNativeTranscriptView,
 } from "../../state/nativeTranscriptView";
-import { consumeNativeDraft, prepareNativePrompt } from "./neopiNativeComposer";
+import {
+  captureNativeComposerFocus,
+  consumeNativeDraft,
+  prepareNativePrompt,
+} from "./neopiNativeComposer";
 import { restoreNativeEditor } from "./neopiNativeDraft";
 import type { ComposerSubmissionIntent } from "../../composer-logic";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../../terminalUiStateStore";
@@ -366,6 +370,7 @@ export function NativeSessionView({
         setLocalError("Wait for the attachment to finish preparing before sending.");
         return;
       }
+      const refocus = captureNativeComposerFocus(composerRef);
       sendingRef.current = true;
       setSending(true);
       setLocalError(null);
@@ -386,10 +391,10 @@ export function NativeSessionView({
       } finally {
         sendingRef.current = false;
         setSending(false);
-        focusComposer();
+        refocus();
       }
     },
-    [target, feed.connected, feed.busy, submit, composerRef, focusComposer],
+    [target, feed.connected, feed.busy, submit, composerRef],
   );
   const commandOutputs = useMemo(() => {
     // Command results are local display history anchored after the entry they followed.

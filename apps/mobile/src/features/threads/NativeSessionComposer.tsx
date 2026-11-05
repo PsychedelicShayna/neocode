@@ -195,7 +195,7 @@ export function NativeSessionComposer({
             <ComposerActionButton
               accessibilityLabel={
                 composer.blockReason ??
-                (composer.sending ? "Sending…" : busy ? "Queue follow-up" : "Send")
+                (composer.sending ? "Sending…" : busy ? "Steer active turn" : "Send")
               }
               icon="arrow.up"
               variant="primary"

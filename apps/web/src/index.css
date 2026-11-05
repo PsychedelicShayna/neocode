@@ -1583,10 +1583,13 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
   /* A message bubble with a static tail on its outer bottom corner: a 13x16px
      fin cut from the bubble fill by one SVG mask. It overlaps the bubble edge
      by 1px so there is no seam, and rows reserve 0.75rem on the tail side so
-     the column's overflow clip never trims it. Plain geometry: no animation,
-     no extra element, no measurement. */
+     the column's overflow clip never trims it. The fin sweeps out of the
+     bubble edge and lands on the bubble's own bottom line at a clear angle:
+     a hairline tip hovering above that line leaves a stray pixel step at
+     fractional zoom. Plain geometry: no animation, no extra element, no
+     measurement. */
   .chat-bubble {
-    --chat-bubble-tail-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 13 16'%3E%3Cpath d='M0 0H1C1 8 5 12 13 15C9 16.5 4 16 0 16Z'/%3E%3C/svg%3E");
+    --chat-bubble-tail-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 13 16'%3E%3Cpath d='M0 0H1C1 7 3.5 12.5 13 16H0Z'/%3E%3C/svg%3E");
     position: relative;
     background-color: var(--chat-bubble-fill);
     color: var(--chat-bubble-foreground);

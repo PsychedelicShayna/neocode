@@ -150,7 +150,15 @@ export function useLocalStorage<T, E>(
   const setValue = useCallback(
     (value: T | ((val: T) => T)) => {
       try {
-        const currentValue = getLocalStorageItem(key, schema) ?? initialValue;
+        let currentValue = initialValue;
+        try {
+          currentValue = getLocalStorageItem(key, schema) ?? initialValue;
+        } catch (error) {
+          // Match the displayed default for obsolete or malformed values,
+          // without treating denied storage access as an absent preference.
+          if (!(error instanceof LocalStorageOperationError) || error.operation !== "decode")
+            throw error;
+        }
         let valueToStore: T;
         if (typeof value === "function") {
           try {

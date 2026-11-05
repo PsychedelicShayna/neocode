@@ -38,6 +38,7 @@ type Router = ReturnType<typeof StackRouter>;
 type Action = Parameters<Router["getStateForAction"]>[1];
 const fixture = vi.hoisted(() => ({
   current: undefined as Effect.Success<ReturnType<typeof makeHarness>> | undefined,
+  draftText: "",
   navigation: undefined as
     | {
         navigate: (name: string, params?: object) => void;
@@ -162,7 +163,14 @@ vi.mock("../../components/ScreenHeader", () => ({
   ),
 }));
 vi.mock("../../state/use-native-composer-state", () => ({
-  useNativeComposerState: () => ({ key: "unused-draft", draft: { text: "" }, setText: () => {} }),
+  useNativeComposerState: () => ({
+    key: "unused-draft",
+    draft: { text: fixture.draftText },
+    setText: (text: string) => {
+      fixture.draftText = text;
+    },
+    send: vi.fn(),
+  }),
 }));
 vi.mock("../../state/use-composer-drafts", () => ({
   getComposerDraftSnapshot: vi.fn(),
@@ -212,7 +220,15 @@ const user: NeoPiJournalEntry = {
 };
 const closedReason = "The native connection was explicitly closed.";
 
-const makeHarness = Effect.fnUntraced(function* () {
+const makeHarness = Effect.fnUntraced(function* (
+  options: {
+    readonly session?: NativeSession;
+    readonly request?: (
+      command: Record<string, unknown> & { type: string },
+    ) => Effect.Effect<unknown>;
+  } = {},
+) {
+  const currentSession = options.session ?? session;
   const active = new Set<Queue.Queue<NativeSessionUpdate>>();
   let watches = 0;
   let closes = 0;
@@ -221,7 +237,7 @@ const makeHarness = Effect.fnUntraced(function* () {
   };
   const closeOwner = () => publish({ type: "closed", reason: closedReason });
   const client = {
-    [WS_METHODS.neopiNativeSessionsOpen]: () => Effect.succeed(session),
+    [WS_METHODS.neopiNativeSessionsOpen]: () => Effect.succeed(currentSession),
     [WS_METHODS.neopiNativeSessionsClose]: () =>
       Effect.sync(() => {
         closes++;
@@ -231,6 +247,7 @@ const makeHarness = Effect.fnUntraced(function* () {
     [WS_METHODS.neopiNativeSessionsRequest]: (input: {
       command: Record<string, unknown> & { type: string };
     }) =>
+      options.request?.(input.command) ??
       Effect.succeed(
         input.command.type === "get_subagents"
           ? { subagents: [] }
@@ -255,7 +272,7 @@ const makeHarness = Effect.fnUntraced(function* () {
           return Stream.concat(
             Stream.succeed<NativeSessionUpdate>({
               type: "snapshot",
-              session,
+              session: currentSession,
               journal: {
                 sessionId: session.sessionId,
                 sessionFile: ref.sessionFile,
@@ -468,5 +485,91 @@ describe("NativeSessionScreen exit and canonical reselection", () => {
           }
         });
       }),
+  );
+});
+
+describe("NativeSessionScreen command argument completions", () => {
+  it.effect("hides results from the previous prefix during debounce and the next request", () =>
+    Effect.gen(function* () {
+      let resolveNext: ((value: unknown) => void) | undefined;
+      const h = yield* makeHarness({
+        session: { ...session, capabilities: ["command_completions"] },
+        request: (command) => {
+          if (command.type === "get_available_commands")
+            return Effect.succeed({ commands: [{ name: "personality" }] });
+          if (command.type !== "get_command_completions") return Effect.succeed({});
+          if (command.prefix === "a")
+            return Effect.succeed({
+              items: [{ value: "Angel", label: "Angel", submitsCommand: true }],
+            });
+          return Effect.promise(
+            () =>
+              new Promise<unknown>((resolve) => {
+                resolveNext = resolve;
+              }),
+          );
+        },
+      });
+      yield* Effect.promise(async () => {
+        vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        fixture.current = h;
+        fixture.draftText = "/personality a";
+        fixture.navigation = {
+          navigate: () => {},
+          dispatch: () => {},
+          addListener: () => () => {},
+        };
+        const container = document.createElement("div");
+        document.body.append(container);
+        const root = createRoot(container);
+        const route = {
+          params: { environmentId: h.target.environmentId, ...ref },
+        };
+        const render = () => root.render(<NativeSessionScreen route={route} />);
+        try {
+          await act(async () => {
+            await h.atoms.open.run(h.registry, {
+              environmentId: h.target.environmentId,
+              input: ref,
+            });
+            render();
+          });
+          await act(async () => h.flush());
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(80);
+          });
+          expect(container.textContent).toContain("Angel");
+
+          await act(async () => {
+            fixture.draftText = "/personality b";
+            render();
+          });
+          expect(container.textContent).not.toContain("Angel");
+          expect(resolveNext).toBeUndefined();
+
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(80);
+          });
+          expect(resolveNext).toBeDefined();
+          expect(container.textContent).not.toContain("Angel");
+          await act(async () => {
+            resolveNext!({ items: [{ value: "Bunny", label: "Bunny", submitsCommand: true }] });
+          });
+          expect(container.textContent).toContain("Bunny");
+          expect(container.textContent).not.toContain("Angel");
+        } finally {
+          await act(async () => root.unmount());
+          h.registry.dispose();
+          h.flush();
+          container.remove();
+          fixture.current = undefined;
+          fixture.navigation = undefined;
+          fixture.draftText = "";
+          vi.useRealTimers();
+          vi.unstubAllGlobals();
+        }
+      });
+    }),
   );
 });

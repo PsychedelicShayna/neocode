@@ -134,6 +134,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const [commands, setCommands] = useState<readonly NativeSlashCommand[]>([]);
   const [completions, setCompletions] = useState<{
     readonly command: string;
+    readonly prefix: string;
     readonly items: readonly NativeCommandCompletion[];
   } | null>(null);
   const key = nativeSessionKey(target);
@@ -212,11 +213,13 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           if (active)
             setCompletions({
               command: argumentCommand,
+              prefix: argumentPrefix,
               items: nativeCommandCompletions(value, argumentPrefix),
             });
         })
         .catch(() => {
-          if (active) setCompletions({ command: argumentCommand, items: [] });
+          if (active)
+            setCompletions({ command: argumentCommand, prefix: argumentPrefix, items: [] });
         });
     }, 80);
     return () => {
@@ -275,7 +278,9 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           .slice(0, 10)
       : [];
   const argumentSuggestions =
-    argumentCommand && completions?.command === argumentCommand
+    argumentCommand &&
+    completions?.command === argumentCommand &&
+    completions.prefix === argumentPrefix
       ? completions.items.filter((item) => item.value !== argumentPrefix).slice(0, 10)
       : [];
   const dialog = feed.dialogs.find(

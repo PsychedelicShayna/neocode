@@ -20,7 +20,7 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
       <dt className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
         {label}
       </dt>
-      <dd className="truncate font-mono text-xs tabular-nums">{children}</dd>
+      <dd className="truncate text-xs tabular-nums">{children}</dd>
     </div>
   );
 }
@@ -72,7 +72,7 @@ function TranscriptPreview({
   const { rows, loading, error } = useAgentTranscript(source, agent);
   const preview = useMemo(() => previewLines(rows, lines), [rows, lines]);
   return (
-    <section className="flex min-h-0 flex-col gap-1">
+    <section className="flex min-h-0 flex-col gap-1.5 rounded-lg border border-border/50 bg-card/30 p-2.5">
       <h3 className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
         Transcript
       </h3>
@@ -86,7 +86,7 @@ function TranscriptPreview({
         <ol className="flex flex-col gap-1.5">
           {preview.map((line) => (
             <li key={line.id} className="flex gap-2 text-xs">
-              <span className="w-10 shrink-0 pt-px font-mono text-3xs uppercase text-muted-foreground/60">
+              <span className="w-10 shrink-0 pt-px text-3xs uppercase text-muted-foreground/60">
                 {PREVIEW_LABEL[line.kind]}
               </span>
               <span
@@ -130,7 +130,7 @@ export function AgentDetail({
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="text-sm font-medium [overflow-wrap:anywhere]">{agent.title}</span>
-          <span className="flex items-center gap-2 font-mono text-2xs text-muted-foreground">
+          <span className="flex items-center gap-2 text-2xs text-muted-foreground">
             <span>{agentStatusLabel(agent.status)}</span>
             <span>
               · {agent.identity.label} ({agent.identity.pronouns})
@@ -141,7 +141,7 @@ export function AgentDetail({
         </div>
         {actions ? <div className="flex shrink-0 items-center gap-1">{actions}</div> : null}
       </header>
-      <dl className="grid grid-cols-2 gap-x-3 gap-y-2">
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-2 rounded-lg border border-border/50 bg-card/30 p-2.5">
         <Fact label="Model">{model ?? "—"}</Fact>
         <Fact label="Effort">{agent.effort ?? "—"}</Fact>
         <Fact label="Fast">{agent.fast === null ? "—" : agent.fast.enabled ? "on" : "off"}</Fact>
@@ -155,7 +155,7 @@ export function AgentDetail({
       </dl>
       <ContextMeter agent={agent} />
       {agent.task ? (
-        <section className="flex flex-col gap-1">
+        <section className="flex flex-col gap-1 rounded-lg border border-border/50 bg-card/30 p-2.5">
           <h3 className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
             Task
           </h3>
@@ -165,7 +165,7 @@ export function AgentDetail({
         </section>
       ) : null}
       {agent.activity || agent.recentTools.length > 0 ? (
-        <section className="flex flex-col gap-1">
+        <section className="flex flex-col gap-1 rounded-lg border border-border/50 bg-card/30 p-2.5">
           <h3 className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
             {agent.live ? "Now" : "Outcome"}
           </h3>
@@ -180,7 +180,7 @@ export function AgentDetail({
             </p>
           ) : null}
           {agent.recentTools.length > 0 ? (
-            <ul className="flex flex-col font-mono text-2xs text-muted-foreground">
+            <ul className="flex flex-col gap-0.5 rounded-md bg-muted/40 p-1.5 font-mono text-2xs text-muted-foreground">
               {agent.recentTools.slice(-5).map((tool, index) => (
                 <li
                   key={`${index}:${tool.tool}`}

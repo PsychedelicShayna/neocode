@@ -18,6 +18,7 @@ import {
 import { applyNativeConversationEvent } from "./state/neopiConversation.ts";
 import {
   disconnectNativeSubagents,
+  mergeNativeSubagentHistory,
   reduceNativeSubagents,
   snapshotNativeSubagents,
   type NativeSubagent,
@@ -60,6 +61,11 @@ export type NativeSessionUpdate =
       ref: NeoPiNativeSessionRef;
       revision: number;
       epoch: number;
+      /**
+       * `get_subagent_history` rows read with the inventory: the whole roster, finished
+       * children included. Absent when NeoPi cannot list them.
+       */
+      history?: readonly unknown[];
       agents: readonly unknown[];
     }
   | {
@@ -271,14 +277,20 @@ export function reduceNativeSessionFeed(
       feed.session.ref.providerInstanceId !== event.ref.providerInstanceId
     )
       return feed;
+    const at = DateTime.formatIso(DateTime.nowUnsafe());
+    // History first, stamped with the read revision, so the live inventory read in
+    // the same pass still refines what it lists and nothing a frame touched since.
+    const roster = event.history
+      ? mergeNativeSubagentHistory(feed.agents, event.history, event.revision, at)
+      : feed.agents;
     return {
       ...feed,
       agents: snapshotNativeSubagents(
-        feed.agents,
+        roster,
         event.agents,
         event.revision,
         feed.agentsRevision + 1,
-        DateTime.formatIso(DateTime.nowUnsafe()),
+        at,
       ),
       agentsRevision: feed.agentsRevision + 1,
     };

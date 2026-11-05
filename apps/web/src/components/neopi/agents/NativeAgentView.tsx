@@ -280,16 +280,16 @@ export function NativeAgentView({
               <span className="flex min-w-0 items-center gap-2">
                 <AgentStatusDot status={agent.status} />
                 <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
-                <span className="shrink-0 font-mono text-3xs text-muted-foreground/70">
+                <span className="shrink-0 text-2xs text-muted-foreground/70">
                   {agent.identity.label} · {agent.identity.pronouns}
                 </span>
                 {agent.role ? (
-                  <span className="shrink-0 rounded-sm border border-border/60 px-1 font-mono text-3xs text-muted-foreground">
+                  <span className="shrink-0 rounded-sm border border-border/60 px-1 text-3xs text-muted-foreground">
                     {agent.role}
                   </span>
                 ) : null}
               </span>
-              <span className="flex items-center gap-2 font-mono text-2xs text-muted-foreground">
+              <span className="flex items-center gap-2 text-2xs text-muted-foreground">
                 <span>{agentStatusLabel(agent.status)}</span>
                 <AgentElapsed agent={agent} />
               </span>

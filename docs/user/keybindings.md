@@ -29,9 +29,12 @@ panel and `alt+s` (`agents.hub.toggle`) shows or hides the full Agent Hub. These
 match NeoPi's own chords for those views. Both apply only in native sessions
 (`when: nativeSession`), where `ctrl+s` replaces the composer stash on Linux and
 Windows; other threads keep the stash. Rebind `agents.panel.toggle` to keep
-`ctrl+s` for the stash everywhere. In the panel and the hub, click or use the
-arrow keys (or `j`/`k`) to preview an agent, Enter or a double-click to open it,
-and Esc to go back.
+`ctrl+s` for the stash everywhere. In the panel and the hub, click an agent to
+expand it and click it again to collapse it, or use the arrow keys (or `j`/`k`)
+to move through the list. Press Enter or the **Open** button to open an agent,
+and Esc to go back. The roster lists finished and stopped agents too, as long as
+NeoPi can report the session's earlier agents, and their transcripts open
+read-only.
 
 In the model picker, press Left in an empty search field or Shift+Tab to reach
 the provider list. Use Up/Down to move and Enter to choose. Right returns to

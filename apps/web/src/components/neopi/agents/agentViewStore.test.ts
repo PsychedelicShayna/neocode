@@ -26,4 +26,27 @@ describe("agent view transitions", () => {
     expect(toggled.mode).toBe("hub");
     expect(reduceAgentView(toggled, { type: "toggleHub" }).mode).toBe("session");
   });
+
+  it("expands nothing by default, and a second click on the expanded agent collapses it", () => {
+    expect(SESSION_AGENT_VIEW.selectedId).toBeNull();
+    const expanded = reduceAgentView(SESSION_AGENT_VIEW, { type: "toggle", id: "a" });
+    expect(expanded).toMatchObject({ mode: "session", selectedId: "a" });
+    expect(reduceAgentView(expanded, { type: "toggle", id: "a" }).selectedId).toBeNull();
+  });
+
+  it("a click on another agent moves the expansion, and two fast clicks never enter the agent", () => {
+    const first = reduceAgentView(SESSION_AGENT_VIEW, { type: "toggle", id: "a" });
+    expect(reduceAgentView(first, { type: "toggle", id: "b" }).selectedId).toBe("b");
+    const twice = reduceAgentView(first, { type: "toggle", id: "a" });
+    expect(twice.mode).toBe("session");
+    expect(reduceAgentView(twice, { type: "toggle", id: "a" })).toMatchObject({
+      mode: "session",
+      selectedId: "a",
+    });
+  });
+
+  it("keyboard selection never collapses the expanded agent", () => {
+    const expanded = reduceAgentView(SESSION_AGENT_VIEW, { type: "toggle", id: "a" });
+    expect(reduceAgentView(expanded, { type: "select", id: "a" })).toBe(expanded);
+  });
 });

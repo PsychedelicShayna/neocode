@@ -11,12 +11,13 @@ import { useAgentSelection } from "./useAgentSelection";
 import { useAgentHubSource } from "./useNativeAgentHubSource";
 
 /**
- * The full-screen Agent Hub: summary on top, roster on the left, the highlighted agent's
- * details and transcript preview on the right. Arrows or j/k move, Enter opens, Esc returns.
+ * The full-screen Agent Hub: summary on top, roster on the left, the expanded agent's
+ * details and transcript preview on the right. Click an agent to expand it and again to
+ * collapse it; arrows or j/k move, Enter or the Open button opens it, Esc returns.
  */
 export function NativeAgentHub({ viewKey, onClose }: { viewKey: string; onClose: () => void }) {
   const source = useAgentHubSource();
-  const { selected, select, open } = useAgentSelection(source, viewKey);
+  const { selected, select, toggle, open } = useAgentSelection(source, viewKey);
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     // The roster takes focus itself when there is one; an empty hub still needs Esc to work.
@@ -48,7 +49,7 @@ export function NativeAgentHub({ viewKey, onClose }: { viewKey: string; onClose:
           <Kbd>Esc</Kbd>
         </Button>
       </header>
-      {selected === null ? (
+      {source.agents.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
           <p className="text-sm font-medium">No agents in this session</p>
           <p className="max-w-80 text-xs text-muted-foreground">
@@ -62,19 +63,26 @@ export function NativeAgentHub({ viewKey, onClose }: { viewKey: string; onClose:
             <AgentRoster
               autoFocus
               agents={source.agents}
-              selectedId={selected.id}
+              selectedId={selected?.id ?? null}
               onSelect={select}
+              onToggle={toggle}
               onOpen={open}
             />
           </div>
           <div className="min-h-0 overflow-y-auto">
-            <AgentDetail
-              agent={selected}
-              source={source}
-              previewCount={16}
-              className="mx-auto max-w-3xl p-5"
-              actions={<AgentActions agent={selected} source={source} onOpen={open} />}
-            />
+            {selected === null ? (
+              <div className="flex h-full items-center justify-center p-6 text-center text-xs text-muted-foreground">
+                Select an agent to see its details and transcript.
+              </div>
+            ) : (
+              <AgentDetail
+                agent={selected}
+                source={source}
+                previewCount={16}
+                className="mx-auto max-w-3xl p-5"
+                actions={<AgentActions agent={selected} source={source} onOpen={open} />}
+              />
+            )}
           </div>
         </div>
       )}

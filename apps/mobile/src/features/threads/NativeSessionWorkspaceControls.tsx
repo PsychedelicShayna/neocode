@@ -163,59 +163,61 @@ export function NativeSessionAgents({
   );
   return (
     <NativeModal title="Agents" onClose={onClose}>
-      <Text className="text-sm text-foreground-muted">
-        {model.liveCount} active · {model.settledCount} settled ·{" "}
-        {formatSubagentTokenCount(model.totalTokens)} tokens
-      </Text>
-      {!model.hasAgents ? (
-        <Text className="text-foreground-muted">No agents observed in this session.</Text>
-      ) : null}
-      {rows.map((agent) => (
-        <View key={agent.id} className="gap-1 border-b border-border py-3">
-          <Text className="font-t3-medium text-foreground">{agent.title}</Text>
-          <Text className="text-xs text-foreground-muted">
-            {[agent.status, agent.role, formatSubagentModelLabel(agent.model, agent.effort)]
-              .filter(Boolean)
-              .join(" · ")}
-          </Text>
-          {agent.usage ? (
+      <ScrollView className="flex-1" contentContainerClassName="px-4 pb-4">
+        <Text className="text-sm text-foreground-muted">
+          {model.liveCount} active · {model.settledCount} settled ·{" "}
+          {formatSubagentTokenCount(model.totalTokens)} tokens
+        </Text>
+        {!model.hasAgents ? (
+          <Text className="text-foreground-muted">No agents observed in this session.</Text>
+        ) : null}
+        {rows.map((agent) => (
+          <View key={agent.id} className="gap-1 border-b border-border py-3">
+            <Text className="font-t3-medium text-foreground">{agent.title}</Text>
             <Text className="text-xs text-foreground-muted">
-              {formatSubagentTokenCount(agent.usage.totalTokens)} tokens
-              {agent.usage.toolUses !== undefined ? ` · ${agent.usage.toolUses} tools` : ""}
-              {agent.usage.durationMs !== undefined
-                ? ` · ${(agent.usage.durationMs / 1000).toFixed(1)}s`
-                : ""}
+              {[agent.status, agent.role, formatSubagentModelLabel(agent.model, agent.effort)]
+                .filter(Boolean)
+                .join(" · ")}
             </Text>
-          ) : null}
-          {agent.progress ? (
-            <Text selectable className="text-sm text-foreground">
-              {agent.progress}
-            </Text>
-          ) : null}
-          {agent.lastToolName ? (
-            <Text className="text-xs text-foreground-muted">{agent.lastToolName}</Text>
-          ) : null}
-          {agent.recentActivity.map((activity, index) => (
-            <Text
-              key={`${activity.at}:${index}`}
-              selectable
-              className="text-xs text-foreground-muted"
-            >
-              {activity.summary}
-            </Text>
-          ))}
-          {agent.result ? (
-            <Text selectable className="text-sm text-foreground">
-              {agent.result}
-            </Text>
-          ) : null}
-          {agent.error ? (
-            <Text selectable className="text-sm text-danger-foreground">
-              {agent.error}
-            </Text>
-          ) : null}
-        </View>
-      ))}
+            {agent.usage ? (
+              <Text className="text-xs text-foreground-muted">
+                {formatSubagentTokenCount(agent.usage.totalTokens)} tokens
+                {agent.usage.toolUses !== undefined ? ` · ${agent.usage.toolUses} tools` : ""}
+                {agent.usage.durationMs !== undefined
+                  ? ` · ${(agent.usage.durationMs / 1000).toFixed(1)}s`
+                  : ""}
+              </Text>
+            ) : null}
+            {agent.progress ? (
+              <Text selectable className="text-sm text-foreground">
+                {agent.progress}
+              </Text>
+            ) : null}
+            {agent.lastToolName ? (
+              <Text className="text-xs text-foreground-muted">{agent.lastToolName}</Text>
+            ) : null}
+            {agent.recentActivity.map((activity, index) => (
+              <Text
+                key={`${activity.at}:${index}`}
+                selectable
+                className="text-xs text-foreground-muted"
+              >
+                {activity.summary}
+              </Text>
+            ))}
+            {agent.result ? (
+              <Text selectable className="text-sm text-foreground">
+                {agent.result}
+              </Text>
+            ) : null}
+            {agent.error ? (
+              <Text selectable className="text-sm text-danger-foreground">
+                {agent.error}
+              </Text>
+            ) : null}
+          </View>
+        ))}
+      </ScrollView>
     </NativeModal>
   );
 }

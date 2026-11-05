@@ -31,6 +31,12 @@ export interface NativeSubagentFacts {
   }[];
 }
 
+/**
+ * NeoPi advertises this once `get_subagent_history` can list every child of the
+ * session, finished and persisted ones included, not only the live roster.
+ */
+export const SUBAGENT_HISTORY_CAPABILITY = "subagent_history";
+
 /** Native ownership and read barriers stay out of the source-neutral panel model. */
 export interface NativeSubagent extends RuntimeSubagent {
   readonly native: {
@@ -38,6 +44,8 @@ export interface NativeSubagent extends RuntimeSubagent {
     readonly parentToolCallId: string | null;
     readonly sessionFile: string | null;
     readonly disconnected: boolean;
+    /** Last observed through `get_subagent_history`, not a lifecycle frame; it is not a spawn or exit event. */
+    readonly restored: boolean;
     readonly usageBase: SubagentUsage | null;
     readonly facts: NativeSubagentFacts;
   };
@@ -218,6 +226,7 @@ function observe(
       parentToolCallId: text(payload.parentToolCallId) ?? previous?.native.parentToolCallId ?? null,
       sessionFile: text(payload.sessionFile) ?? previous?.native.sessionFile ?? null,
       disconnected: false,
+      restored: false,
       usageBase: base,
       facts: facts(fresh ? undefined : previous.native.facts, payload, progress),
     },
@@ -296,7 +305,8 @@ export function snapshotNativeSubagents(
     inventory.delete(agent.id);
     if (agent.native.revision > readRevision) return agent;
     if (!snapshot) {
-      if (isTerminalSubagentStatus(agent.status)) return agent;
+      // `idle` is a history state (result accepted, session still in memory); the live inventory never lists it.
+      if (isTerminalSubagentStatus(agent.status) || agent.status === "idle") return agent;
       return disconnectNativeSubagents([agent], revision, at)[0]!;
     }
     const nextStatus = status(snapshot.status)!;
@@ -330,4 +340,117 @@ export function snapshotNativeSubagents(
       ),
     );
   return result;
+}
+
+/** NeoPi's registry has no completed/failed: a finished child is parked, a killed one aborted. */
+function historyStatus(value: unknown): RuntimeSubagentStatus | null {
+  switch (value) {
+    case "running":
+      return "running";
+    case "idle":
+      return "idle";
+    case "parked":
+      return "completed";
+    case "aborted":
+      return "cancelled";
+    default:
+      return null;
+  }
+}
+
+const isoTime = (value: unknown) => {
+  const ms = number(value);
+  return ms === undefined ? null : new Date(ms).toISOString();
+};
+
+/** One `get_subagent_history` row, folded onto what live observation already knew of the child. */
+function restore(
+  previous: NativeSubagent | undefined,
+  entry: Record<string, unknown>,
+  id: string,
+  nextStatus: RuntimeSubagentStatus,
+  revision: number,
+  at: string,
+): NativeSubagent {
+  const metrics = record(entry.metrics);
+  const description = text(entry.description);
+  const created = isoTime(entry.createdAt);
+  const terminal = isTerminalSubagentStatus(nextStatus);
+  const agent = observe(
+    previous,
+    {
+      agent: entry.agent,
+      // The persisted gist is a fallback; it never replaces an assignment already observed.
+      ...(previous?.title ? {} : { description }),
+      ...(previous?.native.facts.task ? {} : { task: description }),
+      resolvedModel: entry.resolvedModel,
+      resolvedModelIdentity: entry.resolvedModelIdentity,
+      resolvedThinkingLevel: entry.resolvedThinkingLevel,
+      fastModeEnabled: entry.fastModeEnabled,
+      fastModeActive: entry.fastModeActive,
+      parentToolCallId: entry.parentToolCallId,
+      sessionFile: entry.sessionFile,
+    },
+    {
+      tokens: metrics.tokens,
+      toolCount: metrics.tools,
+      durationMs: metrics.durationMs,
+      requests: metrics.requests,
+      cost: metrics.cost ?? entry.directCost,
+      contextTokens: metrics.contextTokens,
+      contextWindow: metrics.contextWindow,
+    },
+    id,
+    nextStatus,
+    revision,
+    at,
+    false,
+  );
+  return {
+    ...agent,
+    firstSeenAt: created ?? agent.firstSeenAt,
+    startedAt: created ?? agent.startedAt,
+    completedAt: terminal
+      ? (isoTime(entry.terminalAt) ?? isoTime(entry.lastActivity) ?? agent.completedAt)
+      : null,
+    updatedAt: isoTime(entry.lastActivity) ?? agent.updatedAt,
+    native: { ...agent.native, restored: true },
+  };
+}
+
+/**
+ * `get_subagent_history` is the session's whole roster, finished and persisted
+ * children included. It adds what live observation never saw and orders what it
+ * did, but never overrides a child a frame touched since the read began
+ * (`readRevision`) or one still observed live; absent children stay as they are.
+ */
+export function mergeNativeSubagentHistory(
+  agents: readonly NativeSubagent[],
+  entries: readonly unknown[],
+  readRevision: number,
+  at: string,
+): readonly NativeSubagent[] {
+  const rows = new Map<string, { entry: Record<string, unknown>; status: RuntimeSubagentStatus }>();
+  for (const value of entries) {
+    const entry = record(value);
+    const id = text(entry.id);
+    const nextStatus = historyStatus(entry.status);
+    if (id && nextStatus && entry.kind !== "advisor") rows.set(id, { entry, status: nextStatus });
+  }
+  const merged = agents.map((agent) => {
+    const row = rows.get(agent.id);
+    if (!row) return agent;
+    rows.delete(agent.id);
+    if (agent.native.revision > readRevision) return agent;
+    if (!agent.native.restored && !agent.native.disconnected) {
+      const created = isoTime(row.entry.createdAt);
+      return created !== null && created < agent.firstSeenAt
+        ? { ...agent, firstSeenAt: created }
+        : agent;
+    }
+    return restore(agent, row.entry, agent.id, row.status, readRevision, at);
+  });
+  for (const [id, row] of rows)
+    merged.push(restore(undefined, row.entry, id, row.status, readRevision, at));
+  return merged;
 }

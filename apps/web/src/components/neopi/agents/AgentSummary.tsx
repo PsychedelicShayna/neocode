@@ -27,7 +27,7 @@ export function AgentSummary({
   return (
     <div
       className={cn(
-        "flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-2xs text-muted-foreground",
+        "flex flex-wrap items-center gap-x-3 gap-y-0.5 text-2xs text-muted-foreground",
         className,
       )}
     >

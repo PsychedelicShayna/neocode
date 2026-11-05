@@ -10,6 +10,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { request as rpcRequest, subscribe } from "../rpc/client.ts";
 import { NATIVE_JOBS_CAPABILITY } from "../neopiNativeJobs.ts";
+import { SUBAGENT_HISTORY_CAPABILITY } from "../neopiNativeSubagents.ts";
 import {
   emptyNativeSessionFeed,
   nativeJournalPage,
@@ -130,6 +131,15 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
             yield* read({ type: "set_subagent_subscription", level: "progress" });
             if (!current.connected || current.agentsEpoch !== epoch) return;
             const revision = current.agentsRevision;
+            // Finished and persisted children are only in the history; a failed read leaves
+            // the live inventory to carry the roster, as for a NeoPi that cannot list them.
+            const history = current.session.capabilities.includes(SUBAGENT_HISTORY_CAPABILITY)
+              ? nativeRecord(
+                  yield* read({ type: "get_subagent_history" }).pipe(
+                    Effect.catch(() => Effect.succeed(null)),
+                  ),
+                ).subagents
+              : undefined;
             const result = nativeRecord(yield* read({ type: "get_subagents" }));
             if (!Array.isArray(result.subagents))
               return yield* failed(
@@ -142,6 +152,7 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
               sessionId,
               epoch,
               revision,
+              ...(Array.isArray(history) ? { history } : {}),
               agents: result.subagents,
             });
             yield* recovered("subagents");

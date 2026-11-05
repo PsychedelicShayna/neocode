@@ -131,16 +131,27 @@ export function snapshotNativeJobs(
   for (const previous of jobs.entries)
     if (!listed.has(previous.id) && previous.revision > readRevision) entries.push(previous);
   const reported = count(body.runningCount);
-  return {
-    entries,
-    // A frame that landed during the read carries a newer count than the inventory.
-    runningCount:
-      jobs.revision > readRevision && jobs.runningCount !== null
-        ? jobs.runningCount
-        : (reported ??
-          entries.filter((entry) => entry.status === "running" && entry.type !== "task").length),
-    revision,
-  };
+  // A frame that landed during the read carries a newer count than the inventory.
+  const runningCount =
+    jobs.revision > readRevision && jobs.runningCount !== null
+      ? jobs.runningCount
+      : (reported ??
+        entries.filter((entry) => entry.status === "running" && entry.type !== "task").length);
+  // A terminal attachment polls this every few seconds: an inventory that changed
+  // nothing must not hand every subscriber a new value.
+  if (
+    runningCount === jobs.runningCount &&
+    entries.length === jobs.entries.length &&
+    entries.every((entry, index) => sameJob(entry, jobs.entries[index]!))
+  )
+    return jobs;
+  return { entries, runningCount, revision };
+}
+
+function sameJob(a: NativeJobEntry, b: NativeJobEntry) {
+  const { revision: _a, ...left } = a;
+  const { revision: _b, ...right } = b;
+  return (Object.keys(left) as (keyof NativeJob)[]).every((key) => left[key] === right[key]);
 }
 
 /** Running jobs first (newest first), then settled ones by most recent finish. */

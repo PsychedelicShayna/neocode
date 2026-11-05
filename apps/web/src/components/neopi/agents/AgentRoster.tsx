@@ -79,13 +79,11 @@ export function agentMetricsText(agent: AgentHubAgent): string {
 function AgentRow({
   agent,
   selected,
-  onSelect,
-  onOpen,
+  onToggle,
 }: {
   agent: AgentHubAgent;
   selected: boolean;
-  onSelect: (id: string) => void;
-  onOpen: (id: string) => void;
+  onToggle: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -102,12 +100,12 @@ function AgentRow({
       id={`agent-row-${agent.id}`}
       role="option"
       aria-selected={selected}
+      aria-expanded={selected}
       data-agent-row
-      onClick={() => onSelect(agent.id)}
-      onDoubleClick={() => onOpen(agent.id)}
+      onClick={() => onToggle(agent.id)}
       className={cn(
-        "grid h-[4.25rem] cursor-pointer grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1.125rem] items-center gap-x-2 rounded-md px-1.5 py-1 hover:bg-accent/40",
-        selected && "bg-accent/70 hover:bg-accent/70",
+        "grid h-[4.5rem] shrink-0 cursor-pointer grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1.125rem] items-center gap-x-2 rounded-lg border border-border/50 bg-card/30 px-2.5 py-1.5 hover:bg-accent/40",
+        selected && "border-border bg-accent/70 hover:bg-accent/70",
       )}
     >
       <span className="col-start-1 row-start-1 flex items-center">
@@ -116,18 +114,18 @@ function AgentRow({
       <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
         <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
         <span
-          className="shrink-0 font-mono text-3xs text-muted-foreground/70"
+          className="shrink-0 text-2xs text-muted-foreground/70"
           title={`${agent.identity.label} · ${agent.identity.pronouns}`}
         >
           {agent.identity.label}
         </span>
         {role ? (
-          <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 font-mono text-3xs text-muted-foreground">
+          <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 text-3xs text-muted-foreground">
             {role}
           </span>
         ) : null}
       </span>
-      <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-2xs text-muted-foreground/80">
+      <span className="col-start-3 row-start-1 min-w-14 text-right text-2xs text-muted-foreground/80">
         <AgentElapsed agent={agent} />
       </span>
       <span
@@ -138,7 +136,7 @@ function AgentRow({
       >
         {agent.activity ?? agent.task ?? STATUS_VISUALS[agent.status].label}
       </span>
-      <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-2xs tabular-nums text-muted-foreground/70">
+      <span className="col-start-2 col-end-4 row-start-3 truncate text-2xs tabular-nums text-muted-foreground/70">
         {[model, agentMetricsText(agent)].filter(Boolean).join(" · ")}
       </span>
       <span className="sr-only">{STATUS_VISUALS[agent.status].label}</span>
@@ -147,13 +145,15 @@ function AgentRow({
 }
 
 /**
- * The selectable roster. Arrow keys or j/k move, Home/End jump, Enter opens.
- * Roster rows keep three fixed lines so live data never changes their height.
+ * The selectable roster. A click expands an agent's detail and a second click
+ * collapses it; arrow keys or j/k move the expanded agent, Home/End jump, and Enter
+ * opens it. Roster rows keep three fixed lines so live data never changes their height.
  */
 export function AgentRoster({
   agents,
   selectedId,
   onSelect,
+  onToggle,
   onOpen,
   autoFocus = false,
   className,
@@ -161,6 +161,7 @@ export function AgentRoster({
   agents: readonly AgentHubAgent[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onToggle: (id: string) => void;
   onOpen: (id: string) => void;
   autoFocus?: boolean;
   className?: string;
@@ -196,15 +197,14 @@ export function AgentRoster({
       aria-activedescendant={selectedId === null ? undefined : `agent-row-${selectedId}`}
       tabIndex={0}
       onKeyDown={onKeyDown}
-      className={cn("flex flex-col gap-0.5 p-1.5 outline-none", className)}
+      className={cn("flex flex-col gap-1.5 p-2 outline-none", className)}
     >
       {agents.map((agent) => (
         <AgentRow
           key={agent.id}
           agent={agent}
           selected={agent.id === selectedId}
-          onSelect={onSelect}
-          onOpen={onOpen}
+          onToggle={onToggle}
         />
       ))}
     </div>

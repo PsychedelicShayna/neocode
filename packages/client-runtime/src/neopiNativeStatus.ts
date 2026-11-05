@@ -139,6 +139,8 @@ function flashFor(
 ): SubagentFlash | null {
   // Losing the connection interrupts agents without any of them having exited.
   if (previous?.native.disconnected || next.native.disconnected) return null;
+  // History hydration is not a spawn or an exit.
+  if (next.native.restored) return null;
   const wasActive = previous !== undefined && isActiveSubagentStatus(previous.status);
   const active = isActiveSubagentStatus(next.status);
   if (active) return wasActive ? null : "spawn";

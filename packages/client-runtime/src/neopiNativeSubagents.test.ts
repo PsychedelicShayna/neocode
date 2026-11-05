@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   disconnectNativeSubagents,
+  mergeNativeSubagentHistory,
   reduceNativeSubagents,
   snapshotNativeSubagents,
 } from "./neopiNativeSubagents.ts";
+import { subagentFlashFor } from "./neopiNativeStatus.ts";
 import { deriveAgentPanelModel } from "./state/subagentRuntime.ts";
 
 const at = "2026-10-29T00:00:00.000Z";
@@ -172,5 +174,150 @@ describe("native subagent roster", () => {
     agents = reduceNativeSubagents(agents, progress(), 2, at);
     agents = snapshotNativeSubagents(agents, [], 1, 3, at);
     expect(agents[0]).toMatchObject({ status: "running", usage: { totalTokens: 120 } });
+  });
+});
+
+describe("native subagent history roster", () => {
+  const entry = (id: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    kind: "sub",
+    status: "parked",
+    agent: "scout",
+    description: `Task of ${id}`,
+    createdAt: Date.parse("2026-10-28T10:00:00.000Z"),
+    lastActivity: Date.parse("2026-10-28T10:05:00.000Z"),
+    ...extra,
+  });
+
+  it("lists finished, aborted and idle children with their status, order and metrics", () => {
+    const agents = mergeNativeSubagentHistory(
+      [],
+      [
+        entry("late", {
+          status: "aborted",
+          createdAt: Date.parse("2026-10-28T11:00:00.000Z"),
+          terminalAt: Date.parse("2026-10-28T11:02:00.000Z"),
+        }),
+        entry("early", {
+          metrics: { tokens: 900, tools: 7, requests: 3, cost: 0.25, durationMs: 4000 },
+          resolvedModelIdentity: "provider/model",
+          resolvedThinkingLevel: "high",
+        }),
+        entry("accepted", { status: "idle" }),
+        entry("advisor", { kind: "advisor" }),
+        entry("odd", { status: "mystery" }),
+      ],
+      0,
+      at,
+    );
+    expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
+      ["late", "cancelled"],
+      ["early", "completed"],
+      ["accepted", "idle"],
+    ]);
+    const early = agents.find((agent) => agent.id === "early")!;
+    expect(early).toMatchObject({
+      title: "Task of early",
+      role: "scout",
+      model: "provider/model",
+      effort: "high",
+      firstSeenAt: "2026-10-28T10:00:00.000Z",
+      completedAt: "2026-10-28T10:05:00.000Z",
+      usage: { totalTokens: 900, toolUses: 7, durationMs: 4000 },
+      native: { restored: true, disconnected: false },
+    });
+    expect(early.native.facts).toMatchObject({ requests: 3, cost: 0.25 });
+    expect(agents.find((agent) => agent.id === "late")?.completedAt).toBe(
+      "2026-10-28T11:02:00.000Z",
+    );
+    expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
+  });
+
+  it("never overrides a child a frame touched after the read began, nor one still observed live", () => {
+    let agents = reduceNativeSubagents([], lifecycle("started"), 5, at);
+    agents = mergeNativeSubagentHistory(agents, [entry("worker", { status: "parked" })], 4, at);
+    expect(agents[0]).toMatchObject({
+      id: "worker",
+      status: "running",
+      native: { restored: false },
+    });
+    // Read after the frame: the live child keeps its state but takes the older creation time.
+    agents = mergeNativeSubagentHistory(agents, [entry("worker", { status: "parked" })], 5, at);
+    expect(agents[0]).toMatchObject({
+      status: "running",
+      firstSeenAt: "2026-10-28T10:00:00.000Z",
+      native: { restored: false },
+    });
+  });
+
+  it("restores a disconnected child's outcome without losing what was observed of it", () => {
+    let agents = reduceNativeSubagents(
+      [],
+      progress({ cost: 0.5, requests: 2, lastIntent: "Reading protocol" }),
+      1,
+      at,
+    );
+    agents = disconnectNativeSubagents(agents, 2, at);
+    expect(agents[0]?.status).toBe("interrupted");
+    agents = mergeNativeSubagentHistory(agents, [entry("worker", { description: "gist" })], 2, at);
+    expect(agents[0]).toMatchObject({
+      id: "worker",
+      status: "completed",
+      title: "Inspect native protocol",
+      native: { restored: true, disconnected: false },
+    });
+    expect(agents[0]?.native.facts).toMatchObject({
+      task: "Inspect native protocol",
+      cost: 0.5,
+      requests: 2,
+    });
+  });
+
+  it("survives the live inventory read that follows it, and a resumed child reactivates", () => {
+    let agents = mergeNativeSubagentHistory(
+      [],
+      [
+        entry("done"),
+        entry("accepted", { status: "idle" }),
+        entry("working", { status: "running" }),
+      ],
+      0,
+      at,
+    );
+    agents = snapshotNativeSubagents(
+      agents,
+      [{ id: "working", agent: "scout", index: 0, status: "running" }],
+      0,
+      1,
+      at,
+    );
+    expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
+      ["done", "completed"],
+      ["accepted", "idle"],
+      ["working", "running"],
+    ]);
+    // An inventory that omits a child history called running means it is gone.
+    agents = snapshotNativeSubagents(agents, [], 1, 2, at);
+    expect(agents.find((agent) => agent.id === "working")?.status).toBe("interrupted");
+    agents = reduceNativeSubagents(
+      agents,
+      { type: "subagent_lifecycle", payload: { id: "done", agent: "scout", status: "started" } },
+      3,
+      at,
+    );
+    expect(agents.find((agent) => agent.id === "done")).toMatchObject({
+      status: "running",
+      activationCount: 2,
+    });
+  });
+
+  it("hydrating history is not a spawn or exit for the status chip", () => {
+    const agents = mergeNativeSubagentHistory(
+      [],
+      [entry("done"), entry("working", { status: "running" })],
+      0,
+      at,
+    );
+    expect(subagentFlashFor([], agents)).toBeNull();
   });
 });

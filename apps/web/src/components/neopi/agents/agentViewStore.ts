@@ -2,8 +2,9 @@ import { create } from "zustand";
 
 /**
  * Which main-area view a native session shows. The agents right panel and the
- * Agent Hub share one selection, so highlighting an agent in either previews it
- * in both. Not persisted: a reload returns to the session.
+ * Agent Hub share one selection, so expanding an agent in either expands it in
+ * both. Nothing is selected until the user picks an agent. Not persisted: a
+ * reload returns to the session.
  */
 export type AgentViewMode = "session" | "hub" | "agent";
 
@@ -22,7 +23,11 @@ export const SESSION_AGENT_VIEW: AgentViewState = {
 
 export type AgentViewAction =
   | { readonly type: "toggleHub" }
+  /** Move the selection (keyboard); never clears it. */
   | { readonly type: "select"; readonly id: string }
+  /** A click: selects an agent, and collapses it again when it is already selected. */
+  | { readonly type: "toggle"; readonly id: string }
+  /** Enter the agent's own view. Only ever an explicit action, never a side effect of clicking. */
   | { readonly type: "open"; readonly id: string }
   | { readonly type: "back" };
 
@@ -34,6 +39,8 @@ export function reduceAgentView(state: AgentViewState, action: AgentViewAction):
         : { ...state, mode: "hub", returnTo: "session" };
     case "select":
       return state.selectedId === action.id ? state : { ...state, selectedId: action.id };
+    case "toggle":
+      return { ...state, selectedId: state.selectedId === action.id ? null : action.id };
     case "open":
       return {
         mode: "agent",

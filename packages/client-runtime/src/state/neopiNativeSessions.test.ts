@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import * as TestClock from "effect/testing/TestClock";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
@@ -802,5 +803,97 @@ describe("native feed reconciliation lifetime", () => {
           expect(refreshed.conversation.pending).toEqual(completed.conversation.pending);
         }),
       ),
+  );
+
+  it.effect("loads the whole roster once NeoPi advertises its history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested: string[] = [];
+        const history = [
+          {
+            id: "0-Finished",
+            kind: "sub",
+            status: "parked",
+            agent: "scout",
+            description: "Map the protocol",
+            createdAt: 1_000,
+            lastActivity: 5_000,
+            metrics: { tokens: 300, tools: 4 },
+          },
+          { id: "1-Killed", kind: "sub", status: "aborted", createdAt: 2_000, lastActivity: 3_000 },
+        ];
+        const { events, feeds } = yield* harness((command) => {
+          requested.push(command.type);
+          if (command.type === "get_subagent_history")
+            return Effect.succeed({ subagents: history });
+          if (command.type === "get_subagents") return Effect.succeed({ subagents: [] });
+          return Effect.succeed({});
+        });
+        yield* Queue.offer(events, {
+          type: "snapshot",
+          session: { ...session, capabilities: ["subagent_history"] },
+          journal: page([user]),
+        });
+        const loaded = yield* nextFeed(feeds, (feed) => feed.agents.length === 2);
+        expect(loaded.agents.map((agent) => [agent.id, agent.status])).toEqual([
+          ["0-Finished", "completed"],
+          ["1-Killed", "cancelled"],
+        ]);
+        expect(loaded.agents[0]?.usage?.totalTokens).toBe(300);
+        expect(requested).toContain("get_subagent_history");
+      }),
+    ),
+  );
+
+  it.effect("keeps the live inventory alone for a NeoPi without history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested: string[] = [];
+        const { events, feeds } = yield* harness((command) => {
+          requested.push(command.type);
+          if (command.type === "get_subagents")
+            return Effect.succeed({
+              subagents: [{ id: "live", agent: "task", index: 0, status: "running" }],
+            });
+          return Effect.succeed({});
+        });
+        yield* Queue.offer(events, { type: "snapshot", session, journal: page([user]) });
+        yield* nextFeed(feeds, (feed) => feed.agents.length === 1);
+        expect(requested).not.toContain("get_subagent_history");
+      }),
+    ),
+  );
+
+  it.effect("polls jobs for a terminal-attached session and settles on zero", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let reads = 0;
+        const job = { id: "bg_1", type: "bash", label: "sleep 9", status: "running", startedAt: 1 };
+        const { events, feeds } = yield* harness((command) => {
+          if (command.type === "get_subagents") return Effect.succeed({ subagents: [] });
+          if (command.type !== "get_jobs") return Effect.succeed({});
+          reads++;
+          return Effect.succeed(
+            reads === 1
+              ? { running: [job], recent: [], runningCount: 1 }
+              : {
+                  running: [],
+                  recent: [{ ...job, status: "completed", finishedAt: 2 }],
+                  runningCount: 0,
+                },
+          );
+        });
+        yield* Queue.offer(events, {
+          type: "snapshot",
+          session: { ...session, attachment: "terminal", capabilities: ["background_jobs"] },
+          journal: page([user]),
+        });
+        yield* nextFeed(feeds, (feed) => feed.jobs.runningCount === 1);
+        // No job_lifecycle frame reaches a terminal attachment: only the poll can learn it ended.
+        yield* TestClock.adjust("5 seconds");
+        const settled = yield* nextFeed(feeds, (feed) => feed.jobs.runningCount === 0);
+        expect(settled.jobs.entries.map((entry) => entry.status)).toEqual(["completed"]);
+      }),
+    ),
   );
 });

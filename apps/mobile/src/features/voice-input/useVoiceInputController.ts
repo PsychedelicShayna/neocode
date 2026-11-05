@@ -217,12 +217,14 @@ export function useVoiceInputController(input: {
   }, [controller]);
   const stop = useCallback(() => controller.stop(), [controller]);
   const cancel = useCallback(() => controller.cancel(), [controller]);
+  const getCurrentState = useCallback(() => controller.currentState, [controller]);
 
   return {
     // Store screenshots show the dictation button even on simulators, whose
     // on-device transcription is unavailable.
     isAvailable: getLocalVoiceTranscriber() !== null || getNativeShowcaseScene() !== null,
     state,
+    getCurrentState,
     audioLevels,
     elapsedSeconds,
     isBusy: voiceInputBlocksSubmission(state),

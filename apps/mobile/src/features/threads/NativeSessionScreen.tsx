@@ -4,7 +4,6 @@ import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
   nativeCatalogModels,
   nativeCommandCompletions,
-  nativeCommandNeedsTerminal,
   nativeRecord,
   nativeSessionKey,
   nativeSlashArgument,
@@ -417,53 +416,24 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
               {notice}
             </Text>
           ))}
-        {suggestions.length ? (
-          <ScrollView horizontal>
-            {suggestions.map((command) => (
-              <MaterialButton
-                key={command.name}
-                label={[
-                  `/${command.name}`,
-                  command.input?.hint,
-                  nativeCommandNeedsTerminal(command, feed.session?.attachment)
-                    ? "· terminal only"
-                    : undefined,
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                tone="text"
-                onPress={() => composer.setText(`/${command.name} `)}
-              />
-            ))}
-          </ScrollView>
-        ) : null}
-        {argumentCommand && argumentSuggestions.length ? (
-          <ScrollView horizontal>
-            {argumentSuggestions.map((item) => (
-              <MaterialButton
-                key={item.value}
-                label={item.label}
-                tone="text"
-                onPress={() => {
-                  composer.setText(`/${argumentCommand} ${item.value}`);
-                  if (item.submitsCommand) void composer.send();
-                }}
-              />
-            ))}
-          </ScrollView>
-        ) : null}
-        <NativeSessionWorkspaceControls
-          target={target}
-          cwd={feed.session?.cwd ?? null}
-          agentCount={feed.agents.length}
-          onOpenAgents={() => setAgents(true)}
-          onError={setLocalError}
-        />
         <NativeSessionComposer
           target={target}
           cwd={feed.session?.cwd ?? null}
           composer={composer}
           busy={feed.busy}
+          commands={suggestions}
+          argumentCommand={argumentCommand}
+          argumentSuggestions={argumentSuggestions}
+          attachment={feed.session?.attachment}
+          workspaceControls={
+            <NativeSessionWorkspaceControls
+              target={target}
+              cwd={feed.session?.cwd ?? null}
+              agentCount={feed.agents.length}
+              onOpenAgents={() => setAgents(true)}
+              onError={setLocalError}
+            />
+          }
           onStop={() =>
             void execute({ type: "abort" }).catch((cause) => setLocalError(String(cause)))
           }

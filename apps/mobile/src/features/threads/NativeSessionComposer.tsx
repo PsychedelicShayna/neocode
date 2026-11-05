@@ -1,13 +1,19 @@
 import { useNavigation } from "@react-navigation/native";
-import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
-import { useState } from "react";
-import { Keyboard, View } from "react-native";
+import {
+  nativeCommandNeedsTerminal,
+  type NativeCommandCompletion,
+  type NativeSessionTarget,
+  type NativeSlashCommand,
+} from "@t3tools/client-runtime/neopi-native-sessions";
+import { useState, type ReactNode } from "react";
+import { Keyboard, ScrollView, View } from "react-native";
 import { ComposerAttachmentButton } from "../../components/ComposerAttachmentButton";
 import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStrip";
 import { ComposerEditor } from "../../components/ComposerEditor";
 import { ComposerActionButton, ComposerToolbarRow } from "../../components/ComposerToolbar";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
 import { VideoPreviewModal, type VideoPreviewSource } from "../../components/VideoPreviewModal";
+import { MaterialButton } from "../../components/MaterialButton";
 import type { ComposerDocumentAttachment } from "../../lib/composerContext";
 import { composerStripAttachments } from "../../lib/composerImages";
 import type { useNativeComposerState } from "../../state/use-native-composer-state";
@@ -23,6 +29,7 @@ import { NativeError } from "./NativeNeoPiControls";
 import { useComposerCommandMenu } from "./use-composer-command-menu";
 import { ComposerCommandPopover } from "./ComposerCommandPopover";
 import { ComposerSurface } from "./ThreadComposer";
+import { selectNativeSlashSuggestion } from "./nativeSlashSuggestion";
 
 /** Stock mobile editor, context chips, media viewers and dictation without a SQL thread adapter. */
 export function NativeSessionComposer({
@@ -30,12 +37,22 @@ export function NativeSessionComposer({
   cwd,
   composer,
   busy,
+  commands,
+  argumentCommand,
+  argumentSuggestions,
+  attachment,
+  workspaceControls,
   onStop,
 }: {
   target: NativeSessionTarget;
   cwd: string | null;
   composer: ReturnType<typeof useNativeComposerState>;
   busy: boolean;
+  commands: readonly NativeSlashCommand[];
+  argumentCommand: string | null;
+  argumentSuggestions: readonly NativeCommandCompletion[];
+  attachment: "owned" | "terminal" | undefined;
+  workspaceControls: ReactNode;
   onStop: () => void;
 }) {
   const navigation = useNavigation();
@@ -82,6 +99,46 @@ export function NativeSessionComposer({
     Boolean(composer.serverConfig.environment.capabilities.fileAttachments);
   return (
     <>
+      {!voice.isBusy && commands.length ? (
+        <ScrollView horizontal>
+          {commands.map((command) => (
+            <MaterialButton
+              key={command.name}
+              label={[
+                `/${command.name}`,
+                command.input?.hint,
+                nativeCommandNeedsTerminal(command, attachment) ? "· terminal only" : undefined,
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              tone="text"
+              onPress={() =>
+                selectNativeSlashSuggestion(voice.getCurrentState, composer, `/${command.name} `)
+              }
+            />
+          ))}
+        </ScrollView>
+      ) : null}
+      {!voice.isBusy && argumentCommand && argumentSuggestions.length ? (
+        <ScrollView horizontal>
+          {argumentSuggestions.map((item) => (
+            <MaterialButton
+              key={item.value}
+              label={item.label}
+              tone="text"
+              onPress={() =>
+                selectNativeSlashSuggestion(
+                  voice.getCurrentState,
+                  composer,
+                  `/${argumentCommand} ${item.value}`,
+                  item.submitsCommand,
+                )
+              }
+            />
+          ))}
+        </ScrollView>
+      ) : null}
+      {workspaceControls}
       <NativeError message={composer.error ?? composer.blockReason} />
       {!voice.isBusy &&
       menu.trigger &&

@@ -32,7 +32,7 @@ import { EnvironmentRegistry } from "../../../../../packages/client-runtime/src/
 import { EnvironmentSupervisor } from "../../../../../packages/client-runtime/src/connection/supervisor";
 import type { WsRpcProtocolClient } from "../../../../../packages/client-runtime/src/rpc/protocol";
 import type { RpcSession } from "../../../../../packages/client-runtime/src/rpc/session";
-import { NativeSessionScreen } from "./NativeSessionScreen";
+import { NativeMobileModels, NativeSessionScreen } from "./NativeSessionScreen";
 
 type Router = ReturnType<typeof StackRouter>;
 type Action = Parameters<Router["getStateForAction"]>[1];
@@ -176,7 +176,7 @@ vi.mock("./NativeSessionWorkspaceControls", () => ({
 }));
 vi.mock("./NativeNeoPiControls", () => ({
   NativeField: () => null,
-  NativeModal: () => null,
+  NativeModal: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   NativeError: ({ message }: { message: string | null }) =>
     message ? <p role="alert">{message}</p> : null,
 }));
@@ -469,4 +469,74 @@ describe("NativeSessionScreen exit and canonical reselection", () => {
         });
       }),
   );
+});
+
+describe("native mobile model picker", () => {
+  it("keeps models selectable while the optional roles request is pending or fails", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    let rejectRoles!: (cause: Error) => void;
+    const roles = new Promise<unknown>((_resolve, reject) => {
+      rejectRoles = reject;
+    });
+    const request = vi.fn((command: Record<string, unknown> & { type: string }) => {
+      if (command.type === "get_available_models")
+        return Promise.resolve({ models: [{ provider: "example", id: "one", name: "Model One" }] });
+      if (command.type === "get_roles") return roles;
+      return Promise.resolve({});
+    });
+    const onClose = vi.fn();
+    try {
+      await act(async () => {
+        root.render(<NativeMobileModels request={request} rolesSupported onClose={onClose} />);
+      });
+      expect(container.textContent).toContain("Model One · example");
+      await act(async () => rejectRoles(new Error("roles unavailable")));
+      expect(container.textContent).toContain("Could not load roles: Error: roles unavailable");
+      expect(container.textContent).toContain("Model One · example");
+      await act(async () => {
+        const model = Array.from(container.querySelectorAll("button")).find((button) =>
+          button.textContent?.includes("Model One"),
+        );
+        expect(model).toBeDefined();
+        model!.click();
+      });
+      expect(request).toHaveBeenCalledWith({
+        type: "set_model",
+        provider: "example",
+        modelId: "one",
+      });
+      expect(onClose).toHaveBeenCalledOnce();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not ask older sessions for unsupported roles", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const request = vi.fn(async (_command: Record<string, unknown> & { type: string }) => ({
+      models: [{ provider: "example", id: "one", name: "Model One" }],
+    }));
+    try {
+      await act(async () => {
+        root.render(
+          <NativeMobileModels request={request} rolesSupported={false} onClose={() => {}} />,
+        );
+      });
+      expect(container.textContent).toContain("Model One · example");
+      expect(container.textContent).toContain("Role selection is unavailable");
+      expect(request.mock.calls.map(([command]) => command.type)).toEqual(["get_available_models"]);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      vi.unstubAllGlobals();
+    }
+  });
 });

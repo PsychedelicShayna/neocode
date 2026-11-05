@@ -502,7 +502,13 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       {agents ? (
         <NativeSessionAgents agents={feed.agents} onClose={() => setAgents(false)} />
       ) : null}
-      {models ? <NativeMobileModels request={execute} onClose={() => setModels(false)} /> : null}
+      {models ? (
+        <NativeMobileModels
+          request={execute}
+          rolesSupported={feed.session?.capabilities.includes("get_roles") ?? false}
+          onClose={() => setModels(false)}
+        />
+      ) : null}
       {tree ? (
         <NativeSessionMobileTree target={target} request={execute} onClose={() => setTree(false)} />
       ) : null}
@@ -522,20 +528,26 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   );
 }
 
-function NativeMobileModels({ request, onClose }: { request: Request; onClose: () => void }) {
+export function NativeMobileModels({
+  request,
+  rolesSupported,
+  onClose,
+}: {
+  request: Request;
+  rolesSupported: boolean;
+  onClose: () => void;
+}) {
   const [models, setModels] = useState<ReturnType<typeof nativeCatalogModels>>([]);
   const [roles, setRoles] = useState<readonly Record<string, unknown>[]>([]);
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rolesError, setRolesError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    void Promise.all([request({ type: "get_available_models" }), request({ type: "get_roles" })])
-      .then(([models, roles]) => {
-        if (!active) return;
-        setModels(nativeCatalogModels(models));
-        const items = nativeRecord(roles).roles;
-        if (Array.isArray(items)) setRoles(items.map(nativeRecord));
+    void request({ type: "get_available_models" })
+      .then((value) => {
+        if (active) setModels(nativeCatalogModels(value));
       })
       .catch((cause) => {
         if (active) setError(String(cause));
@@ -544,6 +556,24 @@ function NativeMobileModels({ request, onClose }: { request: Request; onClose: (
       active = false;
     };
   }, [request]);
+  useEffect(() => {
+    let active = true;
+    setRoles([]);
+    setRolesError(null);
+    if (rolesSupported) {
+      void request({ type: "get_roles" })
+        .then((value) => {
+          const items = nativeRecord(value).roles;
+          if (active && Array.isArray(items)) setRoles(items.map(nativeRecord));
+        })
+        .catch((cause) => {
+          if (active) setRolesError(`Could not load roles: ${String(cause)}`);
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [request, rolesSupported]);
   const choose = async (command: Record<string, unknown> & { type: string }) => {
     if (pending) return;
     setPending(true);
@@ -561,6 +591,12 @@ function NativeMobileModels({ request, onClose }: { request: Request; onClose: (
       <View className="gap-3 px-4 pb-3">
         <NativeField label="Search models and roles" value={query} onChange={setQuery} />
         <NativeError message={error} />
+        <NativeError message={rolesError} />
+        {!rolesSupported ? (
+          <Text className="text-sm text-foreground-muted">
+            Role selection is unavailable for this NeoPi session.
+          </Text>
+        ) : null}
       </View>
       <FlatList
         data={models.filter((model) =>
@@ -569,7 +605,7 @@ function NativeMobileModels({ request, onClose }: { request: Request; onClose: (
         keyExtractor={(model) => `${model.provider}/${model.id}`}
         ListHeaderComponent={
           <View className="px-4">
-            {roles
+            {(rolesSupported ? roles : [])
               .filter(
                 (role) =>
                   role.hidden !== true &&

@@ -102,6 +102,9 @@ click a model; Left and Right move between the rail and the list. Choosing a rol
 or model applies it to the session and returns focus to the prompt. This is the
 quick session switcher, separate from the Models management page.
 
+On mobile, you can still choose a model if the connected NeoPi cannot provide
+its role list.
+
 ## Custom models
 
 NeoPi owns the model catalog and role configuration. Use **Settings → Models** to

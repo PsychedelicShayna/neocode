@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => ({
   openPictureInPicture: vi.fn(async (_tabId: string): Promise<void> => undefined),
   closePictureInPicture: vi.fn(async (_tabId: string): Promise<void> => undefined),
   pickElement: vi.fn(),
+  cancelPickElement: vi.fn(async (_tabId: string): Promise<void> => undefined),
+  pickPressed: false,
   addPreviewAnnotation: vi.fn(),
   addImage: vi.fn(),
   toggleAnnotation: null as (() => void) | null,
@@ -207,6 +209,7 @@ vi.mock("./previewBridge", () => ({
   previewBridge: {
     navigate: mocks.navigate,
     pickElement: mocks.pickElement,
+    cancelPickElement: mocks.cancelPickElement,
     pictureInPicture: {
       open: mocks.openPictureInPicture,
       close: mocks.closePictureInPicture,
@@ -218,6 +221,7 @@ vi.mock("./PreviewChromeRow", () => ({
   PreviewChromeRow: (props: {
     onSubmit: (url: string) => void;
     onPickElement?: () => void;
+    pickActive?: boolean;
     onPictureInPicture?: () => void;
     pictureInPicture?: boolean;
     trailingActions?: {
@@ -226,6 +230,7 @@ vi.mock("./PreviewChromeRow", () => ({
   }) => {
     mocks.submittedUrl = props.onSubmit;
     mocks.toggleAnnotation = props.onPickElement ?? null;
+    mocks.pickPressed = props.pickActive ?? false;
     mocks.togglePictureInPicture = props.onPictureInPicture ?? null;
     mocks.toggleNativePictureInPicture =
       props.trailingActions?.props.onNativePictureInPicture ?? null;
@@ -263,6 +268,18 @@ const TEST_THREAD_REF = {
   threadId: ThreadId.make("thread-1"),
 } as const;
 const TEST_RUNTIME_TAB_ID = previewRuntimeTabId(TEST_THREAD_REF, null, "tab-1");
+const pickedAnnotation = (id: string) => ({
+  id,
+  pageUrl: "https://example.com/dashboard",
+  pageTitle: "Dashboard",
+  comment: id,
+  elements: [],
+  regions: [],
+  strokes: [],
+  styleChanges: [],
+  screenshot: null,
+  createdAt: "2026-07-27T00:00:00.000Z",
+});
 
 // ReactDOM needs a host, but this unit suite intentionally has no DOM dependency.
 class TestNode {
@@ -343,6 +360,8 @@ describe("PreviewView navigation", () => {
     mocks.openPictureInPicture.mockClear();
     mocks.closePictureInPicture.mockClear();
     mocks.pickElement.mockReset();
+    mocks.cancelPickElement.mockClear();
+    mocks.pickPressed = false;
     mocks.addPreviewAnnotation.mockClear();
     vi.mocked(toastManager.add).mockClear();
     mocks.addImage.mockClear();
@@ -378,6 +397,184 @@ describe("PreviewView navigation", () => {
       expect(mocks.recordingTabIds.has(TEST_RUNTIME_TAB_ID)).toBe(true);
     } finally {
       await act(() => root.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["replacement-runtime", "same-runtime", "hidden-panel"] as const)(
+    "ignores a superseded pick without disturbing its replacement (%s)",
+    async (change) => {
+      const document = installTestDom();
+      const { createRoot } = await import("react-dom/client");
+      const root = createRoot(document.createElement("div") as unknown as Element);
+      const first = Promise.withResolvers<unknown>();
+      const second = Promise.withResolvers<unknown>();
+      const firstFocus = { isConnected: true, focus: vi.fn() };
+      const secondFocus = { isConnected: true, focus: vi.fn() };
+      const onSendAnnotation = vi.fn();
+      mocks.pickElement.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      try {
+        await act(() =>
+          root.render(
+            <PreviewView
+              threadRef={TEST_THREAD_REF}
+              tabId="tab-1"
+              visible
+              onSendAnnotation={onSendAnnotation}
+            />,
+          ),
+        );
+        Object.assign(document, { activeElement: firstFocus });
+        await act(() => mocks.toggleAnnotation?.());
+        expect(mocks.pickPressed).toBe(true);
+        const oldHandler = mocks.toggleAnnotation;
+        if (change === "hidden-panel") {
+          await act(() =>
+            root.render(
+              <PreviewView
+                threadRef={TEST_THREAD_REF}
+                tabId="tab-1"
+                visible={false}
+                onSendAnnotation={onSendAnnotation}
+              />,
+            ),
+          );
+          await act(() => oldHandler?.());
+          expect(mocks.pickElement).toHaveBeenCalledOnce();
+        } else {
+          mocks.serverEpoch = "replacement-server";
+          await act(() =>
+            root.render(
+              <PreviewView
+                threadRef={TEST_THREAD_REF}
+                tabId="tab-1"
+                visible
+                onSendAnnotation={onSendAnnotation}
+              />,
+            ),
+          );
+        }
+        expect(mocks.cancelPickElement).toHaveBeenCalledExactlyOnceWith(TEST_RUNTIME_TAB_ID);
+        if (change !== "replacement-runtime") {
+          mocks.serverEpoch = null;
+          await act(() =>
+            root.render(
+              <PreviewView
+                threadRef={TEST_THREAD_REF}
+                tabId="tab-1"
+                visible
+                onSendAnnotation={onSendAnnotation}
+              />,
+            ),
+          );
+        }
+        const replacementRuntime = previewRuntimeTabId(TEST_THREAD_REF, mocks.serverEpoch, "tab-1");
+        Object.assign(document, { activeElement: secondFocus });
+        await act(() => mocks.toggleAnnotation?.());
+        expect(mocks.pickElement).toHaveBeenNthCalledWith(2, replacementRuntime);
+        const stale = pickedAnnotation("stale");
+        await act(async () => {
+          first.resolve({ annotation: stale, submission: "send", screenshotFailed: true });
+          await first.promise;
+        });
+        expect(mocks.addPreviewAnnotation).not.toHaveBeenCalled();
+        expect(mocks.addImage).not.toHaveBeenCalled();
+        expect(onSendAnnotation).not.toHaveBeenCalled();
+        expect(toastManager.add).not.toHaveBeenCalled();
+        expect(firstFocus.focus).not.toHaveBeenCalled();
+        expect(secondFocus.focus).not.toHaveBeenCalled();
+        expect(mocks.pickPressed).toBe(true);
+        const current = pickedAnnotation("current");
+        await act(async () => {
+          second.resolve({ annotation: current, submission: "send" });
+          await second.promise;
+        });
+        expect(mocks.addPreviewAnnotation).toHaveBeenCalledExactlyOnceWith(
+          TEST_THREAD_REF,
+          current,
+        );
+        expect(onSendAnnotation).toHaveBeenCalledExactlyOnceWith(current, null);
+        expect(secondFocus.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+        expect(firstFocus.focus).not.toHaveBeenCalled();
+        expect(mocks.pickPressed).toBe(false);
+      } finally {
+        await act(() => root.unmount());
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("does not apply a successful response after the current pick was explicitly cancelled", async () => {
+    const document = installTestDom();
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(document.createElement("div") as unknown as Element);
+    const pick = Promise.withResolvers<unknown>();
+    const opener = { isConnected: true, focus: vi.fn() };
+    const onSendAnnotation = vi.fn();
+    mocks.pickElement.mockReturnValueOnce(pick.promise);
+    try {
+      await act(() =>
+        root.render(
+          <PreviewView
+            threadRef={TEST_THREAD_REF}
+            tabId="tab-1"
+            visible
+            onSendAnnotation={onSendAnnotation}
+          />,
+        ),
+      );
+      Object.assign(document, { activeElement: opener });
+      await act(() => mocks.toggleAnnotation?.());
+      await act(() => mocks.toggleAnnotation?.());
+      expect(mocks.cancelPickElement).toHaveBeenCalledExactlyOnceWith(TEST_RUNTIME_TAB_ID);
+      await act(async () => {
+        pick.resolve({ annotation: pickedAnnotation("cancelled"), submission: "send" });
+        await pick.promise;
+      });
+      expect(mocks.addPreviewAnnotation).not.toHaveBeenCalled();
+      expect(onSendAnnotation).not.toHaveBeenCalled();
+      expect(opener.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      expect(mocks.pickPressed).toBe(false);
+    } finally {
+      await act(() => root.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("cancels on unmount without applying a late result or restoring focus", async () => {
+    const document = installTestDom();
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(document.createElement("div") as unknown as Element);
+    const pick = Promise.withResolvers<unknown>();
+    const opener = { isConnected: true, focus: vi.fn() };
+    const onSendAnnotation = vi.fn();
+    let mounted = true;
+    mocks.pickElement.mockReturnValueOnce(pick.promise);
+    try {
+      await act(() =>
+        root.render(
+          <PreviewView
+            threadRef={TEST_THREAD_REF}
+            tabId="tab-1"
+            visible
+            onSendAnnotation={onSendAnnotation}
+          />,
+        ),
+      );
+      Object.assign(document, { activeElement: opener });
+      await act(() => mocks.toggleAnnotation?.());
+      await act(() => root.unmount());
+      mounted = false;
+      expect(mocks.cancelPickElement).toHaveBeenCalledExactlyOnceWith(TEST_RUNTIME_TAB_ID);
+      await act(async () => {
+        pick.resolve({ annotation: pickedAnnotation("closed"), submission: "send" });
+        await pick.promise;
+      });
+      expect(mocks.addPreviewAnnotation).not.toHaveBeenCalled();
+      expect(onSendAnnotation).not.toHaveBeenCalled();
+      expect(opener.focus).not.toHaveBeenCalled();
+    } finally {
+      if (mounted) await act(() => root.unmount());
       vi.unstubAllGlobals();
     }
   });

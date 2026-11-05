@@ -16,7 +16,7 @@ import {
   type PreviewViewportSetting,
 } from "@t3tools/contracts";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   BROWSER_HISTORY_MAX_ENTRIES_PER_PROJECT,
@@ -113,7 +113,7 @@ export function PreviewView({
   const [focusUrlNonce, setFocusUrlNonce] = useState<number | undefined>(undefined);
   const [pickActive, setPickActive] = useState(false);
   const activeRecordingTabIds = useActiveBrowserRecordingTabIds();
-  const pickActiveRef = useRef(false);
+  const pickActiveRef = useRef<{ runtimeTabId: string; cancelled: boolean } | null>(null);
   const isMountedRef = useRef(true);
   // Kept in sync so the title effect can depend on the stable thread key
   // instead of the thread object, which is recreated on every update.
@@ -138,7 +138,7 @@ export function PreviewView({
 
   usePreviewSession(threadRef);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
@@ -149,6 +149,10 @@ export function PreviewView({
   const runtimeTabId = tabId
     ? previewRuntimeTabId(threadRef, previewState.serverEpoch, tabId)
     : null;
+  const runtimeTabIdRef = useRef(visible ? runtimeTabId : null);
+  useLayoutEffect(() => {
+    runtimeTabIdRef.current = visible ? runtimeTabId : null;
+  }, [runtimeTabId, visible]);
   const recordingRuntimeTabId =
     tabId && runtimeTabId
       ? activeRecordingTabIds.has(runtimeTabId)
@@ -590,10 +594,14 @@ export function PreviewView({
   );
 
   const handlePickElement = useCallback(() => {
-    if (!previewBridge || !runtimeTabId) return;
-    if (pickActiveRef.current) {
-      void previewBridge.cancelPickElement(runtimeTabId).catch(() => undefined);
+    if (!previewBridge || !visible || !runtimeTabId || runtimeTabIdRef.current !== runtimeTabId)
       return;
+    const activePick = pickActiveRef.current;
+    if (activePick) {
+      activePick.cancelled = true;
+      void previewBridge.cancelPickElement(activePick.runtimeTabId).catch(() => undefined);
+      if (activePick.runtimeTabId === runtimeTabId) return;
+      pickActiveRef.current = null;
     }
     // Snapshot whatever the user was focused on (typically the chat
     // composer textarea or the chrome-row pick button) BEFORE main steals
@@ -602,12 +610,20 @@ export function PreviewView({
     // every pick they'd have to click back into the textarea.
     const previouslyFocused =
       typeof document !== "undefined" ? (document.activeElement as HTMLElement | null) : null;
-    pickActiveRef.current = true;
+    const pick = { runtimeTabId, cancelled: false };
+    pickActiveRef.current = pick;
     setPickActive(true);
     void (async () => {
       try {
         const result = await previewBridge.pickElement(runtimeTabId);
-        if (!result) return;
+        if (
+          !result ||
+          pick.cancelled ||
+          pickActiveRef.current !== pick ||
+          runtimeTabIdRef.current !== pick.runtimeTabId ||
+          !isMountedRef.current
+        )
+          return;
         const { annotation: picked, submission, screenshotFailed = false } = result;
         // The structured annotation is still sendable when its optional crop
         // stalls or fails, so tell the user what they lost and keep going
@@ -653,41 +669,46 @@ export function PreviewView({
       } catch {
         // Picker failed (e.g. webview navigated). Treat as silent cancel.
       } finally {
-        pickActiveRef.current = false;
-        // Avoid `setState on unmounted component` if the panel/thread closed
-        // while the pick was in flight.
-        if (isMountedRef.current) setPickActive(false);
-        // Best-effort: restore focus to whatever the user had before the
-        // pick stole it into the guest webContents. Skip if the previously-
-        // focused element was unmounted or is no longer focusable.
-        if (
-          previouslyFocused &&
-          previouslyFocused.isConnected &&
-          typeof previouslyFocused.focus === "function"
-        ) {
-          try {
-            previouslyFocused.focus({ preventScroll: true });
-          } catch {
-            // Some elements throw on .focus() (detached iframes, etc.).
+        if (pickActiveRef.current === pick) {
+          pickActiveRef.current = null;
+          if (isMountedRef.current) setPickActive(false);
+          // Only the current operation may restore focus. A cancelled old runtime
+          // must not steal the opener from a pick that started after a tab switch.
+          if (
+            isMountedRef.current &&
+            runtimeTabIdRef.current === pick.runtimeTabId &&
+            previouslyFocused &&
+            previouslyFocused.isConnected &&
+            typeof previouslyFocused.focus === "function"
+          ) {
+            try {
+              previouslyFocused.focus({ preventScroll: true });
+            } catch {
+              // Some elements throw on .focus() (detached iframes, etc.).
+            }
           }
         }
       }
     })();
-  }, [addImage, addPreviewAnnotation, onSendAnnotation, runtimeTabId, threadRef]);
+  }, [addImage, addPreviewAnnotation, onSendAnnotation, runtimeTabId, threadRef, visible]);
 
-  // If the active tab changes mid-pick (close, thread switch, hot restart),
+  // If the active tab changes or the panel hides mid-pick (close, switch, restart),
   // tell main to tear down the in-flight session AND reset our local toggle
   // state so the button doesn't get stuck pressed against a stale tab id.
-  useEffect(() => {
+  // Layout cleanup invalidates ownership before a late native reply can act on
+  // the committed replacement tab or a panel that has already unmounted.
+  useLayoutEffect(() => {
     return () => {
-      if (!pickActiveRef.current) return;
-      pickActiveRef.current = false;
-      if (previewBridge && runtimeTabId) {
-        void previewBridge.cancelPickElement(runtimeTabId).catch(() => undefined);
+      const activePick = pickActiveRef.current;
+      if (!activePick || activePick.runtimeTabId !== runtimeTabId) return;
+      activePick.cancelled = true;
+      pickActiveRef.current = null;
+      if (previewBridge) {
+        void previewBridge.cancelPickElement(activePick.runtimeTabId).catch(() => undefined);
       }
       if (isMountedRef.current) setPickActive(false);
     };
-  }, [runtimeTabId]);
+  }, [runtimeTabId, visible]);
 
   // Subscribe only while visible; `toggle-panel` is owned by ChatView's
   // URL-aware handler regardless of whether the panel is currently mounted.

@@ -872,7 +872,7 @@ describe("EnvironmentThreads", () => {
           ),
         removeThread: () => Ref.update(operations, (values) => [...values, "remove"]),
       }).pipe(Effect.provideService(Scope.Scope, scope));
-      yield* Scope.addFinalizer(scope, () => Deferred.succeed(closingStarted, undefined));
+      yield* Scope.addFinalizer(scope, Deferred.succeed(closingStarted, undefined));
       yield* Queue.offer(h.inputs, snapshot(BASE_THREAD));
       yield* awaitThreadState(h.observed, (value) => value.status === "live");
       yield* TestClock.adjust("500 millis");

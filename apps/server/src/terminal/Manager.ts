@@ -1393,8 +1393,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
-    env, }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
@@ -1610,6 +1609,16 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     threadId: string,
     terminalId: string,
   ) {
+    let exited = false;
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        process.onExit(() => {
+          exited = true;
+        }),
+      ),
+      (unsubscribe) => Effect.sync(unsubscribe),
+    );
+    if (exited) return;
     const terminated = yield* Effect.try({
       try: () => process.kill("SIGTERM"),
       catch: (cause) =>
@@ -1634,6 +1643,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     yield* Effect.sleep(processKillGraceMs);
+    if (exited) return;
 
     yield* Effect.try({
       try: () => process.kill("SIGKILL"),
@@ -1653,7 +1663,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }),
       ),
     );
-  });
+  }, Effect.scoped);
 
   const startKillEscalation = Effect.fn("terminal.startKillEscalation")(function* (
     process: PtyAdapter.PtyProcess,
@@ -2494,6 +2504,15 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       });
 
       yield* Effect.forEach(sessions, cleanupSession, {
+        concurrency: "unbounded",
+        discard: true,
+      });
+      // Closed sessions have already detached their process, but their termination
+      // still belongs to this manager. Drain it before workerScope is interrupted.
+      const pendingKills = yield* SynchronizedRef.get(managerStateRef).pipe(
+        Effect.map((state) => Array.from(state.killFibers.values())),
+      );
+      yield* Effect.forEach(pendingKills, Fiber.await, {
         concurrency: "unbounded",
         discard: true,
       });

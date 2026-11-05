@@ -1,3 +1,5 @@
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 
 import * as Context from "effect/Context";
@@ -38,6 +40,49 @@ const loadNodePty: NodePtyModuleLoader = () =>
 export const NodePtyModuleLoaderRef = Context.Reference<NodePtyModuleLoader>(
   "server/terminal/NodePtyModuleLoader",
   { defaultValue: () => loadNodePty },
+);
+
+type ProcessIdentityReader = (pid: number, platform: NodeJS.Platform) => string | undefined;
+
+const readProcessIdentity: ProcessIdentityReader = (pid, platform) => {
+  try {
+    if (platform === "linux") {
+      const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+      // comm is parenthesized and may itself contain spaces and parentheses.
+      const fields = stat
+        .slice(stat.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/);
+      const parent = fields[1];
+      const start = fields[19];
+      if (
+        fields[0] === "Z" ||
+        fields[0] === "X" ||
+        parent !== String(process.pid) ||
+        !start ||
+        !/^\d+$/.test(start)
+      )
+        return undefined;
+      return `${parent}:${start}`;
+    }
+    const result = NodeChildProcess.spawnSync(
+      "/bin/ps",
+      ["-p", String(pid), "-o", "ppid=", "-o", "lstart="],
+      { encoding: "utf8", timeout: 1_000, maxBuffer: 4_096 },
+    );
+    if (result.error || result.status !== 0) return undefined;
+    const [parent, ...start] = result.stdout.trim().split(/\s+/);
+    if (parent !== String(process.pid) || start.length !== 5) return undefined;
+    return `${parent}:${start.join(" ")}`;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Identity checks run only at spawn/signal time, never on the PTY output path. */
+export const NodePtyProcessIdentityReaderRef = Context.Reference<ProcessIdentityReader>(
+  "server/terminal/NodePtyProcessIdentityReader",
+  { defaultValue: () => readProcessIdentity },
 );
 
 let didEnsureSpawnHelperExecutable = false;
@@ -85,10 +130,23 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
+  private readonly identity: string | undefined;
+  private readonly readIdentity: ProcessIdentityReader;
+  private exited = false;
 
-  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
+  constructor(
+    process: import("node-pty").IPty,
+    platform: NodeJS.Platform,
+    readIdentity: ProcessIdentityReader,
+  ) {
     this.process = process;
     this.platform = platform;
+    this.readIdentity = readIdentity;
+    // Keep this observer independent of the manager's detachable session callbacks.
+    process.onExit(() => {
+      this.exited = true;
+    });
+    this.identity = platform === "win32" ? undefined : readIdentity(process.pid, platform);
   }
 
   get pid(): number {
@@ -104,6 +162,12 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
   }
 
   kill(signal?: string): void {
+    if (this.exited) return;
+    if (this.platform !== "win32") {
+      const current = this.readIdentity(this.pid, this.platform);
+      if (!this.identity || !current || current !== this.identity)
+        throw new Error("Refusing to signal a PTY process whose identity is no longer owned.");
+    }
     // node-pty terminates the Windows process tree without a POSIX signal.
     this.process.kill(this.platform === "win32" ? undefined : signal);
   }
@@ -134,6 +198,7 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
   const architecture = yield* HostProcessArchitecture;
+  const readIdentity = yield* NodePtyProcessIdentityReaderRef;
 
   const nodePty = yield* Effect.tryPromise({
     try: loadNodePtyModule,
@@ -181,7 +246,7 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
             cause,
           }),
       });
-      return new NodePtyProcess(ptyProcess, platform);
+      return new NodePtyProcess(ptyProcess, platform, readIdentity);
     }),
   });
 });

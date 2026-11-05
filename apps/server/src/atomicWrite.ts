@@ -5,6 +5,7 @@ import * as Path from "effect/Path";
 export const writeFileStringAtomically = (input: {
   readonly filePath: string;
   readonly contents: string;
+  readonly overwrite?: boolean;
 }) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -20,6 +21,13 @@ export const writeFileStringAtomically = (input: {
       const tempPath = path.join(tempDirectory, "contents.tmp");
 
       yield* fs.writeFileString(tempPath, input.contents);
-      yield* fs.rename(tempPath, input.filePath);
+      // Linking publishes the complete file and fails atomically if another
+      // writer already owns the name. An existence check followed by rename
+      // would silently replace a file created between those two operations.
+      if (input.overwrite === false) {
+        yield* fs.link(tempPath, input.filePath);
+      } else {
+        yield* fs.rename(tempPath, input.filePath);
+      }
     }),
   );

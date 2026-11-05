@@ -269,6 +269,156 @@ it.layer(TestLayer, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
       }),
     );
 
+    it.effect("creates a plan without clobbering an existing file", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "plans/plan.md", "# Existing work\n");
+
+        const error = yield* workspaceFileSystem
+          .writeFile({
+            cwd,
+            relativePath: "plans/plan.md",
+            contents: "# New plan\n",
+            mode: "create",
+          })
+          .pipe(Effect.flip);
+
+        expect(error).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFileAlreadyExistsError);
+        expect(yield* fileSystem.readFileString(path.join(cwd, "plans/plan.md"))).toBe(
+          "# Existing work\n",
+        );
+        expect(yield* fileSystem.readDirectory(path.join(cwd, "plans"))).toEqual(["plan.md"]);
+      }),
+    );
+
+    it.effect("publishes a complete new plan and creates its parent directories", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const contents = "# Plan\n" + "Complete plan contents\n".repeat(4_096);
+
+        const result = yield* workspaceFileSystem.writeFile({
+          cwd,
+          relativePath: "plans/new/plan.md",
+          contents,
+          mode: "create",
+        });
+
+        expect(result).toEqual({ relativePath: "plans/new/plan.md" });
+        expect(yield* fileSystem.readFileString(path.join(cwd, result.relativePath))).toBe(
+          contents,
+        );
+        expect(yield* fileSystem.readDirectory(path.join(cwd, "plans/new"))).toEqual(["plan.md"]);
+      }),
+    );
+
+    it.effect("allows only one concurrent creator of the same plan filename", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const plans = ["# First plan\n".repeat(4_096), "# Second plan\n".repeat(4_096)];
+
+        const results = yield* Effect.all(
+          plans.map((contents) =>
+            workspaceFileSystem
+              .writeFile({
+                cwd,
+                relativePath: "plans/plan.md",
+                contents,
+                mode: "create",
+              })
+              .pipe(Effect.result),
+          ),
+          { concurrency: "unbounded" },
+        );
+
+        expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
+        const failures = results.filter((result) => result._tag === "Failure");
+        expect(failures).toHaveLength(1);
+        expect(failures[0]?.failure).toBeInstanceOf(
+          WorkspaceFileSystem.WorkspaceFileAlreadyExistsError,
+        );
+        const winnerIndex = results.findIndex((result) => result._tag === "Success");
+        expect(yield* fileSystem.readFileString(path.join(cwd, "plans/plan.md"))).toBe(
+          plans[winnerIndex],
+        );
+        expect(yield* fileSystem.readDirectory(path.join(cwd, "plans"))).toEqual(["plan.md"]);
+      }),
+    );
+
+    it.effect("atomically replaces a plan only when replacement is explicitly requested", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "plan.md", "# Existing\n");
+
+        yield* workspaceFileSystem.writeFile({
+          cwd,
+          relativePath: "plan.md",
+          contents: "# Replacement\n",
+          mode: "replace",
+        });
+
+        expect(yield* fileSystem.readFileString(path.join(cwd, "plan.md"))).toBe("# Replacement\n");
+        expect(yield* fileSystem.readDirectory(cwd)).toEqual(["plan.md"]);
+      }),
+    );
+
+    it.effect("preserves the editor's intentional in-place overwrite behavior", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "notes.md", "# Existing\n");
+
+        yield* workspaceFileSystem.writeFile({
+          cwd,
+          relativePath: "notes.md",
+          contents: "# Edited\n",
+        });
+
+        expect(yield* fileSystem.readFileString(path.join(cwd, "notes.md"))).toBe("# Edited\n");
+      }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)("does not follow an existing plan symlink on create", () =>
+      Effect.gen(function* () {
+        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "original.md", "# Original\n");
+        yield* fileSystem.symlink(path.join(cwd, "original.md"), path.join(cwd, "plan.md"));
+
+        const error = yield* workspaceFileSystem
+          .writeFile({
+            cwd,
+            relativePath: "plan.md",
+            contents: "# New plan\n",
+            mode: "create",
+          })
+          .pipe(Effect.flip);
+
+        expect(error).toBeInstanceOf(WorkspaceFileSystem.WorkspaceFileAlreadyExistsError);
+        expect(yield* fileSystem.readFileString(path.join(cwd, "original.md"))).toBe(
+          "# Original\n",
+        );
+        expect(yield* fileSystem.realPath(path.join(cwd, "plan.md"))).toBe(
+          yield* fileSystem.realPath(path.join(cwd, "original.md")),
+        );
+      }),
+    );
+
     it.effect("rejects writes by absolute path", () =>
       Effect.gen(function* () {
         const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;

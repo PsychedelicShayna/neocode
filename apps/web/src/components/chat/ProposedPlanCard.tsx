@@ -1,9 +1,14 @@
-import { memo, useState, useId } from "react";
+import { memo, useState, useId, useRef } from "react";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
+import {
+  ProjectWriteFileError,
+  WS_METHODS,
+  type EnvironmentId,
+  type ScopedThreadRef,
+} from "@t3tools/contracts";
 import {
   buildCollapsedProposedPlanPreviewMarkdown,
   buildProposedPlanMarkdownFilename,
@@ -49,8 +54,18 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   const [expanded, setExpanded] = useState(false);
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
+  const [saveConflict, setSaveConflict] = useState<{
+    environmentId: EnvironmentId;
+    workspaceRoot: string;
+    relativePath: string;
+  } | null>(null);
+  const conflictingSavePath =
+    saveConflict?.environmentId === environmentId && saveConflict.workspaceRoot === workspaceRoot
+      ? saveConflict.relativePath
+      : null;
+  const savePathInputRef = useRef<HTMLInputElement>(null);
   const [isSavingToWorkspace, setIsSavingToWorkspace] = useState(false);
-  const writeProjectFile = useAtomCommand(projectEnvironment.writeFile, {
+  const writeProjectFile = useAtomCommand(projectEnvironment.writeFileAtomic, {
     reportFailure: false,
   });
   const { copyToClipboard, isCopied } = useCopyToClipboard({
@@ -96,12 +111,17 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
       return;
     }
     setSavePath((existing) => (existing.length > 0 ? existing : downloadFilename));
+    setSaveConflict(null);
     setIsSaveDialogOpen(true);
   };
 
-  const handleSaveToWorkspace = () => {
+  const handleSaveToWorkspace = (mode: "create" | "replace" = "create") => {
     const relativePath = savePath.trim();
-    if (!workspaceRoot) {
+    if (
+      !workspaceRoot ||
+      isSavingToWorkspace ||
+      (mode === "replace" && conflictingSavePath !== relativePath)
+    ) {
       return;
     }
     if (!relativePath) {
@@ -113,6 +133,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
     }
 
     setIsSavingToWorkspace(true);
+    setSaveConflict(null);
     void (async () => {
       const result = await writeProjectFile({
         environmentId,
@@ -120,6 +141,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
           cwd: workspaceRoot,
           relativePath,
           contents: saveContents,
+          mode,
         },
       });
       setIsSavingToWorkspace(false);
@@ -134,11 +156,23 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
       }
       if (!isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
+        if (error instanceof ProjectWriteFileError && error.failure === "already_exists") {
+          setSaveConflict({ environmentId, workspaceRoot, relativePath });
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const unsupported =
+          message.includes("Unknown request tag") &&
+          message.includes(WS_METHODS.projectsWriteFileAtomic);
         toastManager.add(
           stackedThreadToast({
             type: "error",
             title: "Could not save plan",
-            description: error instanceof Error ? error.message : "An error occurred while saving.",
+            description: unsupported
+              ? "Update the server to save plans safely."
+              : error instanceof Error
+                ? error.message
+                : "An error occurred while saving.",
           }),
         );
       }
@@ -229,12 +263,22 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               <Input
                 id={savePathInputId}
                 value={savePath}
-                onChange={(event) => setSavePath(event.target.value)}
+                ref={savePathInputRef}
+                onChange={(event) => {
+                  setSavePath(event.target.value);
+                  setSaveConflict(null);
+                }}
                 placeholder={downloadFilename}
                 spellCheck={false}
                 disabled={isSavingToWorkspace}
               />
             </label>
+            {conflictingSavePath !== null ? (
+              <p role="alert" className="mt-3 text-sm text-destructive">
+                A file already exists at <code>{conflictingSavePath}</code>. It has not been
+                changed. Choose another name or explicitly overwrite it.
+              </p>
+            ) : null}
           </DialogPanel>
           <DialogFooter>
             <Button
@@ -245,13 +289,38 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
             >
               Cancel
             </Button>
-            <Button
-              size="sm"
-              onClick={() => void handleSaveToWorkspace()}
-              disabled={isSavingToWorkspace}
-            >
-              {isSavingToWorkspace ? "Saving..." : "Save"}
-            </Button>
+            {conflictingSavePath !== null ? (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setSaveConflict(null);
+                    savePathInputRef.current?.focus();
+                    savePathInputRef.current?.select();
+                  }}
+                  disabled={isSavingToWorkspace}
+                >
+                  Choose another name
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => handleSaveToWorkspace("replace")}
+                  disabled={isSavingToWorkspace}
+                >
+                  Overwrite file
+                </Button>
+              </>
+            ) : (
+              <Button
+                size="sm"
+                onClick={() => handleSaveToWorkspace()}
+                disabled={isSavingToWorkspace}
+              >
+                {isSavingToWorkspace ? "Saving..." : "Save"}
+              </Button>
+            )}
           </DialogFooter>
         </DialogPopup>
       </Dialog>

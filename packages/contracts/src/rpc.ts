@@ -196,6 +196,7 @@ import {
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
   ProjectWriteFileError,
+  ProjectWriteFileAtomicInput,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "./project.ts";
@@ -315,6 +316,7 @@ export const WS_METHODS = {
   projectsSearchContents: "projects.searchContents",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsWriteFileAtomic: "projects.writeFileAtomic",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -927,6 +929,14 @@ const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
 
 const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
+  success: ProjectWriteFileResult,
+  error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
+});
+
+// A separate method fails closed on older servers, which would otherwise
+// discard an unknown no-clobber flag on the editor's writeFile request.
+const WsProjectsWriteFileAtomicRpc = Rpc.make(WS_METHODS.projectsWriteFileAtomic, {
+  payload: ProjectWriteFileAtomicInput,
   success: ProjectWriteFileResult,
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
@@ -1582,6 +1592,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchContentsRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectsWriteFileAtomicRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsNeoPiNativeSessionsListRpc,

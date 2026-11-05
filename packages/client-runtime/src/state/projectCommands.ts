@@ -102,5 +102,15 @@ export function createProjectEnvironmentAtoms<R, E>(
           JSON.stringify([environmentId, input.cwd, input.relativePath]),
       },
     }),
+    writeFileAtomic: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:write-file-atomic",
+      tag: WS_METHODS.projectsWriteFileAtomic,
+      scheduler: fileScheduler,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.cwd, input.relativePath]),
+      },
+    }),
   };
 }

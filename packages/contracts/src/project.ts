@@ -217,6 +217,7 @@ export const ProjectFileFailure = Schema.Literals([
   "resolved_path_outside_root",
   "path_not_file",
   "binary_file",
+  "already_exists",
   "operation_failed",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
@@ -275,6 +276,12 @@ export const ProjectWriteFileInput = Schema.Struct({
   contents: Schema.String,
 });
 export type ProjectWriteFileInput = typeof ProjectWriteFileInput.Type;
+
+export const ProjectWriteFileAtomicInput = Schema.Struct({
+  ...ProjectWriteFileInput.fields,
+  mode: Schema.Literals(["create", "replace"]),
+});
+export type ProjectWriteFileAtomicInput = typeof ProjectWriteFileAtomicInput.Type;
 
 export const ProjectWriteFileResult = Schema.Struct({
   relativePath: TrimmedNonEmptyString,

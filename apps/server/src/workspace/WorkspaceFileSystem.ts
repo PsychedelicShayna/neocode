@@ -15,6 +15,7 @@ import * as NodeFSP from "node:fs/promises";
 import type {
   ProjectReadFileInput,
   ProjectReadFileResult,
+  ProjectWriteFileAtomicInput,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "@t3tools/contracts";
@@ -24,6 +25,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+
+import { writeFileStringAtomically } from "../atomicWrite.ts";
 
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
@@ -95,11 +98,25 @@ export class WorkspaceBinaryFileError extends Schema.TaggedError<WorkspaceBinary
   }
 }
 
+export class WorkspaceFileAlreadyExistsError extends Schema.TaggedError<WorkspaceFileAlreadyExistsError>()(
+  "WorkspaceFileAlreadyExistsError",
+  {
+    workspaceRoot: Schema.String,
+    relativePath: Schema.String,
+    resolvedPath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Workspace file '${this.relativePath}' already exists in '${this.workspaceRoot}'.`;
+  }
+}
+
 export const WorkspaceFileSystemError = Schema.Union([
   WorkspaceFileSystemOperationError,
   WorkspaceFilePathEscapeError,
   WorkspacePathNotFileError,
   WorkspaceBinaryFileError,
+  WorkspaceFileAlreadyExistsError,
 ]);
 export type WorkspaceFileSystemError = typeof WorkspaceFileSystemError.Type;
 
@@ -124,7 +141,7 @@ export class WorkspaceFileSystem extends Context.Service<
      * workspace root.
      */
     readonly writeFile: (
-      input: ProjectWriteFileInput,
+      input: ProjectWriteFileInput | ProjectWriteFileAtomicInput,
     ) => Effect.Effect<
       ProjectWriteFileResult,
       WorkspaceFileSystemError | WorkspacePaths.WorkspacePathOutsideRootError
@@ -305,6 +322,7 @@ export const make = Effect.gen(function* () {
   const writeFile: WorkspaceFileSystem["Service"]["writeFile"] = Effect.fn(
     "WorkspaceFileSystem.writeFile",
   )(function* (input) {
+    const mode = "mode" in input ? input.mode : undefined;
     const target = yield* workspacePaths.resolveRelativePathWithinRoot({
       workspaceRoot: input.cwd,
       relativePath: input.relativePath,
@@ -323,17 +341,30 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
-    yield* fileSystem.writeFileString(target.absolutePath, input.contents).pipe(
-      Effect.mapError(
-        (cause) =>
-          new WorkspaceFileSystemOperationError({
-            workspaceRoot: input.cwd,
-            relativePath: input.relativePath,
-            resolvedPath: target.absolutePath,
-            operationPath: target.absolutePath,
-            operation: "write-file",
-            cause,
-          }),
+    const write =
+      mode === undefined
+        ? fileSystem.writeFileString(target.absolutePath, input.contents)
+        : writeFileStringAtomically({
+            filePath: target.absolutePath,
+            contents: input.contents,
+            overwrite: mode === "replace",
+          });
+    yield* write.pipe(
+      Effect.mapError((cause) =>
+        mode === "create" && cause.reason._tag === "AlreadyExists"
+          ? new WorkspaceFileAlreadyExistsError({
+              workspaceRoot: input.cwd,
+              relativePath: input.relativePath,
+              resolvedPath: target.absolutePath,
+            })
+          : new WorkspaceFileSystemOperationError({
+              workspaceRoot: input.cwd,
+              relativePath: input.relativePath,
+              resolvedPath: target.absolutePath,
+              operationPath: target.absolutePath,
+              operation: "write-file",
+              cause,
+            }),
       ),
     );
     yield* workspaceEntries.refresh(input.cwd);

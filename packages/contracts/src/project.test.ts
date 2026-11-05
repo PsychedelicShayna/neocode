@@ -8,6 +8,8 @@ import {
   ProjectSearchEntriesError,
   ProjectSearchEntriesInput,
   ProjectWriteFileError,
+  ProjectWriteFileAtomicInput,
+  ProjectWriteFileInput,
 } from "./project.ts";
 
 const decodeSearchEntriesInput = Schema.decodeUnknownSync(ProjectSearchEntriesInput);
@@ -34,6 +36,33 @@ describe("project search inputs", () => {
       useRegex: false,
     });
     expect(decoded.query).toBe(" foo ");
+  });
+});
+
+describe("project file write inputs", () => {
+  const input = { cwd: "/workspace", relativePath: "plan.md", contents: "# Plan\n" };
+  const decode = Schema.decodeUnknownSync(ProjectWriteFileAtomicInput);
+
+  it("preserves atomic create and explicit replacement modes", () => {
+    expect(decode({ ...input, mode: "create" }).mode).toBe("create");
+    expect(decode({ ...input, mode: "replace" }).mode).toBe("replace");
+    expect(Schema.decodeUnknownSync(ProjectWriteFileInput)(input)).toEqual(input);
+    expect(() => decode(input)).toThrow();
+    expect(() => decode({ ...input, mode: "truncate" })).toThrow();
+  });
+
+  it("round-trips an already-existing file conflict through the RPC error schema", () => {
+    const error = new ProjectWriteFileError({
+      cwd: input.cwd,
+      relativePath: input.relativePath,
+      failure: "already_exists",
+      resolvedPath: "/workspace/plan.md",
+    });
+    const encoded = Schema.encodeSync(ProjectWriteFileError)(error);
+    const decoded = Schema.decodeUnknownSync(ProjectWriteFileError)(encoded);
+    expect(decoded).toBeInstanceOf(ProjectWriteFileError);
+    expect(decoded.failure).toBe("already_exists");
+    expect(decoded.relativePath).toBe("plan.md");
   });
 });
 

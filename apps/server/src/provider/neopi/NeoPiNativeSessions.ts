@@ -27,6 +27,7 @@ import {
 } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -60,6 +61,7 @@ import { NEOPI_CAPABILITIES } from "./NeoPiCompatibility.ts";
 import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
+import { isNeoPiNativeIdle, NEOPI_NATIVE_IDLE_DEBOUNCE_MS } from "./NeoPiNativeIdle.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import {
   neoPiSessionCatalogSource,
@@ -174,6 +176,10 @@ interface NativeSession {
   closed: boolean;
   /** A turn is in flight, from `agent_start`/`agent_end` frames and `get_state`. */
   busy: boolean;
+  /** Open UI subscriptions and in-flight client operations share the same retention lease. */
+  leases: number;
+  activityRevision: number;
+  idleSince: number;
 }
 
 /** One owner/control connection per canonical native file, never per browser subscription. */
@@ -181,6 +187,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   dependencies: NeoPiNativeSessionsDependencies,
 ) {
   const lifetime = yield* Effect.scope;
+  const clock = yield* Clock.Clock;
   const sessions = new Map<string, NativeSession>();
   // Gates are per native path: unrelated sessions can start independently.
   const gates = new Map<string, Semaphore.Semaphore>();
@@ -192,6 +199,23 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     gates.set(file, winner);
     return winner;
   });
+  const touch = (session: NativeSession) => {
+    session.activityRevision++;
+    session.idleSince = clock.currentTimeMillisUnsafe();
+  };
+  const retain = (session: NativeSession) =>
+    Effect.acquireRelease(
+      Effect.gen(function* () {
+        if (session.closed) return yield* fail("This native connection is closed.", "closed");
+        session.leases++;
+        touch(session);
+      }),
+      () =>
+        Effect.sync(() => {
+          session.leases--;
+          touch(session);
+        }),
+    );
   const finish = (session: NativeSession, reason: string) =>
     Effect.gen(function* () {
       if (session.closed) return;
@@ -328,6 +352,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           pendingUi.delete(frame.id);
         const current = session;
         if (!current || current.closed) return;
+        touch(current);
         if (frame.type === "agent_start") current.busy = true;
         else if (frame.type === "agent_end") current.busy = false;
         if (
@@ -409,6 +434,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         cwdFile: file,
         closed: false,
         busy: state.isStreaming === true,
+        leases: 0,
+        activityRevision: 0,
+        idleSince: clock.currentTimeMillisUnsafe(),
       };
       const current = session;
       sessions.set(file, current);
@@ -445,6 +473,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               providerInstanceId: input.providerInstanceId,
               sessionFile: file,
             });
+            yield* retain(current);
             yield* refreshCwd(current);
             const result = current.pendingUi.size > 0 ? describe(current) : yield* refresh(current);
             yield* verifyRef(current, {
@@ -456,7 +485,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           return describe(yield* create(profile, { ...input, sessionFile: file }));
         }),
       );
-    }).pipe(Effect.mapError(nativeError));
+    }).pipe(Effect.scoped, Effect.mapError(nativeError));
   /**
    * What a session's owner is doing. NeoCode's own connection is authoritative
    * for sessions it owns; for a terminal-owned session the control snapshot
@@ -655,6 +684,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   ): Effect.Effect<unknown, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
       const session = yield* requireSession(input.ref);
+      yield* retain(session);
       const client = session.native.client;
       const command = input.command;
       if (
@@ -753,7 +783,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       // Commands such as abort succeed without data; undefined cannot cross the
       // JSON wire and would turn that success into a client-side failure.
       return result ?? null;
-    }).pipe(Effect.mapError(nativeError));
+    }).pipe(Effect.scoped, Effect.mapError(nativeError));
   const request = (input: NeoPiNativeSessionsRequestInput) => requestNative(input);
   const watch = (input: {
     ref: NeoPiNativeSessionRef;
@@ -761,6 +791,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     Stream.unwrap(
       Effect.gen(function* () {
         const session = yield* requireSession(input.ref);
+        yield* retain(session);
         const events = yield* session.hub.subscribe;
         const uiEvents = yield* session.hub.subscribe;
         const pendingUi = Array.from(session.pendingUi.values());
@@ -935,8 +966,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             Effect.asVoid,
             Effect.mapError((cause) => new NeoPiRpcError({ message: cause.message })),
           ),
-        ui: Stream.fromPubSub(session.modelUi),
-        changes: Stream.fromPubSub(session.modelChanges),
+        ui: Stream.unwrap(retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelUi)))).pipe(
+          Stream.catch(() => Stream.empty),
+          Stream.scoped,
+        ),
+        changes: Stream.unwrap(
+          retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelChanges))),
+        ).pipe(
+          Stream.catch(() => Stream.empty),
+          Stream.scoped,
+        ),
         validate: validate.pipe(
           Effect.mapError((cause) => new NeoPiModelsError({ message: nativeError(cause).message })),
         ),
@@ -954,6 +993,53 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         ),
       ),
     ).pipe(Effect.forkIn(lifetime));
+  // Clients retain their observation for five minutes after the last view unmounts.
+  // That is the warm-switch grace; after its final lease leaves, only this short
+  // debounce remains. Do not add a second five-minute server retention window.
+  const reapIdleOwners = Effect.gen(function* () {
+    const unobserved = (session: NativeSession) =>
+      !session.closed &&
+      session.native.attachment === "owned" &&
+      session.leases === 0 &&
+      !session.busy &&
+      session.pendingUi.size === 0;
+    yield* Effect.forEach(
+      Array.from(sessions.values()),
+      (session) =>
+        Effect.gen(function* () {
+          if (!unobserved(session)) {
+            touch(session);
+            return;
+          }
+          if (clock.currentTimeMillisUnsafe() - session.idleSince < NEOPI_NATIVE_IDLE_DEBOUNCE_MS)
+            return;
+          const native = session.native;
+          const revision = session.activityRevision;
+          if (!(yield* isNeoPiNativeIdle(native.client))) {
+            touch(session);
+            return;
+          }
+          yield* (yield* gate(session.ref.sessionFile)).withPermits(1)(
+            Effect.gen(function* () {
+              // An observer, command, event or reconnect invalidates an in-flight inventory.
+              if (
+                !unobserved(session) ||
+                session.native !== native ||
+                session.activityRevision !== revision
+              )
+                return;
+              yield* finish(session, "The unobserved native owner was idle and has been released.");
+              // Its transport closes stdin, awaits EOF exit, then escalates to TERM if needed.
+              yield* Scope.close(session.scope, Exit.void);
+            }),
+          );
+        }),
+      { concurrency: 4, discard: true },
+    );
+  });
+  yield* Effect.forever(
+    Effect.sleep(NEOPI_NATIVE_IDLE_DEBOUNCE_MS).pipe(Effect.andThen(reapIdleOwners)),
+  ).pipe(Effect.forkIn(lifetime));
   return { list, open, request, watch, close, modelsConnection, resolveWorkspace, setSettled };
 });
 

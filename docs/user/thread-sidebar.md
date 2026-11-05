@@ -33,6 +33,12 @@ It appears under the title in the session's tab, in its sidebar row, and on the
 assistant's messages; hover the tab to see the pronouns. A session keeps its name
 across reloads and devices, and its subagents have names of their own.
 
+When you stop viewing a session, NeoCode keeps it warm for about five minutes.
+An idle runtime started by NeoCode is then released to save memory. Active turns,
+unanswered questions, running background jobs, and live subagents keep it running.
+Returning to its tab opens the saved session again; your unsent draft stays intact.
+This idle release never stops a session owned by a terminal.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.

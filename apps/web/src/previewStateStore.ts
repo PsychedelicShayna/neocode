@@ -177,6 +177,14 @@ export function readThreadPreviewState(ref: WorkspaceRef): ThreadPreviewState {
 }
 
 export function applyPreviewServerEvent(ref: WorkspaceRef, event: PreviewEvent): void {
+  if (event.type === "resync") {
+    reconcilePreviewServerSessions(ref, {
+      sessions: event.sessions,
+      serverEpoch: event.serverEpoch,
+      revision: event.revision,
+    });
+    return;
+  }
   if (event.threadId !== workspaceResourceId(ref)) return;
   updateThreadPreviewState(ref, (current) => {
     if (current.serverEpoch !== null && event.serverEpoch !== current.serverEpoch) return current;

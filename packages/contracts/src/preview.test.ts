@@ -295,6 +295,24 @@ describe("PreviewEvent", () => {
     });
     expect(event.type).toBe("closed");
   });
+
+  it("decodes an authoritative resync without a thread or tab id", () => {
+    const event = decodePreviewEvent({
+      type: "resync",
+      serverEpoch: "server-a",
+      revision: 2,
+      sessions: [{
+        threadId: "t",
+        tabId: "preview-t",
+        navStatus: { _tag: "Idle" },
+        canGoBack: false,
+        canGoForward: false,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }],
+    });
+    expect(event.type).toBe("resync");
+    if (event.type === "resync") expect(event.sessions).toHaveLength(1);
+  });
 });
 
 describe("DiscoveredLocalServer", () => {

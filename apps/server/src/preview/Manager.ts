@@ -5,9 +5,8 @@
  * multiple tabs (browser-style). `open` always creates a new tab — tab
  * lifecycle is owned by the renderer.
  *
- * Events are published via Effect's `PubSub`, so subscriber failures are
- * isolated from the publishing call (a closed WS subscriber queue cannot
- * fail an in-progress `navigate()`).
+ * Each subscriber retains a bounded mutation window. When it falls behind,
+ * it receives the authoritative current session set instead.
  */
 import {
   type PreviewCloseInput,
@@ -36,10 +35,10 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as PubSub from "effect/PubSub";
-import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
+
+import { boundedEventStream } from "../boundedEventStream.ts";
 
 export class PreviewManager extends Context.Service<
   PreviewManager,
@@ -56,7 +55,9 @@ export class PreviewManager extends Context.Service<
     readonly close: (input: PreviewCloseInput) => Effect.Effect<void, PreviewError>;
     readonly list: (input: PreviewListInput) => Effect.Effect<PreviewListResult>;
     readonly events: Stream.Stream<PreviewEvent>;
-    readonly subscribeEvents: Effect.Effect<PubSub.Subscription<PreviewEvent>, never, Scope.Scope>;
+    readonly subscribe: (
+      listener: (event: PreviewMutationEvent) => Effect.Effect<void>,
+    ) => Effect.Effect<() => void>;
   }
 >()("t3/preview/Manager/PreviewManager") {}
 
@@ -75,7 +76,9 @@ interface ManagerState {
 
 const initialState: ManagerState = { sessions: new Map(), revision: 0 };
 
-type PreviewEventDraft = PreviewEvent extends infer Event
+type PreviewMutationEvent = Exclude<PreviewEvent, { readonly type: "resync" }>;
+type PreviewResyncEvent = Extract<PreviewEvent, { readonly type: "resync" }>;
+type PreviewEventDraft = PreviewMutationEvent extends infer Event
   ? Event extends { readonly revision: number }
     ? Omit<Event, "revision" | "serverEpoch">
     : never
@@ -93,6 +96,25 @@ const sessionsForThread = (
   }
   return out;
 };
+
+function retainedPreviewEventBytes(event: PreviewMutationEvent): number {
+  let chars = event.threadId.length + event.tabId.length + event.createdAt.length +
+    event.serverEpoch.length;
+  if (event.type === "failed") {
+    chars += event.url.length + event.title.length + event.description.length;
+  } else if ("snapshot" in event) {
+    const snapshot = event.snapshot;
+    chars += snapshot.threadId.length + snapshot.tabId.length + snapshot.updatedAt.length +
+      (snapshot.profileId?.length ?? 0);
+    const status = snapshot.navStatus;
+    if (status._tag !== "Idle") {
+      chars += status.url.length + status.title.length;
+      if (status._tag === "LoadFailed") chars += status.description.length;
+    }
+  }
+  // UTF-16 upper-bound plus object overhead: no serialization on the writer path.
+  return 256 + 2 * chars;
+}
 
 const normalizeUrl = (rawUrl: string): Effect.Effect<string, PreviewInvalidUrlError> =>
   Effect.try({
@@ -157,11 +179,32 @@ const buildIdleSnapshot = (input: {
 export const make = Effect.gen(function* PreviewManagerMake() {
   const serverEpoch = NodeCrypto.randomUUID();
   const stateRef = yield* SynchronizedRef.make<ManagerState>(initialState);
-  // Unbounded PubSub is fine here — events are tiny and we don't want to
-  // block publishers if a subscriber is slow. WS clients backpressure on
-  // their own queues downstream.
-  const eventsPubSub = yield* PubSub.unbounded<PreviewEvent>();
-  const events: Stream.Stream<PreviewEvent> = Stream.fromPubSub(eventsPubSub);
+  const listeners = new Set<(event: PreviewMutationEvent) => Effect.Effect<void>>();
+  const subscribe: PreviewManager["Service"]["subscribe"] = (listener) =>
+    Effect.sync(() => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    });
+  const publish = (event: PreviewMutationEvent) =>
+    Effect.forEach(listeners, (listener) => listener(event), { discard: true });
+  const resync = SynchronizedRef.get(stateRef).pipe(
+    Effect.map((state): ReadonlyArray<PreviewResyncEvent> => [{
+      type: "resync",
+      sessions: Array.from(state.sessions.values(), (session) => session.snapshot),
+      serverEpoch,
+      revision: state.revision,
+    }]),
+  );
+  const events: Stream.Stream<PreviewEvent> = Stream.suspend(() => {
+    let revision = -1;
+    return boundedEventStream(subscribe, resync, retainedPreviewEventBytes).pipe(
+      Stream.filter((event) => {
+        if (event.revision <= revision) return false;
+        revision = event.revision;
+        return true;
+      }),
+    );
+  });
 
   /**
    * Atomic read-modify-write over the session for `(threadId, tabId)`. The
@@ -169,9 +212,9 @@ export const make = Effect.gen(function* PreviewManagerMake() {
    * interleave. Lookup failures travel through the modify result so both
    * branches yield the same `[A, S]` shape `modifyEffect` requires.
    *
-   * The event is published INSIDE the lock so observers see events in the
-   * same order as the underlying state transitions. Publishing an unbounded
-   * PubSub is non-blocking, so this is cheap.
+   * The event is published INSIDE the lock to preserve transition order.
+   * The bounded listener only offers into a subscriber-local FIFO, so a
+   * stalled RPC cannot block the writer or retain its mutation history.
    */
   const mutateExistingSession = <R, E>(
     threadId: string,
@@ -197,11 +240,11 @@ export const make = Effect.gen(function* PreviewManagerMake() {
           Effect.fn("PreviewManager.commitMutation")(function* ({ next, emit, result }) {
             const revision = emit ? state.revision + 1 : state.revision;
             if (emit) {
-              yield* PubSub.publish(eventsPubSub, {
+              yield* publish({
                 ...emit,
                 revision,
                 serverEpoch,
-              } as PreviewEvent);
+              } as PreviewMutationEvent);
             }
             const sessions = new Map(state.sessions);
             sessions.set(compositeKey(threadId, tabId), next);
@@ -253,7 +296,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
             tabId,
             snapshot,
           });
-          yield* PubSub.publish(eventsPubSub, {
+          yield* publish({
             type: "opened",
             threadId: input.threadId,
             tabId,
@@ -398,7 +441,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     function* (input) {
       const createdAt = yield* currentIsoTimestamp;
       yield* SynchronizedRef.modifyEffect(stateRef, (state) => {
-        const eventsToEmit: PreviewEvent[] = [];
+        const eventsToEmit: PreviewMutationEvent[] = [];
         const sessions = new Map(state.sessions);
         const targets = input.tabId
           ? [state.sessions.get(compositeKey(input.threadId, input.tabId))].filter(
@@ -422,9 +465,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
           return Effect.succeed([undefined, state] as const);
         }
         return Effect.as(
-          Effect.forEach(eventsToEmit, (event) => PubSub.publish(eventsPubSub, event), {
-            discard: true,
-          }),
+          Effect.forEach(eventsToEmit, publish, { discard: true }),
           [undefined, { sessions, revision }] as const,
         );
       });
@@ -454,7 +495,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     close,
     list,
     events,
-    subscribeEvents: PubSub.subscribe(eventsPubSub),
+    subscribe,
   });
 }).pipe(Effect.withSpan("PreviewManager.make"));
 

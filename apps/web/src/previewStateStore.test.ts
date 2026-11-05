@@ -458,6 +458,46 @@ describe("previewStateStore (single-tab)", () => {
     expect(state.snapshot).toBeNull();
   });
 
+  it("reconciles a global resync after missed closes and ignores older events", () => {
+    const stale = makeSnapshot({ tabId: "tab_stale" });
+    const current = makeSnapshot({ tabId: "tab_current", updatedAt: "2026-01-01T00:00:01.000Z" });
+    const other = makeSnapshot({ threadId: "thread-2", tabId: "tab_other" });
+    applyPreviewServerEvent(ref, {
+      type: "opened",
+      threadId: stale.threadId,
+      tabId: stale.tabId,
+      createdAt: stale.updatedAt,
+      snapshot: stale,
+    });
+    applyPreviewServerEventImpl(ref, {
+      type: "resync",
+      sessions: [current, other],
+      serverEpoch,
+      revision: 2,
+    });
+
+    expect(readThreadPreviewState(ref).sessions).toEqual({ [current.tabId]: current });
+    expect(readThreadPreviewState(ref).serverRevision).toBe(2);
+    applyPreviewServerEventImpl(ref, {
+      type: "opened",
+      threadId: stale.threadId,
+      tabId: stale.tabId,
+      createdAt: stale.updatedAt,
+      snapshot: stale,
+      serverEpoch,
+      revision: 1,
+    });
+    expect(readThreadPreviewState(ref).sessions).toEqual({ [current.tabId]: current });
+
+    applyPreviewServerEventImpl(otherRef, {
+      type: "resync",
+      sessions: [current, other],
+      serverEpoch,
+      revision: 2,
+    });
+    expect(readThreadPreviewState(otherRef).sessions).toEqual({ [other.tabId]: other });
+  });
+
   it("ignores a list response older than the latest server event", () => {
     const snapshot = makeSnapshot();
     applyPreviewServerEvent(ref, {

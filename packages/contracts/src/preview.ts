@@ -288,12 +288,21 @@ const PreviewClosedEvent = Schema.Struct({
   type: Schema.Literal("closed"),
 });
 
+/** Full current state after a subscriber's bounded mutation history overflows. */
+const PreviewResyncEvent = Schema.Struct({
+  type: Schema.Literal("resync"),
+  sessions: Schema.Array(PreviewSessionSnapshot),
+  serverEpoch: TrimmedNonEmptyString,
+  revision: NonNegativeInt,
+});
+
 export const PreviewEvent = Schema.Union([
   PreviewOpenedEvent,
   PreviewNavigatedEvent,
   PreviewResizedEvent,
   PreviewFailedEvent,
   PreviewClosedEvent,
+  PreviewResyncEvent,
 ]);
 export type PreviewEvent = typeof PreviewEvent.Type;
 

@@ -51,11 +51,12 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
     };
 
     const applyLatestEvent = (result: Atom.Type<typeof eventsAtom>) => {
-      if (
-        !AsyncResult.isSuccess(result) ||
-        result.value.threadId !== workspaceResourceId(threadRef)
-      )
+      if (!AsyncResult.isSuccess(result)) return;
+      if (result.value.type === "resync") {
+        applyPreviewServerEvent(threadRef, result.value);
         return;
+      }
+      if (result.value.threadId !== workspaceResourceId(threadRef)) return;
       const currentEpoch = readThreadPreviewState(threadRef).serverEpoch;
       if (currentEpoch !== null && currentEpoch !== result.value.serverEpoch) {
         get.refresh(sessionsAtom);

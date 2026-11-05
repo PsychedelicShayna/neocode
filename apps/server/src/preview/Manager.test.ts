@@ -1,12 +1,10 @@
 import { it } from "@effect/vitest";
 import { type PreviewEvent, ThreadId } from "@t3tools/contracts";
 import { PreviewUrlNormalizationError } from "@t3tools/shared/preview";
-import { Effect, PubSub } from "effect";
+import { Effect, Fiber, Stream } from "effect";
 import { expect } from "vite-plus/test";
 
 import * as PreviewManager from "./Manager.ts";
-
-const DRAIN_LIMIT = 100;
 
 interface EventCollector {
   /** Drain everything published since the last call (or since subscribe). */
@@ -21,16 +19,16 @@ interface EventCollector {
 let nextThreadId = 0;
 const freshThreadId = () => ThreadId.make(`thread-${++nextThreadId}`);
 
-/**
- * Subscribe to the manager's event stream BEFORE the test publishes. We
- * use `subscribeEvents` (synchronous PubSub.subscribe under the hood) so
- * no event can land between subscribe and the consumer drain.
- */
+/** Subscribe before publishing so tests can inspect the independently delivered events. */
 const collectEvents = Effect.gen(function* () {
   const manager = yield* PreviewManager.PreviewManager;
-  const subscription = yield* manager.subscribeEvents;
+  const events: PreviewEvent[] = [];
+  yield* Effect.acquireRelease(
+    manager.subscribe((event) => Effect.sync(() => { events.push(event); })),
+    (unsubscribe) => Effect.sync(unsubscribe),
+  );
   const collector: EventCollector = {
-    drain: PubSub.takeUpTo(subscription, DRAIN_LIMIT),
+    drain: Effect.sync(() => events.splice(0)),
   };
   return collector;
 }).pipe(Effect.withSpan("preview.test.collectEvents"));
@@ -399,18 +397,57 @@ it.layer(PreviewManager.layer)("PreviewManager", (it) => {
     }),
   );
 
+  it.effect("resyncs a stalled subscriber without delaying a healthy one", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const threadId = freshThreadId();
+        const manager = yield* PreviewManager.PreviewManager;
+        const slow = yield* Stream.toPull(manager.events);
+        const fast = yield* Stream.toPull(manager.events);
+        const firstSlow = yield* Effect.fork(slow);
+        const firstFast = yield* Effect.fork(fast);
+        yield* Effect.yieldNow();
+        const opened = yield* manager.open({ threadId, url: "http://localhost:5173" });
+        expect((yield* Fiber.join(firstSlow))[0]?.type).toBe("opened");
+        expect((yield* Fiber.join(firstFast))[0]?.type).toBe("opened");
+
+        for (let index = 1; index <= 300; index += 1) {
+          yield* manager.resize({
+            threadId,
+            tabId: opened.tabId,
+            viewport: { _tag: "freeform", width: 800 + index, height: 600 },
+          });
+          const latest = yield* fast;
+          expect(latest.map((event) => event.type)).toEqual(["resized"]);
+        }
+        const authoritative = yield* manager.list({ threadId });
+        const recovered = yield* slow;
+        expect(recovered).toHaveLength(1);
+        expect(recovered[0]?.type).toBe("resync");
+        if (recovered[0]?.type === "resync") {
+          expect(recovered[0].revision).toBe(authoritative.revision);
+          expect(recovered[0].sessions.filter((session) => session.threadId === threadId)).toEqual(
+            authoritative.sessions,
+          );
+        }
+        yield* manager.close({ threadId, tabId: opened.tabId });
+        expect((yield* slow).map((event) => event.type)).toEqual(["closed"]);
+      }),
+    ),
+  );
+
   it.effect("multiple subscribers receive every event independently", () =>
     Effect.gen(function* () {
       const threadId = freshThreadId();
       const manager = yield* PreviewManager.PreviewManager;
-      const aSub = yield* manager.subscribeEvents;
-      const bSub = yield* manager.subscribeEvents;
+      const aSub = yield* collectEvents;
+      const bSub = yield* collectEvents;
 
       yield* manager.open({ threadId, url: "http://localhost:5173" });
       yield* manager.open({ threadId, url: "http://localhost:3000" });
 
-      const aEvents = yield* PubSub.takeUpTo(aSub, DRAIN_LIMIT);
-      const bEvents = yield* PubSub.takeUpTo(bSub, DRAIN_LIMIT);
+      const aEvents = yield* aSub.drain;
+      const bEvents = yield* bSub.drain;
       expect(aEvents.map((e) => e.type)).toEqual(["opened", "opened"]);
       expect(bEvents.map((e) => e.type)).toEqual(["opened", "opened"]);
     }),

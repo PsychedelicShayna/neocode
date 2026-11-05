@@ -37,6 +37,45 @@ describe("AvccDemuxer", () => {
     expect(Array.from(chunks[1]!.payload)).toEqual([9, 9, 9]);
   });
 
+  it("rejects an oversized first envelope before allocating for its input chunk", () => {
+    const demuxer = new AvccDemuxer();
+    const bytes = new Uint8Array(128 * 1024);
+    new DataView(bytes.buffer).setUint32(0, 0xffffffff, false);
+    const allocations = vi.spyOn(globalThis, "Uint8Array");
+    try {
+      expect(() => demuxer.push(bytes)).toThrow("16 MiB limit");
+      expect(allocations).not.toHaveBeenCalled();
+    } finally {
+      allocations.mockRestore();
+    }
+  });
+
+  it.each([1, 2, 3])("rejects an oversized header split after byte %s", (split) => {
+    const demuxer = new AvccDemuxer();
+    const bytes = new Uint8Array([0x01, 0x00, 0x00, 0x01, 2, 3]);
+    expect(demuxer.push(bytes.subarray(0, split))).toEqual([]);
+    expect(() => demuxer.push(bytes.subarray(split))).toThrow("16 MiB limit");
+    demuxer.reset();
+    expect(demuxer.push(new Uint8Array(envelope(3, [4])))).toEqual([
+      { type: "delta", payload: new Uint8Array([4]) },
+    ]);
+  });
+
+  it("accepts a maximum-sized envelope and another frame in one read", () => {
+    const frameLength = 16 * 1024 * 1024;
+    const bytes = new Uint8Array(frameLength + 4 + 6);
+    new DataView(bytes.buffer).setUint32(0, frameLength, false);
+    bytes[4] = 2;
+    bytes[frameLength + 3] = 0x5a;
+    bytes.set(envelope(3, [9]), frameLength + 4);
+    const chunks = new AvccDemuxer().push(bytes);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]!.type).toBe("keyframe");
+    expect(chunks[0]!.payload).toHaveLength(frameLength - 1);
+    expect(chunks[0]!.payload.at(-1)).toBe(0x5a);
+    expect(chunks[1]).toEqual({ type: "delta", payload: new Uint8Array([9]) });
+  });
+
   it("derives the WebCodecs codec string from the avcC record", () => {
     expect(avcCodecString(new Uint8Array([1, 0x64, 0x00, 0x1f]))).toBe("avc1.64001f");
     expect(avcCodecString(new Uint8Array([1]))).toBe("avc1.42E01E");
@@ -682,6 +721,26 @@ describe("shared device stream readiness and recovery", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(events.onUnauthorized).not.toHaveBeenCalled();
     expect(events.onStatus).not.toHaveBeenCalled();
+    client.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("aborts and retries an AVCC feed with an oversized fragmented envelope", async () => {
+    const { client, videoBodies, events, signals } = recoveryFixture("ios", false);
+    client.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const streamSignal = signals.at(-1)!;
+    videoBodies[0]!.enqueue(new Uint8Array([0xff, 0xff, 0xff]));
+    await vi.advanceTimersByTimeAsync(0);
+    videoBodies[0]!.enqueue(new Uint8Array([0xff, 2, 3]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.onStatus).toHaveBeenLastCalledWith(
+      "connecting",
+      expect.stringContaining("16 MiB limit"),
+    );
+    expect(streamSignal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(videoBodies).toHaveLength(2);
     client.stop();
     expect(vi.getTimerCount()).toBe(0);
   });

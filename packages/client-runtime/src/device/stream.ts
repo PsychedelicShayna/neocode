@@ -213,6 +213,9 @@ export type AvccChunk = {
   readonly payload: Uint8Array;
 };
 
+// Compressed H.264 frames and JPEG seeds must not retain unbounded stream data.
+const MAX_AVCC_ENVELOPE_BYTES = 16 * 1024 * 1024;
+
 const AVCC_TAGS: Record<number, AvccChunk["type"] | undefined> = {
   1: "description",
   2: "keyframe",
@@ -226,33 +229,42 @@ export class AvccDemuxer {
   private length = 0;
 
   push(bytes: Uint8Array): AvccChunk[] {
-    if (this.length + bytes.length > this.buffer.length) {
-      let capacity = this.buffer.length;
-      while (capacity < this.length + bytes.length) capacity *= 2;
-      const grown = new Uint8Array(capacity);
-      grown.set(this.buffer.subarray(0, this.length));
-      this.buffer = grown;
-    }
-    this.buffer.set(bytes, this.length);
-    this.length += bytes.length;
-
     const chunks: AvccChunk[] = [];
     let offset = 0;
-    while (this.length - offset >= 4) {
-      const view = new DataView(this.buffer.buffer, this.buffer.byteOffset + offset, 4);
-      const frameLength = view.getUint32(0, false);
-      if (this.length - offset - 4 < frameLength) break;
-      if (frameLength >= 1) {
-        const type = AVCC_TAGS[this.buffer[offset + 4]!];
-        if (type) {
-          chunks.push({ type, payload: this.buffer.slice(offset + 5, offset + 4 + frameLength) });
-        }
+    while (offset < bytes.length) {
+      // Read and validate the header before retaining any of its payload.
+      if (this.length < 4) {
+        const end = Math.min(offset + 4 - this.length, bytes.length);
+        this.buffer.set(bytes.subarray(offset, end), this.length);
+        this.length += end - offset;
+        offset = end;
+        if (this.length < 4) break;
       }
-      offset += 4 + frameLength;
-    }
-    if (offset > 0) {
-      this.buffer.copyWithin(0, offset, this.length);
-      this.length -= offset;
+      const view = new DataView(this.buffer.buffer, this.buffer.byteOffset, 4);
+      const frameLength = view.getUint32(0, false);
+      if (frameLength > MAX_AVCC_ENVELOPE_BYTES)
+        throw new RangeError("Device AVCC envelope exceeds the 16 MiB limit.");
+      const envelopeLength = 4 + frameLength;
+      const end = Math.min(offset + envelopeLength - this.length, bytes.length);
+      const requiredLength = this.length + end - offset;
+      if (requiredLength > this.buffer.length) {
+        const capacity = Math.min(
+          MAX_AVCC_ENVELOPE_BYTES + 4,
+          Math.max(requiredLength, this.buffer.length * 2),
+        );
+        const grown = new Uint8Array(capacity);
+        grown.set(this.buffer.subarray(0, this.length));
+        this.buffer = grown;
+      }
+      this.buffer.set(bytes.subarray(offset, end), this.length);
+      this.length = requiredLength;
+      offset = end;
+      if (this.length < envelopeLength) break;
+      if (frameLength >= 1) {
+        const type = AVCC_TAGS[this.buffer[4]!];
+        if (type) chunks.push({ type, payload: this.buffer.slice(5, envelopeLength) });
+      }
+      this.length = 0;
     }
     return chunks;
   }

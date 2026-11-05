@@ -77,8 +77,10 @@ is a few lines that point at the tools and prefer them over raw `simctl` and
 The hub vendors two streaming servers with different wire formats. iOS video is
 an HTTP body of AVCC envelopes decoded with WebCodecs, with input on a separate
 binary WebSocket; Android multiplexes SEMU-framed H.264 and JSON gestures over
-one WebSocket. [`deviceStream.ts`](../../apps/web/src/components/device/deviceStream.ts)
-speaks both so one panel covers both platforms.
+one WebSocket. [`stream.ts`](../../packages/client-runtime/src/device/stream.ts)
+speaks both so one panel covers both platforms. AVCC buffering retains one
+envelope at a time, capped at 16 MiB so corrupt length headers cannot exhaust a
+client's memory. Rejected envelopes use the normal video reconnect path.
 
 Simulators encode H.264 High 5.1. Hardware decoders on some machines and all
 headless browsers reject that profile, and WebCodecs is secure-context only, so

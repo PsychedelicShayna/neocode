@@ -72,6 +72,14 @@ storage and instance lock. It does not reuse the default profile's saved browser
 connections. Use another window, not another profile pointed at the same state,
 when you want to work with the same local sessions.
 
+If startup reports that desktop preferences could not be loaded, NeoCode stops
+instead of resetting them. The error identifies the settings file; invalid
+documents also get an adjacent `.invalid-….bak` copy when the directory is
+writable. Keep that backup, then repair the original document or restore a
+known-good copy. For a read-permission error, make the original file readable.
+Restart NeoCode after the repair. Closing the app does not overwrite the
+unreadable or invalid preferences with defaults.
+
 Open **Models** from the sidebar or press **Alt-M** to configure NeoPi's native
 inference providers, model roles and effort rules. Choose the environment and
 project whose settings you want to change. Opening Models from a connected

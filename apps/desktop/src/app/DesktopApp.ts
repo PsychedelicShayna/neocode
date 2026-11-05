@@ -294,7 +294,9 @@ const startup = Effect.gen(function* () {
   const userDataPath = yield* appIdentity.resolveUserDataPath;
   yield* electronApp.setPath("userData", userDataPath);
   yield* logStartupInfo("runtime logging configured", { logDir: environment.logDir });
-  yield* desktopSettings.load;
+  yield* desktopSettings.load.pipe(
+    Effect.catchCause((cause) => fatalStartupCause("desktop settings", cause)),
+  );
 
   if (linuxElectronOptions !== null) {
     yield* logStartupInfo("linux password store configured", {

@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as DesktopConfig from "../app/DesktopConfig.ts";
@@ -228,18 +229,126 @@ describe("DesktopSettings", () => {
     ),
   );
 
-  it.effect("falls back to defaults when the settings file is malformed", () =>
+  for (const [description, original] of [
+    ["malformed JSON", "{not-json"],
+    ["an unsupported field value", '{"updateChannel":"future-channel","wslBackendEnabled":true}'],
+  ] as const) {
+    it.effect(`preserves and backs up settings containing ${description}`, () =>
+      withSettings(
+        Effect.gen(function* () {
+          const environment = yield* DesktopEnvironment.DesktopEnvironment;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const settings = yield* DesktopAppSettings.DesktopAppSettings;
+          yield* writeSettingsPatch({ wslBackendEnabled: true, wslDistro: "Ubuntu" });
+          const known = yield* settings.load;
+          yield* fileSystem.writeFileString(environment.desktopSettingsPath, original);
+
+          const error = yield* settings.load.pipe(Effect.flip);
+          assert.instanceOf(error, DesktopAppSettings.DesktopSettingsReadError);
+          assert.equal(error.operation, "decode-document");
+          assert.equal(error.path, environment.desktopSettingsPath);
+          const backupPath = error.backupPath;
+          if (backupPath === null) return yield* Effect.die("Expected an invalid-settings backup");
+          assert.equal(yield* fileSystem.readFileString(backupPath), original);
+          assert.include(error.message, backupPath);
+          const blocked = yield* settings
+            .setMainWindowBounds({ x: 10, y: 20, width: 1100, height: 780 }, false)
+            .pipe(Effect.flip);
+          assert.equal(blocked.operation, "load-settings");
+          assert.strictEqual(blocked.cause, error);
+          assert.equal(yield* fileSystem.readFileString(environment.desktopSettingsPath), original);
+          assert.deepEqual(yield* settings.get, known);
+
+          yield* writeSettingsPatch({ wslBackendEnabled: true, wslDistro: "Ubuntu" });
+          yield* settings.load;
+          assert.isTrue((yield* settings.setUpdateChannel("nightly")).changed);
+          assert.equal((yield* settings.load).wslDistro, "Ubuntu");
+        }),
+      ),
+    );
+  }
+
+  it.effect("blocks bounds persistence after a transient read failure and recovers on reload", () =>
     withSettings(
       Effect.gen(function* () {
         const environment = yield* DesktopEnvironment.DesktopEnvironment;
         const fileSystem = yield* FileSystem.FileSystem;
-        const settings = yield* DesktopAppSettings.DesktopAppSettings;
-        yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
-        yield* fileSystem.writeFileString(environment.desktopSettingsPath, "{not-json");
-
-        assert.deepEqual(yield* settings.load, DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS);
+        yield* writeSettingsPatch({
+          wslBackendEnabled: true,
+          wslDistro: "Ubuntu",
+          serverExposureMode: "network-accessible",
+        });
+        const original = yield* fileSystem.readFileString(environment.desktopSettingsPath);
+        const permissionError = PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "readFileString",
+          pathOrDescriptor: environment.desktopSettingsPath,
+        });
+        let unreadable = true;
+        const settings = yield* DesktopAppSettings.make.pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fileSystem,
+            readFileString: (path) =>
+              unreadable ? Effect.fail(permissionError) : fileSystem.readFileString(path),
+          }),
+        );
+        const error = yield* settings.load.pipe(Effect.flip);
+        assert.equal(error.operation, "read-file");
+        assert.isNull(error.backupPath);
+        assert.strictEqual(error.cause, permissionError);
+        const blocked = yield* settings
+          .setMainWindowBounds({ x: 10, y: 20, width: 1100, height: 780 }, false)
+          .pipe(Effect.flip);
+        assert.equal(blocked.operation, "load-settings");
+        assert.equal(yield* fileSystem.readFileString(environment.desktopSettingsPath), original);
+        unreadable = false;
+        yield* settings.load;
+        yield* settings.setMainWindowBounds({ x: 10, y: 20, width: 1100, height: 780 }, true);
+        const reloaded = yield* settings.load;
+        assert.equal(reloaded.wslDistro, "Ubuntu");
+        assert.equal(reloaded.serverExposureMode, "network-accessible");
+        assert.isTrue(reloaded.mainWindowMaximized);
       }),
     ),
+  );
+
+  it.effect(
+    "leaves invalid settings untouched and blocks writes if the backup cannot be saved",
+    () =>
+      withSettings(
+        Effect.gen(function* () {
+          const environment = yield* DesktopEnvironment.DesktopEnvironment;
+          const fileSystem = yield* FileSystem.FileSystem;
+          yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
+          yield* fileSystem.writeFileString(environment.desktopSettingsPath, "{invalid");
+          const settings = yield* DesktopAppSettings.make.pipe(
+            Effect.provideService(FileSystem.FileSystem, {
+              ...fileSystem,
+              writeFileString: (path) =>
+                Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "PermissionDenied",
+                    module: "FileSystem",
+                    method: "writeFileString",
+                    pathOrDescriptor: path,
+                  }),
+                ),
+            }),
+          );
+          const error = yield* settings.load.pipe(Effect.flip);
+          assert.equal(error.operation, "back-up-document");
+          assert.isNull(error.backupPath);
+          const blocked = yield* settings
+            .setServerExposureMode("network-accessible")
+            .pipe(Effect.flip);
+          assert.equal(blocked.operation, "load-settings");
+          assert.equal(
+            yield* fileSystem.readFileString(environment.desktopSettingsPath),
+            "{invalid",
+          );
+        }),
+      ),
   );
 
   it.effect("loads lenient persisted desktop settings JSON", () =>

@@ -128,7 +128,23 @@ const settingsChange = (settings: DesktopSettings, changed: boolean): DesktopSet
   changed,
 });
 
+export class DesktopSettingsReadError extends Schema.TaggedError<DesktopSettingsReadError>()(
+  "DesktopSettingsReadError",
+  {
+    operation: Schema.Literals(["read-file", "decode-document", "back-up-document"]),
+    path: Schema.String,
+    backupPath: Schema.NullOr(Schema.String),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    const backup = this.backupPath === null ? "" : ` A backup was saved to ${this.backupPath}.`;
+    return `Desktop settings could not be loaded during ${this.operation} at ${this.path}. The original file has not been changed.${backup} Check file permissions or repair the settings document, then restart NeoCode.`;
+  }
+}
+
 const DesktopSettingsWriteOperation = Schema.Literals([
+  "load-settings",
   "create-temporary-file-name",
   "encode-document",
   "create-directory",
@@ -153,7 +169,7 @@ export class DesktopSettingsWriteError extends Schema.TaggedError<DesktopSetting
 export class DesktopAppSettings extends Context.Service<
   DesktopAppSettings,
   {
-    readonly load: Effect.Effect<DesktopSettings>;
+    readonly load: Effect.Effect<DesktopSettings, DesktopSettingsReadError>;
     readonly get: Effect.Effect<DesktopSettings>;
     readonly setLocalEnvironmentEnabled: (
       enabled: boolean,
@@ -391,27 +407,55 @@ function applyWslWindowsFallback(settings: DesktopSettings): DesktopSettings {
   return setWslOnly(setWslBackendEnabled(settings, false), false);
 }
 
-function readSettings(
+const readSettings = Effect.fn("desktop.settings.readSettings")(function* (
   fileSystem: FileSystem.FileSystem,
   settingsPath: string,
   appVersion: string,
-): Effect.Effect<DesktopSettings> {
-  const defaultSettings = resolveDefaultDesktopSettings(appVersion);
-
-  return fileSystem.readFileString(settingsPath).pipe(
-    Effect.option,
-    Effect.flatMap(
-      Option.match({
-        onNone: () => Effect.succeed(defaultSettings),
-        onSome: (raw) =>
-          decodeDesktopSettingsJson(raw).pipe(
-            Effect.map((parsed) => normalizeDesktopSettingsDocument(parsed, appVersion)),
-            Effect.orElseSucceed(() => defaultSettings),
+  crypto: Crypto.Crypto,
+): Effect.fn.Return<DesktopSettings, DesktopSettingsReadError> {
+  const raw = yield* fileSystem.readFileString(settingsPath).pipe(
+    Effect.catch((cause) =>
+      cause.reason._tag === "NotFound"
+        ? Effect.succeed<string | null>(null)
+        : Effect.fail(
+            new DesktopSettingsReadError({
+              operation: "read-file",
+              path: settingsPath,
+              backupPath: null,
+              cause,
+            }),
           ),
+    ),
+  );
+  if (raw === null) return resolveDefaultDesktopSettings(appVersion);
+  const parsed = yield* decodeDesktopSettingsJson(raw).pipe(
+    Effect.catch((cause) =>
+      Effect.gen(function* () {
+        const backupError = (cause: unknown) =>
+          new DesktopSettingsReadError({
+            operation: "back-up-document",
+            path: settingsPath,
+            backupPath: null,
+            cause,
+          });
+        const suffix = yield* crypto.randomUUIDv4.pipe(Effect.mapError(backupError));
+        const backupPath = `${settingsPath}.invalid-${suffix}.bak`;
+        yield* fileSystem
+          .writeFileString(backupPath, raw, { flag: "wx", mode: 0o600 })
+          .pipe(Effect.mapError(backupError));
+        return yield* Effect.fail(
+          new DesktopSettingsReadError({
+            operation: "decode-document",
+            path: settingsPath,
+            backupPath,
+            cause,
+          }),
+        );
       }),
     ),
   );
-}
+  return normalizeDesktopSettingsDocument(parsed, appVersion);
+});
 
 const writeSettings = Effect.fn("desktop.settings.writeSettings")(function* (input: {
   readonly fileSystem: FileSystem.FileSystem;
@@ -474,6 +518,7 @@ export const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const settingsRef = yield* SynchronizedRef.make(environment.defaultDesktopSettings);
+  let loadError: DesktopSettingsReadError | undefined;
 
   const updateInMemory = (update: (settings: DesktopSettings) => DesktopSettings) =>
     SynchronizedRef.modify(settingsRef, (settings) => {
@@ -485,6 +530,14 @@ export const make = Effect.gen(function* () {
     update: (settings: DesktopSettings) => DesktopSettings,
   ): Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError> =>
     SynchronizedRef.modifyEffect(settingsRef, (settings) => {
+      if (loadError !== undefined)
+        return Effect.fail(
+          new DesktopSettingsWriteError({
+            operation: "load-settings",
+            path: environment.desktopSettingsPath,
+            cause: loadError,
+          }),
+        );
       const nextSettings = update(settings);
       if (nextSettings === settings) {
         return Effect.succeed([settingsChange(settings, false), settings] as const);
@@ -516,14 +569,26 @@ export const make = Effect.gen(function* () {
 
   return DesktopAppSettings.of({
     get: SynchronizedRef.get(settingsRef),
-    load: Effect.gen(function* () {
-      const settings = yield* readSettings(
+    // Loading and writing share one lock, including the failed-load latch:
+    // bounds flushes during shutdown must never replace an unread document.
+    load: SynchronizedRef.modifyEffect(settingsRef, () =>
+      readSettings(
         fileSystem,
         environment.desktopSettingsPath,
         environment.appVersion,
-      );
-      return yield* SynchronizedRef.setAndGet(settingsRef, settings);
-    }).pipe(Effect.withSpan("desktop.settings.load")),
+        crypto,
+      ).pipe(
+        Effect.tapError((error) =>
+          Effect.sync(() => {
+            loadError = error;
+          }),
+        ),
+        Effect.map((settings) => {
+          loadError = undefined;
+          return [settings, settings] as const;
+        }),
+      ),
+    ).pipe(Effect.withSpan("desktop.settings.load")),
     setMainWindowBounds: (bounds, isMaximized) =>
       persist((settings) => setMainWindowBounds(settings, bounds, isMaximized)).pipe(
         Effect.withSpan("desktop.settings.setMainWindowBounds", {

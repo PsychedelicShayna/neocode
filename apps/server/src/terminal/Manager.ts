@@ -1393,7 +1393,8 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
+    env, }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,

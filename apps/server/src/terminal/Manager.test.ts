@@ -1915,26 +1915,24 @@ it.layer(
     }),
   );
 
-  it.effect(
-    "preserves explicit terminal environment values without runtime-specific expansion",
-    () =>
-      Effect.gen(function* () {
-        const { manager, ptyAdapter } = yield* createManager(5);
+  it.effect("preserves explicit terminal environment values without runtime-specific expansion", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager(5);
 
-        yield* manager.open({
-          ...openInput(),
-          env: {
-            CODEX_HOME: "~/.codex-work",
-            CLAUDE_CONFIG_DIR: "~/.claude-work",
-            CUSTOM_ACCOUNT: "~/leave-this-value-alone",
-          },
-        });
+      yield* manager.open({
+        ...openInput(),
+        env: {
+          CODEX_HOME: "~/.codex-work",
+          CLAUDE_CONFIG_DIR: "~/.claude-work",
+          CUSTOM_ACCOUNT: "~/leave-this-value-alone",
+        },
+      });
 
-        const environment = ptyAdapter.spawnInputs[0]?.env;
-        expect(environment?.CODEX_HOME).toBe("~/.codex-work");
-        expect(environment?.CLAUDE_CONFIG_DIR).toBe("~/.claude-work");
-        expect(environment?.CUSTOM_ACCOUNT).toBe("~/leave-this-value-alone");
-      }),
+      const environment = ptyAdapter.spawnInputs[0]?.env;
+      expect(environment?.CODEX_HOME).toBe("~/.codex-work");
+      expect(environment?.CLAUDE_CONFIG_DIR).toBe("~/.claude-work");
+      expect(environment?.CUSTOM_ACCOUNT).toBe("~/leave-this-value-alone");
+    }),
   );
 
   it.effect("strips AppImage runtime env from terminal sessions", () =>
@@ -2095,11 +2093,8 @@ it.layer(
         subscribeChanges: Effect.succeed(Stream.empty),
       });
 
-      const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
-        serverSettings,
-        rawProviderInstanceId: providerInstanceId,
-        env: undefined,
-      }).pipe(Effect.flip);
+      const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId: providerInstanceId,
+      env: undefined, }).pipe(Effect.flip);
 
       expect(error).toMatchObject({
         _tag: "TerminalProviderEnvironmentError",
@@ -2111,108 +2106,49 @@ it.layer(
     }),
   );
 
-  it.effect.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"] as const)(
-    "does not start a terminal bound to the removed %s runtime",
-    (driver) =>
-      Effect.gen(function* () {
-        const serverSettings = yield* ServerSettings.ServerSettingsService;
-        const providerInstanceId = ProviderInstanceId.make("legacy");
-        const { manager, ptyAdapter } = yield* createManager(5, {
-          resolveProviderInstanceEnvironment: (rawProviderInstanceId, env) =>
-            TerminalManager.resolveProviderInstanceTerminalEnvironment({
-              serverSettings,
-              rawProviderInstanceId,
-              env,
-            }),
-        });
-        const error = yield* manager.open(openInput({ providerInstanceId })).pipe(Effect.flip);
-        expect(error).toMatchObject({
-          _tag: "TerminalProviderInstanceNotFoundError",
-          providerInstanceId,
-        });
-        expect(ptyAdapter.spawnInputs).toHaveLength(0);
-        expect(
-          (yield* serverSettings.getSettings).providerInstances[providerInstanceId]?.config,
-        ).toEqual({ homePath: "/saved/legacy" });
-      }).pipe(
-        Effect.provide(
-          ServerSettings.layerTest({
-            providerInstances: {
-              [ProviderInstanceId.make("legacy")]: {
-                driver: ProviderDriverKind.make(driver),
-                enabled: true,
-                config: { homePath: "/saved/legacy" },
-                environment: [{ name: "LEGACY_SECRET", value: "saved", sensitive: false }],
-              },
-            },
-          }),
-        ),
-      ),
+  it.effect.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"] as const)("does not start a terminal bound to the removed %s runtime", (driver) =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const providerInstanceId = ProviderInstanceId.make("legacy");
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        resolveProviderInstanceEnvironment: (rawProviderInstanceId, env) => TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
+      });
+      const error = yield* manager.open(openInput({ providerInstanceId })).pipe(Effect.flip);
+      expect(error).toMatchObject({ _tag: "TerminalProviderInstanceNotFoundError", providerInstanceId });
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+      expect((yield* serverSettings.getSettings).providerInstances[providerInstanceId]?.config).toEqual({ homePath: "/saved/legacy" });
+    }).pipe(Effect.provide(ServerSettings.layerTest({ providerInstances: {
+      [ProviderInstanceId.make("legacy")]: { driver: ProviderDriverKind.make(driver), enabled: true, config: { homePath: "/saved/legacy" }, environment: [{ name: "LEGACY_SECRET", value: "saved", sensitive: false }] },
+    } }))),
   );
 
-  it.effect.each(["codex", "claudeAgent"] as const)(
-    "does not synthesize an executable legacy %s default",
-    (driver) =>
-      Effect.gen(function* () {
-        const serverSettings = yield* ServerSettings.ServerSettingsService;
-        const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
-          serverSettings,
-          rawProviderInstanceId: driver,
-          env: undefined,
-        }).pipe(Effect.flip);
-        expect(error).toMatchObject({
-          _tag: "TerminalProviderInstanceNotFoundError",
-          providerInstanceId: driver,
-        });
-      }).pipe(
-        Effect.provide(
-          ServerSettings.layerTest({
-            providerInstances: {},
-            providers: {
-              codex: { homePath: "~/.saved-codex" },
-              claudeAgent: { homePath: "~/.saved-claude" },
-            },
-          }),
-        ),
-      ),
+  it.effect.each(["codex", "claudeAgent"] as const)("does not synthesize an executable legacy %s default", (driver) =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId: driver, env: undefined }).pipe(Effect.flip);
+      expect(error).toMatchObject({ _tag: "TerminalProviderInstanceNotFoundError", providerInstanceId: driver });
+    }).pipe(Effect.provide(ServerSettings.layerTest({ providerInstances: {}, providers: { codex: { homePath: "~/.saved-codex" }, claudeAgent: { homePath: "~/.saved-claude" } } }))),
   );
 
-  it.effect(
-    "uses the explicit native instance environment instead of legacy runtime settings",
-    () =>
-      Effect.gen(function* () {
-        const serverSettings = yield* ServerSettings.ServerSettingsService;
-        const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
-          serverSettings,
-          rawProviderInstanceId: "neopi",
-          env: undefined,
-        });
-        expect(environment.OMP_PROFILE).toBe("work");
-        expect(environment.CODEX_HOME).toBeUndefined();
-      }).pipe(
-        Effect.provide(
-          ServerSettings.layerTest({
-            providers: { codex: { homePath: "~/.saved-codex" } },
-            providerInstances: {
-              [ProviderInstanceId.make("neopi")]: {
-                driver: ProviderDriverKind.make("neopi"),
-                config: { profile: "work" },
-                environment: [{ name: "OMP_PROFILE", value: "work", sensitive: false }],
-              },
-            },
-          }),
-        ),
-      ),
+  ;
+
+  it.effect("uses the explicit native instance environment instead of legacy runtime settings", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId: "neopi", env: undefined });
+      expect(environment.OMP_PROFILE).toBe("work");
+      expect(environment.CODEX_HOME).toBeUndefined();
+    }).pipe(Effect.provide(ServerSettings.layerTest({
+      providers: { codex: { homePath: "~/.saved-codex" } },
+      providerInstances: { [ProviderInstanceId.make("neopi")]: { driver: ProviderDriverKind.make("neopi"), config: { profile: "work" }, environment: [{ name: "OMP_PROFILE", value: "work", sensitive: false }] } },
+    }))),
   );
 
   it.effect("keeps unknown provider instance ids unavailable after legacy hydration", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettings.ServerSettingsService;
-      const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
-        serverSettings,
-        rawProviderInstanceId: "codex_unknown",
-        env: undefined,
-      }).pipe(Effect.flip);
+      const error = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId: "codex_unknown",
+      env: undefined, }).pipe(Effect.flip);
 
       expect(error).toMatchObject({
         _tag: "TerminalProviderInstanceNotFoundError",
@@ -2247,11 +2183,8 @@ it.layer(
       const { manager, ptyAdapter, logsDir } = yield* createManager(2, {
         historyByteLimit: 8,
         resolveProviderInstanceEnvironment: (rawProviderInstanceId, env) =>
-          TerminalManager.resolveProviderInstanceTerminalEnvironment({
-            serverSettings,
-            rawProviderInstanceId,
-            env,
-          }),
+          TerminalManager.resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
+          env, }),
       });
       const profile = "work";
       const updateSecret = (value: string) =>

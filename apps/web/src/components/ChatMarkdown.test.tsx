@@ -60,6 +60,7 @@ vi.mock("~/lib/openPullRequestLink", () => ({
 }));
 
 import ChatMarkdown, {
+  buildFileLinkParentSuffixByPath,
   canUseMarkdownFileShellActions,
   hasMarkdownFilePrimaryAction,
   shouldUseMarkdownFileBrowserPrimaryAction,
@@ -72,6 +73,52 @@ function codeButton(renderer: ReactTestRenderer, label: string) {
   if (!button) throw new Error(`Missing code button: ${label}`);
   return button.props as ComponentProps<typeof Button>;
 }
+
+describe("file link parent suffixes", () => {
+  it("uses the shortest unique parent suffix, retaining at least two segments", () => {
+    const paths = [
+      "/project/one/shared/src/index.ts",
+      "/project/two/shared/src/index.ts",
+      "/project/test/index.ts",
+    ];
+    expect(buildFileLinkParentSuffixByPath(paths)).toEqual(
+      new Map([
+        [paths[0], "one/shared/src"],
+        [paths[1], "two/shared/src"],
+        [paths[2], "project/test"],
+      ]),
+    );
+  });
+
+  it("preserves short parents, duplicate references, and slash normalization", () => {
+    expect(
+      buildFileLinkParentSuffixByPath([
+        "index.ts",
+        "src/index.ts",
+        "project/src/index.ts",
+        String.raw`project\src\index.ts`,
+        "other.ts",
+      ]),
+    ).toEqual(
+      new Map([
+        ["src/index.ts", "src"],
+        ["project/src/index.ts", "project/src"],
+      ]),
+    );
+    expect(
+      buildFileLinkParentSuffixByPath(["/project/src/index.ts", "/project/src/index.ts"]),
+    ).toEqual(new Map());
+  });
+
+  it("disambiguates a large list of package index files", () => {
+    const paths = Array.from({ length: 2000 }, (_, index) => `/project/pkg${index}/src/index.ts`);
+    const suffixes = buildFileLinkParentSuffixByPath(paths);
+    expect(suffixes.size).toBe(paths.length);
+    for (let index = 0; index < paths.length; index += 1) {
+      expect(suffixes.get(paths[index]!)).toBe(`pkg${index}/src`);
+    }
+  });
+});
 
 describe("ChatMarkdown context references", () => {
   it("renders text and image references through the chip renderer, with readable fallback", async () => {

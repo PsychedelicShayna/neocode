@@ -1,3 +1,4 @@
+import type { NativeCommandCompletion } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   insertRankedSearchResult,
   normalizeSearchQuery,
@@ -11,6 +12,25 @@ type SlashSearchItem = Extract<
   ComposerCommandItem,
   { type: "slash-command" | "provider-slash-command" | "skill" }
 >;
+
+export interface ComposerArgumentCompletions {
+  readonly command: string;
+  readonly prefix: string;
+  readonly source: (command: string, prefix: string) => Promise<readonly NativeCommandCompletion[]>;
+  readonly items: readonly NativeCommandCompletion[];
+}
+
+/** Only offer an answer for the same request and native session that produced it. */
+export function currentComposerArgumentCompletions(
+  result: ComposerArgumentCompletions | null,
+  command: string | undefined,
+  prefix: string,
+  source: ComposerArgumentCompletions["source"] | undefined,
+): readonly NativeCommandCompletion[] {
+  if (!result || result.command !== command || result.prefix !== prefix || result.source !== source)
+    return [];
+  return result.items;
+}
 
 /**
  * A provider expands a slash command only when it opens the whole message;

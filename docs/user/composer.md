@@ -25,8 +25,9 @@ In a session NeoCode runs itself, the menu marks commands that need NeoPi's
 terminal interface **Terminal only**; sending one shows NeoPi's explanation
 instead of reaching the model. In a session attached to a terminal NeoPi, those
 commands run in that terminal as if typed there. After a command name and a
-space, the menu offers NeoPi's completions for its argument: `Tab` takes the
-first, and `Enter` sends what you typed unless you highlight a completion first.
+space, the menu offers NeoPi's completions for the argument text before the caret.
+Suggestions update as you type; `Tab` takes the first, and `Enter` sends what you
+typed unless you highlight a completion first.
 
 When NeoPi fails to start a turn in a saved conversation, web and desktop return
 the unsent prompt and its attachments to an empty composer. If you've already

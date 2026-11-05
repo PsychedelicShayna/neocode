@@ -3,10 +3,40 @@ import { ProviderDriverKind } from "@t3tools/contracts";
 
 import type { ComposerCommandItem } from "./ComposerCommandMenu";
 import {
+  currentComposerArgumentCompletions,
   searchSlashCommandItems,
   slashCommandItemsForPromptPosition,
 } from "./composerSlashCommandSearch";
 import { composerCapabilitiesForProvider } from "./neopiComposerUi";
+
+describe("native slash argument completions", () => {
+  it("only offers and accepts completions for the current prefix, command, and session", () => {
+    const source = async () => [];
+    const otherSession = async () => [];
+    const angela = { value: "Angela", label: "Angela", submitsCommand: true };
+    const bella = { value: "Bella", label: "Bella", submitsCommand: true };
+    const earlier = { command: "personality", prefix: "An", source, items: [angela] };
+
+    expect(currentComposerArgumentCompletions(earlier, "personality", "An", source)).toEqual([
+      angela,
+    ]);
+    const whileTyping = currentComposerArgumentCompletions(earlier, "personality", "Be", source);
+    expect(whileTyping).toEqual([]);
+    expect(whileTyping.includes(angela)).toBe(false);
+    expect(currentComposerArgumentCompletions(earlier, "other", "An", source)).toEqual([]);
+    expect(currentComposerArgumentCompletions(earlier, "personality", "An", otherSession)).toEqual(
+      [],
+    );
+
+    const latest = { command: "personality", prefix: "Be", source, items: [bella] };
+    expect(currentComposerArgumentCompletions(latest, "personality", "Be", source)).toEqual([
+      bella,
+    ]);
+    expect(
+      currentComposerArgumentCompletions(latest, "personality", "Be", source).includes(angela),
+    ).toBe(false);
+  });
+});
 
 describe("searchSlashCommandItems", () => {
   const claudeDriver = ProviderDriverKind.make("claudeAgent");

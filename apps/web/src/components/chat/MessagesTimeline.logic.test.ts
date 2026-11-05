@@ -28,6 +28,8 @@ import {
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveWorkGroupScrollIndex,
+  rowsWerePrepended,
+  scrollMovedAwayFromEnd,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   turnToolDisclosureKeys,
@@ -3991,5 +3993,30 @@ describe("turn tool disclosure keys", () => {
       "activity-group:thought",
       "work-group:b",
     ]);
+  });
+});
+
+describe("older history paging", () => {
+  const ids = (...values: string[]) => values.map((id) => ({ id }));
+
+  it("recognises a page of earlier rows inserted above the listed ones", () => {
+    expect(rowsWerePrepended(ids("c", "d"), ids("a", "b", "c", "d"))).toBe(true);
+  });
+
+  it("does not mistake appended, replaced or first-load rows for a prepend", () => {
+    expect(rowsWerePrepended(ids("a", "b"), ids("a", "b", "c"))).toBe(false);
+    expect(rowsWerePrepended(ids("a", "b"), ids("x", "y", "z"))).toBe(false);
+    expect(rowsWerePrepended(ids(), ids("a", "b"))).toBe(false);
+    expect(rowsWerePrepended(ids("b", "c"), ids("b", "c"))).toBe(false);
+  });
+
+  it("treats only an upward scroll off the live edge as the reader leaving it", () => {
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: false })).toBe(true);
+    // Streaming growth under a pinned viewport raises scrollTop.
+    expect(scrollMovedAwayFromEnd({ previousTop: 700, top: 900, isAtEnd: false })).toBe(false);
+    // A small drop that stays inside the live-edge band keeps following.
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 880, isAtEnd: true })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 899.5, isAtEnd: false })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: undefined })).toBe(false);
   });
 });

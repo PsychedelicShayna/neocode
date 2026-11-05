@@ -192,6 +192,7 @@ import {
   resolveTimelineMinimapNavigationInteractive,
   resolveTimelineMinimapTopPercent,
   resolveWorkGroupScrollIndex,
+  rowsWerePrepended,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   toolGroupAction,
@@ -850,6 +851,20 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     queuedMessages,
   ]);
   const rows = useStableRows(rawRows, listIdentityKey);
+  // A page of earlier turns landing while the reader is off the live edge must
+  // not re-pin the list to the end. This render holds follow off; the layout
+  // effect then tells the host the reader is away, so follow stays off until
+  // they scroll back down. Rows are only recorded after commit, so a
+  // discarded render cannot lose the comparison.
+  const previousRowsRef = useRef(rows);
+  const prependedAwayFromEnd =
+    previousRowsRef.current !== rows &&
+    rowsWerePrepended(previousRowsRef.current, rows) &&
+    resolveTimelineIsAtEnd(listRef.current?.getState()) === false;
+  useLayoutEffect(() => {
+    previousRowsRef.current = rows;
+    if (prependedAwayFromEnd) onManualNavigation();
+  }, [rows, prependedAwayFromEnd, onManualNavigation]);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
@@ -1314,6 +1329,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
               (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
               anchoredEndSpace ||
               !liveFollowEnabled ||
+              prependedAwayFromEnd ||
               disclosureToggleSettling
                 ? false
                 : isWorking && !prefersReducedMotion && settlingListIdentity === null

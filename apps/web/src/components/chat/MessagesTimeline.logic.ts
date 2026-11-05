@@ -179,6 +179,32 @@ export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boo
   return contentLength - scroll - scrollLength <= TIMELINE_FOLLOW_REARM_THRESHOLD_PX;
 }
 
+/**
+ * Older history was inserted above rows that were already listed (a page of
+ * earlier turns arriving), as opposed to rows appended or reshuffled below.
+ */
+export function rowsWerePrepended(
+  previous: ReadonlyArray<{ readonly id: string }>,
+  next: ReadonlyArray<{ readonly id: string }>,
+): boolean {
+  const first = previous[0];
+  if (!first || next.length <= previous.length || next[0]?.id === first.id) return false;
+  return next.some((row, index) => index > 0 && row.id === first.id);
+}
+
+/**
+ * A scroll that moved the viewport up and off the live edge is the reader
+ * leaving it. Growth under a pinned viewport only ever raises scrollTop, so a
+ * drop is never the list following the stream.
+ */
+export function scrollMovedAwayFromEnd(input: {
+  readonly previousTop: number;
+  readonly top: number;
+  readonly isAtEnd: boolean | undefined;
+}): boolean {
+  return input.isAtEnd === false && input.top < input.previousTop - 1;
+}
+
 export function shouldPreserveAssistantLineBreaks(text: string): boolean {
   return /^★ Insight(?:\s|─)/mu.test(text);
 }

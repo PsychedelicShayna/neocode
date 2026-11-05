@@ -8,6 +8,7 @@ import type { QueuedComposerMessage } from "../../queuedMessageStore";
 import { MessagesTimeline } from "../chat/MessagesTimeline";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import type { CitationHistoryPage } from "../chat/useAssistantCitationTarget";
+import { useLeaveLiveEdgeOnScroll } from "../chat/useLeaveLiveEdgeOnScroll";
 import { projectNativeTimeline } from "./nativeTimeline";
 
 const NO_TURN_DIFFS: [] = [];
@@ -58,6 +59,9 @@ export function NativeTimelineView(props: {
     if (atEnd) setLiveFollow(true);
   }, []);
   const onManualNavigation = useCallback(() => setLiveFollow(false), []);
+  // Nothing else tells this view the reader scrolled up, and the list re-pins
+  // to the end on every layout while follow is on.
+  useLeaveLiveEdgeOnScroll(listRef, onManualNavigation);
   const followSignal = props.followSignal ?? 0;
   useEffect(() => {
     if (followSignal === 0) return;

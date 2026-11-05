@@ -22,6 +22,46 @@ describe("terminalUiStateStore actions", () => {
     });
   });
 
+  it.each(["horizontal", "vertical"] as const)(
+    "returns a %s panel split as one drawer group with its active terminal",
+    (splitDirection) => {
+      const store = useTerminalUiStateStore.getState();
+      store.newTerminal(THREAD_REF, "existing");
+      store.newTerminal(THREAD_REF, "a");
+      store.closeTerminal(THREAD_REF, "b");
+      store.closeTerminal(THREAD_REF, "unrelated-closed");
+      store.setTerminalHeight(THREAD_REF, 420);
+      const group = { id: "returned-panel", terminalIds: ["a", "b"], splitDirection };
+      store.returnTerminalGroup(THREAD_REF, group, "b");
+      store.returnTerminalGroup(THREAD_REF, group, "b");
+      store.reconcileTerminalIds(THREAD_REF, ["existing", "a", "b", "unrelated-closed"]);
+
+      const state = useTerminalUiStateStore.getState();
+      const ui = selectThreadTerminalUiState(state.terminalUiStateByThreadKey, THREAD_REF);
+      expect(ui).toMatchObject({
+        terminalOpen: true,
+        terminalHeight: 420,
+        terminalIds: ["existing", "a", "b"],
+        activeTerminalId: "b",
+        activeTerminalGroupId: group.id,
+      });
+      expect(ui.terminalGroups).toHaveLength(2);
+      expect(ui.terminalGroups[0]?.terminalIds).toEqual(["existing"]);
+      expect(ui.terminalGroups[1]).toMatchObject({
+        id: group.id,
+        terminalIds: ["a", "b"],
+        ...(splitDirection === "vertical" ? { splitDirection } : {}),
+      });
+      expect(ui.terminalGroups[1]?.splitDirection ?? "horizontal").toBe(splitDirection);
+      expect(state.suppressedTerminalIdsByThreadKey[scopedThreadKey(THREAD_REF)]).toEqual([
+        "unrelated-closed",
+      ]);
+      expect(
+        selectThreadTerminalUiState(state.terminalUiStateByThreadKey, OTHER_THREAD_REF).terminalIds,
+      ).toEqual([]);
+    },
+  );
+
   it("isolates native layouts and close tombstones by environment, provider and canonical file", () => {
     const target = {
       environmentId: EnvironmentId.make("environment-a"),

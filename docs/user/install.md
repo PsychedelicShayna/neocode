@@ -307,6 +307,10 @@ changes in that session's folder, even when it is outside the folder where
 NeoCode started. Native sessions do not create the turn snapshots used by
 turn-based diffs.
 
+Use **Return to terminal drawer** to move a native terminal panel back below the
+conversation without closing its shells. Split panes keep their grouping,
+direction and active terminal.
+
 In a native session, the **Session tree** button in the tab strip opens the tree
 in the right panel beside the conversation, the way NeoPi's `/tree` draws it.
 Forks get `├─`/`└─` connectors and `│` gutters, a straight run of entries stays in

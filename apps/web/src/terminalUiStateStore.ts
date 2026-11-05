@@ -572,6 +572,11 @@ interface TerminalUiStateStoreState {
   splitTerminal: (threadRef: WorkspaceRef, terminalId: string) => void;
   splitTerminalVertical: (threadRef: WorkspaceRef, terminalId: string) => void;
   newTerminal: (threadRef: WorkspaceRef, terminalId: string) => void;
+  returnTerminalGroup: (
+    threadRef: WorkspaceRef,
+    group: ThreadTerminalGroup,
+    activeTerminalId: string,
+  ) => void;
   ensureTerminal: (
     threadRef: WorkspaceRef,
     terminalId: string,
@@ -657,6 +662,52 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
           updateTerminal(threadRef, (state) => newThreadTerminal(state, terminalId), {
             terminalId,
             suppressed: false,
+          }),
+        returnTerminalGroup: (threadRef, group, activeTerminalId) =>
+          set((state) => {
+            const terminalIds = normalizeTerminalGroupIds(group.terminalIds);
+            if (terminalIds.length === 0) return state;
+            const returnedIds = new Set(terminalIds);
+            const threadKey = terminalThreadKey(threadRef);
+            const suppressedIds = state.suppressedTerminalIdsByThreadKey[threadKey] ?? [];
+            const remainingSuppressedIds = suppressedIds.filter((id) => !returnedIds.has(id));
+            const suppressedTerminalIdsByThreadKey =
+              remainingSuppressedIds.length === suppressedIds.length
+                ? state.suppressedTerminalIdsByThreadKey
+                : remainingSuppressedIds.length > 0
+                  ? {
+                      ...state.suppressedTerminalIdsByThreadKey,
+                      [threadKey]: remainingSuppressedIds,
+                    }
+                  : removeRecordEntry(state.suppressedTerminalIdsByThreadKey, threadKey);
+            return {
+              terminalUiStateByThreadKey: updateTerminalUiStateByThreadKey(
+                state.terminalUiStateByThreadKey,
+                threadRef,
+                (current) =>
+                  normalizeThreadTerminalUiState({
+                    ...current,
+                    terminalOpen: true,
+                    terminalIds: [...current.terminalIds, ...terminalIds],
+                    terminalGroups: [
+                      ...current.terminalGroups.flatMap((existing) => {
+                        const retainedIds = existing.terminalIds.filter(
+                          (id) => !returnedIds.has(id),
+                        );
+                        return retainedIds.length > 0
+                          ? [{ ...existing, terminalIds: retainedIds }]
+                          : [];
+                      }),
+                      { ...group, terminalIds },
+                    ],
+                    activeTerminalId: returnedIds.has(activeTerminalId)
+                      ? activeTerminalId
+                      : terminalIds[0]!,
+                    activeTerminalGroupId: "",
+                  }),
+              ),
+              suppressedTerminalIdsByThreadKey,
+            };
           }),
         ensureTerminal: (threadRef, terminalId, options) =>
           updateTerminal(

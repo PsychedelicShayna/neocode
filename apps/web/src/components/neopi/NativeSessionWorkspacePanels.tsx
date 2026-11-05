@@ -563,8 +563,16 @@ export function NativeSessionWorkspacePanels({
                 size="xs"
                 variant="ghost"
                 onClick={() => {
+                  useTerminalUiStateStore.getState().returnTerminalGroup(
+                    target,
+                    {
+                      id: surface.id,
+                      terminalIds: surface.terminalIds,
+                      ...(surface.splitDirection ? { splitDirection: surface.splitDirection } : {}),
+                    },
+                    surface.activeTerminalId,
+                  );
                   useRightPanelStore.getState().closeSurface(target, surface.id);
-                  useTerminalUiStateStore.getState().setTerminalOpen(target, true);
                 }}
               >
                 Return to terminal drawer

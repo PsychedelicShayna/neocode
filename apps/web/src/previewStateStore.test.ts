@@ -10,7 +10,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   __testing,
@@ -652,5 +652,85 @@ describe("native preview state isolation", () => {
     beginPreviewSessionClose(target, ownSnapshot.tabId);
     expect(readThreadPreviewState(target).snapshot).toBeNull();
     expect(readThreadPreviewState(other).snapshot).toEqual(otherSnapshot);
+  });
+});
+
+describe("preview state lifetime", () => {
+  beforeEach(() => {
+    appAtomRegistry.reset();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    resetPreviewStateForTests();
+    appAtomRegistry.reset();
+    vi.useRealTimers();
+  });
+
+  it("releases idle state for both changed and merely visited workspaces", async () => {
+    const visited = Array.from({ length: 200 }, (_, index) =>
+      scopeThreadRef(environmentId, ThreadId.make(`idle-${index}`)),
+    );
+    const atoms = visited.map((workspace, index) => {
+      if (index % 2 === 0) rememberPreviewUrl(workspace, `http://localhost:${5000 + index}/`);
+      else readThreadPreviewState(workspace);
+      return previewStateAtom(scopedThreadKey(workspace));
+    });
+
+    await vi.runAllTimersAsync();
+
+    expect(atoms.every((atom) => !appAtomRegistry.getNodes().has(atom))).toBe(true);
+    expect(readThreadPreviewState(visited[0]!)).toEqual(__testing.EMPTY_THREAD_PREVIEW_STATE);
+  });
+
+  it("keeps live background sessions without a mounted preview host and releases them on close", async () => {
+    const snapshot = makeSnapshot();
+    const atom = previewStateAtom(scopedThreadKey(ref));
+    applyPreviewServerSnapshot(ref, snapshot);
+    await vi.runAllTimersAsync();
+    expect(appAtomRegistry.getNodes().has(atom)).toBe(true);
+    expect(readThreadPreviewState(ref).snapshot).toEqual(snapshot);
+
+    applyPreviewServerEvent(ref, {
+      type: "closed",
+      threadId: "thread-1",
+      tabId: snapshot.tabId,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    await vi.runAllTimersAsync();
+    expect(appAtomRegistry.getNodes().has(atom)).toBe(false);
+  });
+
+  it("retains optimistic close tombstones until the close receipt arrives", async () => {
+    const snapshot = makeSnapshot();
+    const atom = previewStateAtom(scopedThreadKey(ref));
+    applyPreviewServerSnapshot(ref, snapshot);
+    beginPreviewSessionClose(ref, snapshot.tabId);
+    await vi.runAllTimersAsync();
+    expect(appAtomRegistry.getNodes().has(atom)).toBe(true);
+    applyPreviewServerSnapshot(ref, snapshot);
+    expect(readThreadPreviewState(ref).snapshot).toBeNull();
+    expect(readThreadPreviewState(ref).suppressedTabIds.has(snapshot.tabId)).toBe(true);
+
+    applyPreviewServerEvent(ref, {
+      type: "closed",
+      threadId: "thread-1",
+      tabId: snapshot.tabId,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    await vi.runAllTimersAsync();
+    expect(appAtomRegistry.getNodes().has(atom)).toBe(false);
+  });
+
+  it("preserves an idle workspace while it is being viewed, then expires after unmount", async () => {
+    const atom = previewStateAtom(scopedThreadKey(ref));
+    const unmount = appAtomRegistry.mount(atom);
+    rememberPreviewUrl(ref, "http://localhost:5173/");
+    await vi.runAllTimersAsync();
+    expect(readThreadPreviewState(ref).recentlySeenUrls).toEqual(["http://localhost:5173/"]);
+
+    unmount();
+    await vi.runAllTimersAsync();
+    expect(appAtomRegistry.getNodes().has(atom)).toBe(false);
   });
 });

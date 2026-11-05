@@ -68,12 +68,17 @@ const emptyPreviewStateAtom = Atom.make<ThreadPreviewState>(EMPTY_THREAD_PREVIEW
   Atom.withLabel("preview:empty-thread"),
 );
 
-export const previewStateAtom = Atom.family((threadKey: string) =>
-  Atom.make<ThreadPreviewState>(EMPTY_THREAD_PREVIEW_STATE).pipe(
-    Atom.keepAlive,
+const PREVIEW_STATE_IDLE_TTL_MS = 5 * 60_000;
+const previewAtoms = new WeakSet<Atom.Atom<ThreadPreviewState>>();
+
+export const previewStateAtom = Atom.family((threadKey: string) => {
+  const atom = Atom.make<ThreadPreviewState>(EMPTY_THREAD_PREVIEW_STATE).pipe(
+    Atom.setIdleTTL(PREVIEW_STATE_IDLE_TTL_MS),
     Atom.withLabel(`preview:thread:${threadKey}`),
-  ),
-);
+  );
+  previewAtoms.add(atom);
+  return atom;
+});
 
 // Only the Electron browser host needs a cross-thread view. Keep that index
 // separate so thread-local readers never subscribe to unrelated previews.
@@ -96,10 +101,24 @@ const activePreviewSessionsAtom = Atom.make((get) => {
   return byThreadKey;
 }).pipe(Atom.withLabel("preview:active-sessions"));
 
-const changedPreviewThreadKeys = new Set<string>();
+const retainedPreviewThreadMounts = new Map<string, () => void>();
 
 function syncActivePreviewThread(threadKey: string, state: ThreadPreviewState): void {
   const active = Object.keys(state.sessions).length > 0;
+  // Live background tabs and in-flight close tombstones must survive without a
+  // rendered preview host. Everything else expires after its last reader leaves.
+  if (active || state.suppressedTabIds.size > 0) {
+    if (!retainedPreviewThreadMounts.has(threadKey)) {
+      retainedPreviewThreadMounts.set(
+        threadKey,
+        appAtomRegistry.mount(previewStateAtom(threadKey)),
+      );
+    }
+  } else {
+    const unmount = retainedPreviewThreadMounts.get(threadKey);
+    retainedPreviewThreadMounts.delete(threadKey);
+    unmount?.();
+  }
   appAtomRegistry.update(activePreviewThreadKeysAtom, (current) => {
     if (current.keys.has(threadKey) === active) return current;
     const next = new Set(current.keys);
@@ -121,7 +140,6 @@ function updateThreadPreviewState(
     return [nextState !== current, nextState];
   });
   if (!changed) return;
-  changedPreviewThreadKeys.add(threadKey);
   syncActivePreviewThread(threadKey, nextState);
 }
 
@@ -471,10 +489,13 @@ export function isPreviewSupportedInRuntime(): boolean {
 }
 
 export function resetPreviewStateForTests(): void {
-  for (const threadKey of changedPreviewThreadKeys) {
-    appAtomRegistry.set(previewStateAtom(threadKey), EMPTY_THREAD_PREVIEW_STATE);
+  for (const unmount of retainedPreviewThreadMounts.values()) unmount();
+  retainedPreviewThreadMounts.clear();
+  for (const atom of appAtomRegistry.getNodes().keys()) {
+    if (typeof atom !== "string" && previewAtoms.has(atom)) {
+      appAtomRegistry.set(atom as Atom.Writable<ThreadPreviewState>, EMPTY_THREAD_PREVIEW_STATE);
+    }
   }
-  changedPreviewThreadKeys.clear();
   appAtomRegistry.set(activePreviewThreadKeysAtom, { keys: new Set<string>() });
 }
 

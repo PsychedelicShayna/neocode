@@ -75,6 +75,12 @@ not advance the cached cursor beyond the applied data, and an old scope must not
 overwrite its successor's cache. Preserve pagination data on reuse, but clear
 canceled loading state.
 
+Native session observations instead stay warm for five idle minutes so switching
+tabs does not reopen the owner. Their in-memory transcript cache belongs to that
+observation scope and expires with it, including unobserved session-move handoffs.
+A destination with its own observation retains its own cache. Disposing a client
+observation releases local history without closing the native owner.
+
 The [RPC boundary](../../packages/client-runtime/src/rpc/client.ts) resolves
 requests against the current session at execution time. Durable subscriptions
 follow replacement sessions. After a transport failure they wait for the

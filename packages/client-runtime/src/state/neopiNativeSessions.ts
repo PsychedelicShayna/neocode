@@ -222,8 +222,10 @@ export function createNativeSessionAtoms<R, E>(
     Effect.sync(() => {
       const queue = updates.get(key);
       if (queue) Queue.offerUnsafe(queue, update);
-      else
-        cache.set(key, reduceNativeSessionFeed(cache.get(key) ?? emptyNativeSessionFeed(), update));
+      else {
+        const feed = cache.get(key);
+        if (feed) cache.set(key, reduceNativeSessionFeed(feed, update));
+      }
     });
   const list = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "native-sessions:list",
@@ -242,11 +244,22 @@ export function createNativeSessionAtoms<R, E>(
             ref: input.ref,
           });
           const queue = yield* Queue.unbounded<NativeSessionUpdate>();
+          const handedOffKeys = new Set<string>();
           yield* Effect.acquireRelease(
             Effect.sync(() => updates.set(key, queue)),
             () =>
               Effect.sync(() => {
-                if (updates.get(key) === queue) updates.delete(key);
+                if (updates.get(key) !== queue) return;
+                updates.delete(key);
+                cache.delete(key);
+                endedObservations.delete(key);
+                // Unobserved move handoffs live only as long as their source.
+                // A mounted destination owns its own feed and must stay intact.
+                for (const movedKey of handedOffKeys)
+                  if (!updates.has(movedKey)) {
+                    cache.delete(movedKey);
+                    endedObservations.delete(movedKey);
+                  }
               }),
           );
           return SubscriptionRef.changes(supervisor.session).pipe(
@@ -327,14 +340,16 @@ export function createNativeSessionAtoms<R, E>(
                   cache.set(key, feed);
                   // The moved session's own observation starts from what is
                   // already known, so the transcript does not flash empty.
-                  if (feed.movedTo && !wasMoved)
-                    cache.set(
-                      nativeSessionKey({
-                        environmentId: supervisor.target.environmentId,
-                        ref: feed.movedTo,
-                      }),
-                      { ...feed, movedTo: null, connected: false },
-                    );
+                  if (feed.movedTo && !wasMoved) {
+                    const movedKey = nativeSessionKey({
+                      environmentId: supervisor.target.environmentId,
+                      ref: feed.movedTo,
+                    });
+                    if (!updates.has(movedKey)) {
+                      handedOffKeys.add(movedKey);
+                      cache.set(movedKey, { ...feed, movedTo: null, connected: false });
+                    }
+                  }
                 },
               );
             }),

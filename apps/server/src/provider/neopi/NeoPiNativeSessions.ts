@@ -59,6 +59,12 @@ import {
 import { NEOPI_CAPABILITIES } from "./NeoPiCompatibility.ts";
 import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
+import {
+  decodeNeoPiControlRegistry,
+  neoPiOwnerVersion,
+  olderOwnerMessage,
+  resolveNativeLive,
+} from "./NeoPiNativeLiveness.ts";
 import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import {
@@ -1019,6 +1025,13 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         err: err.text,
       };
     }).pipe(Effect.scoped, Effect.timeout("30 seconds"));
+  /** `npi ctl list --json`; `undefined` when the binary cannot list or answers with something else. */
+  const readControlRegistry = (profile: NeoPiNativeProfile) =>
+    runCatalog(profile, ["ctl", "list", "--json"]).pipe(
+      Effect.map((output) => (output.ok ? decodeNeoPiControlRegistry(output.out) : undefined)),
+      Effect.timeout("5 seconds"),
+      Effect.orElseSucceed(() => undefined),
+    );
   const catalog = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
     cwd?: string,
@@ -1033,14 +1046,37 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       ...(live ? ["--live"] : []),
     ];
     // Only the full listing feeds the sidebar; single-file lookups need no owner probes.
-    const live = !file && !liveUnsupported.has(profile.source.binary);
-    let output = yield* runCatalog(profile, listArgs(live));
+    let live = !file && !liveUnsupported.has(profile.source.binary);
+    // The control registry is each running process's own snapshot. A failed read leaves it
+    // `undefined`, which `resolveNativeLive` treats as "believe only the streaming flag".
+    const [first, registry] = yield* Effect.all(
+      [
+        runCatalog(profile, listArgs(live)),
+        live ? readControlRegistry(profile) : Effect.succeed(undefined),
+      ],
+      { concurrency: 2 },
+    );
+    let output = first;
     if (!output.ok && live && /--live/.test(`${output.err}\n${output.out}`)) {
       liveUnsupported.add(profile.source.binary);
+      live = false;
       output = yield* runCatalog(profile, listArgs(false));
     }
     if (!output.ok) return yield* fail(output.err || "Native session discovery failed.");
-    const result = yield* Schema.decodeUnknownEffect(Catalog)(output.out);
+    const decoded = yield* Schema.decodeUnknownEffect(Catalog)(output.out);
+    const result = {
+      sessions: live
+        ? decoded.sessions.map((row) => ({
+            ...row,
+            live:
+              resolveNativeLive({
+                instanceId: row.control?.instanceId ?? null,
+                reported: row.live,
+                registry,
+              }) ?? null,
+          }))
+        : decoded.sessions,
+    };
     yield* profile.validate;
     if (!cwd) return result.sessions;
     const expected = yield* fs.realPath(cwd);
@@ -1201,6 +1237,18 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             return yield* fail(
               "The native endpoint did not establish a control attachment.",
               "unsupported",
+            );
+          // A terminal started before session_journal existed cannot be followed here; say which
+          // release it runs instead of blaming the configured binary, which is not the owner.
+          if (
+            !client.capabilities.has("session_journal") ||
+            !client.capabilities.has("session_journal_events")
+          )
+            return yield* fail(
+              olderOwnerMessage(
+                neoPiOwnerVersion(yield* readControlRegistry(profile), owner.control.instanceId),
+              ),
+              "owner_outdated",
             );
           return {
             client,

@@ -237,6 +237,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --color-info-foreground: var(--info-foreground);
   --color-info: var(--info);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-solid-foreground: var(--destructive-solid-foreground);
   --color-ring: var(--ring);
   --color-input: var(--contrast-input);
   --color-border: var(--contrast-border);
@@ -1074,6 +1075,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --input: rgb(0 0 0 / 14%);
   --ring: color-mix(in srgb, #1fa9bb 85%, #151518);
   --destructive-foreground: var(--error-foreground);
+  --destructive-solid-foreground: #ffffff;
   --info: #1fa9bb;
   --info-foreground: color-mix(in srgb, var(--info) 70%, #151518);
   --success: #12a36b;
@@ -1116,6 +1118,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
     --accent: rgb(255 255 255 / 3.5%);
     --error: #ff6166;
     --error-foreground: #ff6166;
+    --destructive-solid-foreground: #151518;
     --tool-error-icon: var(--error);
     --error-surface: rgb(255 97 102 / 13%);
     --border: rgb(255 255 255 / 9%);
@@ -1186,6 +1189,7 @@ html[data-theme-id]:not([data-theme-id=""]) {
   --error-surface: var(--app-theme-error-surface);
   --destructive: var(--error);
   --destructive-foreground: var(--error-foreground);
+  --destructive-solid-foreground: var(--app-theme-error-solid-foreground);
   --warning: var(--app-theme-warning);
   --warning-foreground: var(--app-theme-warning-foreground);
   --warning-surface: var(--app-theme-warning-surface);

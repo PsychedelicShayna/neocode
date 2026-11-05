@@ -1566,6 +1566,23 @@ export function getThemeColorVariable(role: ThemeColorRole): string {
   return APP_THEME_VARIABLES[role];
 }
 
+const DESTRUCTIVE_SOLID_FOREGROUND_VARIABLE = "--app-theme-error-solid-foreground";
+
+/** Status text is solved against errorSurface; filled actions need their own foreground. */
+export function getDestructiveSolidForeground(
+  colors: Pick<ThemeColors, "canvas" | "error">,
+): string | null {
+  const error = parseThemeColor(colors.error);
+  const canvas = parseThemeColor(colors.canvas);
+  if (!error || !canvas) return null;
+  const fill = mixThemeRgbColors(
+    themeOklchToRgb(canvas.color),
+    themeOklchToRgb(error.color),
+    error.alpha,
+  );
+  return themeRgbToThemeColor(readableThemeForeground(fill));
+}
+
 /** Marks the document as wearing an unsaved draft rather than a stored theme. */
 export const THEME_PREVIEW_ID = "__preview";
 
@@ -1585,6 +1602,9 @@ export function applyThemeColorPreview(colors: ThemeColors, appearance: ThemeApp
     // A half-typed hex keeps the last good value instead of blanking the role.
     if (isThemeColor(value)) root.style.setProperty(APP_THEME_VARIABLES[role], value);
   }
+  const destructiveForeground = getDestructiveSolidForeground(colors);
+  if (destructiveForeground)
+    root.style.setProperty(DESTRUCTIVE_SOLID_FOREGROUND_VARIABLE, destructiveForeground);
 }
 
 export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppearance): void {
@@ -1602,6 +1622,9 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
     for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
       root.style.setProperty(APP_THEME_VARIABLES[role], value);
     }
+    const destructiveForeground = getDestructiveSolidForeground(colors);
+    if (destructiveForeground)
+      root.style.setProperty(DESTRUCTIVE_SOLID_FOREGROUND_VARIABLE, destructiveForeground);
     return;
   }
 
@@ -1609,6 +1632,7 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
   for (const variable of Object.values(APP_THEME_VARIABLES)) {
     root.style.removeProperty(variable);
   }
+  root.style.removeProperty(DESTRUCTIVE_SOLID_FOREGROUND_VARIABLE);
 }
 
 export function resolveThemeAppearance(

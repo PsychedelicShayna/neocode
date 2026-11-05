@@ -3,6 +3,9 @@ import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
 
 import {
   getThemeColorsForMode,
+  getDestructiveSolidForeground,
+  applyThemeColorPreview,
+  applyThemePalette,
   getThemeDefinition,
   getThemeModes,
   getThemePreferenceMode,
@@ -74,6 +77,60 @@ function contrastRatio(first: string, second: string): number {
   const darker = Math.min(luminance(first), luminance(second));
   return (lighter + 0.05) / (darker + 0.05);
 }
+
+describe("filled destructive foreground", () => {
+  it("keeps solid labels readable for light and dark custom error fills", () => {
+    for (const appearance of ["light", "dark"] as const) {
+      for (const error of ["#ffffff", "#ffffbb", "#000000", "#4c0000", "#dc3a40", "#ff6166"]) {
+        const foreground = getDestructiveSolidForeground({
+          ...getDefaultThemeColors(appearance),
+          error,
+        });
+        expect(foreground).not.toBeNull();
+        expect(contrastRatio(foreground!, error)).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("composites transparent fills against the palette canvas", () => {
+    for (const canvas of ["#ffffff", "#101010"]) {
+      const foreground = getDestructiveSolidForeground({ canvas, error: "#ffffff00" });
+      expect(foreground).not.toBeNull();
+      expect(contrastRatio(foreground!, canvas)).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(getDestructiveSolidForeground({ canvas: "#ffffff", error: "#" })).toBeNull();
+  });
+
+  it("updates previews and installed palettes, retains valid drafts, and clears overrides", () => {
+    const variables = new Map<string, string>();
+    const root = {
+      dataset: {} as Record<string, string>,
+      classList: { toggle: vi.fn() },
+      style: {
+        setProperty: (name: string, value: string) => variables.set(name, value),
+        removeProperty: (name: string) => variables.delete(name),
+      },
+    };
+    vi.stubGlobal("document", { documentElement: root });
+    try {
+      const variable = "--app-theme-error-solid-foreground";
+      const draft = { ...getDefaultThemeColors("light"), error: "#ffffff" };
+      applyThemeColorPreview(draft, "light");
+      const foreground = variables.get(variable)!;
+      expect(contrastRatio(foreground, draft.error)).toBeGreaterThanOrEqual(4.5);
+      applyThemeColorPreview({ ...draft, error: "#" }, "light");
+      expect(variables.get(variable)).toBe(foreground);
+
+      applyThemePalette(EMBER_THEME.id, "dark");
+      const colors = getThemeColorsForMode(EMBER_THEME, "dark")!;
+      expect(variables.get(variable)).toBe(getDestructiveSolidForeground(colors));
+      applyThemePalette("system");
+      expect(variables.has(variable)).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("native theme projection", () => {
   it("maps native semantic surfaces without losing text or focus contrast", () => {

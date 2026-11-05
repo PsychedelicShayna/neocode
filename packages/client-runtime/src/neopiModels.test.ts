@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { NeoPiModelsConfiguration } from "@t3tools/contracts";
-import { formatNeoPiModelTokenLimit, getNeoPiModelsSelectorOptions } from "./neopiModels.ts";
+import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  formatNeoPiModelTokenLimit,
+  getNeoPiModelsSelectorOptions,
+  neopiModelsSnapshotKey,
+  recallNeoPiModelsConfiguration,
+  rememberNeoPiModelsConfiguration,
+} from "./neopiModels.ts";
 
 describe("native Models limit presentation", () => {
   it("shows unknown native limits without inventing a zero-token capability", () => {
@@ -82,5 +89,35 @@ describe("native Models assignment options", () => {
 
     expect(options.has(selected)).toBe(true);
     expect(options.has("")).toBe(false);
+  });
+});
+
+describe("remembered Models snapshots", () => {
+  const environmentId = EnvironmentId.make("snapshot-env");
+  const target = { providerInstanceId: ProviderInstanceId.make("neopi") };
+  const snapshot = (): NeoPiModelsConfiguration => ({ ...configuration() });
+
+  it("keys a snapshot by environment and every target field", () => {
+    const keys = new Set([
+      neopiModelsSnapshotKey(environmentId, target),
+      neopiModelsSnapshotKey(EnvironmentId.make("other"), target),
+      neopiModelsSnapshotKey(environmentId, { ...target, sessionFile: "/s.jsonl" }),
+    ]);
+    expect(keys.size).toBe(3);
+  });
+
+  it("recalls the latest snapshot and keeps only a few", () => {
+    const first = snapshot();
+    const keys = ["a", "b", "c", "d"].map((name) =>
+      neopiModelsSnapshotKey(environmentId, { ...target, sessionFile: name }),
+    );
+    rememberNeoPiModelsConfiguration(keys[0]!, first);
+    expect(recallNeoPiModelsConfiguration(keys[0]!)).toBe(first);
+    const second = snapshot();
+    rememberNeoPiModelsConfiguration(keys[0]!, second);
+    expect(recallNeoPiModelsConfiguration(keys[0]!)).toBe(second);
+    for (const key of keys.slice(1)) rememberNeoPiModelsConfiguration(key, snapshot());
+    expect(recallNeoPiModelsConfiguration(keys[0]!)).toBeUndefined();
+    expect(recallNeoPiModelsConfiguration(keys[3]!)).toBeDefined();
   });
 });

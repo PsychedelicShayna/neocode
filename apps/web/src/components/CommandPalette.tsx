@@ -2057,8 +2057,8 @@ function OpenCommandPaletteDialog(props: {
   actionItems.push({
     kind: "action",
     value: "action:models",
-    searchTerms: ["models", "providers", "roles", "effort", "native", "login"],
-    title: "Open Models",
+    searchTerms: ["roles", "models", "providers", "effort", "native", "login"],
+    title: "Open Roles",
     icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
     shortcutCommand: "models.open",
     run: async () => {

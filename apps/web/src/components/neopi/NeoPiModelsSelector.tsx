@@ -2,13 +2,42 @@ import type {
   EnvironmentId,
   NeoPiModelsConfiguration,
   NeoPiModelsTarget,
+  NeoPiNativeModel,
+  ProviderInstanceId,
   ServerProvider,
 } from "@t3tools/contracts";
 import { useMemo } from "react";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { SETTINGS_PICKER_TRIGGER_CLASSNAME } from "../settings/settingsLayout";
-import { modelDisplayName } from "./modelsPresentation";
+import { modelDisplayName, modelSelector, modelsIndex } from "./modelsPresentation";
+
+type SelectorOptions = ReturnType<typeof buildSelectorOptions>;
+const optionsByCatalog = new WeakMap<
+  ReadonlyArray<NeoPiNativeModel>,
+  Map<ProviderInstanceId, SelectorOptions>
+>();
+
+const buildSelectorOptions = (models: ReadonlyArray<NeoPiNativeModel>) =>
+  models.map((model) => ({
+    slug: modelSelector(model),
+    name: modelDisplayName(model),
+    provider: "neopi" as const,
+    subProvider: model.provider,
+    isUnavailable: !model.available,
+  }));
+
+/** Every role row offers the same catalog: build its options once per snapshot, not once per row. */
+const selectorOptions = (
+  models: ReadonlyArray<NeoPiNativeModel>,
+  instanceId: ProviderInstanceId,
+): ReadonlyMap<ProviderInstanceId, SelectorOptions> => {
+  let byInstance = optionsByCatalog.get(models);
+  if (!byInstance) optionsByCatalog.set(models, (byInstance = new Map()));
+  let options = byInstance.get(instanceId);
+  if (!options) byInstance.set(instanceId, (options = buildSelectorOptions(models)));
+  return byInstance;
+};
 
 /** A Models assignment uses the stock native selector, scoped to the exact NeoPi connection. */
 export function NeoPiModelsSelector({
@@ -41,30 +70,14 @@ export function NeoPiModelsSelector({
   selectionLabel?: string;
 }) {
   const entries = useMemo(() => deriveProviderInstanceEntries([provider]), [provider]);
-  const options = useMemo(
-    () =>
-      new Map([
-        [
-          provider.instanceId,
-          configuration.models.map((model) => ({
-            slug: `${model.provider}/${model.id}`,
-            name: modelDisplayName(model),
-            provider: "neopi" as const,
-            subProvider: model.provider,
-            isUnavailable: !model.available,
-          })),
-        ],
-      ]),
-    [configuration.models, provider.instanceId],
-  );
-  const selected = configuration.models.find((model) => `${model.provider}/${model.id}` === value);
+  const options = selectorOptions(configuration.models, provider.instanceId);
+  const index = modelsIndex(configuration.models);
+  const selected = index.bySelector.get(value);
   const role = configuration.roles.find((role) => role.alias === value);
   const resolution = role?.scopedResolutions[scope];
-  const resolved =
-    resolution &&
-    configuration.models.find(
-      (model) => model.provider === resolution.provider && model.id === resolution.modelId,
-    );
+  const resolved = resolution
+    ? index.bySelector.get(`${resolution.provider}/${resolution.modelId}`)
+    : undefined;
   const triggerLabel = !value
     ? "Automatic"
     : selected?.available
@@ -99,9 +112,7 @@ export function NeoPiModelsSelector({
       {...(exactOnly
         ? {
             getModelDisabledReason: (_: unknown, selector: string) =>
-              configuration.models.some((model) => `${model.provider}/${model.id}` === selector)
-                ? null
-                : "Choose an exact model.",
+              index.bySelector.has(selector) ? null : "Choose an exact model.",
           }
         : {})}
       {...(open === undefined ? {} : { open })}

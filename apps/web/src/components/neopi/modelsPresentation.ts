@@ -101,6 +101,38 @@ export function modelProviderGroups(
   };
 }
 
+export const modelSelector = (model: Pick<NeoPiNativeModel, "provider" | "id">) =>
+  `${model.provider}/${model.id}`;
+
+export interface ModelsIndex {
+  /** `provider/id` to model; the catalog's one lookup, instead of a scan per row, role or rule. */
+  readonly bySelector: ReadonlyMap<string, NeoPiNativeModel>;
+  /** Lowercased `provider/id name`, parallel to the catalog, built on the first filter only. */
+  searchKeys(): ReadonlyArray<string>;
+}
+
+const indexes = new WeakMap<ReadonlyArray<NeoPiNativeModel>, ModelsIndex>();
+
+/** One linear pass per catalog snapshot, shared by every consumer of that snapshot. */
+export function modelsIndex(models: ReadonlyArray<NeoPiNativeModel>): ModelsIndex {
+  let index = indexes.get(models);
+  if (index) return index;
+  const bySelector = new Map<string, NeoPiNativeModel>();
+  for (const model of models) {
+    const selector = modelSelector(model);
+    // A duplicated selector keeps its first row, matching the Array.find it replaces.
+    if (!bySelector.has(selector)) bySelector.set(selector, model);
+  }
+  let keys: string[] | undefined;
+  index = {
+    bySelector,
+    searchKeys: () =>
+      (keys ??= models.map((model) => `${modelSelector(model)} ${model.name}`.toLocaleLowerCase())),
+  };
+  indexes.set(models, index);
+  return index;
+}
+
 /** A provider page keeps its catalog even without credentials; All models follows Ready. */
 export function modelsForView(
   configuration: Pick<NeoPiModelsConfiguration, "models" | "providers">,
@@ -116,10 +148,14 @@ export function modelsForView(
         )
       : null;
   const search = query.trim().toLocaleLowerCase();
-  return configuration.models.filter(
-    (model) =>
-      (providerId === null ? ready!.has(model.provider) : model.provider === providerId) &&
-      (search === "" ||
-        `${model.provider}/${model.id} ${model.name}`.toLocaleLowerCase().includes(search)),
-  );
+  const keys = search === "" ? null : modelsIndex(configuration.models).searchKeys();
+  const { models } = configuration;
+  const matches: NeoPiNativeModel[] = [];
+  for (let at = 0; at < models.length; at += 1) {
+    const model = models[at]!;
+    if (!(providerId === null ? ready!.has(model.provider) : model.provider === providerId))
+      continue;
+    if (keys === null || keys[at]!.includes(search)) matches.push(model);
+  }
+  return matches;
 }

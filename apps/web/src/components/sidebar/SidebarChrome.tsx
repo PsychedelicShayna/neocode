@@ -180,7 +180,7 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             label="Settings"
             onClick={handleSettingsClick}
           />
-          <SidebarUtilityItem icon={<BlocksIcon />} label="Models" onClick={handleModelsClick} />
+          <SidebarUtilityItem icon={<BlocksIcon />} label="Roles" onClick={handleModelsClick} />
           {pullRequestsSupported ? (
             <SidebarUtilityItem
               icon={<PullRequestGlyph.pullRequest />}

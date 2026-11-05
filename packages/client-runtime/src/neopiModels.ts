@@ -1,4 +1,9 @@
-import { WS_METHODS, type NeoPiModelsConfiguration } from "@t3tools/contracts";
+import {
+  WS_METHODS,
+  type EnvironmentId,
+  type NeoPiModelsConfiguration,
+  type NeoPiModelsTarget,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -14,6 +19,38 @@ import {
 /** A missing native catalog limit is unknown, not a zero-token capability. */
 export function formatNeoPiModelTokenLimit(value: number | null): string {
   return value === null ? "Unknown" : value.toLocaleString();
+}
+
+/**
+ * The last configuration each native source delivered. A reopened Models page shows it at once,
+ * read-only, while the live stream revalidates. Memory-only and small: one entry is several MB.
+ */
+const LAST_SNAPSHOT_LIMIT = 3;
+const lastSnapshots = new Map<string, NeoPiModelsConfiguration>();
+
+export const neopiModelsSnapshotKey = (environmentId: EnvironmentId, target: NeoPiModelsTarget) =>
+  JSON.stringify([
+    environmentId,
+    target.providerInstanceId,
+    target.projectId ?? null,
+    target.sessionFile ?? null,
+    target.threadId ?? null,
+  ]);
+
+export function rememberNeoPiModelsConfiguration(
+  key: string,
+  configuration: NeoPiModelsConfiguration,
+): void {
+  lastSnapshots.delete(key);
+  lastSnapshots.set(key, configuration);
+  for (const oldest of lastSnapshots.keys()) {
+    if (lastSnapshots.size <= LAST_SNAPSHOT_LIMIT) break;
+    lastSnapshots.delete(oldest);
+  }
+}
+
+export function recallNeoPiModelsConfiguration(key: string): NeoPiModelsConfiguration | undefined {
+  return lastSnapshots.get(key);
 }
 
 /** Keep authored selectors intact: catalog refreshes must not turn patterns into resolved model IDs. */

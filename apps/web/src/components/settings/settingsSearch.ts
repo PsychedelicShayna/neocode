@@ -87,7 +87,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/appearance": "Appearance",
   "/settings/keybindings": "Keybindings",
   "/settings/snap-shot": "SnapShots",
-  "/settings/providers": "Providers",
+  "/settings/providers": "Roles",
   "/settings/neocore": "NeoCore",
   "/settings/integrations": "Integrations",
   "/settings/source-control": "Source Control",
@@ -518,9 +518,11 @@ export const SETTINGS_SEARCH_ITEMS = [
   },
   {
     id: "providers",
-    title: "Providers",
+    title: "Roles",
     to: "/settings/providers",
-    searchTerms: ["neopi models custom favorite hidden roles inference providers"],
+    searchTerms: [
+      "neopi models all models providers effort rules custom favorite hidden inference sign in",
+    ],
   },
   {
     id: "neocore",

@@ -26,6 +26,7 @@ import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.t
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { neoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
+import { makeNeoPiModelsHub } from "./NeoPiModelsHub.ts";
 
 const modelError = (cause: unknown) =>
   Schema.is(NeoPiModelsError)(cause)
@@ -479,8 +480,10 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
     return native;
   }, Effect.mapError(modelError));
   const auth = yield* makeNativeModelsAuth(connection);
+  const hub = yield* makeNeoPiModelsHub(connection, readNativeModelsConfiguration);
   const read = (target: NeoPiModelsTarget) =>
     Effect.scoped(Effect.flatMap(connection(target), readNativeModelsConfiguration)).pipe(
+      Effect.tap((configuration) => hub.publish(target, configuration)),
       Effect.mapError(modelError),
     );
   const querySelector = (input: { target: NeoPiModelsTarget; query: string }) =>
@@ -489,26 +492,16 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
         queryNativeModelSelector(native, input.query),
       ),
     ).pipe(Effect.mapError(modelError));
-  const watch = (target: NeoPiModelsTarget) =>
-    Stream.unwrap(
-      Effect.gen(function* () {
-        const native = yield* connection(target);
-        const changes = yield* Stream.toPull(native.changes);
-        return Stream.fromEffect(readNativeModelsConfiguration(native)).pipe(
-          Stream.concat(
-            Stream.fromPull(Effect.succeed(changes)).pipe(
-              Stream.mapEffect(() => readNativeModelsConfiguration(native)),
-            ),
-          ),
-        );
-      }),
-    ).pipe(Stream.mapError(modelError));
+  const watch = (target: NeoPiModelsTarget) => hub.watch(target).pipe(Stream.mapError(modelError));
   const update = (input: NeoPiModelsUpdate) =>
     Effect.scoped(
       Effect.flatMap(connection(input.target), (native) =>
         updateNativeModelsConfiguration(native, input),
       ),
-    ).pipe(Effect.mapError(modelError));
+    ).pipe(
+      Effect.tap((configuration) => hub.publish(input.target, configuration)),
+      Effect.mapError(modelError),
+    );
   const accounts = (input: { target: NeoPiModelsTarget; providerId: string }) =>
     Effect.scoped(
       Effect.gen(function* () {

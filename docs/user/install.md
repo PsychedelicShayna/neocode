@@ -72,23 +72,29 @@ storage and instance lock. It does not reuse the default profile's saved browser
 connections. Use another window, not another profile pointed at the same state,
 when you want to work with the same local sessions.
 
-Open **Models** from the sidebar or press **Alt-M** to configure NeoPi's native
-inference providers, model roles and effort rules. Choose the environment and
-project whose settings you want to change. Opening Models from a connected
-thread uses that native session instead. If that session has disconnected,
-reopen it before using Models; the page does not reconnect it or silently switch
+Open **Roles** from the sidebar or press **Alt-M** to configure NeoPi's native
+inference providers, model roles and effort rules. The page opens on role
+assignments; **All models**, **Effort rules** and each provider are in its rail.
+Choose the environment and project whose settings you want to change. Opening
+Roles from a connected thread uses that native session instead. If that session
+has disconnected, reopen it before using Roles; the page does not reconnect it or silently switch
 to another settings target. Changes go through NeoPi and retain its
 global/project scope rules; an edit made elsewhere can require a refresh before
 you save.
 
 To assign a model found in **All models** to a role, open the model's row menu
 and choose **Assign to role**. The assignment uses the environment, project and
-global/project scope currently selected in Models.
+global/project scope currently selected in Roles.
+
+**All models** lists thousands of catalog rows through a scrolling window, and
+NeoCode keeps the last catalog it read: reopening Roles shows it at once, read-only,
+while NeoPi answers, then it becomes editable. The first read after NeoPi starts
+can take a few seconds because NeoPi builds the catalog.
 
 Provider login, API keys and saved-account removal are handled by NeoPi.
 NeoCode does not keep another credential vault. **Use this account** activates
 an OAuth account for the connected session; it is unavailable without that
-connection and does not apply to API keys. Models requires a native executable
+connection and does not apply to API keys. Roles requires a native executable
 advertising the Models configuration contract; an older executable shows an
 update error rather than pretending a save worked.
 
@@ -190,7 +196,7 @@ before sharing.
 
 Open **Settings → NeoCore** in the web or desktop app to enable NeoPi and configure
 its executable, profile and environment. These controls remain available even
-when the Models page cannot read the native catalog.
+when the Roles page cannot read the native catalog.
 
 1. Download NeoPi for the machine that runs your sessions from
    [NeoPi releases](https://github.com/PsychedelicShayna/neopi/releases), following
@@ -202,7 +208,7 @@ when the Models page cannot read the native catalog.
    may need `chmod +x /path/to/npi`. A GUI launched from the desktop can have a
    different `PATH` from your terminal; use the full path if discovery cannot
    find it. For WSL, install and select the executable inside the chosen distro.
-3. Select **Profile** if you use an `OMP_PROFILE`, then open **Models** to
+3. Select **Profile** if you use an `OMP_PROFILE`, then open **Roles** to
    configure NeoPi's inference providers and model roles.
 
 Ordinary fork release builds do not bundle NeoPi. A Linux build explicitly
@@ -213,7 +219,7 @@ bundled terminal agent with `./NeoCode-<version>-x86_64.AppImage --npi --help`
 (replace the filename with that build's exact name). The NeoCode `t3` server
 archive is not a NeoPi executable.
 
-Use **Settings → Models** to inspect native inference providers, authentication,
+Use **Settings → Roles** to inspect native inference providers, authentication,
 models and roles. Catalog limits that NeoPi does not know are shown as **Unknown**;
 they do not prevent opening the page or choosing an otherwise available model.
 
@@ -249,10 +255,10 @@ If an explicit executable is missing, correct **Binary path** or clear it to
 return to automatic selection. Opening NeoCore or selecting a profile does not
 start or restart sessions. Model catalogs are not configured on this page.
 
-Use **Models** to manage NeoPi's inference-provider accounts and scoped model
+Use **Roles** to manage NeoPi's inference-provider accounts and scoped model
 choices. Login and cancellation are handled by the selected native connection.
 Cancelling a login does not undo an account save that already completed; native
-failures remain visible so you can retry from Models. API-key and local models
+failures remain visible so you can retry from Roles. API-key and local models
 can work even when authentication is reported as unknown.
 
 **New thread** creates a session directly in NeoPi. You do not need to add a
@@ -407,7 +413,7 @@ in NeoPi to persist durable entry identities.
 Add another NeoPi instance for a separate profile or executable configuration.
 Each instance can have its own environment variables. Mark secret values as
 sensitive; NeoCode does not display their original values after saving.
-Upgrade the NeoPi executable separately; Models manages provider sign-in through it.
+Upgrade the NeoPi executable separately; Roles manages provider sign-in through it.
 
 ## Next steps
 

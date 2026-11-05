@@ -38,7 +38,7 @@ See [Connect to NeoProxy](./install.md#connect-to-neoproxy).
 
 You can continue without finishing NeoPi or NeoProxy setup. Starting a new thread
 without an available runtime opens the same computer's NeoCore settings. Other
-inference-provider accounts remain available through **Models** after NeoPi is
+inference-provider accounts remain available through **Roles** after NeoPi is
 available; setup does not start an installer.
 
 Continue to the workspace when ready. Start a thread without a project, choose a

@@ -9,6 +9,7 @@ import {
   modelProviderGroups,
   modelRoleForScope,
   modelsForView,
+  modelsIndex,
   moveModelItem,
 } from "./modelsPresentation";
 
@@ -155,6 +156,31 @@ describe("native Ready provider catalog", () => {
       "anonymous",
       "private",
     ]);
+  });
+});
+
+describe("Models catalog index", () => {
+  const entry = (provider: string, id: string, name: string) =>
+    ({ provider, id, name, available: true }) as NeoPiNativeModel;
+  const models = [
+    entry("a", "one", "First"),
+    entry("a", "one", "Duplicate"),
+    entry("b", "x/y", "Two"),
+  ];
+
+  it("resolves provider/id selectors to the first matching row, including slashes in ids", () => {
+    const index = modelsIndex(models);
+    expect(index.bySelector.get("a/one")?.name).toBe("First");
+    expect(index.bySelector.get("b/x/y")?.name).toBe("Two");
+    expect(index.bySelector.get("a/missing")).toBeUndefined();
+  });
+
+  it("builds once per catalog snapshot and rebuilds for a new one", () => {
+    expect(modelsIndex(models)).toBe(modelsIndex(models));
+    expect(modelsIndex([...models])).not.toBe(modelsIndex(models));
+    const index = modelsIndex(models);
+    expect(index.searchKeys()).toBe(index.searchKeys());
+    expect(index.searchKeys()).toEqual(["a/one first", "a/one duplicate", "b/x/y two"]);
   });
 });
 

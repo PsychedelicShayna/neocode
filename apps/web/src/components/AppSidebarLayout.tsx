@@ -305,7 +305,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
           collapsible="offcanvas"
           data-app-sidebar=""
           role="navigation"
-          aria-label={isOnSettings ? "Settings" : pathname === "/models" ? "Models" : "Threads"}
+          aria-label={isOnSettings ? "Settings" : pathname === "/models" ? "Roles" : "Threads"}
           resizable={{
             maxWidth: sidebarMaximumWidth,
             minWidth: THREAD_SIDEBAR_MIN_WIDTH,

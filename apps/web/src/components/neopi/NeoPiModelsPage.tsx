@@ -11,18 +11,24 @@ import type {
   ServerProvider,
   ServerProviderModel,
 } from "@t3tools/contracts";
+import {
+  neopiModelsSnapshotKey,
+  recallNeoPiModelsConfiguration,
+  rememberNeoPiModelsConfiguration,
+} from "@t3tools/client-runtime/neopi-models";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  ArrowLeftIcon,
-  CheckIcon,
-  ChevronDownIcon,
-  MoreHorizontalIcon,
-  XIcon,
-  ZapIcon,
-} from "lucide-react";
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { ArrowLeftIcon, ChevronDownIcon, MoreHorizontalIcon, XIcon } from "lucide-react";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { formatEnvironmentQueryError } from "../../state/query";
 import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
@@ -54,21 +60,11 @@ import { Group } from "../ui/group";
 import { Input } from "../ui/input";
 import { InputGroup, InputGroupInput } from "../ui/input-group";
 import { Textarea } from "../ui/textarea";
-import {
-  Menu,
-  MenuItem,
-  MenuPopup,
-  MenuSeparator,
-  MenuSub,
-  MenuSubPopup,
-  MenuSubTrigger,
-  MenuTrigger,
-} from "../ui/menu";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Skeleton } from "../ui/skeleton";
 import { Spinner } from "../ui/spinner";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
 import { ToggleGroup, ToggleGroupItem } from "../ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
@@ -83,19 +79,18 @@ import {
 } from "../settings/settingsLayout";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { neopiModels, useModelsPageTarget } from "./modelsPageState";
+import { ModelsCatalogTable } from "./ModelsCatalogTable";
 import { NeoPiModelsSelector } from "./NeoPiModelsSelector";
 import { NativeAuthFlow } from "./NativeAuthFlow";
 import {
   MODEL_EFFORTS,
   isModelRulePattern,
   isModelRuleSelectorValid,
-  modelContextLabel,
   modelDisplayName,
-  modelEffortLabel,
-  modelPriceLabel,
   modelProviderGroups,
   modelRoleForScope,
   modelsForView,
+  modelsIndex,
   moveModelItem,
 } from "./modelsPresentation";
 
@@ -125,7 +120,7 @@ function ErrorText({ children }: { children: ReactNode }) {
 
 function ModelsLoading() {
   return (
-    <SettingsSection title="Models">
+    <SettingsSection title="Roles">
       {[0, 1, 2, 3].map((row) => (
         <Skeleton key={row} className="h-12" />
       ))}
@@ -140,27 +135,52 @@ function ModelsSnapshot({
 }: {
   environmentId: EnvironmentId;
   target: NeoPiModelsTarget;
-  children: (configuration: Configuration, refresh: () => void, catalogReady: boolean) => ReactNode;
+  children: (
+    configuration: Configuration,
+    refresh: () => void,
+    catalogReady: boolean,
+    stale: boolean,
+  ) => ReactNode;
 }) {
   const atom = neopiModels.changes({ environmentId, input: target });
   const result = useAtomValue(atom);
-  const refresh = useAtomRefresh(atom);
+  const retry = useAtomRefresh(atom);
+  const read = useAtomCommand(neopiModels.read, { reportFailure: false });
+  const refresh = () => {
+    void read({ environmentId, input: target }).then((result) => {
+      if (result._tag === "Failure")
+        toastManager.add({
+          type: "error",
+          title: "Couldn't refresh Roles",
+          description: String(squashAtomCommandFailure(result)),
+        });
+    });
+  };
+  const key = neopiModelsSnapshotKey(environmentId, target);
+  const live = AsyncResult.isSuccess(result) ? result.value : null;
+  useEffect(() => {
+    if (live) rememberNeoPiModelsConfiguration(key, live);
+  }, [key, live]);
   if (AsyncResult.isFailure(result))
     return (
-      <SettingsSection title="Models">
+      <SettingsSection title="Roles">
         <SettingsRow
           title="Couldn't read models from NeoPi"
           description={formatEnvironmentQueryError(result.cause)}
           control={
-            <Button variant="outline" size="sm" onClick={refresh}>
+            <Button variant="outline" size="sm" onClick={retry}>
               Retry
             </Button>
           }
         />
       </SettingsSection>
     );
-  if (!AsyncResult.isSuccess(result) || result.value === null) return <ModelsLoading />;
-  return children(result.value, refresh, !result.waiting);
+  if (live === null || !AsyncResult.isSuccess(result)) {
+    // Stale-while-revalidate: last known catalog, read-only, until NeoPi's answer arrives.
+    const stale = recallNeoPiModelsConfiguration(key);
+    return stale ? children(stale, refresh, false, true) : <ModelsLoading />;
+  }
+  return children(live, refresh, !result.waiting, false);
 }
 
 function ProviderRailRow({
@@ -180,23 +200,31 @@ function ProviderRailRow({
 }) {
   const accountsCommand = useAtomCommand(neopiModels.accounts, { reportFailure: false });
   const [label, setLabel] = useState<string | null>(null);
+  const requested = useRef(false);
+  const generation = useRef(0);
+  // The account only names the status tooltip, so ask NeoPi when someone looks, not for every
+  // signed-in provider at page load.
   useEffect(() => {
-    let mounted = true;
+    requested.current = false;
+    generation.current += 1;
     setLabel(null);
-    if (provider.authenticated)
-      void accountsCommand({ environmentId, input: { target, providerId: provider.id } }).then(
-        (result) => {
-          if (mounted && result._tag === "Success")
-            setLabel(
-              result.value.accounts.find((account) => account.active)?.label ??
-                result.value.accounts[0]?.label ??
-                null,
-            );
-        },
-      );
-    return () => {
-      mounted = false;
-    };
+  }, [environmentId, target, provider.id, provider.authenticated]);
+  const loadLabel = useCallback(() => {
+    if (!provider.authenticated || requested.current) return;
+    requested.current = true;
+    const mine = generation.current;
+    void accountsCommand({ environmentId, input: { target, providerId: provider.id } }).then(
+      (result) => {
+        if (mine !== generation.current) return;
+        if (result._tag === "Success")
+          setLabel(
+            result.value.accounts.find((account) => account.active)?.label ??
+              result.value.accounts[0]?.label ??
+              null,
+          );
+        else requested.current = false;
+      },
+    );
   }, [accountsCommand, environmentId, target, provider.id, provider.authenticated]);
   const ready = provider.available === true;
   const status = provider.authenticated
@@ -208,7 +236,12 @@ function ProviderRailRow({
       : "Not signed in";
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton isActive={active} onClick={select}>
+      <SidebarMenuButton
+        isActive={active}
+        onClick={select}
+        onPointerEnter={loadLabel}
+        onFocus={loadLabel}
+      >
         <Tooltip>
           <TooltipTrigger
             render={
@@ -363,13 +396,13 @@ export function NeoPiModelsPage() {
     <SidebarInset className="h-dvh min-h-0 overflow-hidden">
       <div className="flex min-h-0 flex-1 flex-col bg-background text-foreground">
         <WorkspacePageHeader electron={isElectron}>
-          <h1 className="text-sm font-semibold">Models</h1>
+          <h1 className="text-sm font-semibold">Roles</h1>
           {providerId ? <span className="text-sm text-muted-foreground">{providerId}</span> : null}
         </WorkspacePageHeader>
         <SettingsPageContainer>
           {state.target && state.environmentId && state.provider ? (
             <ModelsSnapshot environmentId={state.environmentId} target={state.target}>
-              {(configuration, refresh, catalogReady) => (
+              {(configuration, refresh, catalogReady, stale) => (
                 <ModelsContent
                   key={JSON.stringify([state.environmentId, state.target])}
                   state={state}
@@ -378,6 +411,7 @@ export function NeoPiModelsPage() {
                   provider={state.provider!}
                   configuration={configuration}
                   catalogReady={catalogReady}
+                  stale={stale}
                   refresh={refresh}
                   scope={scope}
                   setScope={setScope}
@@ -385,7 +419,7 @@ export function NeoPiModelsPage() {
               )}
             </ModelsSnapshot>
           ) : (
-            <SettingsSection title="Models">
+            <SettingsSection title="Roles">
               <SettingsRow
                 title="No NeoPi connection"
                 description="Enable a NeoPi connection in Settings → NeoCore to choose models."
@@ -498,6 +532,7 @@ function ModelsContent({
   configuration: snapshot,
   refresh,
   catalogReady,
+  stale,
   scope,
   setScope,
 }: {
@@ -508,34 +543,37 @@ function ModelsContent({
   configuration: Configuration;
   refresh: () => void;
   catalogReady: boolean;
+  /** A remembered snapshot shown while NeoPi answers: readable, not editable. */
+  stale: boolean;
   scope: Scope;
   setScope: (scope: Scope) => void;
 }) {
   const update = useAtomCommand(neopiModels.update, { reportFailure: false });
   const request = useAtomCommand(nativeSessionAtoms.request, { reportFailure: false });
-  const [configuration, setConfiguration] = useState(snapshot);
+  // A save's receipt stands in for the snapshot it was made against; the next snapshot replaces it.
+  const [receipt, setReceipt] = useState<{ base: Configuration; value: Configuration } | null>(
+    null,
+  );
+  const configuration = receipt?.base === snapshot ? receipt.value : snapshot;
   const [pending, setPending] = useState(false);
+  const locked = pending || stale;
   const saving = useRef(false);
   const [query, setQuery] = useState("");
   const section = state.search.section ?? "roles";
-  useEffect(() => {
-    setConfiguration(snapshot);
-  }, [snapshot]);
   const save: Save = async (change, onFailure) => {
-    if (saving.current) return false;
+    if (saving.current || stale) return false;
     saving.current = true;
     setPending(true);
     try {
       const result = await update({ environmentId, input: { target, change } });
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      setConfiguration(result.value);
-      refresh();
+      setReceipt({ base: snapshot, value: result.value });
       return true;
     } catch (cause) {
       onFailure?.(cause);
       toastManager.add({
         type: "error",
-        title: "Couldn't save Models settings",
+        title: "Couldn't save Roles settings",
         description: cause instanceof Error ? cause.message : String(cause),
       });
       return false;
@@ -560,12 +598,21 @@ function ModelsContent({
   const provider = section.startsWith("provider:")
     ? configuration.providers.find((provider) => provider.id === section.slice(9))
     : null;
+  // Typing stays responsive: the list follows the filter one render behind the input.
+  const deferredQuery = useDeferredValue(query);
   const models = useMemo(
     () =>
       section === "all" || provider
-        ? modelsForView(configuration, provider?.id ?? null, query)
+        ? modelsForView(configuration, provider?.id ?? null, deferredQuery)
         : [],
-    [configuration, provider, query, section],
+    [configuration, provider, deferredQuery, section],
+  );
+  const providerHasAvailableModels = useMemo(
+    () =>
+      provider
+        ? configuration.models.some((model) => model.provider === provider.id && model.available)
+        : false,
+    [configuration.models, provider],
   );
   const assign = (role: Role, selector: string) =>
     save({
@@ -576,40 +623,41 @@ function ModelsContent({
       ...(role[scope].effort ? { effort: role[scope].effort } : {}),
       expected: role[scope],
     });
-  const setThreadModel = target.sessionFile
-    ? async (model: NeoPiNativeModel) => {
-        const result = await request({
-          environmentId,
-          input: {
-            ref: {
-              providerInstanceId: target.providerInstanceId,
-              sessionFile: target.sessionFile!,
+  const setThreadModel =
+    target.sessionFile && !stale
+      ? async (model: NeoPiNativeModel) => {
+          const result = await request({
+            environmentId,
+            input: {
+              ref: {
+                providerInstanceId: target.providerInstanceId,
+                sessionFile: target.sessionFile!,
+              },
+              command: { type: "set_model", provider: model.provider, modelId: model.id },
             },
-            command: { type: "set_model", provider: model.provider, modelId: model.id },
-          },
-        });
-        if (result._tag === "Failure")
-          toastManager.add({
-            type: "error",
-            title: "Couldn't change this thread's model",
-            description: String(squashAtomCommandFailure(result)),
           });
-      }
-    : undefined;
+          if (result._tag === "Failure")
+            toastManager.add({
+              type: "error",
+              title: "Couldn't change this thread's model",
+              description: String(squashAtomCommandFailure(result)),
+            });
+        }
+      : undefined;
   return (
     <>
       <ModelsScope
         state={state}
         scope={scope}
-        pending={pending}
+        pending={locked}
         selectScope={(next, project) => {
           void selectScope(next, project);
         }}
       />
       {section === "roles" ? (
-        <RolesView key={scope} picker={picker} scope={scope} pending={pending} save={save} />
+        <RolesView key={scope} picker={picker} scope={scope} pending={locked} save={save} />
       ) : section === "effort" ? (
-        <RulesView key={scope} picker={picker} scope={scope} pending={pending} save={save} />
+        <RulesView key={scope} picker={picker} scope={scope} pending={locked} save={save} />
       ) : section.startsWith("provider:") && !provider ? (
         <SettingsSection title="Models">
           <SettingsRow
@@ -626,13 +674,11 @@ function ModelsContent({
               target={target}
               connectedOwner={state.connectedOwner}
               provider={provider}
-              hasAvailableCatalogModels={configuration.models.some(
-                (model) => model.provider === provider.id && model.available,
-              )}
+              hasAvailableCatalogModels={providerHasAvailableModels}
               catalogReady={catalogReady}
               refresh={refresh}
               save={save}
-              pending={pending}
+              pending={locked}
             />
           ) : null}
           <SettingsSection
@@ -646,233 +692,20 @@ function ModelsContent({
               />
             }
           >
-            <Table
-              className="table-fixed"
-              aria-label={provider ? `${provider.id} models` : "All models"}
-            >
-              <colgroup>
-                <col />
-                <col style={{ width: "6rem" }} />
-                <col style={{ width: "8rem" }} />
-                <col style={{ width: "9rem" }} />
-              </colgroup>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Model</TableHead>
-                  <TableHead className="text-right">Context</TableHead>
-                  <TableHead className="text-right">
-                    <Tooltip>
-                      <TooltipTrigger render={<span />}>Price</TooltipTrigger>
-                      <TooltipPopup>Per million input / output tokens</TooltipPopup>
-                    </Tooltip>
-                  </TableHead>
-                  <TableHead>Effort</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {models.map((model) => (
-                  <ModelRow
-                    key={`${model.provider}/${model.id}`}
-                    model={model}
-                    models={configuration.models}
-                    roles={configuration.roles}
-                    scope={scope}
-                    pending={pending}
-                    assign={assign}
-                    {...(setThreadModel ? { setThreadModel: setThreadModel } : {})}
-                  />
-                ))}
-                {models.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={4}>No models match “{query}”.</TableCell>
-                  </TableRow>
-                ) : null}
-              </TableBody>
-            </Table>
+            <ModelsCatalogTable
+              models={models}
+              catalog={configuration.models}
+              roles={configuration.roles}
+              scope={scope}
+              pending={locked}
+              assign={assign}
+              setThreadModel={setThreadModel}
+              label={provider ? `${provider.id} models` : "All models"}
+              query={deferredQuery}
+            />
           </SettingsSection>
         </>
       )}
-    </>
-  );
-}
-
-function ModelRow({
-  model,
-  models,
-  roles,
-  scope,
-  pending,
-  assign,
-  setThreadModel: setThreadModel,
-}: {
-  model: NeoPiNativeModel;
-  models: ReadonlyArray<NeoPiNativeModel>;
-  roles: ReadonlyArray<Role>;
-  scope: Scope;
-  pending: boolean;
-  assign: (role: Role, selector: string) => Promise<boolean>;
-  setThreadModel?: (model: NeoPiNativeModel) => Promise<void>;
-}) {
-  const [open, setOpen] = useState(false);
-  const [details, setDetails] = useState(false);
-  const selector = `${model.provider}/${model.id}`;
-  const number = (value: number | null) => value?.toLocaleString() ?? "Not reported";
-  return (
-    <>
-      <Menu open={open} onOpenChange={setOpen}>
-        <MenuTrigger
-          nativeButton={false}
-          render={
-            <TableRow
-              tabIndex={0}
-              className="cursor-pointer"
-              onContextMenu={(event) => {
-                event.preventDefault();
-                setOpen(true);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  setOpen(true);
-                }
-              }}
-            />
-          }
-        >
-          <TableCell>
-            <div className="min-w-64 max-w-xl">
-              <div className="flex min-w-0 items-center gap-1.5">
-                <span className="truncate font-medium">{modelDisplayName(model)}</span>
-                {model.supportsFastMode ? (
-                  <Tooltip>
-                    <TooltipTrigger render={<span />}>
-                      <ZapIcon className="size-3" />
-                    </TooltipTrigger>
-                    <TooltipPopup>Fast mode available</TooltipPopup>
-                  </Tooltip>
-                ) : null}
-                {model.kind !== "chat" ? (
-                  <Badge size="sm" variant="outline">
-                    {model.kind}
-                  </Badge>
-                ) : null}
-              </div>
-              <div className="truncate font-mono text-xs text-muted-foreground">{model.id}</div>
-            </div>
-          </TableCell>
-          <TableCell className="text-right">
-            <Tooltip>
-              <TooltipTrigger render={<span className="tabular-nums" />}>
-                {modelContextLabel(model.contextWindow)}
-              </TooltipTrigger>
-              <TooltipPopup>
-                {number(model.effectiveContextWindow)} usable · {number(model.contextWindow)} window
-                · {number(model.maxTokens)} max output
-              </TooltipPopup>
-            </Tooltip>
-          </TableCell>
-          <TableCell className="text-right">
-            <span className="tabular-nums">
-              {model.cost.input === 0 && model.cost.output === 0 ? (
-                <Tooltip>
-                  <TooltipTrigger render={<span />}>—</TooltipTrigger>
-                  <TooltipPopup>No per-token price reported</TooltipPopup>
-                </Tooltip>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger render={<span />}>{modelPriceLabel(model.cost)}</TooltipTrigger>
-                  <TooltipPopup>
-                    {`$${model.cost.input} input / $${model.cost.output} output`}
-                  </TooltipPopup>
-                </Tooltip>
-              )}
-            </span>
-          </TableCell>
-          <TableCell className="whitespace-nowrap">
-            {modelEffortLabel(model.permittedEfforts)}
-          </TableCell>
-        </MenuTrigger>
-        <MenuPopup align="start">
-          {/* Keep role/catalog resolution out of the thousands of closed table rows. */}
-          {open ? (
-            <MenuSub>
-              <MenuSubTrigger>Assign to role</MenuSubTrigger>
-              <MenuSubPopup>
-                {roles.map((role) => {
-                  const resolution = role.scopedResolutions[scope];
-                  const using =
-                    resolution?.provider === model.provider && resolution.modelId === model.id;
-                  const currentModel =
-                    resolution &&
-                    models.find(
-                      (candidate) =>
-                        candidate.provider === resolution.provider &&
-                        candidate.id === resolution.modelId,
-                    );
-                  const current = currentModel
-                    ? modelDisplayName(currentModel)
-                    : resolution?.modelId;
-                  return (
-                    <MenuItem
-                      key={role.id}
-                      disabled={pending}
-                      onClick={() => {
-                        void assign(role, selector);
-                      }}
-                    >
-                      {using ? <CheckIcon className="size-3" /> : null}
-                      <span>{role.id}</span>
-                      <span className="ml-auto max-w-48 truncate text-xs text-muted-foreground">
-                        {current ??
-                          (modelRoleForScope(role, scope).selector ? "Not available" : "Automatic")}
-                      </span>
-                    </MenuItem>
-                  );
-                })}
-              </MenuSubPopup>
-            </MenuSub>
-          ) : null}
-          {setThreadModel ? (
-            <MenuItem
-              onClick={() => {
-                void setThreadModel(model);
-              }}
-            >
-              Use in this thread
-            </MenuItem>
-          ) : null}
-          <MenuSeparator />
-          <MenuItem onClick={() => setDetails(true)}>Details…</MenuItem>
-        </MenuPopup>
-      </Menu>
-      <Dialog open={details} onOpenChange={setDetails}>
-        <DialogPopup>
-          <DialogHeader>
-            <DialogTitle>{modelDisplayName(model)}</DialogTitle>
-            <DialogDescription>{model.description ?? model.name ?? model.id}</DialogDescription>
-          </DialogHeader>
-          <DialogPanel>
-            <SettingsRow title="ID" description={selector} />
-            <SettingsRow
-              title="Context"
-              description={`${number(model.effectiveContextWindow)} usable · ${number(model.contextWindow)} window · ${number(model.maxTokens)} max output`}
-            />
-            <SettingsRow
-              title="Price per million tokens"
-              description={`$${model.cost.input} input / $${model.cost.output} output · $${model.cost.cacheRead} cache read / $${model.cost.cacheWrite} cache write`}
-            />
-            <SettingsRow
-              title="Efforts"
-              description={model.permittedEfforts.join(", ") || "No controllable effort"}
-            />
-          </DialogPanel>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDetails(false)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogPopup>
-      </Dialog>
     </>
   );
 }
@@ -926,7 +759,7 @@ function RolesView({
       <SettingsSection
         title="Roles"
         headerAction={
-          <Button size="xs" variant="outline" onClick={() => setCreating(true)}>
+          <Button size="xs" variant="outline" disabled={pending} onClick={() => setCreating(true)}>
             New role
           </Button>
         }
@@ -986,8 +819,8 @@ function RoleRow({
   const scoped = role[scope];
   const { selector, effort, resolution } = modelRoleForScope(role, scope);
   const resolved = resolution
-    ? picker.configuration.models.find(
-        (model) => resolution.provider === model.provider && resolution.modelId === model.id,
+    ? modelsIndex(picker.configuration.models).bySelector.get(
+        `${resolution.provider}/${resolution.modelId}`,
       )
     : undefined;
   const traitsModel = resolved ? `${resolved.provider}/${resolved.id}` : selector;
@@ -1543,7 +1376,7 @@ function RulesView({
   const createExact = (selector: string) => {
     if (
       isModelRulePattern(selector) ||
-      !picker.configuration.models.some((model) => `${model.provider}/${model.id}` === selector)
+      !modelsIndex(picker.configuration.models).bySelector.has(selector)
     )
       return;
     setExactOpen(false);
@@ -1598,9 +1431,7 @@ function RulesView({
         <SettingsRow title="No rules" description="Models can use every effort they support." />
       ) : null}
       {rules.map((rule, index) => {
-        const model = picker.configuration.models.find(
-          (model) => `${model.provider}/${model.id}` === rule.selector,
-        );
+        const model = modelsIndex(picker.configuration.models).bySelector.get(rule.selector);
         const draft = pattern?.index === index ? pattern : null;
         return (
           <SettingsRow

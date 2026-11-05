@@ -100,11 +100,11 @@ available stay visible.
 Star a model to add it to Favorites. Use the arrow keys and Enter to select, or
 click a model; Left and Right move between the rail and the list. Choosing a role
 or model applies it to the session and returns focus to the prompt. This is the
-quick session switcher, separate from the Models management page.
+quick session switcher, separate from the Roles management page.
 
 ## Custom models
 
-NeoPi owns the model catalog and role configuration. Use **Settings → Models** to
+NeoPi owns the model catalog and role configuration. Use **Settings → Roles** to
 inspect the catalog and manage native model roles. Configure an unlisted model
 in NeoPi rather than adding a separate NeoCode runtime.
 

@@ -40,8 +40,10 @@ export function useNativeDictation(input: {
   readonly feed: Pick<NativeSessionFeed, "dictation">;
   readonly request: Request;
   readonly composerRef: { readonly current: ChatComposerHandle | null };
+  /** Why dictation cannot start right now; null when it can. */
+  readonly unavailableReason: string | null;
 }): ComposerDictationControl {
-  const { feed, request, composerRef } = input;
+  const { feed, request, composerRef, unavailableReason } = input;
   const [capture, setCapture] = useState<Capture | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const captureRef = useRef<Capture | null>(null);
@@ -92,6 +94,11 @@ export function useNativeDictation(input: {
       stop(false);
       return;
     }
+    // The shortcut gets the same explanation the disabled button shows.
+    if (unavailableReason) {
+      setNotice(unavailableReason);
+      return;
+    }
     const snapshot = composerRef.current?.readSnapshot();
     const started: Capture = {
       captureId: randomUUID(),
@@ -114,7 +121,7 @@ export function useNativeDictation(input: {
         setCapture(null);
         setNotice(message(cause));
       });
-  }, [composerRef, stop]);
+  }, [composerRef, stop, unavailableReason]);
 
   // NeoPi ended the capture itself: an error, or a stop from another window.
   const observed = feed.dictation;
@@ -157,6 +164,7 @@ export function useNativeDictation(input: {
           : "starting",
     preview: live?.text ?? "",
     notice,
+    unavailableReason,
     toggle,
     dismissNotice,
   };

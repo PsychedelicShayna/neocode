@@ -13,6 +13,8 @@ export interface ComposerDictationControl {
   /** NeoPi's full live transcript while the capture runs. */
   readonly preview: string;
   readonly notice: string | null;
+  /** Why dictation cannot start now and what fixes it; null when it can. */
+  readonly unavailableReason: string | null;
   readonly toggle: () => void;
   readonly dismissNotice: () => void;
 }

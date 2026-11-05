@@ -1000,7 +1000,7 @@ export type NativeChatComposerProps = Pick<
     onOpenModeControl: () => void;
     onToggleModelPicker: () => void;
     onCompactContext: () => void;
-    /** Present only when NeoPi can use the microphone of the machine this client runs on. */
+    /** Present on the desktop app, enabled or with its reason for being disabled. */
     dictation?: ComposerDictationControl;
     /** Effort and fast-mode controls built from NeoPi's own levels; null while none apply. */
     traits: {

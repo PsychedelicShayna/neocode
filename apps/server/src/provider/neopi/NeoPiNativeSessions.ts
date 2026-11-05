@@ -733,9 +733,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const expected = nativeCommand.if;
         // Native control checks this atomically with dispatch. The terminal may
         // switch files after get_status; a stale graphical prompt must not follow it.
-        if (expected === undefined)
+        // Dictation is the machine's microphone, not session state: a stop must
+        // always reach NeoPi, or the microphone stays open.
+        const sessionBound = !nativeCommand.type.startsWith("dictation_");
+        if (sessionBound && expected === undefined)
           guardedCommand = { ...nativeCommand, if: { generation: current.revisions.generation } };
-        else if (Schema.is(NeoPiNativeSessionRecord)(expected) && expected.generation === undefined)
+        else if (
+          sessionBound &&
+          Schema.is(NeoPiNativeSessionRecord)(expected) &&
+          expected.generation === undefined
+        )
           guardedCommand = {
             ...nativeCommand,
             if: { ...expected, generation: current.revisions.generation },

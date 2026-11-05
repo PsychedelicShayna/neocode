@@ -206,11 +206,13 @@ Click again to stop. While you speak, a notice above the composer shows the live
 transcript. When you stop, the final text is inserted at the cursor where you
 started, and nothing is sent. Press Escape to throw the recording away.
 
-Dictation needs NeoPi's `stt.enabled` setting. If it is off, the speech model is
-unavailable, or live voice is running, the composer shows NeoPi's message. The
-button appears only for native sessions NeoCode owns on the desktop app's own
-backend, because NeoPi records on the machine it runs on. Browsers and remote
-environments do not offer it.
+Dictation needs NeoPi's `stt.enabled` setting. If the speech model is
+unavailable or live voice is running, the composer shows NeoPi's message. It
+works in sessions NeoCode owns and in sessions attached to a terminal NeoPi, as
+long as that NeoPi supports it. NeoPi records on the machine it runs on, so
+browsers and remote environments do not have the button. In the desktop app it
+is always there: when dictation cannot work it is greyed out, and hovering it
+says why and what to change.
 
 ## Branch and worktree
 

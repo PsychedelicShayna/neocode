@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { isElectron } from "../../env";
-import { nativeDictationAvailable } from "./nativeDictation";
+import { nativeDictationAvailability } from "./nativeDictation";
 import { useNativeDictation } from "./useNativeDictation";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
@@ -225,14 +225,6 @@ export function NativeSessionView({
   const localComposerRef = useRef<ChatComposerHandle | null>(null);
   const composerRef = useComposerHandleContext() ?? localComposerRef;
   const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const dictation = useNativeDictation({ feed, request, composerRef });
-  const dictationAvailable = nativeDictationAvailable({
-    isDesktop: isElectron,
-    localEnvironmentDisabled: isLocalEnvironmentDisabled(),
-    environmentId: target.environmentId,
-    primaryEnvironmentId,
-    attachment: session?.attachment,
-  });
   const timelineRef = useRef<LegendListRef | null>(null);
   const [followSignal, setFollowSignal] = useState(0);
   const submit = useCallback<Request>(
@@ -273,6 +265,37 @@ export function NativeSessionView({
   useEffect(() => {
     if (session) setState(session.state);
   }, [session]);
+  const sttEnabled = state.dictationEnabled;
+  const availability = nativeDictationAvailability({
+    isDesktop: isElectron,
+    localEnvironmentDisabled: isLocalEnvironmentDisabled(),
+    environmentId: target.environmentId,
+    primaryEnvironmentId,
+    attachment: session?.attachment,
+    capabilities: session?.capabilities ?? null,
+    connected: feed.connected,
+    sttEnabled: typeof sttEnabled === "boolean" ? sttEnabled : undefined,
+  });
+  const dictation = useNativeDictation({
+    feed,
+    request,
+    composerRef,
+    unavailableReason: availability.kind === "disabled" ? availability.reason : null,
+  });
+  const dictationShown = availability.kind !== "hidden";
+  // Turning stt.enabled on happens in NeoPi's own settings, which announce nothing:
+  // coming back to this window re-reads it, so the button does not stay disabled.
+  const sttOff = state.dictationEnabled === false;
+  useEffect(() => {
+    if (!sttOff) return;
+    const refresh = () => {
+      void request({ type: "get_state" })
+        .then((observed) => setState(nativeRecord(observed)))
+        .catch(() => undefined);
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [sttOff, request]);
   // NeoPi moved this session to another file (`/wt`, fork): the selection and
   // its tab follow in place, never a second tab for the same session.
   const movedRef = feed.movedTo ?? session?.ref ?? null;
@@ -688,7 +711,7 @@ export function NativeSessionView({
         onOpenModels={() => setModels((value) => !value)}
         onInterrupt={interrupt}
         busy={feed.busy}
-        onToggleDictation={dictationAvailable ? dictation.toggle : undefined}
+        onToggleDictation={dictationShown ? dictation.toggle : undefined}
         dictationActive={dictation.phase !== "idle"}
         onNativeCommand={runNativeCommand}
       >
@@ -813,7 +836,7 @@ export function NativeSessionView({
                     setLocalError(String(cause)),
                   );
                 },
-                ...(dictationAvailable ? { dictation } : {}),
+                ...(dictationShown ? { dictation } : {}),
               }}
             />
           </ComposerSurface.Host>

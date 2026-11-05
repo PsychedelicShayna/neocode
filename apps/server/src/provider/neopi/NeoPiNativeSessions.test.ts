@@ -59,6 +59,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       commands: [] as Record<string, unknown>[],
       prompts: [] as string[],
       slashes: [] as Record<string, unknown>[],
+      dictation: [] as Record<string, unknown>[],
       profileValid: true,
       blockSnapshot: false,
       startupDialog: false,
@@ -174,6 +175,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                     native.slashes.push({ ...command });
                     return { delivery: "started" };
                   case "dictation_start":
+                    native.dictation.push({ ...command });
                     yield* publish({
                       type: "dictation_state",
                       captureId: "captureId" in command ? String(command.captureId) : "",
@@ -181,6 +183,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                     });
                     return undefined;
                   case "dictation_stop":
+                    native.dictation.push({ ...command });
                     yield* publish({
                       type: "dictation_end",
                       captureId: "capture-1",
@@ -667,6 +670,24 @@ describe("canonical native session lifecycle", () => {
           { type: "dictation_end", captureId: "capture-1", text: "hello" },
         ],
       );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("sends terminal dictation commands without a session generation guard", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open({ ...originalRef });
+      yield* service.request({
+        ref: originalRef,
+        command: { type: "dictation_start", captureId: "capture-1" },
+      });
+      // The terminal moved on; a stop must still reach NeoPi or the microphone stays open.
+      native.generation++;
+      yield* service.request({ ref: originalRef, command: { type: "dictation_stop" } });
+      assert.deepEqual(native.dictation, [
+        { type: "dictation_start", captureId: "capture-1" },
+        { type: "dictation_stop" },
+      ]);
     }).pipe(Effect.scoped),
   );
 

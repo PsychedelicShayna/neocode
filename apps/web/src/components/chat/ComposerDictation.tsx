@@ -5,33 +5,62 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { ComposerBannerStackItem } from "./ComposerBannerStack";
 import { dictationStatusLabel, type ComposerDictationControl } from "./composerDictation.logic";
 
-/** Click to start, click again to stop. The recording state is static, never animated. */
+/** The button must not take focus from the composer's caret. */
+const keepComposerFocus = (event: { preventDefault(): void }) => event.preventDefault();
+
+/**
+ * Click to start, click again to stop. The recording state is static, never animated.
+ * Always present on the desktop: when dictation cannot work the button is disabled
+ * and its tooltip says why and what fixes it.
+ */
 export function ComposerDictationButton(props: {
   readonly dictation: ComposerDictationControl;
   readonly shortcut: string | null;
 }) {
   const { dictation, shortcut } = props;
   const capturing = dictation.phase === "starting" || dictation.phase === "recording";
+  const unavailable = dictation.phase === "idle" ? dictation.unavailableReason : null;
   const label = capturing ? "Stop dictation" : "Dictate";
   const withShortcut = shortcut ? `${label} (${shortcut})` : label;
+  const icon = capturing ? <MicOffIcon /> : <MicIcon />;
+  const buttonProps = {
+    type: "button",
+    variant: capturing ? "destructive" : "ghost",
+    size: "icon-sm",
+    "aria-pressed": capturing,
+    "data-composer-dictation": dictation.phase,
+    onPointerDown: keepComposerFocus,
+    onClick: dictation.toggle,
+  } as const;
+  // A disabled button receives no pointer events, so the reason hangs off a wrapper.
+  if (unavailable)
+    return (
+      <Tooltip>
+        <TooltipTrigger render={<span className="inline-flex" />}>
+          <Button
+            {...buttonProps}
+            disabled
+            aria-label={`${label} unavailable: ${unavailable}`}
+            data-composer-dictation-unavailable=""
+          >
+            {icon}
+          </Button>
+        </TooltipTrigger>
+        <TooltipPopup className="max-w-72">{unavailable}</TooltipPopup>
+      </Tooltip>
+    );
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <Button
-            type="button"
-            variant={capturing ? "destructive" : "ghost"}
-            size="icon-sm"
+            {...buttonProps}
             disabled={dictation.phase === "transcribing"}
-            aria-pressed={capturing}
             aria-label={withShortcut}
-            data-composer-dictation={dictation.phase}
-            onPointerDown={(event) => event.preventDefault()}
-            onClick={dictation.toggle}
           />
         }
       >
-        {capturing ? <MicOffIcon /> : <MicIcon />}
+        {icon}
       </TooltipTrigger>
       <TooltipPopup>{withShortcut}</TooltipPopup>
     </Tooltip>

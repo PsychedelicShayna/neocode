@@ -140,7 +140,7 @@ export function NativeSessionWorkspacePanels({
   /** Runs a keybinding command that only the native session implements. */
   onNativeCommand: (command: NativeSessionCommand) => void;
   busy: boolean;
-  /** Absent when this client cannot use the microphone NeoPi records from. */
+  /** Absent outside the desktop app, which has no microphone control. */
   onToggleDictation: (() => void) | undefined;
   /** Escape cancels a capture before it interrupts the running turn. */
   dictationActive: boolean;

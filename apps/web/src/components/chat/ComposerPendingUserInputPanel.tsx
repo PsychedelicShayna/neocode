@@ -106,14 +106,15 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     progress.selectedOptionValues,
   ]);
 
-  // Clear auto-advance timer on unmount
+  // A delayed selection belongs to one question, not the next callback in the card.
   useEffect(() => {
     return () => {
       if (autoAdvanceTimerRef.current !== null) {
         window.clearTimeout(autoAdvanceTimerRef.current);
+        autoAdvanceTimerRef.current = null;
       }
     };
-  }, []);
+  }, [activeQuestion?.id, isResponding]);
 
   const handleOptionSelection = useCallback(
     (questionId: string, optionValue: string) => {

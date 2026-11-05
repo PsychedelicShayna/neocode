@@ -145,6 +145,10 @@ export function applyTerminalAttachStreamEvent(
         lifecycleVersion:
           current.version === 0 ? current.lifecycleVersion : current.lifecycleVersion + 1,
       };
+    case "resync":
+      return event.snapshot === null
+        ? { ...current, status: "closed", error: null, version: current.version + 1 }
+        : terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes, current);
     case "restarted":
       return {
         ...terminalBufferStateFromSnapshot(event.snapshot, maxBufferBytes, current),

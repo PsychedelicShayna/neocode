@@ -219,13 +219,27 @@ export const TerminalEvent = Schema.Union([
 ]);
 export type TerminalEvent = typeof TerminalEvent.Type;
 
+/** A legacy event consumer must reattach to recover authoritative terminal state. */
+export const TerminalEventsStreamEvent = Schema.Union([
+  TerminalEvent,
+  Schema.Struct({ type: Schema.Literal("resync") }),
+]);
+export type TerminalEventsStreamEvent = typeof TerminalEventsStreamEvent.Type;
+
 const TerminalAttachSnapshotEvent = Schema.Struct({
   type: Schema.Literal("snapshot"),
   snapshot: TerminalSessionSnapshot,
 });
 
+const TerminalAttachResyncEvent = Schema.Struct({
+  ...TerminalEventBaseSchema.fields,
+  type: Schema.Literal("resync"),
+  snapshot: Schema.NullOr(TerminalSessionSnapshot),
+});
+
 export const TerminalAttachStreamEvent = Schema.Union([
   TerminalAttachSnapshotEvent,
+  TerminalAttachResyncEvent,
   TerminalOutputEvent,
   TerminalExitedEvent,
   TerminalClosedEvent,

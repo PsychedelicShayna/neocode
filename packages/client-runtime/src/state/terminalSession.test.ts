@@ -138,6 +138,35 @@ describe("terminal session reducers", () => {
     expect(terminalOutputText(output.output)).toBe("lo world");
   });
 
+  it("resynchronizes web and mobile output cursors without pretending the PTY restarted", () => {
+    const initial = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
+      type: "snapshot",
+      snapshot: BASE_SNAPSHOT,
+    });
+    const cursor = readTerminalOutputUpdate(initial.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
+    const recovered = applyTerminalAttachStreamEvent(initial, {
+      type: "resync",
+      threadId: TARGET.threadId,
+      terminalId: TARGET.terminalId,
+      snapshot: { ...BASE_SNAPSHOT, history: "authoritative history after overflow" },
+    });
+    expect(readTerminalOutputUpdate(recovered.output, cursor)).toMatchObject({
+      type: "reset",
+      data: "authoritative history after overflow",
+    });
+    expect(recovered.lifecycleVersion).toBe(initial.lifecycleVersion);
+    expect(recovered.version).toBe(initial.version + 1);
+    expect(recovered.status).toBe("running");
+    const closed = applyTerminalAttachStreamEvent(recovered, {
+      type: "resync",
+      threadId: TARGET.threadId,
+      terminalId: TARGET.terminalId,
+      snapshot: null,
+    });
+    expect(closed.status).toBe("closed");
+    expect(closed.lifecycleVersion).toBe(recovered.lifecycleVersion);
+  });
+
   it("does not advance the lifecycle for the initial attach snapshot", () => {
     const snapshot = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
       type: "snapshot",

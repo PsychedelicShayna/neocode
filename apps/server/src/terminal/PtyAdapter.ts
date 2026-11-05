@@ -38,6 +38,8 @@ export interface PtyProcess {
   readonly pid: number;
   write(data: string): void;
   resize(cols: number, rows: number): void;
+  pause(): void;
+  resume(): void;
   kill(signal?: string): void;
   onData(callback: (data: string) => void): () => void;
   onExit(callback: (event: PtyExitEvent) => void): () => void;

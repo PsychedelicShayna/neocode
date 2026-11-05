@@ -69,6 +69,7 @@ import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
 import * as NativeTelemetryClient from "../resourceTelemetry/NativeTelemetryClient.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
+import { ProcessEventQueue, type PendingProcessEvent } from "./ProcessEventQueue.ts";
 
 export {
   TerminalCwdError,
@@ -159,6 +160,12 @@ export class TerminalManager extends Context.Service<
       input: TerminalAttachInput,
       listener: (event: TerminalAttachStreamEvent) => Effect.Effect<void>,
     ) => Effect.Effect<() => void, TerminalError>;
+
+    /** Read a resynchronization snapshot without creating or restarting a PTY. */
+    readonly getSnapshot: (input: {
+      readonly threadId: string;
+      readonly terminalId: string;
+    }) => Effect.Effect<TerminalSessionSnapshot | null>;
 
     /**
      * Write input bytes to a terminal session.
@@ -272,8 +279,7 @@ interface TerminalSessionState {
   pid: number | null;
   history: BoundedTerminalHistory;
   pendingHistoryControlSequence: string;
-  pendingProcessEvents: Array<PendingProcessEvent>;
-  pendingProcessEventIndex: number;
+  pendingProcessEvents: ProcessEventQueue;
   processEventDrainRunning: boolean;
   exitCode: number | null;
   exitSignal: number | null;
@@ -296,10 +302,6 @@ interface PersistHistoryRequest {
   history: BoundedTerminalHistory;
   immediate: boolean;
 }
-
-type PendingProcessEvent =
-  | { type: "output"; data: string }
-  | { type: "exit"; event: PtyAdapter.PtyExitEvent };
 
 type DrainProcessEventAction =
   | { type: "idle" }
@@ -463,7 +465,7 @@ function enqueueProcessEvent(
     return false;
   }
 
-  session.pendingProcessEvents.push(event);
+  session.pendingProcessEvents.push(event, session.process);
   if (session.processEventDrainRunning) {
     return false;
   }
@@ -1393,8 +1395,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
-    env, }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
@@ -1975,24 +1976,16 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     while (true) {
       const action: DrainProcessEventAction = yield* Effect.sync(() => {
         if (session.pid !== expectedPid || !session.process || session.status !== "running") {
-          session.pendingProcessEvents = [];
-          session.pendingProcessEventIndex = 0;
+          session.pendingProcessEvents.clear();
           session.processEventDrainRunning = false;
           return { type: "idle" } as const;
         }
 
-        const nextEvent = session.pendingProcessEvents[session.pendingProcessEventIndex];
+        const nextEvent = session.pendingProcessEvents.shift();
         if (!nextEvent) {
-          session.pendingProcessEvents = [];
-          session.pendingProcessEventIndex = 0;
+          session.pendingProcessEvents.clear();
           session.processEventDrainRunning = false;
           return { type: "idle" } as const;
-        }
-
-        session.pendingProcessEventIndex += 1;
-        if (session.pendingProcessEventIndex >= session.pendingProcessEvents.length) {
-          session.pendingProcessEvents = [];
-          session.pendingProcessEventIndex = 0;
         }
 
         if (nextEvent.type === "output") {
@@ -2024,8 +2017,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         session.childCommandLabel = null;
         session.status = "exited";
         session.pendingHistoryControlSequence = "";
-        session.pendingProcessEvents = [];
-        session.pendingProcessEventIndex = 0;
+        session.pendingProcessEvents.clear();
         session.processEventDrainRunning = false;
         session.exitCode = Number.isInteger(nextEvent.event.exitCode)
           ? nextEvent.event.exitCode
@@ -2096,8 +2088,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       session.childCommandLabel = null;
       session.status = "exited";
       session.pendingHistoryControlSequence = "";
-      session.pendingProcessEvents = [];
-      session.pendingProcessEventIndex = 0;
+      session.pendingProcessEvents.clear();
       session.processEventDrainRunning = false;
       session.updatedAt = updatedAt;
       return [undefined, state] as const;
@@ -2191,8 +2182,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       session.exitSignal = null;
       session.hasRunningSubprocess = false;
       session.childCommandLabel = null;
-      session.pendingProcessEvents = [];
-      session.pendingProcessEventIndex = 0;
+      session.pendingProcessEvents.clear();
       session.processEventDrainRunning = false;
       session.updatedAt = startingAt;
       return [undefined, state] as const;
@@ -2268,8 +2258,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         session.process = null;
         session.hasRunningSubprocess = false;
         session.childCommandLabel = null;
-        session.pendingProcessEvents = [];
-        session.pendingProcessEventIndex = 0;
+        session.pendingProcessEvents.clear();
         session.processEventDrainRunning = false;
         advanceEventSequence(session);
         return [undefined, state] as const;
@@ -2522,8 +2511,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         pid: null,
         history,
         pendingHistoryControlSequence: "",
-        pendingProcessEvents: [],
-        pendingProcessEventIndex: 0,
+        pendingProcessEvents: new ProcessEventQueue(),
         processEventDrainRunning: false,
         exitCode: null,
         exitSignal: null,
@@ -2584,8 +2572,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       liveSession.runtimeEnv = nextRuntimeEnv;
       liveSession.history.clear();
       liveSession.pendingHistoryControlSequence = "";
-      liveSession.pendingProcessEvents = [];
-      liveSession.pendingProcessEventIndex = 0;
+      liveSession.pendingProcessEvents.clear();
       liveSession.processEventDrainRunning = false;
       yield* persistHistory(liveSession.threadId, liveSession.terminalId, liveSession.history);
     } else if (liveSession.status === "exited" || liveSession.status === "error") {
@@ -2593,8 +2580,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       liveSession.worktreePath = nextWorktreePath;
       liveSession.history.clear();
       liveSession.pendingHistoryControlSequence = "";
-      liveSession.pendingProcessEvents = [];
-      liveSession.pendingProcessEventIndex = 0;
+      liveSession.pendingProcessEvents.clear();
       liveSession.processEventDrainRunning = false;
       yield* persistHistory(liveSession.threadId, liveSession.terminalId, liveSession.history);
     }
@@ -2910,8 +2896,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         const session = yield* requireSession(input.threadId, terminalId);
         session.history.clear();
         session.pendingHistoryControlSequence = "";
-        session.pendingProcessEvents = [];
-        session.pendingProcessEventIndex = 0;
+        session.pendingProcessEvents.clear();
         session.processEventDrainRunning = false;
         const eventStamp = advanceEventSequence(session);
         yield* persistHistory(input.threadId, terminalId, session.history);
@@ -2945,8 +2930,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           pid: null,
           history: new BoundedTerminalHistory(historyLineLimit, "", historyByteLimit),
           pendingHistoryControlSequence: "",
-          pendingProcessEvents: [],
-          pendingProcessEventIndex: 0,
+          pendingProcessEvents: new ProcessEventQueue(),
           processEventDrainRunning: false,
           exitCode: null,
           exitSignal: null,
@@ -2982,8 +2966,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
       session.history.clear();
       session.pendingHistoryControlSequence = "";
-      session.pendingProcessEvents = [];
-      session.pendingProcessEventIndex = 0;
+      session.pendingProcessEvents.clear();
       session.processEventDrainRunning = false;
       yield* persistHistory(input.threadId, terminalId, session.history);
       yield* startSession(
@@ -3086,6 +3069,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   return TerminalManager.of({
     open,
     attachStream,
+    getSnapshot: (input) =>
+      getSession(input.threadId, input.terminalId).pipe(
+        Effect.map((session) => (Option.isSome(session) ? snapshot(session.value) : null)),
+      ),
     write,
     resize,
     clear,

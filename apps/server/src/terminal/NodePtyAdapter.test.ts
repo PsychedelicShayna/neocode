@@ -14,6 +14,8 @@ const spawn = vi.fn(() => ({
   pid: 42,
   write: vi.fn(),
   resize: vi.fn(),
+  pause: vi.fn(),
+  resume: vi.fn(),
   kill: vi.fn(),
   onData: vi.fn(() => ({ dispose: vi.fn() })),
   onExit: vi.fn(() => ({ dispose: vi.fn() })),
@@ -56,6 +58,10 @@ for (const platform of ["win32", "linux", "darwin"] as const) {
       process.kill("SIGTERM");
       process.kill("SIGKILL");
       process.kill();
+      process.pause();
+      process.resume();
+      assert.equal(nativeProcess.pause.mock.calls.length, 1);
+      assert.equal(nativeProcess.resume.mock.calls.length, 1);
 
       assert.deepEqual(
         nativeProcess.kill.mock.calls,

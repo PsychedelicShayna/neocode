@@ -4,6 +4,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   DEFAULT_TERMINAL_ID,
   TerminalAttachInput,
+  TerminalAttachStreamEvent,
+  TerminalEventsStreamEvent,
   TerminalClearInput,
   TerminalCloseInput,
   TerminalEvent,
@@ -52,6 +54,26 @@ describe("TerminalProviderEnvironmentError", () => {
       "Could not prepare the terminal environment for provider instance: codex_work",
     );
     expect(decoded.message).not.toContain("secret backend unavailable");
+  });
+});
+
+describe("terminal subscriber resynchronization", () => {
+  it("decodes the explicit legacy boundary and a closed attached terminal", () => {
+    expect(decodeSync(TerminalEventsStreamEvent, { type: "resync" })).toEqual({ type: "resync" });
+    expect(
+      decodeSync(TerminalAttachStreamEvent, {
+        type: "resync",
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        snapshot: null,
+      }),
+    ).toEqual({
+      type: "resync",
+      threadId: "thread-1",
+      terminalId: DEFAULT_TERMINAL_ID,
+      snapshot: null,
+    });
+    expect(decodes(TerminalAttachStreamEvent, { type: "resync" })).toBe(false);
   });
 });
 

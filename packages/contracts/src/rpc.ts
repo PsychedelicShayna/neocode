@@ -205,7 +205,7 @@ import {
   TerminalClearInput,
   TerminalCloseInput,
   TerminalError,
-  TerminalEvent,
+  TerminalEventsStreamEvent,
   TerminalMetadataStreamEvent,
   TerminalOpenInput,
   TerminalResizeInput,
@@ -1451,7 +1451,7 @@ const WsOrchestrationSubscribeThreadRpc = Rpc.make(ORCHESTRATION_WS_METHODS.subs
 
 const WsSubscribeTerminalEventsRpc = Rpc.make(WS_METHODS.subscribeTerminalEvents, {
   payload: Schema.Struct({}),
-  success: TerminalEvent,
+  success: TerminalEventsStreamEvent,
   error: EnvironmentAuthorizationError,
   stream: true,
 });

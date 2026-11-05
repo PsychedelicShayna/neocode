@@ -10,7 +10,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
-import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -35,6 +34,7 @@ import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveProjectFileBackedSetting } from "@t3tools/shared/projectSettings";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import { makeTraceTail } from "./GitTraceTail.ts";
 import {
   parseRemoteNames,
   parseRemoteNamesInGitOrder,
@@ -111,11 +111,6 @@ const NON_REPOSITORY_REMOTE_STATUS_DETAILS = Object.freeze<GitVcsDriver.GitRemot
   behindCount: 0,
   aheadOfDefaultCount: 0,
 });
-
-type TraceTailState = {
-  processedChars: number;
-  remainder: string;
-};
 
 class StatusRemoteRefreshCacheKey extends Data.Class<{
   gitCommonDir: string;
@@ -573,10 +568,7 @@ const createTrace2Monitor = Effect.fnUntraced(function* (
     suffix: ".json",
   });
   const hookStartByChildKey = new Map<string, { hookName: string; startedAtMs: number }>();
-  const traceTailState = yield* Ref.make<TraceTailState>({
-    processedChars: 0,
-    remainder: "",
-  });
+  const traceTail = yield* makeTraceTail(traceFilePath);
 
   const handleTraceLine = Effect.fn("handleTraceLine")(function* (line: string) {
     const trimmedLine = line.trim();
@@ -645,32 +637,13 @@ const createTrace2Monitor = Effect.fnUntraced(function* (
     }
   });
 
+  // Held across the read and the handlers so watch events and the final flush
+  // deliver lines in file order.
   const deltaMutex = yield* Semaphore.make(1);
   const readTraceDelta = deltaMutex.withPermit(
-    fs.readFileString(traceFilePath).pipe(
-      Effect.flatMap((contents) =>
-        Effect.uninterruptible(
-          Ref.modify(traceTailState, ({ processedChars, remainder }) => {
-            if (contents.length <= processedChars) {
-              return [[], { processedChars, remainder }];
-            }
-
-            const appended = contents.slice(processedChars);
-            const combined = remainder + appended;
-            const lines = combined.split("\n");
-            const nextRemainder = lines.pop() ?? "";
-
-            return [
-              lines.map((line) => line.replace(/\r$/, "")),
-              {
-                processedChars: contents.length,
-                remainder: nextRemainder,
-              },
-            ];
-          }).pipe(
-            Effect.flatMap((lines) => Effect.forEach(lines, handleTraceLine, { discard: true })),
-          ),
-        ),
+    traceTail.readLines.pipe(
+      Effect.flatMap((lines) =>
+        Effect.uninterruptible(Effect.forEach(lines, handleTraceLine, { discard: true })),
       ),
       Effect.ignore({ log: true }),
     ),
@@ -688,13 +661,7 @@ const createTrace2Monitor = Effect.fnUntraced(function* (
 
   const finalizeTrace2Monitor = Effect.fn("finalizeTrace2Monitor")(function* () {
     yield* readTraceDelta;
-    const finalLine = yield* Ref.modify(traceTailState, ({ processedChars, remainder }) => [
-      remainder.trim(),
-      {
-        processedChars,
-        remainder: "",
-      },
-    ]);
+    const finalLine = (yield* traceTail.takeRemainder).trim();
     if (finalLine.length > 0) {
       yield* handleTraceLine(finalLine);
     }

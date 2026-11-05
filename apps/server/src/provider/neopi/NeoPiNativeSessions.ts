@@ -27,6 +27,7 @@ import {
 } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
+import * as Duration from "effect/Duration";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -57,6 +58,7 @@ import {
   neoPiTerminalTextRoute,
 } from "./NeoPiCommandCatalog.ts";
 import { NEOPI_CAPABILITIES } from "./NeoPiCompatibility.ts";
+import { makeSharedListing } from "./NeoPiSharedListing.ts";
 import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import {
@@ -116,6 +118,9 @@ const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
 };
 const fail = (message: string, code = "session_unavailable") =>
   new NeoPiNativeSessionsError({ message, code });
+/** How long one catalog scan answers every client's listing request. */
+const CATALOG_SHARE_TTL = Duration.seconds(8);
+const rowKey = (providerInstanceId: string, file: string) => `${providerInstanceId}\0${file}`;
 
 export interface NeoPiNativeProfile {
   readonly providerInstanceId: ProviderInstanceId;
@@ -152,6 +157,8 @@ export interface NeoPiNativeSessionsDependencies {
     cwd?: string,
     file?: string,
   ) => Effect.Effect<ReadonlyArray<CatalogRow>, NeoPiNativeSessionsError>;
+  /** Drops the shared listing so the next list rescans; absent in tests with a fresh catalog per call. */
+  readonly invalidateCatalog?: Effect.Effect<void>;
   readonly connect: (
     profile: NeoPiNativeProfile,
     input: NeoPiNativeSessionsOpenInput,
@@ -186,6 +193,8 @@ interface NativeSession {
 export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWith")(function* (
   dependencies: NeoPiNativeSessionsDependencies,
 ) {
+  // A new or closed connection changes who owns a file, so the shared listing is rescanned.
+  const invalidateCatalog = dependencies.invalidateCatalog ?? Effect.void;
   const lifetime = yield* Effect.scope;
   const sessions = new Map<string, NativeSession>();
   // Gates are per native path: unrelated sessions can start independently.
@@ -441,7 +450,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   ): Effect.Effect<NeoPiNativeSessionsOpenResult, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
       const profile = yield* dependencies.profile(input.providerInstanceId);
-      if (!input.sessionFile) return describe(yield* create(profile, input));
+      if (!input.sessionFile) {
+        const created = describe(yield* create(profile, input));
+        yield* invalidateCatalog;
+        return created;
+      }
       const file = yield* dependencies.canonicalize(input.sessionFile);
       return yield* (yield* gate(file)).withPermits(1)(
         Effect.gen(function* () {
@@ -459,7 +472,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             });
             return result;
           }
-          return describe(yield* create(profile, { ...input, sessionFile: file }));
+          const created = describe(yield* create(profile, { ...input, sessionFile: file }));
+          yield* invalidateCatalog;
+          return created;
         }),
       );
     }).pipe(Effect.mapError(nativeError));
@@ -490,6 +505,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         ? [input.providerInstanceId]
         : yield* dependencies.profileIds;
       const rows: NeoPiNativeSessionSummary[] = [];
+      // Position of each catalog row by profile and file, so merging connected sessions is linear.
+      const rowIndex = new Map<string, number>();
       const diagnostics: Array<{ providerInstanceId: ProviderInstanceId; message: string }> = [];
       for (const id of ids) {
         const result = yield* Effect.gen(function* () {
@@ -522,6 +539,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             connected && connected.profile.providerInstanceId === id ? connected : undefined,
             row.live,
           );
+          const key = rowKey(id, file);
+          // The first row for a profile and file wins, as a linear scan would find it.
+          if (!rowIndex.has(key)) rowIndex.set(key, rows.length);
           rows.push({
             ref: { providerInstanceId: id, sessionFile: file },
             sessionId: row.id,
@@ -547,11 +567,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             session.profile.providerInstanceId !== input.providerInstanceId)
         )
           continue;
-        const existing = rows.findIndex(
-          (row) =>
-            row.ref.providerInstanceId === session.profile.providerInstanceId &&
-            row.ref.sessionFile === session.ref.sessionFile,
-        );
+        const existing =
+          rowIndex.get(rowKey(session.profile.providerInstanceId, session.ref.sessionFile)) ?? -1;
         const cwd = existing >= 0 ? rows[existing]!.cwd : session.cwd;
         if (
           input.cwd &&
@@ -900,6 +917,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               .pipe(Effect.timeoutOption("2 seconds"), Effect.ignore);
           // EOF disposes an owned RPC runtime; ctl pipe EOF detaches only its control socket.
           yield* Scope.close(session.scope, Exit.void);
+          yield* invalidateCatalog;
           return { closed: true };
         }),
       );
@@ -1032,26 +1050,21 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       Effect.timeout("5 seconds"),
       Effect.orElseSucceed(() => undefined),
     );
-  const catalog = Effect.fnUntraced(function* (
-    profile: NeoPiNativeProfile,
-    cwd?: string,
-    file?: string,
-  ) {
-    yield* profile.validate;
-    const listArgs = (live: boolean) => [
-      "sessions",
-      "list",
-      "--json",
-      ...(file ? ["--session-dir", NodePath.dirname(file)] : ["--all"]),
-      ...(live ? ["--live"] : []),
-    ];
+  const listArgs = (live: boolean, file?: string) => [
+    "sessions",
+    "list",
+    "--json",
+    ...(file ? ["--session-dir", NodePath.dirname(file)] : ["--all"]),
+    ...(live ? ["--live"] : []),
+  ];
+  const scan = Effect.fnUntraced(function* (profile: NeoPiNativeProfile, file?: string) {
     // Only the full listing feeds the sidebar; single-file lookups need no owner probes.
     let live = !file && !liveUnsupported.has(profile.source.binary);
     // The control registry is each running process's own snapshot. A failed read leaves it
     // `undefined`, which `resolveNativeLive` treats as "believe only the streaming flag".
     const [first, registry] = yield* Effect.all(
       [
-        runCatalog(profile, listArgs(live)),
+        runCatalog(profile, listArgs(live, file)),
         live ? readControlRegistry(profile) : Effect.succeed(undefined),
       ],
       { concurrency: 2 },
@@ -1060,27 +1073,46 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     if (!output.ok && live && /--live/.test(`${output.err}\n${output.out}`)) {
       liveUnsupported.add(profile.source.binary);
       live = false;
-      output = yield* runCatalog(profile, listArgs(false));
+      output = yield* runCatalog(profile, listArgs(false, file));
     }
     if (!output.ok) return yield* fail(output.err || "Native session discovery failed.");
     const decoded = yield* Schema.decodeUnknownEffect(Catalog)(output.out);
-    const result = {
-      sessions: live
-        ? decoded.sessions.map((row) => ({
-            ...row,
-            live:
-              resolveNativeLive({
-                instanceId: row.control?.instanceId ?? null,
-                reported: row.live,
-                registry,
-              }) ?? null,
-          }))
-        : decoded.sessions,
-    };
+    return live
+      ? decoded.sessions.map((row) => ({
+          ...row,
+          live:
+            resolveNativeLive({
+              instanceId: row.control?.instanceId ?? null,
+              reported: row.live,
+              registry,
+            }) ?? null,
+        }))
+      : decoded.sessions;
+  }, Effect.mapError(nativeError));
+  // One full scan (two CLI processes) serves every client's listing request for a few seconds.
+  const sharedListing = yield* makeSharedListing({
+    scan: (profile: NeoPiNativeProfile) => scan(profile),
+    ttl: CATALOG_SHARE_TTL,
+  });
+  const invalidateCatalog = sharedListing.invalidate;
+  const catalog = Effect.fnUntraced(function* (
+    profile: NeoPiNativeProfile,
+    cwd?: string,
+    file?: string,
+  ) {
     yield* profile.validate;
-    if (!cwd) return result.sessions;
+    let sessions: ReadonlyArray<CatalogRow>;
+    if (file) sessions = yield* scan(profile, file);
+    else {
+      sessions = yield* sharedListing.get(
+        `${profile.providerInstanceId}\0${profile.source.binary}`,
+        profile,
+      );
+    }
+    yield* profile.validate;
+    if (!cwd) return sessions;
     const expected = yield* fs.realPath(cwd);
-    return yield* Effect.filter(result.sessions, (row) =>
+    return yield* Effect.filter(sessions, (row) =>
       fs.realPath(row.cwd).pipe(
         Effect.map((actual) => actual === expected),
         Effect.orElseSucceed(() => false),
@@ -1357,6 +1389,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         Effect.provideService(FileSystem.FileSystem, fs),
       ),
     catalog,
+    invalidateCatalog,
     connect,
     settlement: {
       store: yield* makeNeoPiNativeSettledStore(

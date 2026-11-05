@@ -21,7 +21,10 @@ import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { ProviderService } from "../Services/ProviderService.ts";
-import { neoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
+import {
+  neoPiSessionCatalogSource,
+  type NeoPiSessionCatalogSource,
+} from "./NeoPiSessionCatalogSource.ts";
 import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
@@ -57,6 +60,41 @@ const nativeOwnerError = (cause: unknown) =>
         message: cause instanceof Error ? cause.message : String(cause),
         cause,
       });
+
+/** Discovery is short-lived; the eventual control connection keeps its caller's scope. */
+export const readNeoPiNativeOwnerCatalog = Effect.fn("NeoPiNativeOwner.readCatalog")(
+  function* (
+    source: Pick<NeoPiSessionCatalogSource, "binary" | "env">,
+    cwd: string,
+    sessionFile: string,
+  ) {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(
+      ChildProcess.make(
+        source.binary,
+        ["sessions", "list", "--json", "--session-dir", NodePath.dirname(sessionFile)],
+        { cwd, env: source.env, stdin: "ignore" },
+      ),
+    );
+    const [out, err, code] = yield* Effect.all(
+      [
+        collectUint8StreamText({ stream: child.stdout, maxBytes: MAX_RPC_REASSEMBLED_BYTES }),
+        collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
+        child.exitCode,
+      ],
+      { concurrency: "unbounded" },
+    );
+    if (Number(code) !== 0 || out.truncated || err.truncated)
+      return yield* new NeoPiRuntimeError({
+        code: "rpc",
+        message: "Native owner discovery failed.",
+      });
+    return yield* Schema.decodeUnknownEffect(Catalog)(out.text);
+  },
+  Effect.scoped,
+  Effect.timeout("30 seconds"),
+  Effect.mapError(nativeOwnerError),
+);
 
 /** Resolve the existing writer only. History observation never starts or resumes a session. */
 export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(function* () {
@@ -113,27 +151,7 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
       const project = yield* snapshots.getProjectShellById(thread.value.projectId);
       if (Option.isNone(project)) return undefined;
       const cwd = thread.value.worktreePath ?? project.value.workspaceRoot;
-      const child = yield* spawner.spawn(
-        ChildProcess.make(
-          source.binary,
-          ["sessions", "list", "--json", "--session-dir", NodePath.dirname(expected.sessionFile)],
-          { cwd, env: source.env, stdin: "ignore" },
-        ),
-      );
-      const [out, err, code] = yield* Effect.all(
-        [
-          collectUint8StreamText({ stream: child.stdout, maxBytes: MAX_RPC_REASSEMBLED_BYTES }),
-          collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
-          child.exitCode,
-        ],
-        { concurrency: "unbounded" },
-      );
-      if (Number(code) !== 0 || out.truncated || err.truncated)
-        return yield* new NeoPiRuntimeError({
-          code: "rpc",
-          message: "Native owner discovery failed.",
-        });
-      const catalog = yield* Schema.decodeUnknownEffect(Catalog)(out.text);
+      const catalog = yield* readNeoPiNativeOwnerCatalog(source, cwd, expected.sessionFile);
       let instanceId: string | undefined;
       for (const row of catalog.sessions) {
         if (

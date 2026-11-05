@@ -221,11 +221,18 @@ export const make = Effect.gen(function* () {
       const done = yield* Deferred.make<ProjectSetupScriptCompletion>();
       let lineBuffer = "";
       let settled = false;
+      let unsubscribe: (() => void) | undefined;
+      const release = () => {
+        unsubscribe?.();
+        unsubscribe = undefined;
+        lineBuffer = "";
+      };
 
       const settle = (exitCode: number | null) =>
         Effect.suspend(() => {
           if (settled) return Effect.void;
           settled = true;
+          release();
           return Clock.currentTimeMillis.pipe(
             Effect.flatMap((nowMs) =>
               Deferred.succeed(done, { exitCode, durationMs: nowMs - startedAtMs }),
@@ -253,7 +260,7 @@ export const make = Effect.gen(function* () {
           return input.onOutputLine(cleaned.slice(0, OUTPUT_LINE_MAX_LENGTH));
         });
 
-      const unsubscribe = yield* terminalManager.subscribe((event) => {
+      unsubscribe = yield* terminalManager.subscribe((event) => {
         if (event.threadId !== input.threadId || event.terminalId !== input.terminalId) {
           return Effect.void;
         }
@@ -279,11 +286,10 @@ export const make = Effect.gen(function* () {
         }
         return Effect.void;
       });
+      if (settled) release();
 
-      const completion = Deferred.await(done).pipe(
-        Effect.ensuring(Effect.sync(() => unsubscribe())),
-      );
-      return { completion, unsubscribe };
+      const completion = Deferred.await(done).pipe(Effect.ensuring(Effect.sync(release)));
+      return { completion, unsubscribe: release };
     });
 
   const runForThread: ProjectSetupScriptRunner["Service"]["runForThread"] = Effect.fn(
@@ -381,58 +387,63 @@ export const make = Effect.gen(function* () {
             }),
         ),
       );
-    // Subscribe before writing so the sentinel cannot race past the listener.
-    const observed =
-      observe && completionToken
-        ? yield* observeTerminalCompletion({
-            threadId: input.threadId,
-            terminalId,
-            sentinel: completionSentinel(completionToken),
-            sentinelPattern: completionSentinelPattern(completionToken),
-            echoedWrapperLines: commandLine.split("\r").filter((line) => line.length > 0),
-            onOutputLine: observe.onOutputLine,
-          })
-        : undefined;
+    let observed: Effect.Success<ReturnType<typeof observeTerminalCompletion>> | undefined;
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        // Subscribe before writing so the sentinel cannot race past the listener.
+        observed =
+          observe && completionToken
+            ? yield* observeTerminalCompletion({
+                threadId: input.threadId,
+                terminalId,
+                sentinel: completionSentinel(completionToken),
+                sentinelPattern: completionSentinelPattern(completionToken),
+                echoedWrapperLines: commandLine.split("\r").filter((line) => line.length > 0),
+                onOutputLine: observe.onOutputLine,
+              })
+            : undefined;
 
-    yield* terminalManager
-      .write({
-        threadId: input.threadId,
-        terminalId,
-        data: `${commandLine}\r`,
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProjectSetupScriptOperationError({
-              ...errorContext,
-              operation: "writeCommand",
-              cause,
-            }),
-        ),
-        // Nothing will ever settle the completion if the command never ran.
-        Effect.tapError(() => Effect.sync(() => observed?.unsubscribe())),
-      );
+        yield* restore(
+          terminalManager
+            .write({
+              threadId: input.threadId,
+              terminalId,
+              data: `${commandLine}\r`,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectSetupScriptOperationError({
+                    ...errorContext,
+                    operation: "writeCommand",
+                    cause,
+                  }),
+              ),
+            ),
+        );
 
-    // A clean run leaves only an idle prompt behind; its output stays in the
-    // terminal history. A failed run keeps its shell open for a look.
-    const completion = observed?.completion.pipe(
-      Effect.tap(({ exitCode }) =>
-        exitCode === 0
-          ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
-          : Effect.void,
-      ),
-    );
+        // A clean run leaves only an idle prompt behind; its output stays in the
+        // terminal history. A failed run keeps its shell open for a look.
+        const completion = observed?.completion.pipe(
+          Effect.tap(({ exitCode }) =>
+            exitCode === 0
+              ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
+              : Effect.void,
+          ),
+        );
 
-    return {
-      status: "started",
-      scriptId: script.id,
-      scriptName: script.name,
-      scriptCommand: script.command,
-      terminalId,
-      cwd,
-      async: script.async !== false,
-      ...(completion ? { completion } : {}),
-    } as const;
+        return {
+          status: "started",
+          scriptId: script.id,
+          scriptName: script.name,
+          scriptCommand: script.command,
+          terminalId,
+          cwd,
+          async: script.async !== false,
+          ...(completion ? { completion } : {}),
+        } as const;
+      }),
+    ).pipe(Effect.onError(() => Effect.sync(() => observed?.unsubscribe())));
   });
 
   return ProjectSetupScriptRunner.of({ runForThread });

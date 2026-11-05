@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "@effect/vitest";
 import { type OrchestrationProject, ProjectId, type TerminalEvent } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -318,6 +320,8 @@ describe("ProjectSetupScriptRunner", () => {
         yield* emit("__T3_SETUP_DONE__:0\r\n");
         yield* emit(`__T3_SETUP_DONE___${"0".repeat(32)}:0\r\n`);
         yield* emit(`${sentinel}3\r\n`);
+        // Settlement owns listener cleanup even before a completion consumer starts.
+        expect(listener).toBeNull();
 
         const completion = yield* result.completion!;
         expect(completion.exitCode).toBe(3);
@@ -455,6 +459,85 @@ describe("ProjectSetupScriptRunner", () => {
       expect(unsubscribe).toHaveBeenCalledTimes(1);
     }).pipe(Effect.provide(testLayer(project, { open, write, subscribe })));
   });
+
+  it.effect.each(["closed-before-await", "interrupted-write"] as const)(
+    "releases completion observation on %s",
+    (mode) => {
+      const project = makeProject([
+        {
+          id: "setup",
+          name: "Setup",
+          command: "bun install",
+          icon: "configure",
+          runOnWorktreeCreate: true,
+        },
+      ]);
+      const open = () =>
+        Effect.succeed({
+          threadId: "thread-1",
+          terminalId: "setup-setup",
+          cwd: "/repo/worktrees/a",
+          worktreePath: "/repo/worktrees/a",
+          status: "running" as const,
+          pid: 123,
+          history: "",
+          exitCode: null,
+          exitSignal: null,
+          label: "setup-setup",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+      const writing = Deferred.makeUnsafe<void>();
+      const write = () =>
+        mode === "interrupted-write"
+          ? Deferred.succeed(writing, undefined).pipe(Effect.andThen(Effect.never))
+          : Effect.void;
+      const listeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
+      const unsubscribe = vi.fn((listener: (event: TerminalEvent) => Effect.Effect<void>) => {
+        listeners.delete(listener);
+      });
+      const subscribe = (listener: (event: TerminalEvent) => Effect.Effect<void>) =>
+        Effect.sync(() => {
+          listeners.add(listener);
+          return () => {
+            unsubscribe(listener);
+          };
+        });
+      return Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const launch = runner.runForThread({
+          threadId: "thread-1",
+          projectCwd: "/repo/project",
+          worktreePath: "/repo/worktrees/a",
+          observeCompletion: {},
+        });
+        if (mode === "interrupted-write") {
+          const pending = yield* launch.pipe(Effect.forkChild);
+          yield* Deferred.await(writing);
+          expect(listeners.size).toBe(1);
+          yield* Fiber.interrupt(pending);
+        } else {
+          const result = yield* launch;
+          expect(result.status).toBe("started");
+          expect(listeners.size).toBe(1);
+          for (const listener of listeners) {
+            yield* listener({
+              threadId: "thread-1",
+              terminalId: "setup-setup",
+              type: "closed",
+            });
+          }
+          // Mimics bootstrap cancellation before the completion fiber is installed.
+          expect(listeners.size).toBe(0);
+          if (result.status === "started") {
+            const completion = yield* result.completion!;
+            expect(completion.exitCode).toBeNull();
+          }
+        }
+        expect(listeners.size).toBe(0);
+        expect(unsubscribe).toHaveBeenCalledTimes(1);
+      }).pipe(Effect.provide(testLayer(project, { open, write, subscribe })));
+    },
+  );
 
   it.effect.each([
     {

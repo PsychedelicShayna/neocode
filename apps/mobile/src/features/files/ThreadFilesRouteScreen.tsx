@@ -281,6 +281,7 @@ function FileContent(props: {
         accessibilityLabel={basename(props.relativePath)}
         uri={props.previewUri}
         actionsSource={props.mediaSource}
+        onRetry={props.onRetryPreview}
       />
     );
   }

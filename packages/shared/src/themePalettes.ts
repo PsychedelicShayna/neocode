@@ -117,6 +117,8 @@ export type ThemeDefinition = Readonly<{
   collection?: Readonly<{ id: string; label: string }>;
   /** Generated from the guided editor's canvas and accent roles. */
   managed?: boolean;
+  /** Exact catalog identity of a local NeoPi copy; null means the graphical Neo default. */
+  neoPiSourceName?: string | null;
 }>;
 
 /**

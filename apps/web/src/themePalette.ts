@@ -53,6 +53,7 @@ export type ThemeFile = Readonly<{
   variants?: ThemeVariantOverrides;
   collection?: ThemeCollection;
   managed?: boolean;
+  neoPiSourceName?: string | null;
 }>;
 
 // Reserved ids come from shared so the CLI, the server watcher, and this
@@ -168,6 +169,9 @@ function parseStoredTheme(value: unknown): ThemeDefinition | null {
     colors,
     ...(variants ? { variants } : {}),
     ...(collection ? { collection } : {}),
+    ...(typeof value.neoPiSourceName === "string" || value.neoPiSourceName === null
+      ? { neoPiSourceName: value.neoPiSourceName }
+      : {}),
     ...(value.managed === true ? { managed: true } : {}),
   };
 }
@@ -1483,6 +1487,9 @@ export function parseThemeFile(value: unknown): ThemeDefinition {
     colors: { ...fallback, ...overrides },
     ...(Object.keys(variants).length > 0 ? { variants } : {}),
     ...(collection ? { collection } : {}),
+    ...(typeof value.neoPiSourceName === "string" || value.neoPiSourceName === null
+      ? { neoPiSourceName: value.neoPiSourceName }
+      : {}),
     ...(value.managed === true ? { managed: true } : {}),
   };
 }
@@ -1497,6 +1504,9 @@ export function serializeThemeFile(theme: ThemeDefinition): string {
     colors: canonicalTheme.colors,
     ...(canonicalTheme.variants ? { variants: canonicalTheme.variants } : {}),
     ...(canonicalTheme.collection ? { collection: canonicalTheme.collection } : {}),
+    ...(canonicalTheme.neoPiSourceName !== undefined
+      ? { neoPiSourceName: canonicalTheme.neoPiSourceName }
+      : {}),
     ...(canonicalTheme.managed ? { managed: true } : {}),
   };
   return `${JSON.stringify(file, null, 2)}\n`;

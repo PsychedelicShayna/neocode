@@ -10,6 +10,10 @@ client's light or dark appearance. Selecting a theme saves a local copy of its
 colors. It works offline and does not follow later changes to NeoPi's active
 theme. Hiding the catalog leaves your saved selection unchanged.
 
+Older saved copies may appear as **saved locally** instead of a catalog selection.
+Choose the catalog theme again to refresh that local copy. The graphical
+**Neo default** option is separate from a native theme with the same name.
+
 On web and desktop, the settings scope chooses which environment or project's
 catalog to browse. On mobile, choose the runtime in Appearance. These choices
 select a catalog to read; they do not change native user or project settings.

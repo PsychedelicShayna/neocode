@@ -10,7 +10,11 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useCustomThemes } from "../../hooks/useCustomThemes";
 import { useTheme } from "../../hooks/useTheme";
-import { beginNeoPiThemeSelection, saveNeoPiClientTheme } from "../../neopiLocalTheme";
+import {
+  beginNeoPiThemeSelection,
+  neoPiClientThemeSourceName,
+  saveNeoPiClientTheme,
+} from "../../neopiLocalTheme";
 import { setShowNeoPiThemes, useShowNeoPiThemes } from "../../neopiThemeCatalogPreference";
 import { useServerConfigs } from "../../state/entities";
 import { neopiThemesPalette, neopiThemesRead } from "../../state/neopiThemes";
@@ -244,7 +248,7 @@ function NativeThemeSelections({
         colors = neoPiThemeColors(appearance, response.value.colors);
       }
       if (!canApply()) return;
-      const selected = saveNeoPiClientTheme(appearance, name ?? "Neo default", colors);
+      const selected = saveNeoPiClientTheme(appearance, name, colors);
       const replacesCurrent = resolveThemeHalf(theme, themeHalves, appearance) === selected.id;
       if (!setThemeHalf(appearance, selected.id))
         throw new Error("Could not save this client's palette selection.");
@@ -277,15 +281,15 @@ function NativeThemeSelections({
         <>
           {(["dark", "light"] as const).map((appearance) => {
             const current = getThemeDefinition(resolveThemeHalf(theme, themeHalves, appearance));
-            const name = current?.label ?? null;
-            const selected = name === "Neo default" ? null : name;
+            const selected = neoPiClientThemeSourceName(current);
+            const selectedValue = selected === undefined ? "saved-local" : JSON.stringify(selected);
             return (
               <div key={appearance} className="space-y-1">
                 <label className="flex items-center justify-between gap-4 text-sm">
                   {appearance === "dark" ? "Dark palette" : "Light palette"}
                   <Select
                     disabled={pending}
-                    value={JSON.stringify(selected)}
+                    value={selectedValue}
                     onValueChange={(value) => {
                       if (value === "null") {
                         void select(appearance, null);
@@ -300,9 +304,10 @@ function NativeThemeSelections({
                     </SelectTrigger>
                     <SelectPopup>
                       <SelectItem value="null">Neo default</SelectItem>
-                      {selected !== null && !snapshot.themes.includes(selected) ? (
-                        <SelectItem value={JSON.stringify(selected)} disabled>
-                          {selected} · saved locally
+                      {selected !== null &&
+                      (selected === undefined || !snapshot.themes.includes(selected)) ? (
+                        <SelectItem value={selectedValue} disabled>
+                          {selected ?? current?.label ?? "Current palette"} · saved locally
                         </SelectItem>
                       ) : null}
                       {snapshot.themes.map((item) => (

@@ -9,6 +9,7 @@ import {
   updateCustomTheme,
   type ThemeAppearance,
   type ThemeColors,
+  type ThemeDefinition,
 } from "./themePalette";
 
 export const NEOPI_CLIENT_THEME_IDS = {
@@ -39,7 +40,7 @@ export function beginNeoPiThemeSelection() {
 /** Keep one independent, offline-capable local selection per appearance. */
 export function saveNeoPiClientTheme(
   appearance: ThemeAppearance,
-  name: string,
+  name: string | null,
   colors: ThemeColors,
 ) {
   const id = NEOPI_CLIENT_THEME_IDS[appearance];
@@ -49,10 +50,23 @@ export function saveNeoPiClientTheme(
   }
   const theme = {
     id,
-    label: name.trim().slice(0, 48),
+    label: (name ?? "Neo default").trim().slice(0, 48) || "NeoPi palette",
     appearance,
     colors,
     collection: COLLECTION,
+    neoPiSourceName: name,
   };
   return previous ? updateCustomTheme(theme) : installCustomTheme(theme);
+}
+
+/** A display label cannot identify its source: older copies may have truncated it. */
+export function neoPiClientThemeSourceName(theme: ThemeDefinition | undefined) {
+  if (
+    !theme ||
+    theme.id !== NEOPI_CLIENT_THEME_IDS[theme.appearance] ||
+    theme.collection?.id !== COLLECTION.id
+  ) {
+    return undefined;
+  }
+  return theme.neoPiSourceName;
 }

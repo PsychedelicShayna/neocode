@@ -204,7 +204,7 @@ export function WelcomeWizard({
                 )
               }
               onPaired={(environmentId) => {
-                setSelection(new Set([...selectedIds, environmentId]));
+                setSelection((current) => new Set([...(current ?? selectedIds), environmentId]));
               }}
             />
           ) : step === "neoproxy" ? (

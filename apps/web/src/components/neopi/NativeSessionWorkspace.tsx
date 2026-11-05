@@ -75,7 +75,11 @@ import {
 } from "../../state/server";
 import { selectThreadRightPanelState, useRightPanelStore } from "../../rightPanelStore";
 import type { TerminalContextDraft } from "../../lib/terminalContext";
-import { ChatComposer, type ChatComposerHandle } from "../chat/ChatComposer";
+import {
+  ChatComposer,
+  type ChatComposerHandle,
+  type NativeChatComposerProps,
+} from "../chat/ChatComposer";
 import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import { createPageScrollController } from "../chat/pageScrollController";
@@ -627,6 +631,100 @@ export function NativeSessionView({
     },
     [execute, canCycleRole],
   );
+  // Streamed tokens re-render this view, and the composer is the costliest
+  // subtree on it: everything it takes stays referentially stable until its own
+  // inputs change, so only keystrokes and real composer state re-render it.
+  const providers = serverConfig?.providers ?? EMPTY_SERVER_PROVIDERS;
+  const modelProvider = typeof model.provider === "string" ? model.provider : null;
+  const modelSelector =
+    modelProvider !== null && modelId !== null ? `${modelProvider}/${modelId}` : "";
+  const modelControl = useMemo(
+    () => (
+      <NativeSessionModelPicker
+        target={target}
+        providers={providers}
+        settings={settings}
+        keybindings={keybindings}
+        modelLabel={modelLabel}
+        modelSelector={modelSelector}
+        displayState={displayState}
+        open={models}
+        onOpenChange={setModels}
+        disabled={sending}
+        terminalOpen={terminalOpen}
+        onSelect={selectModel}
+      />
+    ),
+    [
+      target,
+      providers,
+      settings,
+      keybindings,
+      modelLabel,
+      modelSelector,
+      displayState,
+      models,
+      sending,
+      terminalOpen,
+      selectModel,
+    ],
+  );
+  const nativeSessionComposer = useMemo<NativeChatComposerProps["nativeSession"]>(
+    () => ({
+      modelControl,
+      commands,
+      attachment: session?.attachment,
+      ...(completesArguments ? { completeCommandArgument } : {}),
+      traits,
+      onSendQueuedNow: sendNextQueuedNow,
+      promptHistory,
+      modelPickerOpen: models,
+      onOpenModelPicker: () => setModels(true),
+      onOpenSessionTree: openTree,
+      onOpenModeControl: () => {
+        void execute({ type: "prompt", message: "/chat" }).catch((cause) =>
+          setLocalError(String(cause)),
+        );
+      },
+      onToggleModelPicker: () => setModels((value) => !value),
+      onCompactContext: () => {
+        void execute({ type: "prompt", message: "/compact" }).catch((cause) =>
+          setLocalError(String(cause)),
+        );
+      },
+      ...(dictationAvailable ? { dictation } : {}),
+    }),
+    [
+      modelControl,
+      commands,
+      session?.attachment,
+      completesArguments,
+      completeCommandArgument,
+      traits,
+      sendNextQueuedNow,
+      promptHistory,
+      models,
+      openTree,
+      execute,
+      dictationAvailable,
+      dictation,
+    ],
+  );
+  const onComposerSend = useCallback<NativeChatComposerProps["onSend"]>(
+    (event, intent) => {
+      event?.preventDefault();
+      void send(intent);
+    },
+    [send],
+  );
+  const setComposerError = useCallback<NativeChatComposerProps["setThreadError"]>(
+    (_, message) => setLocalError(message),
+    [],
+  );
+  const openComposerFile = useCallback<NativeChatComposerProps["onFileOpen"]>(
+    (attachment) => useRightPanelStore.getState().openAttachment(target, attachment),
+    [target],
+  );
   const dialog = feed.dialogs.find(
     (item) => typeof item.id === "string" && !dismissed.has(item.id),
   );
@@ -760,61 +858,14 @@ export function NativeSessionView({
               onPageScrollKeyDown={pageScroll.handleKeyDown}
               onPageScrollKeyUp={pageScroll.handleKeyUp}
               onPageScrollRelease={pageScroll.releaseActiveKey}
-              onSend={(event, intent) => {
-                event?.preventDefault();
-                void send(intent);
-              }}
+              onSend={onComposerSend}
               onInterrupt={interrupt}
               focusComposer={focusComposer}
               scheduleComposerFocus={focusComposer}
-              setThreadError={(_, message) => setLocalError(message)}
+              setThreadError={setComposerError}
               onExpandImage={setExpandedImage}
-              onFileOpen={(attachment) =>
-                useRightPanelStore.getState().openAttachment(target, attachment)
-              }
-              nativeSession={{
-                modelControl: (
-                  <NativeSessionModelPicker
-                    target={target}
-                    providers={serverConfig?.providers ?? EMPTY_SERVER_PROVIDERS}
-                    settings={settings}
-                    keybindings={keybindings}
-                    modelLabel={modelLabel}
-                    modelSelector={
-                      typeof model.provider === "string" && typeof model.id === "string"
-                        ? `${model.provider}/${model.id}`
-                        : ""
-                    }
-                    displayState={displayState}
-                    open={models}
-                    onOpenChange={setModels}
-                    disabled={sending}
-                    terminalOpen={terminalOpen}
-                    onSelect={selectModel}
-                  />
-                ),
-                commands,
-                attachment: session?.attachment,
-                ...(completesArguments ? { completeCommandArgument } : {}),
-                traits,
-                onSendQueuedNow: sendNextQueuedNow,
-                promptHistory,
-                modelPickerOpen: models,
-                onOpenModelPicker: () => setModels(true),
-                onOpenSessionTree: openTree,
-                onOpenModeControl: () => {
-                  void execute({ type: "prompt", message: "/chat" }).catch((cause) =>
-                    setLocalError(String(cause)),
-                  );
-                },
-                onToggleModelPicker: () => setModels((value) => !value),
-                onCompactContext: () => {
-                  void execute({ type: "prompt", message: "/compact" }).catch((cause) =>
-                    setLocalError(String(cause)),
-                  );
-                },
-                ...(dictationAvailable ? { dictation } : {}),
-              }}
+              onFileOpen={openComposerFile}
+              nativeSession={nativeSessionComposer}
             />
           </ComposerSurface.Host>
           <NativeBranchToolbar

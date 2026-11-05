@@ -2,7 +2,7 @@ import {
   nativeRecord,
   type NativeSessionFeed,
 } from "@t3tools/client-runtime/neopi-native-sessions";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
 import type { ChatComposerHandle } from "../chat/ChatComposer";
@@ -147,17 +147,18 @@ export function useNativeDictation(input: {
 
   const dismissNotice = useCallback(() => setNotice(null), []);
   const live = capture && observed?.captureId === capture.captureId ? observed : null;
-  return {
-    phase: !capture
-      ? "idle"
-      : capture.stopping || live?.phase === "transcribing"
-        ? "transcribing"
-        : live?.phase === "recording"
-          ? "recording"
-          : "starting",
-    preview: live?.text ?? "",
-    notice,
-    toggle,
-    dismissNotice,
-  };
+  const phase = !capture
+    ? "idle"
+    : capture.stopping || live?.phase === "transcribing"
+      ? "transcribing"
+      : live?.phase === "recording"
+        ? "recording"
+        : "starting";
+  const preview = live?.text ?? "";
+  // The composer takes this as a prop: a stable identity keeps it from re-rendering
+  // on every feed update that leaves the capture unchanged.
+  return useMemo(
+    () => ({ phase, preview, notice, toggle, dismissNotice }),
+    [phase, preview, notice, toggle, dismissNotice],
+  );
 }

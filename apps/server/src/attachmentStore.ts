@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import type { ChatAttachment } from "@t3tools/contracts";
@@ -214,46 +215,49 @@ export function planAttachmentClaim(input: {
   };
 }
 
-export function sweepStalePendingAttachments(input: {
+export async function sweepStalePendingAttachments(input: {
   readonly attachmentsDir: string;
   readonly nowMs: number;
-}): { readonly deleted: number } {
-  let entries: string[];
-  try {
-    entries = NodeFS.readdirSync(input.attachmentsDir);
-  } catch {
+}): Promise<{ readonly deleted: number }> {
+  const directory = await NodeFSP.opendir(input.attachmentsDir).catch(() => null);
+  if (directory === null) {
     return { deleted: 0 };
   }
 
   let deleted = 0;
-  for (const entry of entries) {
-    const isPartial = entry.endsWith(".part");
-    if (!isPartial) {
-      const attachmentId = parseAttachmentIdFromRelativePath(entry);
-      if (
-        !attachmentId ||
-        parseThreadSegmentFromAttachmentId(attachmentId) !== PENDING_ATTACHMENT_THREAD_SEGMENT
-      ) {
+  // Stream directory entries rather than reading or synchronously walking all saved files.
+  try {
+    for await (const { name: entry } of directory) {
+      const isPartial = entry.endsWith(".part");
+      if (!isPartial) {
+        const attachmentId = parseAttachmentIdFromRelativePath(entry);
+        if (
+          !attachmentId ||
+          parseThreadSegmentFromAttachmentId(attachmentId) !== PENDING_ATTACHMENT_THREAD_SEGMENT
+        ) {
+          continue;
+        }
+      }
+
+      const resolved = resolveAttachmentRelativePath({
+        attachmentsDir: input.attachmentsDir,
+        relativePath: entry,
+      });
+      if (!resolved) {
+        continue;
+      }
+      try {
+        const maxAgeMs = isPartial ? PARTIAL_UPLOAD_MAX_AGE_MS : PENDING_ATTACHMENT_MAX_AGE_MS;
+        if (input.nowMs - (await NodeFSP.stat(resolved)).mtimeMs > maxAgeMs) {
+          await NodeFSP.unlink(resolved);
+          deleted += 1;
+        }
+      } catch {
         continue;
       }
     }
-
-    const resolved = resolveAttachmentRelativePath({
-      attachmentsDir: input.attachmentsDir,
-      relativePath: entry,
-    });
-    if (!resolved) {
-      continue;
-    }
-    try {
-      const maxAgeMs = isPartial ? PARTIAL_UPLOAD_MAX_AGE_MS : PENDING_ATTACHMENT_MAX_AGE_MS;
-      if (input.nowMs - NodeFS.statSync(resolved).mtimeMs > maxAgeMs) {
-        NodeFS.unlinkSync(resolved);
-        deleted += 1;
-      }
-    } catch {
-      continue;
-    }
+  } catch {
+    // A directory removed or made unreadable during iteration is best-effort cleanup too.
   }
 
   return { deleted };

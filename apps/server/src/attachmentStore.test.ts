@@ -170,7 +170,7 @@ describe("attachmentStore", () => {
     }
   });
 
-  it("removes expired pending and partial files without touching thread attachments", () => {
+  it("removes expired pending and partial files without touching thread attachments", async () => {
     const attachmentsDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-attachment-sweep-"),
     );
@@ -186,12 +186,28 @@ describe("attachmentStore", () => {
         NodeFS.writeFileSync(filePath, Buffer.from("pixels"));
         NodeFS.utimesSync(filePath, oldTimeSeconds, oldTimeSeconds);
       }
+      const freshPendingPath = NodePath.join(attachmentsDir, `pending-${uuid}-txt.txt`);
+      const freshPartialPath = NodePath.join(attachmentsDir, "fresh.part");
+      for (const filePath of [freshPendingPath, freshPartialPath]) {
+        NodeFS.writeFileSync(filePath, "fresh");
+        NodeFS.utimesSync(filePath, now / 1_000, now / 1_000);
+      }
 
-      expect(sweepStalePendingAttachments({ attachmentsDir, nowMs: now })).toEqual({ deleted: 3 });
+      expect(await sweepStalePendingAttachments({ attachmentsDir, nowMs: now })).toEqual({
+        deleted: 3,
+      });
       expect(NodeFS.existsSync(pendingPath)).toBe(false);
       expect(NodeFS.existsSync(pendingFilePath)).toBe(false);
       expect(NodeFS.existsSync(partialPath)).toBe(false);
       expect(NodeFS.existsSync(threadPath)).toBe(true);
+      expect(NodeFS.existsSync(freshPendingPath)).toBe(true);
+      expect(NodeFS.existsSync(freshPartialPath)).toBe(true);
+      expect(
+        await sweepStalePendingAttachments({
+          attachmentsDir: NodePath.join(attachmentsDir, "missing"),
+          nowMs: now,
+        }),
+      ).toEqual({ deleted: 0 });
     } finally {
       NodeFS.rmSync(attachmentsDir, { recursive: true, force: true });
     }

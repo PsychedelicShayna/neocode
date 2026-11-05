@@ -107,7 +107,10 @@ function clampDrawerHeight(height: number): number {
   return Math.min(Math.max(Math.round(safeHeight), MIN_DRAWER_HEIGHT), maxHeight);
 }
 
-function writeSystemMessage(terminal: GhosttyTerminalSurface, message: string): void {
+function writeSystemMessage(
+  terminal: Pick<GhosttyTerminalSurface, "write">,
+  message: string,
+): void {
   terminal.write(`\r\n[terminal] ${message}\r\n`);
 }
 
@@ -120,6 +123,27 @@ export function writeTerminalOutputUpdate(
   } else if (update.type === "append") {
     terminal.write(update.data);
   }
+}
+
+type TerminalContentSnapshot = Pick<TerminalSessionState, "output" | "version" | "error">;
+
+export function synchronizeTerminalContent(
+  terminal: Pick<GhosttyTerminalSurface, "resetAndWrite" | "write" | "clearSelection">,
+  current: TerminalContentSnapshot,
+  previous: TerminalContentSnapshot,
+  cursor: TerminalOutputCursor,
+): TerminalOutputCursor {
+  let nextCursor = cursor;
+  if (current.version !== previous.version || current.output !== previous.output) {
+    const update = readTerminalOutputUpdate(current.output, cursor);
+    writeTerminalOutputUpdate(terminal, update);
+    nextCursor = update.cursor;
+    terminal.clearSelection();
+  }
+  if (current.error !== null && current.error !== previous.error) {
+    writeSystemMessage(terminal, current.error);
+  }
+  return nextCursor;
 }
 
 function parseTerminalColor(value: string, fallback: GhosttyColor): GhosttyColor {
@@ -941,18 +965,12 @@ export function TerminalViewport({
 
     const previous = previousSessionRef.current;
     synchronizeTerminalStatus(terminal, current.status);
-    if (current.version === previous.version && current.output === previous.output) {
-      return;
-    }
-
-    const outputUpdate = readTerminalOutputUpdate(current.output, outputCursorRef.current);
-    writeTerminalOutputUpdate(terminal, outputUpdate);
-    outputCursorRef.current = outputUpdate.cursor;
-    terminal.clearSelection();
-
-    if (current.error !== null && current.error !== previous.error) {
-      writeSystemMessage(terminal, current.error);
-    }
+    outputCursorRef.current = synchronizeTerminalContent(
+      terminal,
+      current,
+      previous,
+      outputCursorRef.current,
+    );
 
     previousSessionRef.current = current;
   }, [terminalOutput, terminalError, terminalStatus, terminalVersion]);

@@ -185,6 +185,9 @@ shortcut such as `alt+w`.
 Many defaults include `!terminalFocus` so they do not intercept terminal input.
 Keep that condition when remapping them if you want the same behavior.
 
+If an integrated terminal cannot attach, the failure appears inside that terminal
+even when its shell is quiet. Reconnect the environment before trying again.
+
 ## Desktop quit shortcut
 
 Use `Cmd+Q` on macOS or `Ctrl+Q` on Windows and Linux. In the default **Hold** mode,

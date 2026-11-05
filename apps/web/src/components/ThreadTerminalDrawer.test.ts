@@ -1,13 +1,41 @@
+import {
+  EMPTY_TERMINAL_SESSION_STATE,
+  INITIAL_TERMINAL_OUTPUT_CURSOR,
+} from "@t3tools/client-runtime/state/terminal";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   shouldClearTerminalSelectionAction,
   shouldHandleTerminalExit,
+  synchronizeTerminalContent,
   terminalContextMenuItems,
   terminalSelectionLineRange,
   terminalSelectionMenuItems,
   terminalThemeFromApp,
 } from "./ThreadTerminalDrawer";
+
+describe("terminal attachment errors", () => {
+  it("prints a new attachment error without output changes or disturbing selection", () => {
+    const terminal = { write: vi.fn(), resetAndWrite: vi.fn(), clearSelection: vi.fn() };
+    const failed = { ...EMPTY_TERMINAL_SESSION_STATE, error: "Attachment failed" };
+    const cursor = synchronizeTerminalContent(
+      terminal,
+      failed,
+      EMPTY_TERMINAL_SESSION_STATE,
+      INITIAL_TERMINAL_OUTPUT_CURSOR,
+    );
+    expect(terminal.write).toHaveBeenCalledExactlyOnceWith("\r\n[terminal] Attachment failed\r\n");
+    expect(terminal.resetAndWrite).not.toHaveBeenCalled();
+    expect(terminal.clearSelection).not.toHaveBeenCalled();
+    expect(cursor).toBe(INITIAL_TERMINAL_OUTPUT_CURSOR);
+
+    synchronizeTerminalContent(terminal, failed, failed, cursor);
+    expect(terminal.write).toHaveBeenCalledTimes(1);
+    synchronizeTerminalContent(terminal, EMPTY_TERMINAL_SESSION_STATE, failed, cursor);
+    synchronizeTerminalContent(terminal, failed, EMPTY_TERMINAL_SESSION_STATE, cursor);
+    expect(terminal.write).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("terminal selection menus", () => {
   it("omits Add to chat when the terminal has no chat target", () => {

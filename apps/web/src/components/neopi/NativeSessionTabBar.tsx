@@ -40,10 +40,11 @@ const TAB_STATUS = {
   ready: { label: "Ready", dot: "bg-success" },
   connecting: { label: "Connecting", dot: "bg-muted-foreground/50" },
   offline: { label: "Reconnecting · showing cached conversation", dot: "bg-muted-foreground/50" },
-  // Watching a session attaches it, so only sessions opened in this run are watched.
+  // Background tabs show inventory status without holding a native observation open.
   idle: { label: "Not connected", dot: "bg-muted-foreground/30" },
 } as const;
 type TabStatus = keyof typeof TAB_STATUS;
+const LISTED_TAB_STATUS = { busy: "working", waiting: "attention", idle: "ready" } as const;
 
 type FeedResult = AsyncResult.AsyncResult<NativeSessionFeed, unknown>;
 const UNWATCHED = Atom.make(AsyncResult.initial<NativeSessionFeed, never>());
@@ -71,20 +72,17 @@ const selectSessionId = (result: FeedResult): string =>
 function NativeSessionTab({
   tab,
   active,
-  watched,
 }: {
   readonly tab: NativeSessionTarget;
   readonly active: boolean;
-  readonly watched: boolean;
 }) {
   const listedSessions = useEnvironmentQuery(
     nativeSessionAtoms.list({ environmentId: tab.environmentId, input: {} }),
   ).data?.sessions;
-  const feed: Atom.Atom<FeedResult> = watched
+  const feed: Atom.Atom<FeedResult> = active
     ? nativeSessionAtoms.watch({ environmentId: tab.environmentId, input: { ref: tab.ref } })
     : UNWATCHED;
   const watchedStatus = useAtomValue(feed, selectStatus);
-  const status = TAB_STATUS[watched ? watchedStatus : "idle"];
   const sessionName = useAtomValue(feed, selectSessionName);
   const sessionId = useAtomValue(feed, selectSessionId);
   // A moved session (`/wt`) keeps its id while its file changes, and the list
@@ -102,6 +100,10 @@ function NativeSessionTab({
             entry.ref.providerInstanceId === tab.ref.providerInstanceId,
         )
       : undefined);
+  const status =
+    TAB_STATUS[
+      active ? watchedStatus : listed?.live ? LISTED_TAB_STATUS[listed.live.state] : "idle"
+    ];
   const title =
     listed?.title || sessionName || listed?.firstMessage.split("\n")[0]?.trim() || "New session";
   const identity = agentIdentity(
@@ -234,14 +236,7 @@ export function NativeSessionTabBar({
         {tabs.map((tab) => {
           const key = nativeSessionKey(tab);
           const active = key === activeKey;
-          return (
-            <NativeSessionTab
-              key={key}
-              tab={tab}
-              active={active}
-              watched={active || nativeSessionAtoms.cached(tab) !== undefined}
-            />
-          );
+          return <NativeSessionTab key={key} tab={tab} active={active} />;
         })}
       </div>
       <Button

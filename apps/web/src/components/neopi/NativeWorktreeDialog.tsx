@@ -15,12 +15,14 @@ export function NativeWorktreeDialog(props: {
   readonly branch: string | null;
   /** The session already works in a linked worktree. */
   readonly linked: boolean;
+  readonly lockReason: string | null;
   readonly onClose: () => void;
   readonly onSend: (message: string) => void;
   readonly onReturnFocus: () => void;
 }) {
   const [name, setName] = useState("");
   const submit = () => {
+    if (props.lockReason !== null) return;
     const branch = sanitizeNewRefName(name);
     props.onSend(branch ? `/wt ${branch}` : "/wt");
     props.onClose();
@@ -63,12 +65,19 @@ export function NativeWorktreeDialog(props: {
               }}
             />
           </label>
+          {props.lockReason ? (
+            <p role="status" className="text-xs text-muted-foreground">
+              {props.lockReason}
+            </p>
+          ) : null}
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={props.onClose}>
             Cancel
           </Button>
-          <Button onClick={submit}>Create worktree</Button>
+          <Button disabled={props.lockReason !== null} onClick={submit}>
+            Create worktree
+          </Button>
         </DialogFooter>
       </DialogPopup>
     </Dialog>

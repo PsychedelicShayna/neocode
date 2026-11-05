@@ -109,6 +109,7 @@ export function NativeBranchToolbar(props: {
     );
   };
   const choose = (item: string) => {
+    if (lockReason !== null || switching) return;
     setOpen(false);
     setQuery("");
     props.onReturnFocus();
@@ -192,7 +193,12 @@ export function NativeBranchToolbar(props: {
                 // Git refuses to check a branch out where another worktree holds it.
                 const heldElsewhere = !create && ref?.worktreePath != null && !ref.current;
                 return (
-                  <ComboboxItem key={item} hideIndicator value={item} disabled={heldElsewhere}>
+                  <ComboboxItem
+                    key={item}
+                    hideIndicator
+                    value={item}
+                    disabled={heldElsewhere || lockReason !== null || switching}
+                  >
                     {create ? (
                       <span className="truncate">
                         Create and switch to &quot;{item.slice(CREATE_BRANCH_PREFIX.length)}&quot;
@@ -219,7 +225,9 @@ export function NativeBranchToolbar(props: {
                 );
               }}
             </ComboboxList>
-            {branches.error ? (
+            {lockReason ? (
+              <ComboboxStatus>{lockReason}</ComboboxStatus>
+            ) : branches.error ? (
               <ComboboxStatus>{branches.error}</ComboboxStatus>
             ) : hasMore ? (
               <ComboboxStatus>
@@ -234,6 +242,7 @@ export function NativeBranchToolbar(props: {
           cwd={cwd}
           branch={branch}
           linked={linkedWorktree}
+          lockReason={lockReason}
           onClose={() => setWorktreeOpen(false)}
           onSend={props.onRunCommand}
           onReturnFocus={props.onReturnFocus}

@@ -222,8 +222,10 @@ listed but cannot be selected.
 **New worktree** (or **Worktree**, when the session already works in one) asks for an
 optional branch name and runs NeoPi's `/wt`: NeoPi creates the worktree, carries
 uncommitted changes into it and moves the session there. The tab and header stay on
-the same session. Both controls are disabled while NeoPi is working, because NeoPi
-refuses `/wt` mid-run and switching branches would change files under it.
+the same session. Both controls are disabled while NeoPi is working or disconnected:
+NeoPi refuses `/wt` mid-run, and switching branches would change files under it.
+If that happens while the worktree form is open, its branch name stays in place
+until NeoPi is ready again.
 
 ## Commands and skills
 

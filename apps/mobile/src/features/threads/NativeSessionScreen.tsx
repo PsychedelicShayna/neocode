@@ -2,6 +2,7 @@ import { StackActions, useNavigation, type StaticScreenProps } from "@react-navi
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
+  executeNativeSessionCommand,
   nativeCatalogModels,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
@@ -245,10 +246,14 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   }, [feed.editor, key, composer.key]);
   const execute = useCallback<Request>(
     async (command, attachments) => {
-      const result = await submit(command, attachments);
-      if (command.type !== "prompt" && command.type !== "extension_ui_response")
-        setState(nativeRecord(await request({ type: "get_state" })));
-      return result;
+      setLocalError(null);
+      return executeNativeSessionCommand({
+        command,
+        submit: () => submit(command, attachments),
+        readState: () => request({ type: "get_state" }),
+        onState: setState,
+        onRefreshError: setLocalError,
+      });
     },
     [request, submit],
   );

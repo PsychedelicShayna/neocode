@@ -2,6 +2,7 @@ import { BracesIcon, GitForkIcon, UnplugIcon } from "lucide-react";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
+  executeNativeSessionCommand,
   nativeCommandCompletions,
   nativeRecord,
   nativeSessionKey,
@@ -341,12 +342,13 @@ export function NativeSessionView({
   const execute = useCallback(
     async (command: Record<string, unknown> & { type: string }) => {
       setLocalError(null);
-      const result = await submit(command);
-      if (command.type !== "prompt" && command.type !== "extension_ui_response") {
-        const observed = await request({ type: "get_state" });
-        setState(nativeRecord(observed));
-      }
-      return result;
+      return executeNativeSessionCommand({
+        command,
+        submit: () => submit(command),
+        readState: () => request({ type: "get_state" }),
+        onState: setState,
+        onRefreshError: setLocalError,
+      });
     },
     [request, submit],
   );

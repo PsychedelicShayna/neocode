@@ -85,6 +85,31 @@ export const nativeRecord = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+
+/** A follow-up read must not turn an accepted mutation into a failed command. */
+export async function executeNativeSessionCommand<Result>(input: {
+  readonly command: { readonly type: string };
+  readonly submit: () => Promise<Result>;
+  readonly readState: () => Promise<unknown>;
+  readonly onState: (state: Record<string, unknown>) => void;
+  readonly onRefreshError: (message: string) => void;
+}): Promise<Result> {
+  const result = await input.submit();
+  if (input.command.type === "prompt" || input.command.type === "extension_ui_response") {
+    return result;
+  }
+  let state: unknown;
+  try {
+    state = await input.readState();
+  } catch {
+    input.onRefreshError(
+      "Command accepted, but the state refresh failed. Reconnect to refresh session details.",
+    );
+    return result;
+  }
+  input.onState(nativeRecord(state));
+  return result;
+}
 interface NativeCommandOutput {
   readonly id: string;
   readonly text: string;

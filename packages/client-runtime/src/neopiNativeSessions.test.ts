@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
@@ -6,6 +6,7 @@ import {
 } from "@t3tools/contracts";
 import {
   emptyNativeSessionFeed,
+  executeNativeSessionCommand,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
   nativeSessionKey,
@@ -16,6 +17,89 @@ import {
   reduceNativeSessionFeed,
   type NativeSession,
 } from "./neopiNativeSessions.ts";
+
+describe("native command acceptance and observation", () => {
+  it("returns the original acceptance receipt when the follow-up read disconnects", async () => {
+    const receipt = { accepted: true, commandId: "native-command" };
+    const submit = vi.fn().mockResolvedValue(receipt);
+    const readState = vi.fn().mockRejectedValue(new Error("Disconnected"));
+    const onState = vi.fn();
+    const onRefreshError = vi.fn();
+
+    const result = await executeNativeSessionCommand({
+      command: { type: "set_model" },
+      submit,
+      readState,
+      onState,
+      onRefreshError,
+    });
+
+    expect(result).toBe(receipt);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(readState).toHaveBeenCalledTimes(1);
+    expect(onState).not.toHaveBeenCalled();
+    expect(onRefreshError).toHaveBeenCalledWith(
+      "Command accepted, but the state refresh failed. Reconnect to refresh session details.",
+    );
+  });
+
+  it("still rejects the command's own failure without reading state or claiming acceptance", async () => {
+    const failure = new Error("The selected model is unavailable");
+    const readState = vi.fn();
+    const onRefreshError = vi.fn();
+    await expect(
+      executeNativeSessionCommand({
+        command: { type: "set_role" },
+        submit: vi.fn().mockRejectedValue(failure),
+        readState,
+        onState: vi.fn(),
+        onRefreshError,
+      }),
+    ).rejects.toBe(failure);
+    expect(readState).not.toHaveBeenCalled();
+    expect(onRefreshError).not.toHaveBeenCalled();
+  });
+
+  it("applies a successful authoritative refresh and returns the acceptance receipt", async () => {
+    const state = { model: { id: "selected-model" }, role: "reviewer" };
+    const receipt = { accepted: true };
+    const onState = vi.fn();
+    const onRefreshError = vi.fn();
+    expect(
+      await executeNativeSessionCommand({
+        command: { type: "set_role" },
+        submit: async () => receipt,
+        readState: async () => state,
+        onState,
+        onRefreshError,
+      }),
+    ).toBe(receipt);
+    expect(onState).toHaveBeenCalledWith(state);
+    expect(onRefreshError).not.toHaveBeenCalled();
+  });
+
+  it.each(["prompt", "extension_ui_response"])(
+    "does not add a state read after %s",
+    async (type) => {
+      const receipt = { accepted: true };
+      const readState = vi.fn();
+      const onState = vi.fn();
+      const onRefreshError = vi.fn();
+      expect(
+        await executeNativeSessionCommand({
+          command: { type },
+          submit: async () => receipt,
+          readState,
+          onState,
+          onRefreshError,
+        }),
+      ).toBe(receipt);
+      expect(readState).not.toHaveBeenCalled();
+      expect(onState).not.toHaveBeenCalled();
+      expect(onRefreshError).not.toHaveBeenCalled();
+    },
+  );
+});
 
 const ref = {
   providerInstanceId: ProviderInstanceId.make("neopi"),

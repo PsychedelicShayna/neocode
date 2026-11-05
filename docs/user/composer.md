@@ -281,6 +281,7 @@ files show the copy that was attached to the message.
 Select a file chip in your draft or a sent message to preview it. Code and JSON use syntax
 highlighting; Markdown, HTML, CSV, and TSV offer rendered and raw views. Audio files have
 playback controls. Large text files show a limited preview; save the file to read it in full.
+Attached files are read-only copies; edits to workspace files save automatically.
 
 On web and desktop, files open beside the conversation with the same controls as a workspace
 file: a header row with the view toggle, **Copy contents** and **Save file**. On mobile, documents

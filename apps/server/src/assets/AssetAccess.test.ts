@@ -13,7 +13,9 @@ import {
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -238,6 +240,73 @@ describe("AssetAccess", () => {
       Effect.scoped,
     );
   });
+
+  it.effect(
+    "shares a cold credential lookup across concurrent media and refreshes it after expiry",
+    () =>
+      Effect.gen(function* () {
+        // The token cache is process-local, including the preceding login regression.
+        yield* TestClock.adjust("6 minutes");
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let lookups = 0;
+        const authorizations: Array<string | undefined> = [];
+        const asset = {
+          url: "https://raw.githubusercontent.com/owner/repo/main/shot.png",
+          cwd: "/repo",
+          expiresAt: Number.MAX_SAFE_INTEGER,
+        };
+        const github = Layer.mock(GitHubCli.GitHubCli)({
+          execute: () =>
+            Effect.gen(function* () {
+              lookups++;
+              if (lookups === 1) {
+                yield* Deferred.succeed(started, undefined);
+                yield* Deferred.await(release);
+              }
+              return {
+                exitCode: ChildProcessSpawner.ExitCode(0),
+                stdout: lookups === 1 ? "initial" : "rotated",
+                stderr: "",
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              };
+            }),
+        });
+        const http = HttpClient.make((request) => {
+          authorizations.push(request.headers.authorization);
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              new Response(null, { status: 200, headers: { "content-type": "image/png" } }),
+            ),
+          );
+        });
+        yield* Effect.gen(function* () {
+          const requests = yield* Effect.all(
+            Array.from({ length: 24 }, () => githubMediaResponse(asset, {})),
+            { concurrency: "unbounded" },
+          ).pipe(Effect.forkChild);
+          yield* Deferred.await(started);
+          // Drain runnable fibers without sleeps; all requests now await auth or its cache lock.
+          yield* TestClock.adjust("0 millis");
+          expect(lookups).toBe(1);
+          yield* Deferred.succeed(release, undefined);
+          const responses = yield* Fiber.join(requests);
+          expect(responses.every((response) => response.status === 200)).toBe(true);
+          expect(lookups).toBe(1);
+          expect(authorizations).toEqual(Array.from({ length: 24 }, () => "Bearer initial"));
+          yield* TestClock.adjust("6 minutes");
+          expect((yield* githubMediaResponse(asset, {})).status).toBe(200);
+          expect(lookups).toBe(2);
+          expect(authorizations.at(-1)).toBe("Bearer rotated");
+        }).pipe(
+          Effect.provide(github),
+          Effect.provideService(HttpClient.HttpClient, http),
+          Effect.scoped,
+        );
+      }),
+  );
 
   it.effect("issues exact URLs for media and browser documents outside the workspace", () =>
     Effect.gen(function* () {

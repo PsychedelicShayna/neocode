@@ -29,6 +29,13 @@ const selectState = (feed: NativeSessionFeed) => feed.session?.state;
 const selectCwd = (feed: NativeSessionFeed) => feed.session?.cwd;
 const selectConnected = (feed: NativeSessionFeed) => feed.connected;
 const selectAgents = (feed: NativeSessionFeed) => feed.agents;
+/** Whether the running-subagent count is real: read, failed to read, or not read yet. */
+const selectAgentCountState = (feed: NativeSessionFeed) =>
+  feed.agentsKnown
+    ? "known"
+    : feed.reconciliationError?.operation === "subagents"
+      ? "unavailable"
+      : "unknown";
 const selectJobs = (feed: NativeSessionFeed) => feed.jobs;
 const selectActivity = (feed: NativeSessionFeed) => feed.activity;
 const selectCapabilities = (feed: NativeSessionFeed) => feed.session?.capabilities;
@@ -80,8 +87,16 @@ function StatusItem(props: {
 function SubagentChip({ target }: { target: NativeSessionTarget }) {
   const agents = useNativeSessionSlice(target, selectAgents);
   const flash = useSubagentFlash(agents);
-  const count = liveSubagentCount(agents);
-  const label = `${count} running ${count === 1 ? "subagent" : "subagents"}`;
+  const countState = useNativeSessionSlice(target, selectAgentCountState);
+  const live = liveSubagentCount(agents);
+  // A started frame proves at least one; otherwise an empty roster is only unknown until the inventory lands.
+  const count = countState === "known" || live > 0 ? live : null;
+  const label =
+    count !== null
+      ? `${count} running ${count === 1 ? "subagent" : "subagents"}`
+      : countState === "unavailable"
+        ? "Subagent count unavailable."
+        : "Checking subagents.";
   return (
     <Tooltip>
       <TooltipTrigger
@@ -104,7 +119,7 @@ function SubagentChip({ target }: { target: NativeSessionTarget }) {
         }
       >
         <BotIcon className="size-3" />
-        {count}
+        {count ?? (countState === "unavailable" ? "—" : "…")}
       </TooltipTrigger>
       <TooltipPopup side="top">{label}</TooltipPopup>
     </Tooltip>

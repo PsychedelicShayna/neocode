@@ -1237,3 +1237,21 @@ describe("native slash commands", () => {
     expect(feed.commandsRevision).toBe(initial().commandsRevision + 1);
   });
 });
+
+describe("subagent roster knowledge", () => {
+  it("is unknown until the live inventory is read, and unknown again whenever the roster resets", () => {
+    let feed = initial();
+    expect(feed.agentsKnown).toBe(false);
+    feed = reduceNativeSessionFeed(feed, {
+      type: "subagents",
+      ref,
+      sessionId: session.sessionId,
+      epoch: feed.agentsEpoch,
+      revision: feed.agentsRevision,
+      agents: [],
+    });
+    expect(feed.agentsKnown).toBe(true);
+    expect(feed.agents).toEqual([]);
+    expect(reduceNativeSessionFeed(feed, { type: "disconnected" }).agentsKnown).toBe(false);
+  });
+});

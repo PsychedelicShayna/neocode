@@ -172,6 +172,8 @@ interface NativeSession {
   cwdFile: string;
   state: Record<string, unknown>;
   closed: boolean;
+  /** Open `watch` streams on this connection. */
+  observers: number;
   /** A turn is in flight, from `agent_start`/`agent_end` frames and `get_state`. */
   busy: boolean;
 }
@@ -408,6 +410,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         cwd: native.cwd,
         cwdFile: file,
         closed: false,
+        observers: 0,
         busy: state.isStreaming === true,
       };
       const current = session;
@@ -761,6 +764,19 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     Stream.unwrap(
       Effect.gen(function* () {
         const session = yield* requireSession(input.ref);
+        // Watchers share one native peer, so child progress stays subscribed only while at
+        // least one is attached; the last to leave silences it. A returning watcher's own
+        // snapshot read re-requests the level it needs.
+        session.observers += 1;
+        yield* Effect.addFinalizer(() =>
+          Effect.suspend(() => {
+            session.observers -= 1;
+            if (session.observers > 0 || session.closed) return Effect.void;
+            return session.native.client
+              .request({ type: "set_subagent_subscription", level: "off" })
+              .pipe(Effect.timeoutOption("2 seconds"), Effect.ignore);
+          }),
+        );
         const events = yield* session.hub.subscribe;
         const uiEvents = yield* session.hub.subscribe;
         const pendingUi = Array.from(session.pendingUi.values());

@@ -176,6 +176,8 @@ export interface NativeSessionFeed {
   readonly agents: readonly NativeSubagent[];
   readonly agentsRevision: number;
   readonly agentsEpoch: number;
+  /** The live inventory has been read since the roster last reset; until then an empty roster means unknown, not none. */
+  readonly agentsKnown: boolean;
   /** Settled-step counter per child (`subagent_event` at the `events` level); a re-read trigger, not content. */
   readonly agentTicks: Readonly<Record<string, number>>;
   /** Background jobs; maintained only for a NeoPi that advertises `background_jobs`. */
@@ -208,6 +210,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   agents: [],
   agentsRevision: 0,
   agentsEpoch: 0,
+  agentsKnown: false,
   agentTicks: {},
   jobs: EMPTY_NATIVE_JOBS,
   activity: EMPTY_NATIVE_ACTIVITY,
@@ -293,6 +296,7 @@ export function reduceNativeSessionFeed(
         at,
       ),
       agentsRevision: feed.agentsRevision + 1,
+      agentsKnown: true,
     };
   }
   if (event.type === "jobs") {
@@ -366,6 +370,7 @@ export function reduceNativeSessionFeed(
       ),
       agentsRevision: feed.agentsRevision + 1,
       agentsEpoch: feed.agentsEpoch + 1,
+      agentsKnown: false,
       activity: closeNativeActivity(feed.activity, nowMs()),
       ...(event.type === "closed"
         ? {
@@ -409,6 +414,7 @@ export function reduceNativeSessionFeed(
         : [],
       agentsRevision: feed.agentsRevision + 1,
       agentsEpoch: feed.agentsEpoch + 1,
+      agentsKnown: false,
       jobs: sameFile ? feed.jobs : EMPTY_NATIVE_JOBS,
       activity: observeNativeActivity(
         sameFile ? closeNativeActivity(feed.activity, nowMs()) : EMPTY_NATIVE_ACTIVITY,
@@ -459,6 +465,7 @@ export function reduceNativeSessionFeed(
       activity: EMPTY_NATIVE_ACTIVITY,
       agentsRevision: feed.agentsRevision + 1,
       agentsEpoch: feed.agentsEpoch + 1,
+      agentsKnown: false,
       error:
         "The native owner changed session. Select its new native file before sending commands.",
     };
@@ -523,6 +530,7 @@ export function reduceNativeSessionFeed(
             jobs: EMPTY_NATIVE_JOBS,
             activity: EMPTY_NATIVE_ACTIVITY,
             agentsEpoch: next.agentsEpoch + 1,
+            agentsKnown: false,
           }
         : {}),
     };

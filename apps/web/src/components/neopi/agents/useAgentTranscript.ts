@@ -6,21 +6,10 @@ import {
 } from "@t3tools/client-runtime/neopi-native-agent-hub";
 import { projectTranscript, type TranscriptRow } from "@t3tools/client-runtime/neopi-transcript";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createTranscriptCache } from "./agentTranscriptCache";
 
-const MAX_CACHED_TRANSCRIPTS = 16;
 const REREAD_THROTTLE_MS = 400;
-/** Transcripts already read, so switching back to an agent continues from its cursor, not byte 0. */
-const cache = new Map<string, AgentTranscript>();
-
-function remember(key: string, transcript: AgentTranscript) {
-  cache.delete(key);
-  cache.set(key, transcript);
-  while (cache.size > MAX_CACHED_TRANSCRIPTS) {
-    const oldest = cache.keys().next();
-    if (oldest.done) break;
-    cache.delete(oldest.value);
-  }
-}
+const cache = createTranscriptCache();
 
 export interface AgentTranscriptState {
   readonly rows: readonly TranscriptRow[];
@@ -42,7 +31,7 @@ export function useAgentTranscript(
   const cacheKey = agentId === null ? null : `${source.key}\u0000${agentId}`;
   const { readTranscript } = source;
   const [transcript, setTranscript] = useState<AgentTranscript | null>(() =>
-    cacheKey === null ? null : (cache.get(cacheKey) ?? null),
+    cacheKey === null ? null : cache.get(cacheKey),
   );
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -54,7 +43,7 @@ export function useAgentTranscript(
 
   useEffect(() => {
     const epoch = ++run.current.epoch;
-    const initial = cacheKey === null ? null : (cache.get(cacheKey) ?? null);
+    const initial = cacheKey === null ? null : cache.get(cacheKey);
     latest.current = initial;
     setTranscript(initial);
     setError(null);
@@ -80,7 +69,7 @@ export function useAgentTranscript(
           const next = foldAgentTranscript(previous, agentId, result);
           if (next !== null && next !== previous) {
             latest.current = next;
-            remember(cacheKey, next);
+            cache.set(cacheKey, next);
             setTranscript(next);
           }
           setError(null);

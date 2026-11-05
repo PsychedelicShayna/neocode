@@ -61,6 +61,32 @@ const first = (watch: Stream.Stream<NeoPiModelsConfiguration, NeoPiModelsError>)
   );
 
 describe("native Models hub", () => {
+  it.live("keeps serving watchers after the scope that built it has closed", () =>
+    Effect.gen(function* () {
+      // The server builds its handlers in a scope that closes once they exist.
+      const hub = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const changes = yield* PubSub.unbounded<void>();
+          const native: NeoPiModelsConnection = {
+            capabilities: new Set(["models_configuration"]),
+            request: () => Effect.void,
+            respondUi: () => Effect.void,
+            validate: Effect.void,
+            ui: Stream.empty,
+            changes: Stream.fromPubSub(changes),
+          };
+          return yield* makeNeoPiModelsHub(
+            () => Effect.succeed(native),
+            () => Effect.succeed(snapshot("built-in-closed-scope")),
+          );
+        }),
+      );
+      expect(marker((yield* hub.watch(target).pipe(Stream.take(1), Stream.runCollect))[0])).toBe(
+        "built-in-closed-scope",
+      );
+    }),
+  );
+
   it.live("shares one native connection and one read between concurrent watchers", () =>
     Effect.scoped(
       Effect.gen(function* () {

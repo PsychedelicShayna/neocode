@@ -6,6 +6,7 @@ import {
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as RcMap from "effect/RcMap";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -13,8 +14,8 @@ import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 
 /** Reading the catalog costs NeoPi seconds; a burst of change signals is one re-read. */
 const CHANGE_COALESCE = Duration.millis(100);
-/** Short: the hub pins a native connection, and config processes are hundreds of MB. */
-const HUB_IDLE_TTL = Duration.seconds(15);
+/** Short: the hub pins a native connection, and a config process is hundreds of MB. Matches the adapter's own idle horizon. */
+const HUB_IDLE_TTL = Duration.seconds(30);
 
 type Entry =
   | { readonly _tag: "Loading" }
@@ -65,6 +66,10 @@ export const makeNeoPiModelsHub = Effect.fn("makeNeoPiModelsHub")(function* (
   ) => Effect.Effect<NeoPiModelsConfiguration, NeoPiModelsError>,
 ) {
   const live = new Map<string, SubscriptionRef.SubscriptionRef<Entry>>();
+  // `makeNeoPiModels` runs in a construction scope that closes as soon as the handlers exist, and
+  // an RcMap closed with it answers every `get` with a bare interrupt. The hub owns its lifetime:
+  // entries evict themselves HUB_IDLE_TTL after their last watcher, so nothing outlives use.
+  const lifetime = yield* Scope.make();
   const hubs: RcMap.RcMap<string, Hub, NeoPiModelsError> = yield* RcMap.make({
     lookup: (key: string) =>
       Effect.gen(function* () {
@@ -99,7 +104,7 @@ export const makeNeoPiModelsHub = Effect.fn("makeNeoPiModelsHub")(function* (
           Stream.runDrain,
           Effect.catch((error) =>
             fail(
-              error instanceof NeoPiModelsError
+              Schema.is(NeoPiModelsError)(error)
                 ? error
                 : new NeoPiModelsError({ message: String(error) }),
             ),
@@ -109,7 +114,7 @@ export const makeNeoPiModelsHub = Effect.fn("makeNeoPiModelsHub")(function* (
         return { state } satisfies Hub;
       }),
     idleTimeToLive: HUB_IDLE_TTL,
-  });
+  }).pipe(Effect.provideService(Scope.Scope, lifetime));
 
   /** Every snapshot of the source, starting with the cached one; fails when a read fails. */
   const watch = (target: NeoPiModelsTarget) =>

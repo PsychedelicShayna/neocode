@@ -18,6 +18,7 @@ import {
 } from "@t3tools/client-runtime/neopi-models";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { createModelCapabilities } from "@t3tools/shared/model";
+import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import {
   useCallback,
@@ -128,6 +129,8 @@ function ModelsLoading() {
   );
 }
 
+const MAX_RESUBSCRIBES = 3;
+
 function ModelsSnapshot({
   environmentId,
   target,
@@ -161,14 +164,43 @@ function ModelsSnapshot({
   useEffect(() => {
     if (live) rememberNeoPiModelsConfiguration(key, live);
   }, [key, live]);
-  if (AsyncResult.isFailure(result))
+  // An interrupted subscription (a reconnect, a restarted native owner) is not a failed read: the
+  // stream just ended. Resubscribe a few times before surfacing anything.
+  const interrupted = AsyncResult.isFailure(result) && Cause.hasInterruptsOnly(result.cause);
+  const resubscribes = useRef(0);
+  const retryRef = useRef(retry);
+  retryRef.current = retry;
+  const [exhausted, setExhausted] = useState(false);
+  useEffect(() => {
+    if (!interrupted) {
+      resubscribes.current = 0;
+      setExhausted(false);
+      return;
+    }
+    if (resubscribes.current >= MAX_RESUBSCRIBES) {
+      setExhausted(true);
+      return;
+    }
+    resubscribes.current += 1;
+    const timer = window.setTimeout(() => retryRef.current(), 400 * resubscribes.current);
+    return () => window.clearTimeout(timer);
+  }, [interrupted, result]);
+  if (AsyncResult.isFailure(result) && !(interrupted && !exhausted))
     return (
       <SettingsSection title="Roles">
         <SettingsRow
           title="Couldn't read models from NeoPi"
           description={formatEnvironmentQueryError(result.cause)}
           control={
-            <Button variant="outline" size="sm" onClick={retry}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                resubscribes.current = 0;
+                setExhausted(false);
+                retry();
+              }}
+            >
               Retry
             </Button>
           }

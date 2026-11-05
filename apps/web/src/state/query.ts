@@ -17,6 +17,8 @@ export interface EnvironmentQueryView<A> {
 }
 
 export function formatEnvironmentQueryError(cause: Cause.Cause<unknown>): string {
+  if (Cause.hasInterruptsOnly(cause))
+    return "The connection was interrupted before the request finished. Try again.";
   const error = Cause.squash(cause);
   return error instanceof Error && error.message.trim().length > 0
     ? error.message

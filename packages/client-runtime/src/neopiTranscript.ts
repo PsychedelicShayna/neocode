@@ -384,13 +384,15 @@ const VISIBLE_DIVIDERS = new Set([
   "branch_summary",
 ]);
 
-export function projectTranscript(
-  source: TranscriptSource,
+/**
+ * One projection pass over `rows`. `pendingTools` maps a call id to the index of
+ * its tool row while no result has joined it yet.
+ */
+function createPass(
   options: TranscriptOptions,
-): readonly TranscriptRow[] {
-  const rows: TranscriptRow[] = [];
-  const pendingTools = new Map<string, number>();
-
+  rows: TranscriptRow[],
+  pendingTools: Map<string, number>,
+) {
   const appendOutputs = (anchor: string | null) => {
     for (const output of options.commandOutputs?.get(anchor) ?? []) rows.push(output);
   };
@@ -586,72 +588,312 @@ export function projectTranscript(
       });
   };
 
-  appendOutputs(null);
-  for (let index = 0; index < source.entries.length; index++) {
-    const entry = source.entries[index]!;
-    const base = { entry, timestamp: entry.timestamp, live: false };
-    if (entry.type === "message") visitMessage(entry, false);
-    else if (entry.type === "custom_message") {
-      if (entry.display !== false || options.debug) {
-        const customType = str(entry.customType);
-        push({
-          ...base,
-          kind: "note",
-          id: `${entry.id}:custom`,
-          label:
-            customType === "async-result"
-              ? "Background result"
-              : (customType?.replaceAll("-", " ") ?? "Notice"),
-          text: stripNoticeTags(blockText(entry.content)),
-          tone: "notice",
-        });
-      }
-    } else if (VISIBLE_DIVIDERS.has(entry.type)) {
-      const next = source.entries[index + 1];
-      // Merge only when nothing (such as a command output) sits between the two entries.
-      const mergeable = next && !options.commandOutputs?.get(entry.id)?.length ? next : undefined;
-      const divider = dividerText(entry, mergeable);
-      if (divider) {
-        push({ ...base, kind: "divider", id: `${entry.id}:divider`, text: divider.text });
-        if (divider.consumed > 0 && next) {
-          if (options.debug)
-            push({
-              kind: "record",
-              id: `${next.id}:record`,
-              label: bookkeepingLabel(next),
-              entry: next,
-              timestamp: next.timestamp,
-              live: false,
-            });
-          index += divider.consumed;
-          appendOutputs(entry.id);
-          appendOutputs(next.id);
-          continue;
+  /**
+   * Projects `entries` from `from`, which must be where an iteration began
+   * (a divider that merges its successor consumes two entries in one).
+   * `onIteration` sees each iteration's first entry index and the row count before it.
+   */
+  const visitEntries = (
+    entries: ReadonlyArray<NeoPiJournalEntry>,
+    from: number,
+    onIteration?: (entryIndex: number, rowCount: number) => void,
+  ) => {
+    // A resume from the first entry already holds the outputs that precede it.
+    if (from === 0 && rows.length === 0) appendOutputs(null);
+    for (let index = from; index < entries.length; index++) {
+      onIteration?.(index, rows.length);
+      const entry = entries[index]!;
+      const base = { entry, timestamp: entry.timestamp, live: false };
+      if (entry.type === "message") visitMessage(entry, false);
+      else if (entry.type === "custom_message") {
+        if (entry.display !== false || options.debug) {
+          const customType = str(entry.customType);
+          push({
+            ...base,
+            kind: "note",
+            id: `${entry.id}:custom`,
+            label:
+              customType === "async-result"
+                ? "Background result"
+                : (customType?.replaceAll("-", " ") ?? "Notice"),
+            text: stripNoticeTags(blockText(entry.content)),
+            tone: "notice",
+          });
         }
+      } else if (VISIBLE_DIVIDERS.has(entry.type)) {
+        const next = entries[index + 1];
+        // Merge only when nothing (such as a command output) sits between the two entries.
+        const mergeable = next && !options.commandOutputs?.get(entry.id)?.length ? next : undefined;
+        const divider = dividerText(entry, mergeable);
+        if (divider) {
+          push({ ...base, kind: "divider", id: `${entry.id}:divider`, text: divider.text });
+          if (divider.consumed > 0 && next) {
+            if (options.debug)
+              push({
+                kind: "record",
+                id: `${next.id}:record`,
+                label: bookkeepingLabel(next),
+                entry: next,
+                timestamp: next.timestamp,
+                live: false,
+              });
+            index += divider.consumed;
+            appendOutputs(entry.id);
+            appendOutputs(next.id);
+            continue;
+          }
+        }
+        if (entry.type === "compaction" && options.debug && typeof entry.summary === "string")
+          push({
+            ...base,
+            kind: "note",
+            id: `${entry.id}:summary`,
+            label: "Compaction summary",
+            text: stripNoticeTags(entry.summary),
+            tone: "system",
+          });
+      } else if (options.debug) {
+        push({ ...base, kind: "record", id: `${entry.id}:record`, label: bookkeepingLabel(entry) });
       }
-      if (entry.type === "compaction" && options.debug && typeof entry.summary === "string")
-        push({
-          ...base,
-          kind: "note",
-          id: `${entry.id}:summary`,
-          label: "Compaction summary",
-          text: stripNoticeTags(entry.summary),
-          tone: "system",
-        });
-    } else if (options.debug) {
-      push({ ...base, kind: "record", id: `${entry.id}:record`, label: bookkeepingLabel(entry) });
+      appendOutputs(entry.id);
     }
-    appendOutputs(entry.id);
-  }
-  for (const { messageId, message } of source.pending) {
-    visitMessage(
-      { id: `live:${messageId}`, parentId: source.leafId, type: "message", timestamp: "", message },
-      true,
-    );
-    appendOutputs(`live:${messageId}`);
-  }
+  };
 
-  return rows;
+  const visitPending = (pending: TranscriptSource["pending"], leafId: string | null) => {
+    for (const { messageId, message } of pending) {
+      visitMessage(liveEntry(messageId, leafId, message), true);
+      appendOutputs(`live:${messageId}`);
+    }
+  };
+
+  return { visitEntries, visitPending };
+}
+
+/**
+ * A live message's synthetic journal entry. Keyed by the message object, which
+ * the conversation reducer replaces only when that message changes, so an
+ * unchanged live message keeps one entry (and rows that share it).
+ */
+const liveEntries = new WeakMap<
+  object,
+  { readonly messageId: string; readonly leafId: string | null; readonly entry: NeoPiJournalEntry }
+>();
+
+function liveEntry(
+  messageId: string,
+  leafId: string | null,
+  message: Readonly<Record<string, unknown>>,
+): NeoPiJournalEntry {
+  const hit = liveEntries.get(message);
+  if (hit && hit.messageId === messageId && hit.leafId === leafId) return hit.entry;
+  const entry: NeoPiJournalEntry = {
+    id: `live:${messageId}`,
+    parentId: leafId,
+    type: "message",
+    timestamp: "",
+    message,
+  };
+  liveEntries.set(message, { messageId, leafId, entry });
+  return entry;
+}
+
+/** Structural equality for plain JSON-like values; shared references short-circuit. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let index = 0; index < a.length; index++) if (!sameValue(a[index], b[index])) return false;
+    return true;
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  for (const key of keys) {
+    if (!(key in right) || !sameValue(left[key], right[key])) return false;
+  }
+  return true;
+}
+
+function sameCommandOutputs(
+  a: TranscriptOptions["commandOutputs"],
+  b: TranscriptOptions["commandOutputs"],
+): boolean {
+  if (a === b) return true;
+  const size = a?.size ?? 0;
+  if (size !== (b?.size ?? 0)) return false;
+  if (size === 0) return true;
+  for (const [anchor, left] of a!) {
+    const right = b!.get(anchor);
+    if (!right || right.length !== left.length) return false;
+    for (let index = 0; index < left.length; index++)
+      if (!sameValue(left[index], right[index])) return false;
+  }
+  return true;
+}
+
+/** Swaps each row for an equal row of the previous projection, so unchanged rows keep identity. */
+function shareRows(
+  rows: TranscriptRow[],
+  from: number,
+  previous: ReadonlyMap<string, TranscriptRow>,
+) {
+  for (let index = from; index < rows.length; index++) {
+    const row = rows[index]!;
+    const before = previous.get(row.id);
+    if (before && before !== row && sameValue(before, row)) rows[index] = before;
+  }
+}
+
+const sameEntries = (a: ReadonlyArray<NeoPiJournalEntry>, b: ReadonlyArray<NeoPiJournalEntry>) =>
+  a === b || (a.length === b.length && a.every((entry, index) => entry === b[index]));
+
+/** The persisted entries' rows, and what resuming after an appended entry needs. */
+interface PersistedProjection {
+  readonly entries: ReadonlyArray<NeoPiJournalEntry>;
+  readonly debug: boolean;
+  readonly commandOutputs: TranscriptOptions["commandOutputs"];
+  readonly rows: TranscriptRow[];
+  /** Unjoined tool calls after the last entry, for live results that join them. */
+  readonly pendingTools: Map<string, number>;
+  /** Per iteration of the entry loop: its first entry index and the rows before it. */
+  readonly iterationEntry: number[];
+  readonly iterationRows: number[];
+}
+
+function projectPersisted(
+  entries: ReadonlyArray<NeoPiJournalEntry>,
+  options: TranscriptOptions,
+  resume: {
+    readonly base: PersistedProjection;
+    readonly from: number;
+    readonly rowCount: number;
+    readonly iterations: number;
+    readonly pendingTools: Map<string, number>;
+  } | null,
+  previous: ReadonlyMap<string, TranscriptRow>,
+): PersistedProjection {
+  const rows = resume ? resume.base.rows.slice(0, resume.rowCount) : [];
+  const pendingTools = resume ? resume.pendingTools : new Map<string, number>();
+  const iterationEntry = resume ? resume.base.iterationEntry.slice(0, resume.iterations) : [];
+  const iterationRows = resume ? resume.base.iterationRows.slice(0, resume.iterations) : [];
+  createPass(options, rows, pendingTools).visitEntries(
+    entries,
+    resume?.from ?? 0,
+    (entryIndex, rowCount) => {
+      iterationEntry.push(entryIndex);
+      iterationRows.push(rowCount);
+    },
+  );
+  shareRows(rows, resume?.rowCount ?? 0, previous);
+  return {
+    entries,
+    debug: options.debug,
+    commandOutputs: options.commandOutputs,
+    rows,
+    pendingTools,
+    iterationEntry,
+    iterationRows,
+  };
+}
+
+/**
+ * Where `entries` can continue the cached projection of an earlier, shorter list:
+ * from the last iteration, whose output may change once an entry follows it.
+ * Null when `entries` is not an extension, or the cached rows cannot be resumed
+ * (duplicate tool call ids make the unjoined-call map ambiguous).
+ */
+function resumeAfterAppend(cached: PersistedProjection, entries: ReadonlyArray<NeoPiJournalEntry>) {
+  const count = cached.entries.length;
+  if (entries.length <= count || cached.iterationEntry.length === 0) return null;
+  for (let index = 0; index < count; index++)
+    if (entries[index] !== cached.entries[index]) return null;
+  const iterations = cached.iterationEntry.length - 1;
+  const rowCount = cached.iterationRows[iterations]!;
+  const pendingTools = new Map<string, number>();
+  const seen = new Set<string>();
+  for (let index = 0; index < rowCount; index++) {
+    const row = cached.rows[index]!;
+    if (row.kind !== "tool" || row.call.id === "") continue;
+    if (seen.has(row.call.id)) return null;
+    seen.add(row.call.id);
+    if (row.result === null) pendingTools.set(row.call.id, index);
+  }
+  return {
+    base: cached,
+    from: cached.iterationEntry[iterations]!,
+    rowCount,
+    iterations,
+    pendingTools,
+  };
+}
+
+const rowsById = (rows: ReadonlyArray<TranscriptRow>, from = 0) => {
+  const byId = new Map<string, TranscriptRow>();
+  for (let index = from; index < rows.length; index++) byId.set(rows[index]!.id, rows[index]!);
+  return byId;
+};
+
+/**
+ * `projectTranscript` for one conversation across its updates. Streaming only
+ * replaces live messages, so persisted entries project once and a delta
+ * re-projects just the live tail; an appended entry resumes from the last
+ * entry. Rows equal to the previous projection's keep their identity, so
+ * memoized consumers see only what changed.
+ */
+export function createTranscriptProjector() {
+  let cached: PersistedProjection | null = null;
+  let last: { rows: ReadonlyArray<TranscriptRow>; tail: Map<string, TranscriptRow> } | null = null;
+  return (source: TranscriptSource, options: TranscriptOptions): readonly TranscriptRow[] => {
+    const { entries } = source;
+    const reusable =
+      cached !== null &&
+      cached.debug === options.debug &&
+      sameCommandOutputs(cached.commandOutputs, options.commandOutputs);
+    let persisted: PersistedProjection;
+    if (reusable && sameEntries(cached!.entries, entries))
+      persisted = cached!.entries === entries ? cached! : { ...cached!, entries };
+    else {
+      const resume = reusable ? resumeAfterAppend(cached!, entries) : null;
+      persisted = projectPersisted(
+        entries,
+        options,
+        resume,
+        resume ? rowsById(resume.base.rows, resume.rowCount) : rowsById(last?.rows ?? []),
+      );
+    }
+    cached = persisted;
+
+    let rows: ReadonlyArray<TranscriptRow> = persisted.rows;
+    const tail = new Map<string, TranscriptRow>();
+    if (source.pending.length > 0) {
+      const next = persisted.rows.slice();
+      createPass(options, next, new Map(persisted.pendingTools)).visitPending(
+        source.pending,
+        source.leafId,
+      );
+      for (let index = 0; index < next.length; index++) {
+        if (next[index] === persisted.rows[index]) continue;
+        const row = next[index]!;
+        const before = last?.tail.get(row.id);
+        if (before && before !== row && sameValue(before, row)) next[index] = before;
+        tail.set(row.id, next[index]!);
+      }
+      rows = next;
+    }
+    if (last && last.rows.length === rows.length && last.rows.every((row, i) => row === rows[i]))
+      rows = last.rows;
+    last = { rows, tail };
+    return rows;
+  };
+}
+
+export function projectTranscript(
+  source: TranscriptSource,
+  options: TranscriptOptions,
+): readonly TranscriptRow[] {
+  return createTranscriptProjector()(source, options);
 }
 
 export function transcriptUserText(entries: ReadonlyArray<NeoPiJournalEntry>) {

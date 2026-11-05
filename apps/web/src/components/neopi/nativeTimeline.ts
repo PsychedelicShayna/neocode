@@ -218,6 +218,35 @@ function settingLabel(state: SettingState): string | null {
   return null;
 }
 
+/**
+ * A row's timeline entry depends on the row and the running state when it was
+ * reached (`a`, `b`). Rows keep their identity across updates, so a hit hands
+ * back the same entry and the timeline's streaming fast path sees unchanged history.
+ */
+const entryMemo = new WeakMap<
+  TranscriptRow,
+  { readonly a: unknown; readonly b: unknown; readonly entry: TimelineEntry }
+>();
+
+function memoized(
+  row: TranscriptRow,
+  a: unknown,
+  b: unknown,
+  build: () => TimelineEntry,
+): TimelineEntry {
+  const hit = entryMemo.get(row);
+  if (hit && hit.a === a && hit.b === b) return hit.entry;
+  const entry = build();
+  entryMemo.set(row, { a, b, entry });
+  return entry;
+}
+
+/** The merged entry for a settings change, kept while the previous entry and label hold. */
+const mergedSettingMemo = new WeakMap<
+  TimelineEntry,
+  { readonly label: string; readonly entry: TimelineEntry }
+>();
+
 export function projectNativeTimeline(
   rows: readonly TranscriptRow[],
   busy: boolean,
@@ -232,14 +261,16 @@ export function projectNativeTimeline(
   for (const row of rows) {
     if (row.kind === "command") {
       entries.push(
-        work({
-          id: row.id,
-          createdAt: lastAt ?? new Date(0).toISOString(),
-          turnId,
-          label: "Command output",
-          detail: row.text,
-          tone: "info",
-        }),
+        memoized(row, turnId, lastAt, () =>
+          work({
+            id: row.id,
+            createdAt: lastAt ?? new Date(0).toISOString(),
+            turnId,
+            label: "Command output",
+            detail: row.text,
+            tone: "info",
+          }),
+        ),
       );
       continue;
     }
@@ -257,35 +288,48 @@ export function projectNativeTimeline(
           sawTurn = true;
         }
         entries.push(
-          message(
-            row.id,
-            "user",
-            row.text,
-            turnId,
-            row.timestamp,
-            false,
-            imageAttachments(row.id, row.images),
+          memoized(row, turnId, null, () =>
+            message(
+              row.id,
+              "user",
+              row.text,
+              turnId,
+              row.timestamp,
+              false,
+              imageAttachments(row.id, row.images),
+            ),
           ),
         );
         break;
       case "assistant":
         entries.push(
-          message(
-            row.id,
-            "assistant",
-            row.text,
-            turnId,
-            row.timestamp,
-            row.live,
-            imageAttachments(row.id, row.images),
+          memoized(row, turnId, null, () =>
+            message(
+              row.id,
+              "assistant",
+              row.text,
+              turnId,
+              row.timestamp,
+              row.live,
+              imageAttachments(row.id, row.images),
+            ),
           ),
         );
         break;
       case "thinking":
-        entries.push(message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live));
+        entries.push(
+          memoized(row, turnId, null, () =>
+            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live),
+          ),
+        );
         break;
       case "tool":
-        entries.push(work(toolWorkEntry(row, turnId, busy)));
+        // Only a call still waiting for its result shows whether the run is live.
+        entries.push(
+          memoized(row, turnId, row.result ? null : busy, () =>
+            work(toolWorkEntry(row, turnId, busy)),
+          ),
+        );
         lastAt = row.result?.entry.timestamp ?? lastAt;
         workEndedAt = lastAt;
         break;
@@ -299,23 +343,30 @@ export function projectNativeTimeline(
             model: setting.model ?? lastSetting.model,
             level: setting.level ?? lastSetting.level,
           };
-          entries[entries.length - 1] = {
-            ...previous,
-            ...(previous.kind === "work"
-              ? { entry: { ...previous.entry, label: settingLabel(lastSetting) ?? row.text } }
-              : {}),
-          } as TimelineEntry;
+          const label = settingLabel(lastSetting) ?? row.text;
+          const merged = mergedSettingMemo.get(previous);
+          if (merged?.label === label) entries[entries.length - 1] = merged.entry;
+          else {
+            const entry = {
+              ...previous,
+              ...(previous.kind === "work" ? { entry: { ...previous.entry, label } } : {}),
+            } as TimelineEntry;
+            mergedSettingMemo.set(previous, { label, entry });
+            entries[entries.length - 1] = entry;
+          }
           break;
         }
         entries.push(
-          work({
-            id: row.id,
-            createdAt: row.timestamp,
-            turnId,
-            label: row.text,
-            tone: "info",
-            sourceActivityKind: "context-compaction",
-          }),
+          memoized(row, turnId, null, () =>
+            work({
+              id: row.id,
+              createdAt: row.timestamp,
+              turnId,
+              label: row.text,
+              tone: "info",
+              sourceActivityKind: "context-compaction",
+            }),
+          ),
         );
         lastSetting = setting ? { id: row.id, ...setting } : null;
         break;
@@ -324,28 +375,32 @@ export function projectNativeTimeline(
         const label = row.label.charAt(0).toUpperCase() + row.label.slice(1);
         const text = noticeText(row.text);
         entries.push(
-          work({
-            id: row.id,
-            createdAt: row.timestamp,
-            turnId,
-            label,
-            // The first line is the row label, the rest opens below it.
-            ...(text ? { intent: text.split("\n")[0]!.trim(), detail: boundedOutput(text) } : {}),
-            tone: row.tone === "error" ? "error" : "info",
-          }),
+          memoized(row, turnId, null, () =>
+            work({
+              id: row.id,
+              createdAt: row.timestamp,
+              turnId,
+              label,
+              // The first line is the row label, the rest opens below it.
+              ...(text ? { intent: text.split("\n")[0]!.trim(), detail: boundedOutput(text) } : {}),
+              tone: row.tone === "error" ? "error" : "info",
+            }),
+          ),
         );
         break;
       }
       case "record":
         entries.push(
-          work({
-            id: row.id,
-            createdAt: row.timestamp,
-            turnId,
-            label: row.label,
-            detail: JSON.stringify(row.entry, null, 2),
-            tone: "info",
-          }),
+          memoized(row, turnId, null, () =>
+            work({
+              id: row.id,
+              createdAt: row.timestamp,
+              turnId,
+              label: row.label,
+              detail: JSON.stringify(row.entry, null, 2),
+              tone: "info",
+            }),
+          ),
         );
         break;
     }

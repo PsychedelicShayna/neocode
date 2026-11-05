@@ -10,7 +10,7 @@ import {
   type NativeSlashCommand,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
-  projectTranscript,
+  createTranscriptProjector,
   transcriptUserText,
   type CommandRow,
 } from "@t3tools/client-runtime/neopi-transcript";
@@ -405,9 +405,11 @@ export function NativeSessionView({
     }
     return outputs;
   }, [feed.commandOutputs, conversation.persisted]);
+  // Streaming replaces only live messages; the projector keeps the rest of the rows as they were.
+  const [projectRows] = useState(createTranscriptProjector);
   const rows = useMemo(
     () =>
-      projectTranscript(
+      projectRows(
         {
           entries: conversation.entries,
           pending: conversation.pending,
@@ -416,6 +418,7 @@ export function NativeSessionView({
         { debug, commandOutputs },
       ),
     [
+      projectRows,
       conversation.entries,
       conversation.pending,
       conversation.identity?.leafId,

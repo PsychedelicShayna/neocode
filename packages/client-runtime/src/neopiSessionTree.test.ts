@@ -189,6 +189,32 @@ describe("filterSessionTree", () => {
     expect(ids("default", "parser")).toEqual(["u"]);
     expect(ids("default", "src/a.ts read")).toEqual(["r"]);
   });
+  it("searches beyond row snippets in string and multi-block messages", () => {
+    const longText = "x".repeat(2500);
+    const longItems = [
+      item("user", null, {
+        message: { role: "user", content: `${longText} late-user-token` },
+      }),
+      item("assistant", "user", {
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: longText },
+            { type: "text", text: " late-assistant-token" },
+          ],
+        },
+      }),
+      item("custom", "assistant", {
+        type: "custom_message",
+        content: `${longText} late-custom-token`,
+      }),
+    ];
+    const tree = projectSessionTree(longItems, "custom");
+    for (const id of ["user", "assistant", "custom"]) {
+      expect(filterSessionTree(tree, "all", `late-${id}-token`).map((row) => row.id)).toEqual([id]);
+    }
+    expect(describeSessionTreeEntry(longItems[0]!.entry, tree.toolCalls).text).toHaveLength(2000);
+  });
   it("shows the current leaf even when it is a bare tool turn", () => {
     expect(
       filterSessionTree(projectSessionTree(items, "t"), "default", "").map((row) => row.id),

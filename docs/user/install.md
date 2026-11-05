@@ -317,8 +317,9 @@ entry in view unless you scrolled away. Click a row to preview the whole entry
 under the tree, then choose **Go to this point** or press Enter; **Go and
 summarize** or Shift+Enter carries a branch summary along. Click a chevron, or
 press Left and Right, to fold a branch. The filter offers Default, No tools, User
-only, Labeled and All, and the search box narrows the rows; press `/` in the tree
-to reach it. Up, Down, Page Up, Page Down, Home and End move through rows.
+only, Labeled and All. Search matches the full text of prompts and replies, not just
+the row snippets; press `/` in the tree to reach it. Up, Down, Page Up, Page Down,
+Home and End move through rows.
 Going to a message you wrote puts it back in the composer for editing, unless the
 composer already holds a draft; that draft is kept.
 

@@ -325,6 +325,7 @@ const assistantErrorText = (message: Record<string, unknown>) =>
 export function describeSessionTreeEntry(
   entry: NeoPiJournalEntry,
   toolCalls: ReadonlyMap<string, SessionTreeToolCall>,
+  textLimit = 2000,
 ): SessionTreeDescription {
   if (entry.type === "message") {
     const message = journalRecord(entry.message);
@@ -337,11 +338,11 @@ export function describeSessionTreeEntry(
     });
     switch (role) {
       case "user":
-        return row("user", textOf(message.content));
+        return row("user", textOf(message.content, textLimit));
       case "developer":
-        return row("system", textOf(message.content));
+        return row("system", textOf(message.content, textLimit));
       case "assistant": {
-        const text = textOf(message.content);
+        const text = textOf(message.content, textLimit);
         const failure = assistantErrorText(message);
         const failed = message.stopReason === "error" || failure !== null;
         if (text) return row("assistant", text, failed);
@@ -374,13 +375,18 @@ export function describeSessionTreeEntry(
       case "pythonExecution":
         return row("tool", String(message.code ?? ""), false, "eval");
       default:
-        return row("system", textOf(message.content));
+        return row("system", textOf(message.content, textLimit));
     }
   }
   const custom = typeof entry.customType === "string" ? entry.customType : "custom";
   switch (entry.type) {
     case "custom_message":
-      return { kind: "custom", label: custom, text: oneLine(textOf(entry.content)), error: false };
+      return {
+        kind: "custom",
+        label: custom,
+        text: oneLine(textOf(entry.content, textLimit)),
+        error: false,
+      };
     case "custom":
       return { kind: "system", label: custom, text: "", error: false };
     case "compaction": {
@@ -463,7 +469,8 @@ const searchTexts = new WeakMap<SessionTreeItem, string>();
 function searchText(row: SessionTreeRow, toolCalls: SessionTreeProjection["toolCalls"]): string {
   const cached = searchTexts.get(row.item);
   if (cached !== undefined) return cached;
-  const described = describeSessionTreeEntry(row.item.entry, toolCalls);
+  // Search the full entry while keeping rendered row snippets bounded.
+  const described = describeSessionTreeEntry(row.item.entry, toolCalls, Infinity);
   const text = `${row.item.label ?? ""} ${described.label} ${described.text}`.toLowerCase();
   searchTexts.set(row.item, text);
   return text;

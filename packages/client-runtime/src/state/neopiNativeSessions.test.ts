@@ -221,6 +221,33 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
 });
 
 describe("native session observation lifetime", () => {
+  it.effect("clears a jobs reconciliation failure after a successful panel retry", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeAtomHarness();
+        const unmount = h.registry.mount(h.watch);
+        const first = yield* Queue.take(h.subscriptions);
+        yield* h.observe((feed) => feed.connected);
+        yield* Queue.offer(first.events, {
+          type: "reconciliation",
+          operation: "jobs",
+          error: "Inventory unavailable",
+        });
+        yield* h.observe((feed) => feed.reconciliationError?.operation === "jobs");
+        const result = yield* Effect.promise(() =>
+          h.atoms.request.run(h.registry, {
+            environmentId: h.target.environmentId,
+            input: { ref, command: { type: "get_jobs" } },
+          }),
+        );
+        expect(result._tag).toBe("Success");
+        const recovered = yield* h.observe((feed) => feed.reconciliationError === null);
+        expect(recovered.error).toBeNull();
+        unmount();
+      }),
+    ),
+  );
+
   it.effect(
     "reopens an explicitly closed canonical ref with cached history and command output",
     () =>

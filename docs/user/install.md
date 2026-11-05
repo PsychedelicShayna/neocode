@@ -339,7 +339,9 @@ one fails; click it to open **Agents**. Click the task count to open
 **Background tasks**, which lists NeoPi's background jobs with their output and
 a **Cancel** button for running ones. That panel needs a NeoPi release that
 supports background jobs; with an older one the count shows "—" and the panel
-says so.
+says so. While the inventory loads, the panel does not report it as empty.
+If a refresh fails, existing jobs stay visible; use **Retry** after reconnecting
+to refresh the list.
 
 Open **NeoPi session configuration** in the header to inspect native ownership,
 current permissions and role configuration. **Next owned turn** changes the

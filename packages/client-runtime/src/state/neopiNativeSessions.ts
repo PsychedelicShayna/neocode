@@ -392,6 +392,7 @@ export function createNativeSessionAtoms<R, E>(
               revision: jobsRevision,
               response: value,
             });
+          yield* publish(key, { type: "reconciliation", operation: "jobs", error: null });
         }
         if (input.command.type === "get_state") {
           yield* publish(key, { type: "state", state: nativeRecord(value) });

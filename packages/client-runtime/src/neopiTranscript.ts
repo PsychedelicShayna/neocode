@@ -771,10 +771,14 @@ function projectPersisted(
     readonly rowCount: number;
     readonly iterations: number;
     readonly pendingTools: Map<string, number>;
+    /** Tool rows the last iteration joined a result onto; they resume as open calls. */
+    readonly unjoined: ReadonlyArray<number>;
   } | null,
   previous: ReadonlyMap<string, TranscriptRow>,
 ): PersistedProjection {
   const rows = resume ? resume.base.rows.slice(0, resume.rowCount) : [];
+  for (const index of resume?.unjoined ?? [])
+    rows[index] = { ...(rows[index] as ToolRow), result: null };
   const pendingTools = resume ? resume.pendingTools : new Map<string, number>();
   const iterationEntry = resume ? resume.base.iterationEntry.slice(0, resume.iterations) : [];
   const iterationRows = resume ? resume.base.iterationRows.slice(0, resume.iterations) : [];
@@ -787,6 +791,11 @@ function projectPersisted(
     },
   );
   shareRows(rows, resume?.rowCount ?? 0, previous);
+  // Re-joined rows are new objects; equal to what they were, they stay what they were.
+  for (const index of resume?.unjoined ?? []) {
+    const before = resume!.base.rows[index]!;
+    if (sameValue(before, rows[index])) rows[index] = before;
+  }
   return {
     entries,
     debug: options.debug,
@@ -811,22 +820,21 @@ function resumeAfterAppend(cached: PersistedProjection, entries: ReadonlyArray<N
     if (entries[index] !== cached.entries[index]) return null;
   const iterations = cached.iterationEntry.length - 1;
   const rowCount = cached.iterationRows[iterations]!;
+  const from = cached.iterationEntry[iterations]!;
+  const lastEntry = cached.entries[from];
   const pendingTools = new Map<string, number>();
+  const unjoined: number[] = [];
   const seen = new Set<string>();
   for (let index = 0; index < rowCount; index++) {
     const row = cached.rows[index]!;
     if (row.kind !== "tool" || row.call.id === "") continue;
     if (seen.has(row.call.id)) return null;
     seen.add(row.call.id);
-    if (row.result === null) pendingTools.set(row.call.id, index);
+    // The last iteration may be the result that joined this call; it runs again.
+    if (row.result !== null && row.result.entry === lastEntry) unjoined.push(index);
+    if (row.result === null || row.result.entry === lastEntry) pendingTools.set(row.call.id, index);
   }
-  return {
-    base: cached,
-    from: cached.iterationEntry[iterations]!,
-    rowCount,
-    iterations,
-    pendingTools,
-  };
+  return { base: cached, from, rowCount, iterations, pendingTools, unjoined };
 }
 
 const rowsById = (rows: ReadonlyArray<TranscriptRow>, from = 0) => {

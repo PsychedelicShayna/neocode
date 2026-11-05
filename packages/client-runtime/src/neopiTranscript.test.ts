@@ -108,6 +108,18 @@ describe("createTranscriptProjector", () => {
     expect(joined).toEqual(fresh(source([...calls, result("r1", "c1")])));
   });
 
+  it("keeps a result joined to its call when more entries follow the result", () => {
+    const project = createTranscriptProjector();
+    const joined = [user("u1"), call("a1", "c1"), result("r1", "c1")];
+    const first = project(source(joined), { debug: false });
+    const entries = [...joined, reply("a2")];
+    const next = project(source(entries), { debug: false });
+    expect(next).toEqual(fresh(source(entries)));
+    expect(next.filter((row) => row.kind === "tool")).toHaveLength(1);
+    // Nothing that was shown before is replaced by an equal copy.
+    for (let index = 0; index < first.length; index++) expect(next[index]).toBe(first[index]);
+  });
+
   it("joins a live tool result onto a persisted call without disturbing the cache", () => {
     const project = createTranscriptProjector();
     const calls = [user("u1"), call("a1", "c1")];

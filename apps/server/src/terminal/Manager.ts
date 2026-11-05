@@ -1393,8 +1393,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
-    env, }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
@@ -1519,7 +1518,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     sessions: new Map(),
     killFibers: new Map(),
   });
-  const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+  interface ThreadLock {
+    readonly semaphore: Semaphore.Semaphore;
+    readonly users: number;
+  }
+  const threadLocksRef = yield* SynchronizedRef.make(new Map<string, ThreadLock>());
   const terminalEventListeners = new Set<(event: TerminalEvent) => Effect.Effect<void>>();
   const workerScope = yield* Scope.make("sequential");
   yield* Effect.addFinalizer(() => Scope.close(workerScope, Exit.void));
@@ -1548,29 +1551,46 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     f: (state: TerminalManagerState) => readonly [A, TerminalManagerState],
   ) => SynchronizedRef.modify(managerStateRef, f);
 
-  const getThreadSemaphore = (threadId: string) =>
+  // Retain queued acquirers as well as the current holder so cancellation
+  // cannot split one thread's operations across two different semaphores.
+  const retainThreadSemaphore = (threadId: string) =>
     SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
-      const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
-        current.get(threadId),
+      const existing = current.get(threadId);
+      if (existing !== undefined) {
+        const next = new Map(current).set(threadId, {
+          semaphore: existing.semaphore,
+          users: existing.users + 1,
+        });
+        return Effect.succeed([existing.semaphore, next] as const);
+      }
+      return Semaphore.make(1).pipe(
+        Effect.map(
+          (semaphore) =>
+            [semaphore, new Map(current).set(threadId, { semaphore, users: 1 })] as const,
+        ),
       );
-      return Option.match(existing, {
-        onNone: () =>
-          Semaphore.make(1).pipe(
-            Effect.map((semaphore) => {
-              const next = new Map(current);
-              next.set(threadId, semaphore);
-              return [semaphore, next] as const;
-            }),
-          ),
-        onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
-      });
     });
 
   const withThreadLock = <A, E, R>(
     threadId: string,
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E, R> =>
-    Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
+    Effect.acquireUseRelease(
+      retainThreadSemaphore(threadId),
+      (semaphore) => semaphore.withPermit(effect),
+      (semaphore) =>
+        SynchronizedRef.update(threadLocksRef, (current) => {
+          const existing = current.get(threadId);
+          if (existing === undefined || existing.semaphore !== semaphore) return current;
+          const next = new Map(current);
+          if (existing.users === 1) {
+            next.delete(threadId);
+          } else {
+            next.set(threadId, { semaphore, users: existing.users - 1 });
+          }
+          return next;
+        }),
+    );
 
   const clearKillFiber = Effect.fn("terminal.clearKillFiber")(function* (
     process: PtyAdapter.PtyProcess | null,

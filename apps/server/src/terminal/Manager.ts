@@ -1393,8 +1393,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
   )((rawProviderInstanceId: string, env: Record<string, string> | undefined) =>
-    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId,
-    env, }),
+    resolveProviderInstanceTerminalEnvironment({ serverSettings, rawProviderInstanceId, env }),
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
@@ -2758,6 +2757,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           yield* listener(attachEvent);
         }
       }
+      // The listener outlives the replay; release output it no longer needs.
+      bufferedEvents.length = 0;
 
       deliverLive = true;
       return () => {

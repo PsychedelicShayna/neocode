@@ -2032,6 +2032,78 @@ describe("PreviewManager", () => {
     ),
   );
 
+  effectIt.effect("reopens a tab without retaining its actions or reviving old control", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const evaluating = Promise.withResolvers<void>();
+        const finishEvaluation = Promise.withResolvers<unknown>();
+        const capturePage = vi.fn(async () => ({
+          toJPEG: () => Buffer.from("preview-frame"),
+          toPNG: () => Buffer.from("preview-frame"),
+          getSize: () => ({ width: 100, height: 100 }),
+        }));
+        const makeGuest = (id: number) =>
+          Object.assign(makeTestPreviewWebContents(capturePage, id), {
+            debugger: {
+              isAttached: () => false,
+              attach: vi.fn(),
+              on: vi.fn(),
+              off: vi.fn(),
+              sendCommand: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+                if (method === "Runtime.evaluate" && params?.expression === "old-action") {
+                  evaluating.resolve();
+                  return finishEvaluation.promise;
+                }
+                return {
+                  result: {
+                    value: {
+                      url: "https://example.com",
+                      title: "Example",
+                      loading: false,
+                      visibleText: "",
+                      interactiveElements: [],
+                    },
+                  },
+                };
+              }),
+            },
+          });
+        const firstGuest = makeGuest(42);
+        const replacementGuest = makeGuest(43);
+        fromId.mockImplementation((id) =>
+          id === 42 ? firstGuest : id === 43 ? replacementGuest : null,
+        );
+
+        yield* manager.createTab("tab_reopened");
+        yield* manager.registerWebview("tab_reopened", 42);
+        const oldAction = yield* manager
+          .automationEvaluate("tab_reopened", { expression: "old-action" })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => evaluating.promise);
+
+        yield* manager.closeTab("tab_reopened");
+        yield* manager.createTab("tab_reopened");
+        yield* manager.registerWebview("tab_reopened", 43);
+        const snapshot = yield* manager.automationSnapshot("tab_reopened");
+        expect(snapshot.actionTimeline.map((event) => event.action)).toEqual(["snapshot"]);
+
+        finishEvaluation.resolve({ result: { value: "old-result" } });
+        const oldExit = yield* Fiber.await(oldAction);
+        expect(Exit.isFailure(oldExit)).toBe(true);
+        if (Exit.isFailure(oldExit)) {
+          expect(Option.getOrThrow(Cause.findErrorOption(oldExit.cause))).toMatchObject({
+            _tag: "PreviewAutomationControlInterruptedError",
+          });
+        }
+        const afterCompletion = yield* manager.automationSnapshot("tab_reopened");
+        expect(afterCompletion.actionTimeline.map((event) => event.action)).toEqual([
+          "snapshot",
+          "snapshot",
+        ]);
+      }),
+    ),
+  );
+
   effectIt.effect("keeps a main-frame load failure visible until a retry starts", () =>
     withManager((manager) =>
       Effect.gen(function* () {
@@ -2410,7 +2482,7 @@ describe("PreviewManager", () => {
           if (event === "destroyed") destroyFirst = listener;
           return firstGuest;
         }) as typeof firstGuest.on);
-        fromId.mockImplementation((id) => id === 42 ? firstGuest : secondGuest);
+        fromId.mockImplementation((id) => (id === 42 ? firstGuest : secondGuest));
         for (const host of [firstHost, secondHost]) {
           yield* manager.setMainWindow({
             isDestroyed: () => false,

@@ -692,6 +692,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     { readonly semaphore: Semaphore.Semaphore; users: number }
   >();
   const tabLifecycleGenerations = new Map<string, number>();
+  let nextTabLifecycleGeneration = 0;
 
   const attempt = <A>(errorContext: PreviewOperationContext, evaluate: () => A) =>
     Effect.try({
@@ -1426,11 +1427,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     );
   });
 
-  const pushAction = (tabId: string, event: PreviewAutomationActionEvent) =>
+  const pushAction = (
+    tabId: string,
+    event: PreviewAutomationActionEvent,
+    expectedGeneration: number | undefined,
+  ) =>
     Ref.update(actionTimelineRef, (timelines) =>
-      replaceMap(timelines, (copy) => {
-        copy.set(tabId, [...(timelines.get(tabId) ?? []), event].slice(-200));
-      }),
+      expectedGeneration === undefined || tabLifecycleGenerations.get(tabId) !== expectedGeneration
+        ? timelines
+        : replaceMap(timelines, (copy) => {
+            copy.set(tabId, [...(timelines.get(tabId) ?? []), event].slice(-200));
+          }),
     );
   const replaceAction = (tabId: string, event: PreviewAutomationActionEvent) =>
     Ref.update(actionTimelineRef, (timelines) => {
@@ -1473,6 +1480,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       checkControl: Effect.Effect<void, PreviewManagerError>,
     ) => Effect.Effect<A, PreviewManagerError>,
   ) {
+    const expectedGeneration = tabLifecycleGenerations.get(tabId);
     const sequence = yield* nextCounter(actionSequenceRef);
     const startedAt = yield* currentIso;
     const millis = yield* currentMillis;
@@ -1482,14 +1490,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       status: "running",
       startedAt,
     };
-    yield* pushAction(tabId, actionEvent);
+    yield* pushAction(tabId, actionEvent, expectedGeneration);
     const epoch = (yield* Ref.get(controlEpochRef)).get(tabId) ?? 0;
     const control = yield* ensureControlSession(wc);
     const execute = Effect.fn("PreviewManager.executeControlAction")(function* () {
-      yield* update(tabId, { controller: "agent" });
       const checkControl = Effect.gen(function* () {
         const currentEpoch = (yield* Ref.get(controlEpochRef)).get(tabId) ?? 0;
-        if (currentEpoch !== epoch) {
+        if (
+          expectedGeneration === undefined ||
+          tabLifecycleGenerations.get(tabId) !== expectedGeneration ||
+          currentEpoch !== epoch
+        ) {
           return yield* new PreviewAutomationControlInterruptedError({
             operation: action,
             tabId,
@@ -1497,6 +1508,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           });
         }
       });
+      yield* checkControl;
+      yield* update(tabId, { controller: "agent" });
       const send: SendCommand = Effect.fn("PreviewManager.sendCommand")(
         function* (method, commandParams, sessionId) {
           yield* checkControl;
@@ -1534,6 +1547,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const finalize = Effect.fn("PreviewManager.finalizeControlAction")(function* (
       exit: Exit.Exit<A, PreviewManagerError>,
     ) {
+      if (
+        expectedGeneration === undefined ||
+        tabLifecycleGenerations.get(tabId) !== expectedGeneration
+      )
+        return;
       const completedAt = yield* currentIso;
       if (exit._tag === "Success") {
         yield* replaceAction(tabId, {
@@ -1672,9 +1690,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   };
 
   const consumeExpectedAgentInput = Effect.fn("PreviewManager.consumeExpectedAgentInput")(
-    function* (tabId: string, signal: PreviewInputSignal) {
+    function* (tabId: string, signal: PreviewInputSignal, expectedGeneration: number | undefined) {
       const now = yield* currentMillis;
       return yield* Ref.modify(expectedAgentInputsRef, (allExpected) => {
+        if (
+          expectedGeneration === undefined ||
+          tabLifecycleGenerations.get(tabId) !== expectedGeneration
+        )
+          return [false, allExpected] as const;
         const pending = (allExpected.get(tabId) ?? []).filter(
           (expected) => expected.expiresAt > now,
         );
@@ -1697,15 +1720,18 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const expectAgentInput = Effect.fn("PreviewManager.expectAgentInput")(function* (
     tabId: string,
     signal: PreviewInputSignal,
+    expectedGeneration: number | undefined,
   ) {
     const now = yield* currentMillis;
     yield* Ref.update(expectedAgentInputsRef, (allExpected) =>
-      replaceMap(allExpected, (copy) => {
-        const pending = (allExpected.get(tabId) ?? []).filter(
-          (expected) => expected.expiresAt > now,
-        );
-        copy.set(tabId, [...pending, { signal, expiresAt: now + 1_000 }]);
-      }),
+      expectedGeneration === undefined || tabLifecycleGenerations.get(tabId) !== expectedGeneration
+        ? allExpected
+        : replaceMap(allExpected, (copy) => {
+            const pending = (allExpected.get(tabId) ?? []).filter(
+              (expected) => expected.expiresAt > now,
+            );
+            copy.set(tabId, [...pending, { signal, expiresAt: now + 1_000 }]);
+          }),
     );
   });
 
@@ -1713,6 +1739,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     tabId: string,
     wc: Electron.WebContents,
   ) {
+    const expectedGeneration = tabLifecycleGenerations.get(tabId);
     const scope = yield* Scope.fork(parentScope, "sequential");
     const attachmentId = Symbol();
     let documentId = 0;
@@ -1918,14 +1945,28 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     const handleHumanInput = Effect.fn("PreviewManager.handleHumanInput")(function* (
       rawSignal?: unknown,
     ) {
-      if (isPreviewInputSignal(rawSignal) && (yield* consumeExpectedAgentInput(tabId, rawSignal))) {
+      if (
+        expectedGeneration === undefined ||
+        tabLifecycleGenerations.get(tabId) !== expectedGeneration
+      )
+        return;
+      if (
+        isPreviewInputSignal(rawSignal) &&
+        (yield* consumeExpectedAgentInput(tabId, rawSignal, expectedGeneration))
+      ) {
         return;
       }
-      yield* Ref.update(controlEpochRef, (epochs) =>
-        replaceMap(epochs, (copy) => {
-          copy.set(tabId, (epochs.get(tabId) ?? 0) + 1);
-        }),
+      const current = yield* Ref.modify(controlEpochRef, (epochs) =>
+        tabLifecycleGenerations.get(tabId) !== expectedGeneration
+          ? ([false, epochs] as const)
+          : ([
+              true,
+              replaceMap(epochs, (copy) => {
+                copy.set(tabId, (epochs.get(tabId) ?? 0) + 1);
+              }),
+            ] as const),
       );
+      if (!current) return;
       yield* update(
         tabId,
         { controller: "human" },
@@ -1935,7 +1976,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       );
       yield* Effect.sleep(750);
       const tabs = yield* SynchronizedRef.get(tabsRef);
-      if (tabs.get(tabId)?.controller === "human") {
+      if (
+        tabLifecycleGenerations.get(tabId) === expectedGeneration &&
+        tabs.get(tabId)?.webContentsId === wc.id &&
+        tabs.get(tabId)?.controller === "human"
+      ) {
         yield* update(tabId, { controller: "none" });
       }
     });
@@ -2151,7 +2196,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       },
     );
     if (result.created) {
-      tabLifecycleGenerations.set(tabId, (tabLifecycleGenerations.get(tabId) ?? 0) + 1);
+      tabLifecycleGenerations.set(tabId, ++nextTabLifecycleGeneration);
     }
     yield* emit(tabId, result.state);
     return result.state;
@@ -2190,6 +2235,21 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     });
     if (Option.isNone(tab)) return;
     const closedTab = tab.value;
+    tabLifecycleGenerations.delete(tabId);
+    const forgetState = <A>(ref: Ref.Ref<ReadonlyMap<string, A>>) =>
+      Ref.update(ref, (entries) =>
+        replaceMap(entries, (copy) => {
+          copy.delete(tabId);
+        }),
+      );
+    yield* Effect.all(
+      [
+        forgetState(expectedAgentInputsRef),
+        forgetState(controlEpochRef),
+        forgetState(actionTimelineRef),
+      ],
+      { discard: true },
+    );
     if (closedTab.webContentsId != null) {
       yield* Effect.all(
         [detachControlSession(closedTab.webContentsId), detachListeners(closedTab.webContentsId)],
@@ -2255,12 +2315,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         }
       }
     }
-    if (
-      !wc ||
-      wc.isDestroyed() ||
-      wc.getType() !== "webview" ||
-      !trustedHost
-    ) {
+    if (!wc || wc.isDestroyed() || wc.getType() !== "webview" || !trustedHost) {
       return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
     }
     const attached = yield* Ref.get(attachedRef);
@@ -3870,6 +3925,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     input: PreviewAutomationClickInput,
     send: SendCommand,
   ) {
+    const expectedGeneration = tabLifecycleGenerations.get(tabId);
     yield* prepareAutomationInput(send, true);
     const point = yield* resolveClickPoint(tabId, send, input);
     const viewport = yield* evaluateWithDebugger<{ width: number; height: number }>(
@@ -3907,7 +3963,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       createdAt: clickCreatedAt,
     });
     yield* Effect.sleep(AGENT_CURSOR_CLICK_LEAD_MS);
-    yield* expectAgentInput(tabId, { kind: "pointer", ...point, button: 0 });
+    yield* expectAgentInput(tabId, { kind: "pointer", ...point, button: 0 }, expectedGeneration);
     yield* send("Input.dispatchMouseEvent", {
       type: "mousePressed",
       ...point,
@@ -4243,6 +4299,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     sendCleanup: SendCommand,
     checkControl: Effect.Effect<void, PreviewManagerError>,
   ) {
+    const expectedGeneration = tabLifecycleGenerations.get(tabId);
     yield* prepareAutomationInput(send, false);
     const keySequence = makePreviewAutomationNativeKeySequence(input, {
       isMac: hostPlatform === "darwin",
@@ -4369,7 +4426,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         tabId,
         wc,
         Effect.gen(function* () {
-          yield* expectAgentInput(tabId, keySequence.signal);
+          yield* expectAgentInput(tabId, keySequence.signal, expectedGeneration);
           yield* attempt(
             { operation: "automationPress.sendInputEvent", tabId, webContentsId: wc.id },
             () => {
@@ -4613,10 +4670,13 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const destroy = Effect.fn("PreviewManager.destroy")(function* () {
     const tabs = yield* SynchronizedRef.get(tabsRef);
     yield* Effect.forEach(tabs.keys(), closeTab, { discard: true });
+    tabLifecycleGenerations.clear();
     yield* Effect.all(
       [
         Ref.set(listenersRef, new Set()),
         Ref.set(expectedAgentInputsRef, new Map()),
+        Ref.set(controlEpochRef, new Map()),
+        Ref.set(actionTimelineRef, new Map()),
         Ref.set(pointerEventListenersRef, new Set()),
         Ref.set(recordingFrameListenersRef, new Set()),
         Ref.set(recordingInputListenersRef, new Set()),

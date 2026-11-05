@@ -46,6 +46,16 @@ describe("NeoPi launch plan", () => {
       );
     }),
   );
+  it.effect("opts only supported owned runtimes into bounded parent-death cleanup", () =>
+    Effect.gen(function* () {
+      const supported = yield* buildNeoPiLaunchPlan({ ...input, exitWithParent: true });
+      const legacy = yield* buildNeoPiLaunchPlan(input);
+      NodeAssert.ok(supported.args.includes("--exit-with-parent"));
+      NodeAssert.ok(!legacy.args.includes("--exit-with-parent"));
+      NodeAssert.equal(supported.command, legacy.command);
+      NodeAssert.equal(supported.sessionDir, legacy.sessionDir);
+    }),
+  );
   it.effect(
     "maps both unrestricted modes to yolo and never lets extra args override identity",
     () =>
@@ -71,6 +81,7 @@ describe("NeoPi launch plan", () => {
           "--auto-approve",
           "--no-session",
           "--new-session",
+          "--exit-with-parent",
         ]) {
           const result = yield* buildNeoPiLaunchPlan({
             ...input,

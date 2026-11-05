@@ -21,6 +21,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { DEFAULT_CLOSE_BUDGET_MS, DEFAULT_CLOSE_GRACE_MS } from "effect-neopi-rpc/shutdown";
 
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopApp from "../app/DesktopApp.ts";
@@ -260,9 +261,9 @@ describe("DesktopBackendManager", () => {
         assert.isDefined(spawnedCommand.options.forceKillAfter);
         assert.equal(spawnedCommand.options.additionalFds?.fd4?.type, "input");
         assert.equal(spawnedCommand.options.additionalFds?.fd5?.type, "output");
-        assert.equal(
+        assert.isAbove(
           Duration.toMillis(Duration.fromInputUnsafe(spawnedCommand.options.forceKillAfter)),
-          2_000,
+          DEFAULT_CLOSE_BUDGET_MS,
         );
 
         assert.deepEqual(yield* decodeBootstrap(bootstrapJson), configWithObservability);
@@ -914,6 +915,82 @@ describe("DesktopBackendManager", () => {
     ),
   );
 
+  it.effect("keeps quit waiting until owned runtime shutdown can finish", () =>
+    Effect.gen(function* () {
+      const stopping = yield* Deferred.make<void>();
+      const allowOwnedExit = yield* Deferred.make<void>();
+      const ownedExited = yield* Deferred.make<void>();
+      const backendExited = yield* Deferred.make<void>();
+      const quitComplete = yield* Deferred.make<void>();
+      let forced = false;
+      const instance = yield* makeTestInstance({
+        spawnerLayer: Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (
+                command._tag !== "StandardCommand" ||
+                command.options.forceKillAfter === undefined
+              )
+                return yield* Effect.die(new Error("Expected a bounded backend process."));
+              const forceGrace = Duration.fromInputUnsafe(command.options.forceKillAfter);
+              yield* Effect.addFinalizer(() =>
+                Deferred.succeed(stopping, undefined).pipe(
+                  Effect.andThen(
+                    Effect.raceFirst(
+                      Deferred.await(allowOwnedExit).pipe(
+                        Effect.andThen(Deferred.succeed(ownedExited, undefined)),
+                      ),
+                      Effect.sleep(forceGrace).pipe(
+                        Effect.andThen(
+                          Effect.sync(() => {
+                            forced = true;
+                          }),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Effect.andThen(Deferred.succeed(backendExited, undefined)),
+                  Effect.asVoid,
+                ),
+              );
+              return makeProcess({
+                exitCode: Deferred.await(backendExited).pipe(
+                  Effect.as(ChildProcessSpawner.ExitCode(0)),
+                ),
+              });
+            }),
+          ),
+        ),
+        httpClientLayer: httpClientLayer(() => Effect.never),
+      });
+      yield* instance.start;
+      const pool = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
+        list: Effect.succeed([instance]),
+        get: () => Effect.succeedNone,
+        primary: Effect.die(new Error("Unused primary")),
+        register: () => Effect.die(new Error("Unused register")),
+        unregister: () => Effect.die(new Error("Unused unregister")),
+      });
+      const quitting = yield* Effect.scoped(
+        Effect.addFinalizer(() => DesktopApp.stopAllPoolInstances()),
+      ).pipe(
+        Effect.provide(pool),
+        Effect.andThen(Deferred.succeed(quitComplete, undefined)),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(stopping);
+      // A busy peer may need both its EOF and TERM grace before it can exit.
+      yield* TestClock.adjust(DEFAULT_CLOSE_GRACE_MS * 2);
+      assert.isFalse(yield* Deferred.isDone(quitComplete));
+      assert.isFalse(forced);
+      yield* Deferred.succeed(allowOwnedExit, undefined);
+      yield* Fiber.join(quitting);
+      assert.isTrue(yield* Deferred.isDone(ownedExited));
+      assert.isFalse(forced);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("restarts when start is requested during stop teardown", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1561,9 +1638,9 @@ describe("DesktopBackendManager", () => {
         const started = yield* Queue.takeN(teardownStarted, 2);
         assert.deepEqual(started.toSorted(), ["instance1", "instance2"]);
 
-        // Both backends are now hung in teardown. Advancing past the 5s
-        // budget must let the quit finalizer return without them.
-        yield* TestClock.adjust(Duration.seconds(5));
+        // Both backends are hung in teardown. The outer budget still bounds quit
+        // after allowing the backend's complete child-shutdown and output-drain windows.
+        yield* TestClock.adjust(DesktopBackendManager.DEFAULT_BACKEND_STOP_TIMEOUT);
         yield* Fiber.join(quitFiber);
         assert.equal(yield* Queue.size(teardownFinished), 0);
 

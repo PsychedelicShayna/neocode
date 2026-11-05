@@ -19,6 +19,8 @@ export interface NeoPiLaunchInput {
   readonly cursor?: NeoPiResumeCursor;
   /** Both session_lease and new_session were advertised by a preflight RPC peer. */
   readonly sharedSession?: boolean;
+  /** Only enable when the probed runtime advertises exit_with_parent for RPC mode. */
+  readonly exitWithParent?: boolean;
 }
 
 /** Older cursors predate the marker: only the T3-owned root was ever isolated. */
@@ -50,15 +52,22 @@ const protectedFlags = new Set([
   "--auto-approve",
   "--no-session",
   "--new-session",
+  "--exit-with-parent",
 ]);
 
-export const parseNeoPiLaunchArguments = Effect.fn("parseNeoPiLaunchArguments")(function* (launchArgs?: string) {
+export const parseNeoPiLaunchArguments = Effect.fn("parseNeoPiLaunchArguments")(function* (
+  launchArgs?: string,
+) {
   const extra = tokenizeCliArgs(launchArgs);
   for (const arg of extra) {
     if (arg === "--") break;
     const flag = arg.split("=", 1)[0] ?? arg;
     if (flag.startsWith("--session") || protectedFlags.has(flag))
-      return yield* new NeoPiRuntimeError({ code: "settings", flag, message: `NeoPi launch arguments may not override ${flag}` });
+      return yield* new NeoPiRuntimeError({
+        code: "settings",
+        flag,
+        message: `NeoPi launch arguments may not override ${flag}`,
+      });
   }
   return extra;
 });
@@ -80,6 +89,7 @@ export const buildNeoPiLaunchPlan = (
             projectId: input.projectId,
           }));
     const args = ["--mode", "rpc-ui", "--cwd", input.cwd, "--no-title"];
+    if (input.exitWithParent) args.push("--exit-with-parent");
     if (sessionDir) args.push("--session-dir", sessionDir);
     else args.push("--new-session");
     if (input.cursor) {

@@ -166,6 +166,9 @@ importers:
       effect:
         specifier: 4.0.0-rc.115
         version: 4.0.0-rc.115(patch_hash=0dfc4bb8ebd80fb3e06b91ef61346f5259517ab0f2437644fe95ae531084b1f5)
+      effect-neopi-rpc:
+        specifier: workspace:*
+        version: link:../../packages/effect-neopi-rpc
       electron:
         specifier: 44.4.2
         version: 44.4.2

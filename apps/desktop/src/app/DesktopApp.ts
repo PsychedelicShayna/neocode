@@ -1,5 +1,4 @@
 import * as Cause from "effect/Cause";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -18,6 +17,7 @@ import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopApplicationMenu from "../window/DesktopApplicationMenu.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
+import { DEFAULT_BACKEND_STOP_TIMEOUT } from "../backend/DesktopBackendManager.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import * as DesktopLinuxUrlHandler from "./DesktopLinuxUrlHandler.ts";
@@ -151,7 +151,7 @@ export const stopAllPoolInstances = Effect.fn("desktop.app.stopAllPoolInstances"
     const instances = yield* pool.list;
     yield* Effect.forEach(
       instances,
-      (instance) => instance.stop({ timeout: Duration.seconds(5) }),
+      (instance) => instance.stop({ timeout: DEFAULT_BACKEND_STOP_TIMEOUT }),
       { concurrency: "unbounded" },
     );
   },

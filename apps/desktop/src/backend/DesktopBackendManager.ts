@@ -40,6 +40,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { DEFAULT_CLOSE_BUDGET_MS } from "effect-neopi-rpc/shutdown";
 
 import {
   DesktopBackendBootstrap,
@@ -64,8 +65,15 @@ const MAX_PREFLIGHT_FAILURE_ATTEMPTS = 5;
 const DEFAULT_BACKEND_READINESS_TIMEOUT = Duration.minutes(1);
 const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
-const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(2);
+// Native owners finalize concurrently; allow their EOF/TERM/exit window plus
+// headroom for the server's other owned resources before force-killing its group.
+const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.millis(DEFAULT_CLOSE_BUDGET_MS + 15_000);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
+export const DEFAULT_BACKEND_STOP_TIMEOUT = Duration.millis(
+  Duration.toMillis(DEFAULT_BACKEND_TERMINATE_GRACE) +
+    Duration.toMillis(DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT) +
+    1_000,
+);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
 const { logWarning: logBackendProcessWarning } =
   DesktopObservability.makeComponentLogger("desktop-backend-process");

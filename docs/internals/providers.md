@@ -55,6 +55,18 @@ one: that original request remains pending until its next send, interruption,
 or session stop, which resolves it as a refinement. Rollback cannot remove just
 the refinement continuation without also removing its original native turn.
 
+Owned native-session scopes finalize in parallel: quitting must cost one RPC
+shutdown window, not one window per open session. The shared
+[`shutdown.ts`](../../packages/effect-neopi-rpc/src/shutdown.ts) budget covers
+stdin EOF, SIGTERM escalation and exit receipts. The desktop backend's force-kill
+grace exceeds it, and the outer application-quit deadline also includes backend
+output draining. Shortening either outer deadline can orphan detached owners.
+
+When NeoPi advertises `exit_with_parent`, owned RPC launches opt into
+`--exit-with-parent` so parent death and stdin EOF abort and dispose their work.
+Older peers retain their normal EOF-drain behavior. Control-pipe attachments
+never receive that option: closing them only detaches from the terminal's owner.
+
 ## Attachments and stored history
 
 Attachments live outside the project workspace. [ProviderService](../../apps/server/src/provider/Layers/ProviderService.ts)

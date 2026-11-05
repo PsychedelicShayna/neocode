@@ -12,6 +12,8 @@ export const NEOPI_CAPABILITIES = {
   setChatMode: "set_chat_mode",
   promptEntryIds: "prompt_entry_ids",
   planProposalCancel: "plan_proposal_cancel",
+  /** RPC mode can abort and dispose on parent death/EOF instead of draining forever. */
+  exitWithParent: "exit_with_parent",
   /** `npi sessions list|read --json` exist (NeoPi #355). */
   sessionCatalog: "session_catalog",
   /** Stable selected-branch IDs and shutdown provenance in `sessions read --json`. */

@@ -36,6 +36,7 @@ import type {
   UiResponseWire,
 } from "./schema.ts";
 import { decodeFrameLine, isRecord } from "./schema.ts";
+import { DEFAULT_CLOSE_GRACE_MS, DEFAULT_STDIO_DRAIN_MS } from "./shutdown.ts";
 
 export type {
   AgentToolResultWire,
@@ -65,9 +66,6 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
 /** Caps live stderr retention when a subscriber is attached. Unused sessions offer nothing. */
 export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
-/** How long to drain stdout/stderr after process death before releasing readers. */
-export const DEFAULT_STDIO_DRAIN_MS = 250;
-export const DEFAULT_CLOSE_GRACE_MS = 5_000;
 
 export interface NeoPiRpcClientOptions {
   readonly spawn: SpawnFn;
@@ -205,9 +203,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   );
 
   const outbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const events = options.eventQueueCapacity === undefined
-    ? yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>()
-    : yield* Queue.bounded<SessionEventFrame, Cause.Done<void>>(options.eventQueueCapacity);
+  const events =
+    options.eventQueueCapacity === undefined
+      ? yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>()
+      : yield* Queue.bounded<SessionEventFrame, Cause.Done<void>>(options.eventQueueCapacity);
   const uiRequests = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
   const hostToolCalls = yield* Queue.unbounded<
     HostToolCallFrame | HostToolCancelFrame,
@@ -244,12 +243,14 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       for (const prompt of prompts.values()) {
         // Failure must settle requests even when the bounded event consumer has
         // stopped. Prompt outcomes and process exit remain separate receipts.
-        yield* Effect.sync(() => Queue.offerUnsafe(events, {
-          type: "t3.prompt.failed",
-          id: prompt.id,
-          error: error.message,
-          code: error.code,
-        }));
+        yield* Effect.sync(() =>
+          Queue.offerUnsafe(events, {
+            type: "t3.prompt.failed",
+            id: prompt.id,
+            error: error.message,
+            code: error.code,
+          }),
+        );
         yield* completePrompt(prompt, {
           kind: "rejected",
           error: error.message,
@@ -345,8 +346,8 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               if (result.kind === "reply") return result.value;
             }
           })
-        // Native navigation and login own their interactive lifetime and cancellation.
-        : cmd.type === "navigate_tree" || cmd.type === "login"
+        : // Native navigation and login own their interactive lifetime and cancellation.
+          cmd.type === "navigate_tree" || cmd.type === "login"
           ? awaitReply
           : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
       return yield* wait.pipe(

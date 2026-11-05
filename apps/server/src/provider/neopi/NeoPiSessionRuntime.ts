@@ -708,6 +708,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       ...input,
       runtimeMode: mode,
       sharedSession,
+      exitWithParent:
+        input.sharedSessionCapabilities?.has(NEOPI_CAPABILITIES.exitWithParent) === true,
       ...(resume ? { cursor: resume } : {}),
     }).pipe(Effect.tapError(() => setState("failed")));
     const scope = yield* Scope.make();

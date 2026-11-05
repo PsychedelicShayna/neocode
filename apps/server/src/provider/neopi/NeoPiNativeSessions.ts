@@ -180,7 +180,8 @@ interface NativeSession {
 export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWith")(function* (
   dependencies: NeoPiNativeSessionsDependencies,
 ) {
-  const lifetime = yield* Effect.scope;
+  // Closing N owners must cost one RPC shutdown window, not N sequential windows.
+  const lifetime = yield* Scope.fork(yield* Effect.scope, "parallel");
   const sessions = new Map<string, NativeSession>();
   // Gates are per native path: unrelated sessions can start independently.
   const gates = new Map<string, Semaphore.Semaphore>();
@@ -1216,6 +1217,9 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         "--cwd",
         canonicalCwd,
         "--no-title",
+        ...(source.capabilities.has(NEOPI_CAPABILITIES.exitWithParent)
+          ? ["--exit-with-parent"]
+          : []),
         ...extra,
         ...(input.sessionFile ? ["--session", input.sessionFile] : ["--new-session"]),
       ];

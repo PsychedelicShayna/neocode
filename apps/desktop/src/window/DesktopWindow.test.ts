@@ -722,7 +722,7 @@ describe("DesktopWindow", () => {
     assert.equal(fakeWindow.setOpacity.mock.calls.length, 0);
   });
 
-  it("restores bounds only when the window fits within a connected display", () => {
+  it("restores bounds only when the entire window remains on connected displays", () => {
     const persistedBounds = { x: 2040, y: 80, width: 1320, height: 880 };
     const displays = [
       { x: 0, y: 0, width: 1920, height: 1080 },
@@ -735,6 +735,35 @@ describe("DesktopWindow", () => {
     );
     assert.deepEqual(
       DesktopWindow.resolveInitialMainWindowBounds(persistedBounds, [displays[0]!]),
+      DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+  });
+
+  it("restores a window straddling adjacent displays without resetting its placement", () => {
+    const displays = [
+      { x: -1920, y: 0, width: 1920, height: 1080 },
+      { x: 0, y: 0, width: 1920, height: 1080 },
+      { x: 1920, y: 0, width: 1920, height: 1080 },
+    ];
+    const spanning = { x: -240, y: 80, width: 2400, height: 800 };
+    assert.strictEqual(DesktopWindow.resolveInitialMainWindowBounds(spanning, displays), spanning);
+    assert.deepEqual(
+      DesktopWindow.resolveInitialMainWindowBounds(spanning, displays.slice(1)),
+      DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+  });
+
+  it("falls back when a display gap or a shorter monitor leaves part of the window off-screen", () => {
+    const window = { x: 1600, y: 200, width: 640, height: 800 };
+    const left = { x: 0, y: 0, width: 1920, height: 1080 };
+    const right = { x: 1920, y: 0, width: 1920, height: 1080 };
+    assert.strictEqual(DesktopWindow.resolveInitialMainWindowBounds(window, [left, right]), window);
+    assert.deepEqual(
+      DesktopWindow.resolveInitialMainWindowBounds(window, [left, { ...right, x: 2000 }]),
+      DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
+    );
+    assert.deepEqual(
+      DesktopWindow.resolveInitialMainWindowBounds(window, [left, { ...right, height: 900 }]),
       DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE,
     );
   });

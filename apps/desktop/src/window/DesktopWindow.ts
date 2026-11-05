@@ -161,16 +161,46 @@ function getInitialWindowBackgroundColor(shouldUseDarkColors: boolean): string {
 
 type DisplayBounds = Pick<Electron.Rectangle, "x" | "y" | "width" | "height">;
 
-function windowFitsWithinDisplay(
+/** A window spanning screens is restorable if every part remains on a connected display. */
+function windowFitsWithinDisplays(
   windowBounds: DesktopAppSettings.DesktopWindowBounds,
-  displayBounds: DisplayBounds,
+  displays: readonly DisplayBounds[],
 ): boolean {
-  return (
-    windowBounds.x >= displayBounds.x &&
-    windowBounds.y >= displayBounds.y &&
-    windowBounds.x + windowBounds.width <= displayBounds.x + displayBounds.width &&
-    windowBounds.y + windowBounds.height <= displayBounds.y + displayBounds.height
-  );
+  let uncovered: DisplayBounds[] = [windowBounds];
+  for (const display of displays) {
+    const remaining: DisplayBounds[] = [];
+    for (const rect of uncovered) {
+      const left = Math.max(rect.x, display.x);
+      const top = Math.max(rect.y, display.y);
+      const right = Math.min(rect.x + rect.width, display.x + display.width);
+      const bottom = Math.min(rect.y + rect.height, display.y + display.height);
+      if (left >= right || top >= bottom) {
+        remaining.push(rect);
+        continue;
+      }
+      if (rect.y < top)
+        remaining.push({ x: rect.x, y: rect.y, width: rect.width, height: top - rect.y });
+      if (bottom < rect.y + rect.height)
+        remaining.push({
+          x: rect.x,
+          y: bottom,
+          width: rect.width,
+          height: rect.y + rect.height - bottom,
+        });
+      if (rect.x < left)
+        remaining.push({ x: rect.x, y: top, width: left - rect.x, height: bottom - top });
+      if (right < rect.x + rect.width)
+        remaining.push({
+          x: right,
+          y: top,
+          width: rect.x + rect.width - right,
+          height: bottom - top,
+        });
+    }
+    if (remaining.length === 0) return true;
+    uncovered = remaining;
+  }
+  return false;
 }
 
 function windowBoundsEqual(
@@ -189,10 +219,7 @@ export function resolveInitialMainWindowBounds(
   persistedBounds: DesktopAppSettings.DesktopWindowBounds | null,
   displays: readonly DisplayBounds[],
 ): DesktopAppSettings.DesktopWindowBounds | typeof DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE {
-  if (
-    persistedBounds !== null &&
-    displays.some((display) => windowFitsWithinDisplay(persistedBounds, display))
-  ) {
+  if (persistedBounds !== null && windowFitsWithinDisplays(persistedBounds, displays)) {
     return persistedBounds;
   }
   return DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE;
@@ -1020,9 +1047,7 @@ export const make = Effect.gen(function* () {
     ),
     flushMainWindowBounds: Effect.suspend(() =>
       Effect.forEach(windowBoundsFlushes.values(), (flush) => flush, { discard: true }),
-    ).pipe(
-      Effect.withSpan("desktop.window.flushMainWindowBounds"),
-    ),
+    ).pipe(Effect.withSpan("desktop.window.flushMainWindowBounds")),
     dispatchMenuAction: Effect.fn("desktop.window.dispatchMenuAction")(function* (action, options) {
       yield* Effect.annotateCurrentSpan({ action });
       if (action === "new-window") {

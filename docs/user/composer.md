@@ -97,6 +97,10 @@ means the native source has not supplied it. Missing metrics do not make a model
 unavailable; you can still select it. Saved selections that are no longer
 available stay visible.
 
+If several NeoPi runtimes are enabled, their choices appear as each runtime
+answers. You can use an available model without waiting for another runtime;
+a failed runtime reports its own error without hiding the others.
+
 Star a model to add it to Favorites. Use the arrow keys and Enter to select, or
 click a model; Left and Right move between the rail and the list. Choosing a role
 or model applies it to the session and returns focus to the prompt. This is the

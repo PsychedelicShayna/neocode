@@ -8,7 +8,7 @@ import {
   ProviderInstanceId,
   type NeoPiModelSelectorResult,
 } from "@t3tools/contracts";
-import { deriveProviderInstanceEntries } from "../../providerInstances";
+import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../../providerInstances";
 import { NATIVE_QUERY_DEBOUNCE_MS, useNeoPiModelSelector } from "./useNeoPiModelSelector";
 import type { NativeSelectorContext } from "./neopiModelSwitcher";
 
@@ -32,6 +32,11 @@ const entries = deriveProviderInstanceEntries([
     skills: [],
   },
 ]);
+const otherInstanceId = ProviderInstanceId.make("neopi-personal");
+const multipleEntries = [
+  ...entries,
+  { ...entries[0]!, instanceId: otherInstanceId, displayName: "Personal NeoPi" },
+];
 const result = (selector: string): NeoPiModelSelectorResult => ({
   roles: [],
   error: null,
@@ -65,8 +70,16 @@ function deferred() {
 }
 let renderer: ReactTestRenderer | undefined;
 let latest: ReturnType<typeof useNeoPiModelSelector> | undefined;
-function Probe({ context, query }: { context: NativeSelectorContext; query: string }) {
-  latest = useNeoPiModelSelector(context, entries, query);
+function Probe({
+  context,
+  query,
+  instanceEntries = entries,
+}: {
+  context: NativeSelectorContext;
+  query: string;
+  instanceEntries?: ReadonlyArray<ProviderInstanceEntry>;
+}) {
+  latest = useNeoPiModelSelector(context, instanceEntries, query);
   return null;
 }
 
@@ -136,11 +149,14 @@ describe("native selector query lifetime", () => {
       first.resolve({ _tag: "Success", value: result("future/first-project") });
     });
     expect(latest?.results.size).toBe(1);
+    const firstScope = latest?.scopeKey;
     await act(async () => {
       renderer!.update(createElement(Probe, { context: secondContext, query: "" }));
     });
     expect(latest?.results.size).toBe(0);
     expect(latest?.pending).toBe(true);
+    expect(latest?.hasResponse).toBe(false);
+    expect(latest?.scopeKey).not.toBe(firstScope);
     await act(async () => {
       second.resolve({
         _tag: "Success",
@@ -191,5 +207,104 @@ describe("native selector query lifetime", () => {
       { providerInstanceId: instanceId, projectId, sessionFile: "/sessions/first.jsonl" },
       { providerInstanceId: instanceId, projectId, sessionFile: "/sessions/second.jsonl" },
     ]);
+  });
+
+  it("publishes a healthy instance before a slow one and preserves instance order", async () => {
+    const first = deferred();
+    const second = deferred();
+    mocks.read.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    await act(async () => {
+      renderer = create(
+        createElement(Probe, {
+          context: { environmentId: EnvironmentId.make("remote") },
+          query: "",
+          instanceEntries: multipleEntries,
+        }),
+      );
+    });
+    expect(latest?.hasResponse).toBe(false);
+    await act(async () => {
+      second.resolve({ _tag: "Success", value: result("future/healthy") });
+    });
+    expect(latest?.pending).toBe(true);
+    expect(latest?.hasResponse).toBe(true);
+    expect(latest?.results.get(otherInstanceId)?.items[0]?.selector).toBe("future/healthy");
+    expect(latest?.results.has(instanceId)).toBe(false);
+
+    await act(async () => {
+      first.resolve({ _tag: "Success", value: result("future/slow") });
+    });
+    expect(latest?.pending).toBe(false);
+    expect([...latest!.results.keys()]).toEqual([instanceId, otherInstanceId]);
+  });
+
+  it("publishes one instance's failure without waiting for or hiding another instance", async () => {
+    const second = deferred();
+    mocks.read.mockRejectedValueOnce(new Error("Offline")).mockReturnValueOnce(second.promise);
+    await act(async () => {
+      renderer = create(
+        createElement(Probe, {
+          context: { environmentId: EnvironmentId.make("remote") },
+          query: "",
+          instanceEntries: multipleEntries,
+        }),
+      );
+    });
+    expect(latest?.pending).toBe(true);
+    expect(latest?.hasResponse).toBe(true);
+    expect(latest?.errors[0]).toContain("Offline");
+    await act(async () => {
+      second.resolve({ _tag: "Success", value: result("future/available") });
+    });
+    expect(latest?.pending).toBe(false);
+    expect(latest?.results.get(otherInstanceId)?.items[0]?.selector).toBe("future/available");
+    expect(latest?.errors[0]).toContain("Offline");
+  });
+
+  it("rejects a slow old-query answer after publishing part of the new query", async () => {
+    const oldFirst = deferred();
+    const oldSecond = deferred();
+    const newFirst = deferred();
+    const newSecond = deferred();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    mocks.read
+      .mockReturnValueOnce(oldFirst.promise)
+      .mockReturnValueOnce(oldSecond.promise)
+      .mockReturnValueOnce(newFirst.promise)
+      .mockReturnValueOnce(newSecond.promise);
+    const context = { environmentId: EnvironmentId.make("remote") };
+    await act(async () => {
+      renderer = create(
+        createElement(Probe, { context, query: "old", instanceEntries: multipleEntries }),
+      );
+    });
+    await act(async () => {
+      oldFirst.resolve({ _tag: "Success", value: result("future/old-first") });
+    });
+    expect(latest?.hasResponse).toBe(true);
+    await act(async () => {
+      renderer!.update(
+        createElement(Probe, { context, query: "new", instanceEntries: multipleEntries }),
+      );
+    });
+    expect(latest?.hasResponse).toBe(false);
+    expect(latest?.results.size).toBe(0);
+    await act(async () => {
+      vi.advanceTimersByTime(NATIVE_QUERY_DEBOUNCE_MS);
+    });
+    await act(async () => {
+      newSecond.resolve({ _tag: "Success", value: result("future/new-second") });
+    });
+    await act(async () => {
+      oldSecond.resolve({ _tag: "Success", value: result("future/stale-second") });
+    });
+    expect(latest?.pending).toBe(true);
+    expect(latest?.results.size).toBe(1);
+    expect(latest?.results.get(otherInstanceId)?.items[0]?.selector).toBe("future/new-second");
+    await act(async () => {
+      newFirst.resolve({ _tag: "Success", value: result("future/new-first") });
+    });
+    expect(latest?.pending).toBe(false);
+    expect(latest?.results.get(instanceId)?.items[0]?.selector).toBe("future/new-first");
   });
 });

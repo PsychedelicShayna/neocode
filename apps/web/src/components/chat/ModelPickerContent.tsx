@@ -123,20 +123,24 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       query,
     ],
   );
-  // The rail and Favorites describe the whole catalog. They keep the last unfiltered
-  // answer while a search is typed or refetched instead of collapsing to the matches.
-  const [browse, setBrowse] = useState<ReadonlyArray<NativeSwitcherModel>>(EMPTY_MODELS);
-  const browseModels = query === "" && !native.pending ? queried : browse;
-  if (browseModels !== browse) setBrowse(browseModels);
+  // Keep unfiltered answers while searching, but never carry them into another native scope.
+  const [browse, setBrowse] = useState({
+    scopeKey: native.scopeKey,
+    models: EMPTY_MODELS,
+  });
+  const cachedBrowse = browse.scopeKey === native.scopeKey ? browse.models : EMPTY_MODELS;
+  const browseModels = query === "" && native.hasResponse ? queried : cachedBrowse;
+  if (browseModels !== browse.models || browse.scopeKey !== native.scopeKey)
+    setBrowse({ scopeKey: native.scopeKey, models: browseModels });
   // While NeoPi ranks a typed query, the unfiltered catalog narrows locally so results appear
   // at once; the ranked answer then replaces them, keeping the user's highlighted row in place.
   const highlightPinRef = useRef<{ key: string; index: number } | null>(null);
   const searchModels = useMemo(
     () =>
-      native.pending
-        ? filterNativeSwitcherModels(browseModels, query)
-        : pinNativeSwitcherModel(queried, highlightPinRef.current),
-    [native.pending, browseModels, query, queried],
+      native.hasResponse
+        ? pinNativeSwitcherModel(queried, highlightPinRef.current)
+        : filterNativeSwitcherModels(browseModels, query),
+    [native.hasResponse, browseModels, query, queried],
   );
   const models = query === "" ? browseModels : searchModels;
   const allModelsByKey = useMemo(

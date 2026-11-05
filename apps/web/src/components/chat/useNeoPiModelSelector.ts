@@ -11,8 +11,8 @@ const EMPTY_RESULTS: ReadonlyMap<ProviderInstanceId, NeoPiModelSelectorResult> =
 export const NATIVE_QUERY_DEBOUNCE_MS = 150;
 
 /**
- * `pending` stays true until NeoPi has answered the query as typed, so callers can show
- * their own provisional results meanwhile. Answers to older queries are discarded.
+ * Each instance publishes independently; `pending` stays true until all have answered.
+ * `hasResponse` exposes partial answers for the typed query. Older queries are discarded.
  */
 export function useNeoPiModelSelector(
   context: NativeSelectorContext,
@@ -45,6 +45,7 @@ export function useNeoPiModelSelector(
     const requests = nativeSelectorRequests(targetContext, entries);
     return {
       key: JSON.stringify({ environmentId, requests, query }),
+      scopeKey: JSON.stringify({ environmentId, requests }),
       environmentId,
       requests,
       query,
@@ -63,53 +64,59 @@ export function useNeoPiModelSelector(
     key: string;
     results: ReadonlyMap<ProviderInstanceId, NeoPiModelSelectorResult>;
     errors: ReadonlyArray<string>;
+    pending: boolean;
   } | null>(null);
   useEffect(() => {
     let current = true;
-    const run = async () => {
-      if (!request.environmentId) {
-        if (current)
-          setSnapshot({
-            key: request.key,
-            results: EMPTY_RESULTS,
-            errors: ["Connect an environment to query native models."],
-          });
-        return;
-      }
-      const environmentId = request.environmentId;
-      const responses = await Promise.all(
-        request.requests.map(async ({ target, displayName }) => {
-          try {
-            const result = await read({ environmentId, input: { target, query: request.query } });
-            if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-            return {
-              instanceId: target.providerInstanceId,
-              value: result.value,
-              error: result.value.error !== null ? `${displayName}: ${result.value.error}` : null,
-            };
-          } catch (cause) {
-            return {
-              instanceId: target.providerInstanceId,
-              value: null,
-              error: `${displayName}: ${cause instanceof Error ? cause.message : String(cause)}`,
-            };
-          }
-        }),
-      );
+    if (!request.environmentId) {
+      setSnapshot({
+        key: request.key,
+        results: EMPTY_RESULTS,
+        errors: ["Connect an environment to query native models."],
+        pending: false,
+      });
+      return;
+    }
+    const environmentId = request.environmentId;
+    const results = new Map<ProviderInstanceId, NeoPiModelSelectorResult>();
+    const errors = new Map<ProviderInstanceId, string>();
+    let remaining = request.requests.length;
+    const publish = () => {
       if (!current) return;
       setSnapshot({
         key: request.key,
         results: new Map(
-          responses.flatMap((response) =>
-            response.value && !response.error
-              ? [[response.instanceId, response.value] as const]
-              : [],
-          ),
+          request.requests.flatMap(({ target }) => {
+            const value = results.get(target.providerInstanceId);
+            return value ? [[target.providerInstanceId, value] as const] : [];
+          }),
         ),
-        errors: responses.flatMap((response) => (response.error ? [response.error] : [])),
+        errors: request.requests.flatMap(({ target }) => {
+          const error = errors.get(target.providerInstanceId);
+          return error ? [error] : [];
+        }),
+        pending: remaining > 0,
       });
     };
-    void run();
+    if (remaining === 0) publish();
+    for (const { target, displayName } of request.requests) {
+      void (async () => {
+        try {
+          const result = await read({ environmentId, input: { target, query: request.query } });
+          if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+          if (result.value.error !== null)
+            errors.set(target.providerInstanceId, `${displayName}: ${result.value.error}`);
+          else results.set(target.providerInstanceId, result.value);
+        } catch (cause) {
+          errors.set(
+            target.providerInstanceId,
+            `${displayName}: ${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
+        remaining--;
+        publish();
+      })();
+    }
     return () => {
       current = false;
     };
@@ -118,6 +125,8 @@ export function useNeoPiModelSelector(
   return {
     results: current?.results ?? EMPTY_RESULTS,
     errors: current?.errors ?? [],
-    pending: current === null,
+    pending: current?.pending ?? true,
+    hasResponse: current !== null,
+    scopeKey: request.scopeKey,
   };
 }

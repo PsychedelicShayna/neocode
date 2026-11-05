@@ -194,6 +194,23 @@ describe("filterSessionTree", () => {
       filterSessionTree(projectSessionTree(items, "t"), "default", "").map((row) => row.id),
     ).toContain("t");
   });
+  it("keeps bookmarked tool-only turns navigable in Labeled, including label searches", () => {
+    const bookmarked = projectSessionTree(
+      items.map((value) =>
+        value === toolTurn ? { ...value, label: "inspect parser bookmark" } : value,
+      ),
+      "s",
+    );
+    const bookmarkedIds = (filter: Parameters<typeof filterSessionTree>[1], query = "") =>
+      filterSessionTree(bookmarked, filter, query).map((row) => row.id);
+    expect(bookmarkedIds("labeled-only")).toEqual(["t"]);
+    expect(bookmarkedIds("labeled-only", "parser bookmark")).toEqual(["t"]);
+    expect(bookmarkedIds("labeled-only", "unmatched")).toEqual([]);
+    expect(ids("labeled-only")).toEqual([]);
+    // Ordinary browsing still folds bare turns, even when they have a bookmark.
+    expect(bookmarkedIds("default")).toEqual(["u", "r", "s"]);
+    expect(bookmarkedIds("all")).toEqual(["u", "r", "m", "s"]);
+  });
 });
 
 describe("describeSessionTreeEntry", () => {

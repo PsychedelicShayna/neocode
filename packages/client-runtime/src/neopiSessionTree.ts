@@ -478,7 +478,8 @@ export function filterSessionTree(
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
   return projection.rows.filter((row) => {
     const { entry } = row.item;
-    if (isBareToolTurn(row)) return false;
+    // Explicit bookmark browsing must not fold away the bookmarked tool turn.
+    if (filter !== "labeled-only" && isBareToolTurn(row)) return false;
     const isSettings = SETTINGS_ENTRY_TYPES.has(entry.type);
     const isToolResult =
       entry.type === "message" && journalRecord(entry.message).role === "toolResult";

@@ -30,6 +30,19 @@ export function slashCommandItemsForPromptPosition(
   );
 }
 
+function scoreCommandName(value: string, query: string): number | null {
+  return scoreQueryMatch({
+    value: value.toLowerCase(),
+    query,
+    exactBase: 0,
+    prefixBase: 2,
+    boundaryBase: 4,
+    includesBase: 6,
+    fuzzyBase: 100,
+    boundaryMarkers: ["-", "_", "/"],
+  });
+}
+
 function scoreSlashCommandItem(item: SlashSearchItem, query: string): number | null {
   if (item.type === "skill") {
     if (query === "skill") {
@@ -43,21 +56,11 @@ function scoreSlashCommandItem(item: SlashSearchItem, query: string): number | n
     return "skill".startsWith(query) ? Number.MAX_SAFE_INTEGER : null;
   }
 
-  const primaryValue =
-    item.type === "slash-command" ? item.command.toLowerCase() : item.command.name.toLowerCase();
+  const primaryValue = item.type === "slash-command" ? item.command : item.command.name;
   const description = item.description.toLowerCase();
 
   const scores = [
-    scoreQueryMatch({
-      value: primaryValue,
-      query,
-      exactBase: 0,
-      prefixBase: 2,
-      boundaryBase: 4,
-      includesBase: 6,
-      fuzzyBase: 100,
-      boundaryMarkers: ["-", "_", "/"],
-    }),
+    scoreCommandName(primaryValue, query),
     scoreQueryMatch({
       value: description,
       query,
@@ -67,6 +70,13 @@ function scoreSlashCommandItem(item: SlashSearchItem, query: string): number | n
       includesBase: 26,
     }),
   ].filter((score): score is number => score !== null);
+
+  if (item.type === "provider-slash-command") {
+    for (const alias of item.command.aliases ?? []) {
+      const score = scoreCommandName(alias, query);
+      if (score !== null) scores.push(score);
+    }
+  }
 
   if (scores.length === 0) {
     return null;

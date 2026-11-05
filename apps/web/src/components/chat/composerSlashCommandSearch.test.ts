@@ -55,6 +55,36 @@ describe("searchSlashCommandItems", () => {
     expect(searchSlashCommandItems(menu, "model")).toEqual([]);
   });
 
+  const aliasedCommand = {
+    id: "native:model",
+    type: "provider-slash-command" as const,
+    provider: ProviderDriverKind.make("neopi"),
+    command: { name: "model", aliases: ["Mi", "provider-switch", "model-switch"] },
+    label: "/model",
+    description: "Choose an inference configuration",
+  };
+
+  it.each(["mi", "/MI", "provider-sw", "pswtch", "mod"])(
+    "finds advertised aliases with query %s without duplicating the command",
+    (query) => {
+      expect(searchSlashCommandItems([aliasedCommand], query)).toEqual([aliasedCommand]);
+    },
+  );
+
+  it("ranks an exact alias ahead of a description-only match", () => {
+    const descriptionMatch = {
+      ...aliasedCommand,
+      id: "native:describe",
+      command: { name: "describe" },
+      label: "/describe",
+      description: "mi",
+    };
+    expect(searchSlashCommandItems([descriptionMatch, aliasedCommand], "mi")).toEqual([
+      aliasedCommand,
+      descriptionMatch,
+    ]);
+  });
+
   it("moves exact provider command matches ahead of broader description matches", () => {
     const items = [
       {

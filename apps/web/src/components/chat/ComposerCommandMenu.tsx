@@ -1,4 +1,7 @@
-import type { NativeCommandCompletion } from "@t3tools/client-runtime/neopi-native-sessions";
+import type {
+  NativeCommandCompletion,
+  NativeSlashCommand,
+} from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   formatProviderSkillDisplayName,
   resolveProviderSkillSourceKind,
@@ -9,7 +12,6 @@ import {
   type ProviderDriverKind,
   type PullRequestContextMetadata,
   type ServerProviderSkill,
-  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import {
   BlocksIcon,
@@ -49,7 +51,7 @@ export type ComposerCommandItem =
       id: string;
       type: "provider-slash-command";
       provider: ProviderDriverKind;
-      command: ServerProviderSlashCommand;
+      command: NativeSlashCommand;
       label: string;
       description: string;
       /** The argument hint the provider reports, shown beside the name. */

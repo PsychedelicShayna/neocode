@@ -104,31 +104,53 @@ function JobDetail(props: {
   const [outputText, setOutputText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
-  const reading = useRef(false);
+  const readState = useRef({ active: false, reading: false, pending: false });
   const viewport = useRef<HTMLPreElement>(null);
   const stickToEnd = useRef(true);
   const running = job.status === "running";
 
   const read = useCallback(async () => {
-    if (reading.current) return;
-    reading.current = true;
-    try {
-      const response = await request({
-        type: "get_job_output",
-        jobId: job.id,
-        fromByte: accumulated.current.nextByte,
-      });
-      setError(null);
-      const next = applyNativeJobOutput(accumulated.current, response);
-      if (next !== accumulated.current) {
-        accumulated.current = next;
-        setOutputText(next.text);
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      reading.current = false;
+    const current = readState.current;
+    if (!current.active) return;
+    if (current.reading) {
+      current.pending = true;
+      return;
     }
+    current.reading = true;
+    try {
+      do {
+        current.pending = false;
+        try {
+          const response = await request({
+            type: "get_job_output",
+            jobId: job.id,
+            fromByte: accumulated.current.nextByte,
+          });
+          if (!current.active) return;
+          setError(null);
+          const next = applyNativeJobOutput(accumulated.current, response);
+          if (next !== accumulated.current) {
+            accumulated.current = next;
+            setOutputText(next.text);
+          }
+        } catch (cause) {
+          if (!current.active) return;
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+        // A completion frame may stop polling while this read is in flight.
+      } while (current.active && current.pending);
+    } finally {
+      current.reading = false;
+    }
+  }, [request, job.id]);
+
+  useEffect(() => {
+    const current = { active: true, reading: false, pending: false };
+    readState.current = current;
+    return () => {
+      current.active = false;
+      current.pending = false;
+    };
   }, [request, job.id]);
 
   // A progress frame or a status change means there is more output to read.

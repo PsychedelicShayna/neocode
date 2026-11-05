@@ -337,9 +337,10 @@ windows drop the lower-priority items first. The subagent count flashes green
 when a subagent starts, red when one finishes or is stopped, and yellow when
 one fails; click it to open **Agents**. Click the task count to open
 **Background tasks**, which lists NeoPi's background jobs with their output and
-a **Cancel** button for running ones. That panel needs a NeoPi release that
-supports background jobs; with an older one the count shows "—" and the panel
-says so.
+a **Cancel** button for running ones. Select a job to follow its output through
+completion, including the final lines after it finishes. That panel needs a NeoPi
+release that supports background jobs; with an older one the count shows "—"
+and the panel says so.
 
 Open **NeoPi session configuration** in the header to inspect native ownership,
 current permissions and role configuration. **Next owned turn** changes the

@@ -3240,7 +3240,7 @@ function LiveActivityRow({
   const showShimmer = animated && shimmer;
   return (
     <div
-      ref={animated ? observeVisibleAnimation : undefined}
+      ref={showShimmer ? observeVisibleAnimation : undefined}
       className="relative min-h-6 w-fit max-w-full min-w-0 overflow-hidden rounded-md text-xs leading-relaxed"
     >
       <LiveActivityContent
@@ -3280,18 +3280,22 @@ function LiveActivityContent({
   const showTrailingFailureMark =
     failed && iconName !== undefined && !toolIconAcceptsTint(iconName, toolIcon);
 
+  // A running tool reads in full foreground against the harness grey of settled
+  // rows. It changes once when the call starts or ends: nothing repaints
+  // while it runs.
+  const lit = highlighted || active;
   return (
     <span
       className={cn(
-        "flex min-h-6 min-w-0 items-center gap-1.5",
-        highlighted ? "text-foreground" : "text-secondary-label",
+        "flex min-h-6 min-w-0 items-center gap-1.5 transition-colors duration-200",
+        lit ? "text-foreground" : "text-secondary-label",
       )}
     >
       {iconName ? (
         <span
           className={cn(
             "flex size-4 shrink-0 items-center justify-center",
-            failed ? failedToolIconClassName : highlighted ? "text-foreground" : "text-icon-muted",
+            failed ? failedToolIconClassName : lit ? "text-foreground" : "text-icon-muted",
           )}
           role={announceFailure ? "img" : undefined}
           aria-label={announceFailure ? "Tool call failed" : undefined}
@@ -3300,11 +3304,11 @@ function LiveActivityContent({
             icon={toolIcon}
             fallbackName={iconName}
             className="block size-4 shrink-0 stroke-2"
-            muted={!highlighted}
+            muted={!lit}
           />
         </span>
       ) : null}
-      <span className={cn("min-w-0 flex-1 truncate", active && "live-tool-shine")}>{label}</span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
       {showTrailingFailureMark ? (
         <XIcon aria-hidden className={cn("size-3 shrink-0", failedToolIconClassName)} />
       ) : null}

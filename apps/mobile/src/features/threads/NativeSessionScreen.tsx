@@ -1,5 +1,6 @@
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import { workspaceKey } from "@t3tools/client-runtime/environment";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
   nativeCatalogModels,
@@ -27,6 +28,7 @@ import { nativeSessionAtoms, useNativeSession } from "../../state/neopiNativeSes
 import { useNativeComposerState } from "../../state/use-native-composer-state";
 import {
   getComposerDraftSnapshot,
+  relocateComposerDraft,
   setComposerDraftText,
   waitForComposerDraftsLoaded,
 } from "../../state/use-composer-drafts";
@@ -147,14 +149,30 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     if (feed.session) setState(feed.session.state);
   }, [feed.session]);
   useEffect(() => {
-    if (feed.session && feed.session.ref.sessionFile !== target.ref.sessionFile)
-      navigation.dispatch(
-        StackActions.replace("NativeSession", {
-          environmentId: target.environmentId,
-          ...feed.session.ref,
-        }),
-      );
-  }, [feed.session, target.environmentId, target.ref.sessionFile, navigation]);
+    const movedRef = feed.movedTo ?? feed.session?.ref;
+    if (!movedRef || movedRef.sessionFile === target.ref.sessionFile) return;
+    let active = true;
+    void relocateComposerDraft(
+      composer.key,
+      workspaceKey({ environmentId: target.environmentId, ref: movedRef }),
+    ).then(
+      () => {
+        if (active)
+          navigation.dispatch(
+            StackActions.replace("NativeSession", {
+              environmentId: target.environmentId,
+              ...movedRef,
+            }),
+          );
+      },
+      (cause) => {
+        if (active) setLocalError(String(cause));
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [feed.movedTo, feed.session?.ref, target, composer.key, navigation]);
   const loadOlder = async () => {
     cancelSubmissionFollow();
     nearEndRef.current = false;

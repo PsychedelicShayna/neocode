@@ -21,6 +21,7 @@ import {
   type NativeSessionTabs,
 } from "./nativeSessionTabs";
 import { useAtomCommand } from "./use-atom-command";
+import { relocateNativeWorkspace } from "./nativeWorkspaceRelocation";
 
 export const nativeSessionAtoms = createNativeSessionAtoms(connectionAtomRuntime);
 interface NativeSessionSelection {
@@ -51,11 +52,13 @@ export const closeNativeSession = (target: NativeSessionTarget) =>
     const next = closeNativeSessionTab(state.tabs, state.target, target);
     return { target: next.active, tabs: next.tabs };
   });
-export const replaceNativeSession = (from: NativeSessionTarget, to: NativeSessionTarget) =>
+export const replaceNativeSession = (from: NativeSessionTarget, to: NativeSessionTarget) => {
+  relocateNativeWorkspace(from, to);
   useNativeSessionSelection.setState((state) => ({
     target: to,
     tabs: replaceNativeSessionTab(state.tabs, from, to),
   }));
+};
 /** Returns whether there was another tab to move to. */
 export const cycleNativeSession = (direction: "previous" | "next") => {
   const { target, tabs } = useNativeSessionSelection.getState();

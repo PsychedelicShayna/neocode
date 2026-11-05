@@ -72,3 +72,54 @@ export function syncNativeComposerDrafts(
   }
   return next;
 }
+
+/** A same-session file move transfers the draft; a fork still gets its own draft. */
+export function relocateNativeComposerDraft(
+  current: Record<string, ComposerDraft>,
+  from: string,
+  to: string,
+): Record<string, ComposerDraft> {
+  if (from === to || !current[from]) return current;
+  const source = canonicalContent(current[from]);
+  const destination = current[to];
+  const text =
+    !destination?.text || destination.text === source.text
+      ? source.text
+      : [source.text, destination.text].filter(Boolean).join("\n\n");
+  const attachments = destination
+    ? [
+        ...new Map(
+          [...destination.attachments, ...source.attachments].map((item) => [item.id, item]),
+        ).values(),
+      ]
+    : source.attachments;
+  const records = new Map(
+    [...(destination?.context?.records ?? []), ...(source.context?.records ?? [])].map((record) => [
+      record.contextId,
+      record,
+    ]),
+  );
+  const moved: ComposerDraft = {
+    ...destination,
+    ...source,
+    text,
+    attachments,
+    ...(records.size ? { context: { version: 1, records: [...records.values()] } } : {}),
+    ...(source.importedShareIds || destination?.importedShareIds
+      ? {
+          importedShareIds: [
+            ...new Set([
+              ...(destination?.importedShareIds ?? []),
+              ...(source.importedShareIds ?? []),
+            ]),
+          ],
+        }
+      : {}),
+  };
+  const { [from]: _old, ...next } = current;
+  next[to] = moved;
+  for (const [key, draft] of Object.entries(next)) {
+    if (draft.nativeSessionKey === from) next[key] = { ...moved, nativeSessionKey: to };
+  }
+  return next;
+}

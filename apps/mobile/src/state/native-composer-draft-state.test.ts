@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { bindNativeComposerDraft, syncNativeComposerDrafts } from "./native-composer-draft-state";
+import {
+  bindNativeComposerDraft,
+  relocateNativeComposerDraft,
+  syncNativeComposerDrafts,
+} from "./native-composer-draft-state";
 import { emptyNativeTreeDraft } from "./native-tree-draft";
 import type { ComposerDraft } from "./use-composer-drafts";
 
@@ -103,5 +107,37 @@ describe("canonical native mobile drafts", () => {
     expect(bindNativeComposerDraft(switched, "alias", "native-file-a").alias?.nativeTree).toEqual(
       tree,
     );
+  });
+
+  it("moves a relocated session's complete draft and retargets its existing aliases", () => {
+    const tree = emptyNativeTreeDraft();
+    const source = { ...draft("unsent before /wt"), nativeTree: tree };
+    const current = bindNativeComposerDraft(
+      { alias: source, unrelated: draft("other") },
+      "alias",
+      "old",
+    );
+    const next = relocateNativeComposerDraft(current, "old", "new");
+    expect(next.old).toBeUndefined();
+    expect(next.new).toMatchObject({ text: source.text, nativeTree: tree });
+    expect(next.alias).toMatchObject({ text: source.text, nativeSessionKey: "new" });
+    expect(next.unrelated).toBe(current.unrelated);
+    expect(relocateNativeComposerDraft(next, "old", "new")).toBe(next);
+    const edited = syncNativeComposerDrafts(next, {
+      ...next,
+      alias: { ...next.alias!, text: "edited after move" },
+    });
+    expect(edited.new?.text).toBe("edited after move");
+    expect(edited.old).toBeUndefined();
+  });
+
+  it("preserves destination edits rather than silently replacing them", () => {
+    const next = relocateNativeComposerDraft(
+      { old: draft("moving"), new: draft("existing") },
+      "old",
+      "new",
+    );
+    expect(next.new?.text).toBe("moving\n\nexisting");
+    expect(next.old).toBeUndefined();
   });
 });

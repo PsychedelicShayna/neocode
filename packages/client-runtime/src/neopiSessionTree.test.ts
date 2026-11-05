@@ -7,6 +7,7 @@ import {
   projectSessionTree,
   sessionTreePrefix,
   sessionTreeScrollOffset,
+  sessionTreeVisibleParent,
   type SessionTreeItem,
 } from "./neopiSessionTree.ts";
 
@@ -105,6 +106,55 @@ describe("projectSessionTree", () => {
       item(`n${index}`, index === 0 ? null : `n${index - 1}`),
     );
     expect(projectSessionTree(chain, "n49999").rows).toHaveLength(50_000);
+  });
+});
+
+describe("sessionTreeVisibleParent", () => {
+  const parent = (items: readonly SessionTreeItem[], id: string) => {
+    const projection = projectSessionTree(items, id);
+    const rows = filterSessionTree(projection, "user-only", "");
+    const itemById = new Map(items.map((item) => [item.entry.id, item]));
+    const visibleIds = new Map(rows.map((row, index) => [row.id, index]));
+    return sessionTreeVisibleParent(itemById.get(id)!, itemById, visibleIds);
+  };
+
+  it("steps over filtered entries to the nearest listed ancestor", () => {
+    expect(
+      parent(
+        [
+          item("root", null),
+          item("hidden", "root", { type: "model_change" }),
+          item("child", "hidden"),
+        ],
+        "child",
+      ),
+    ).toBe("root");
+  });
+
+  it("stops when filtered ancestors form a cycle that does not include the selected row", () => {
+    expect(
+      parent(
+        [
+          item("a", "b", { type: "model_change" }),
+          item("b", "a", { type: "thinking_level_change" }),
+          item("child", "a"),
+        ],
+        "child",
+      ),
+    ).toBeNull();
+  });
+
+  it("stops at roots, missing parents, self-parenting and cycles back to the selection", () => {
+    expect(parent([item("root", null)], "root")).toBeNull();
+    expect(parent([item("orphan", "missing")], "orphan")).toBeNull();
+    expect(parent([item("self", "self")], "self")).toBeNull();
+    expect(
+      parent([item("child", "hidden"), item("hidden", "child", { type: "model_change" })], "child"),
+    ).toBeNull();
+  });
+
+  it("still selects a listed ancestor before encountering the rest of a malformed cycle", () => {
+    expect(parent([item("parent", "child"), item("child", "parent")], "child")).toBe("parent");
   });
 });
 

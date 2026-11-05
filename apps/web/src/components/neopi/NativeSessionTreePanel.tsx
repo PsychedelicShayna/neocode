@@ -14,6 +14,7 @@ import {
   projectSessionTree,
   sessionTreePrefix,
   sessionTreeScrollOffset,
+  sessionTreeVisibleParent,
   type SessionTreeFilter,
   type SessionTreeKind,
   type SessionTreeProjection,
@@ -343,9 +344,7 @@ const TreeBody = memo(function TreeBody({
           if (!row) return;
           if (row.childCount > 0 && !row.collapsed) return toggle(row.id);
           // Otherwise step out to the nearest ancestor that is still listed.
-          let parentId = row.item.entry.parentId;
-          while (parentId !== null && !indexById.has(parentId))
-            parentId = itemById.get(parentId)?.entry.parentId ?? null;
+          const parentId = sessionTreeVisibleParent(row.item, itemById, indexById);
           if (parentId !== null) moveTo(indexById.get(parentId)!);
         });
       case "Enter":

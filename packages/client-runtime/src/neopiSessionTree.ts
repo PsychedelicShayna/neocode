@@ -90,6 +90,23 @@ export interface SessionTreeProjection {
   readonly toolCalls: ReadonlyMap<string, SessionTreeToolCall>;
 }
 
+/** Find the nearest listed ancestor, even when a hidden parent chain is cyclic. */
+export function sessionTreeVisibleParent(
+  item: SessionTreeItem,
+  itemById: ReadonlyMap<string, SessionTreeItem>,
+  visibleIds: ReadonlyMap<string, unknown>,
+): string | null {
+  let parentId = item.entry.parentId;
+  // A finite parent chain cannot visit more records than the snapshot contains.
+  // Bound the walk without allocating another ancestry set for each key press.
+  for (let remaining = itemById.size; parentId !== null && remaining > 0; remaining--) {
+    if (parentId === item.entry.id) return null;
+    if (visibleIds.has(parentId)) return parentId;
+    parentId = itemById.get(parentId)?.entry.parentId ?? null;
+  }
+  return null;
+}
+
 interface PendingRow {
   readonly item: SessionTreeItem;
   readonly depth: number;

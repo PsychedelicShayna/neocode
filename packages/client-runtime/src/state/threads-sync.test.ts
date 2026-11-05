@@ -142,6 +142,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly resumeCache?: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]>;
   readonly loadCached?: Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>>;
   readonly saveThread?: Persistence.EnvironmentCacheStore["Service"]["saveThread"];
+  readonly removeThread?: Persistence.EnvironmentCacheStore["Service"]["removeThread"];
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -232,8 +233,10 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       Ref.update(savedThreads, (current) => [...current, thread]).pipe(
         Effect.andThen(options?.saveThread?.(environmentId, thread) ?? Effect.void),
       ),
-    removeThread: (_environmentId, threadId) =>
-      Ref.update(removedThreads, (current) => [...current, threadId]),
+    removeThread: (environmentId, threadId) =>
+      Ref.update(removedThreads, (current) => [...current, threadId]).pipe(
+        Effect.andThen(options?.removeThread?.(environmentId, threadId) ?? Effect.void),
+      ),
     loadServerConfig: () => Effect.succeedNone,
     saveServerConfig: () => Effect.void,
     loadVcsRefs: () => Effect.succeedNone,
@@ -775,6 +778,160 @@ describe("EnvironmentThreads", () => {
 
       expect(Option.isNone(state.data)).toBe(true);
       expect(yield* Ref.get(harness.removedThreads)).toEqual([THREAD_ID]);
+    }),
+  );
+
+  it.effect("discards debounced cache writes after deletion, including on teardown", () =>
+    Effect.gen(function* () {
+      const removed = yield* Deferred.make<void>();
+      const saved = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness({
+            removeThread: () => Deferred.succeed(removed, undefined),
+          });
+          yield* Queue.offer(h.inputs, snapshot(BASE_THREAD));
+          yield* awaitThreadState(h.observed, (value) => value.status === "live");
+          yield* Queue.offer(h.inputs, deleted());
+          yield* awaitThreadState(h.observed, (value) => value.status === "deleted");
+          yield* Deferred.await(removed);
+          yield* TestClock.adjust("500 millis");
+          return h.savedThreads;
+        }),
+      );
+      expect(yield* Ref.get(saved)).toEqual([]);
+    }),
+  );
+
+  it.effect("removes cached history after an in-flight save and discards queued saves", () =>
+    Effect.gen(function* () {
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const removed = yield* Deferred.make<void>();
+      const stored = yield* Ref.make(Option.some({ snapshotSequence: 7, thread: BASE_THREAD }));
+      const operations = yield* Ref.make<ReadonlyArray<string>>([]);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness({
+            cached: BASE_THREAD,
+            saveThread: (_environmentId, snapshot) =>
+              Deferred.succeed(writing, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(Ref.set(stored, Option.some(snapshot))),
+                Effect.andThen(Ref.update(operations, (values) => [...values, "save"])),
+              ),
+            removeThread: () =>
+              Ref.set(stored, Option.none()).pipe(
+                Effect.andThen(Ref.update(operations, (values) => [...values, "remove"])),
+                Effect.andThen(Deferred.succeed(removed, undefined)),
+              ),
+          });
+          yield* Queue.offer(h.inputs, titleUpdated("Saving history", 8));
+          yield* awaitThreadState(
+            h.observed,
+            (value) => Option.getOrNull(value.data)?.title === "Saving history",
+          );
+          yield* TestClock.adjust("500 millis");
+          yield* Deferred.await(writing);
+          yield* Queue.offer(h.inputs, titleUpdated("Queued history", 9));
+          yield* awaitThreadState(
+            h.observed,
+            (value) => Option.getOrNull(value.data)?.title === "Queued history",
+          );
+          const deletion = deleted();
+          if (deletion.kind !== "event") return yield* Effect.die("Expected an event");
+          yield* Queue.offer(h.inputs, {
+            ...deletion,
+            event: { ...deletion.event, sequence: 10 },
+          });
+          yield* awaitThreadState(h.observed, (value) => value.status === "deleted");
+          expect(yield* Deferred.isDone(removed)).toBe(false);
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(removed);
+          yield* TestClock.adjust("500 millis");
+        }),
+      );
+      expect(yield* Ref.get(operations)).toEqual(["save", "remove"]);
+      expect(Option.isNone(yield* Ref.get(stored))).toBe(true);
+    }),
+  );
+
+  it.effect("finishes deleting after a pending save even when the thread scope closes", () =>
+    Effect.gen(function* () {
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const closingStarted = yield* Deferred.make<void>();
+      const operations = yield* Ref.make<ReadonlyArray<string>>([]);
+      const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const h = yield* makeHarness({
+        saveThread: () =>
+          Deferred.succeed(writing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Ref.update(operations, (values) => [...values, "save"])),
+          ),
+        removeThread: () => Ref.update(operations, (values) => [...values, "remove"]),
+      }).pipe(Effect.provideService(Scope.Scope, scope));
+      yield* Scope.addFinalizer(scope, () => Deferred.succeed(closingStarted, undefined));
+      yield* Queue.offer(h.inputs, snapshot(BASE_THREAD));
+      yield* awaitThreadState(h.observed, (value) => value.status === "live");
+      yield* TestClock.adjust("500 millis");
+      yield* Deferred.await(writing);
+      yield* Queue.offer(h.inputs, deleted());
+      yield* awaitThreadState(h.observed, (value) => value.status === "deleted");
+      const closing = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+      yield* Deferred.await(closingStarted);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(closing);
+      expect(yield* Ref.get(operations)).toEqual(["save", "remove"]);
+    }),
+  );
+
+  it.effect("waits for a predecessor's in-flight save before removing its successor's cache", () =>
+    Effect.gen(function* () {
+      const resumeCache: NonNullable<Parameters<typeof makeEnvironmentThreadState>[1]> = {
+        snapshot: undefined,
+        owner: undefined,
+      };
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const removed = yield* Deferred.make<void>();
+      const operations = yield* Ref.make<ReadonlyArray<string>>([]);
+      const old = yield* makeHarness({
+        cached: BASE_THREAD,
+        resumeCache,
+        saveThread: () =>
+          Deferred.succeed(writing, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Ref.update(operations, (values) => [...values, "save"])),
+          ),
+      });
+      yield* Queue.offer(old.inputs, titleUpdated("Pending predecessor", 8));
+      yield* awaitThreadState(
+        old.observed,
+        (value) => Option.getOrNull(value.data)?.title === "Pending predecessor",
+      );
+      yield* TestClock.adjust("500 millis");
+      yield* Deferred.await(writing);
+      const successor = yield* makeHarness({
+        resumeCache,
+        removeThread: () =>
+          Ref.update(operations, (values) => [...values, "remove"]).pipe(
+            Effect.andThen(Deferred.succeed(removed, undefined)),
+          ),
+      });
+      const deletion = deleted();
+      if (deletion.kind !== "event") return yield* Effect.die("Expected an event");
+      yield* Queue.offer(successor.inputs, {
+        ...deletion,
+        event: { ...deletion.event, sequence: 9 },
+      });
+      yield* awaitThreadState(successor.observed, (value) => value.status === "deleted");
+      expect(yield* Deferred.isDone(removed)).toBe(false);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(removed);
+      yield* TestClock.adjust("500 millis");
+      expect(yield* Ref.get(operations)).toEqual(["save", "remove"]);
     }),
   );
 

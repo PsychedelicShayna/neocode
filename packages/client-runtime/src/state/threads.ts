@@ -147,6 +147,7 @@ interface ThreadResumeSnapshot {
 interface ThreadResumeCache {
   snapshot: ThreadResumeSnapshot | undefined;
   owner: object | undefined;
+  persistenceLock?: Semaphore.Semaphore;
 }
 
 function matchesThreadSnapshot(
@@ -193,7 +194,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const environmentId = supervisor.target.environmentId;
   const retained = resumeCache?.snapshot;
   const owner = {};
-  if (resumeCache) resumeCache.owner = owner;
+  // Retain the storage lock across overlapping live scopes: a successor's
+  // deletion must also wait for writes already started by its predecessor.
+  const persistenceLock = resumeCache?.persistenceLock ?? Semaphore.makeUnsafe(1);
+  if (resumeCache) {
+    resumeCache.owner = owner;
+    resumeCache.persistenceLock = persistenceLock;
+  }
   const cached =
     retained === undefined
       ? yield* cache.loadThread(environmentId, threadId).pipe(
@@ -274,17 +281,21 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     readonly epoch: number;
   } | null>(null);
   const persistence = yield* Queue.sliding<OrchestrationThreadDetailSnapshot>(1);
+  // Deletion waits for an in-flight write, then invalidates debounced writes
+  // under the same lock so removing the cache is the last storage operation.
 
   const persist = Effect.fn("EnvironmentThreadState.persist")(function* (
     snapshot: OrchestrationThreadDetailSnapshot,
   ) {
     if (resumeCache !== undefined && resumeCache.owner !== owner) return;
+    if ((yield* SubscriptionRef.get(state)).status === "deleted") return;
     if (
       committed.persisted &&
       matchesThreadSnapshot(committed, snapshot.thread, snapshot.snapshotSequence, snapshot.page)
     )
       return;
     yield* cache.saveThread(environmentId, snapshot).pipe(
+      Effect.uninterruptible,
       Effect.tap(() =>
         Effect.sync(() => {
           if (
@@ -310,7 +321,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         ),
       ),
     );
-  });
+  }, persistenceLock.withPermit);
 
   yield* Stream.fromQueue(persistence).pipe(
     Stream.debounce("500 millis"),
@@ -422,19 +433,23 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
       page: Option.none(),
     });
     yield* remember;
-    if (resumeCache !== undefined && resumeCache.owner !== owner) return;
-    yield* cache.removeThread(environmentId, threadId).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Could not remove the cached thread.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            threadId,
-            error: error.message,
-          }),
-        ),
-      ),
+    yield* persistenceLock.withPermit(
+      Effect.suspend(() => {
+        if (resumeCache !== undefined && resumeCache.owner !== owner) return Effect.void;
+        return cache.removeThread(environmentId, threadId).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not remove the cached thread.").pipe(
+              Effect.annotateLogs({
+                environmentId,
+                threadId,
+                error: error.message,
+              }),
+            ),
+          ),
+        );
+      }),
     );
-  });
+  }, Effect.uninterruptible);
 
   // Body of applyItem, running under applyLock.
   const applyItemLocked = Effect.fn("EnvironmentThreadState.applyItemLocked")(function* (

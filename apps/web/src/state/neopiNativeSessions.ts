@@ -15,7 +15,7 @@ import { persist } from "zustand/middleware";
 import { connectionAtomRuntime } from "../connection/runtime";
 import {
   closeNativeSessionTab,
-  cycleNativeSessionTab,
+  moveNativeSessionTab,
   openNativeSessionTab,
   replaceNativeSessionTab,
   type NativeSessionTabs,
@@ -56,13 +56,11 @@ export const replaceNativeSession = (from: NativeSessionTarget, to: NativeSessio
     target: to,
     tabs: replaceNativeSessionTab(state.tabs, from, to),
   }));
-/** Returns whether there was another tab to move to. */
-export const cycleNativeSession = (direction: "previous" | "next") => {
-  const { target, tabs } = useNativeSessionSelection.getState();
-  const next = tabs.length > 1 ? cycleNativeSessionTab(tabs, target, direction) : null;
-  if (next) useNativeSessionSelection.setState({ target: next });
-  return next !== null;
-};
+/** Drag-to-reorder: the tab lands on `toIndex`. The order persists with the selection. */
+export const moveNativeSession = (target: NativeSessionTarget, toIndex: number) =>
+  useNativeSessionSelection.setState((state) => ({
+    tabs: moveNativeSessionTab(state.tabs, target, toIndex),
+  }));
 
 /** Sends one native command to the session's owner and resolves with its response. */
 export function useNativeSessionRequest(target: NativeSessionTarget) {

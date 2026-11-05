@@ -160,6 +160,8 @@ interface RightPanelStoreState {
   activateTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
   closeTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
   activateSurface: (ref: WorkspaceRef, surfaceId: string) => void;
+  /** Drag-to-reorder: the tab lands on `toIndex`. The order persists with the panel. */
+  moveSurface: (ref: WorkspaceRef, surfaceId: string, toIndex: number) => void;
   closeSurface: (ref: WorkspaceRef, surfaceId: string) => void;
   closeOtherSurfaces: (ref: WorkspaceRef, surfaceId: string) => void;
   closeSurfacesToRight: (ref: WorkspaceRef, surfaceId: string) => void;
@@ -710,6 +712,17 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               ? { ...current, isOpen: true, activeSurfaceId: surfaceId }
               : current,
           ),
+        ),
+      moveSurface: (ref, surfaceId, toIndex) =>
+        set((state) =>
+          userAction(state, workspaceKey(ref), (current) => {
+            const from = current.surfaces.findIndex((surface) => surface.id === surfaceId);
+            const to = Math.max(0, Math.min(toIndex, current.surfaces.length - 1));
+            if (from < 0 || from === to) return current;
+            const surfaces = current.surfaces.filter((_, index) => index !== from);
+            surfaces.splice(to, 0, current.surfaces[from]!);
+            return { ...current, surfaces };
+          }),
         ),
       closeSurface: (ref, surfaceId) =>
         set((state) =>

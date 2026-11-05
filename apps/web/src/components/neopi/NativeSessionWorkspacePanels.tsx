@@ -487,6 +487,9 @@ export function NativeSessionWorkspacePanels({
         if (surface.kind === "preview" && surface.resourceId)
           setActivePreviewTab(target, surface.resourceId);
       }}
+      onMoveSurface={(surface, toIndex) =>
+        useRightPanelStore.getState().moveSurface(target, surface.id, toIndex)
+      }
       onCloseSurface={(surface) => void closeSurfaces([surface])}
       onCloseOtherSurfaces={(surface) =>
         void closeSurfaces(panel.surfaces.filter((other) => other.id !== surface.id))

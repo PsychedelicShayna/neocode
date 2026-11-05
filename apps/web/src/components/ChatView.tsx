@@ -4963,6 +4963,13 @@ export default function ChatView(props: ChatViewProps) {
       setActivePreviewTab(activeThreadRef, nextActiveSurface.resourceId);
     }
   }, [activeThreadRef]);
+  const moveRightPanelSurface = useCallback(
+    (surface: RightPanelSurface, toIndex: number) => {
+      if (activeThreadRef)
+        useRightPanelStore.getState().moveSurface(activeThreadRef, surface.id, toIndex);
+    },
+    [activeThreadRef],
+  );
   const finishRightPanelSurfaceClose = useCallback(
     (surfaces: readonly RightPanelSurface[]) => {
       if (!activeThreadRef) return;
@@ -9944,6 +9951,7 @@ export default function ChatView(props: ChatViewProps) {
           previewRuntimeTabId={resolvePreviewRuntimeTabId}
           terminalLabelsById={activeTerminalLabelsById}
           onActivate={activateRightPanelSurface}
+          onMoveSurface={moveRightPanelSurface}
           onCloseSurface={closeRightPanelSurface}
           onRenameDevice={(surfaceId, title) => {
             if (activeThreadRef)
@@ -10007,6 +10015,7 @@ export default function ChatView(props: ChatViewProps) {
             previewRuntimeTabId={resolvePreviewRuntimeTabId}
             terminalLabelsById={activeTerminalLabelsById}
             onActivate={activateRightPanelSurface}
+            onMoveSurface={moveRightPanelSurface}
             onCloseSurface={closeRightPanelSurface}
             onRenameDevice={(surfaceId, title) => {
               if (activeThreadRef)

@@ -3,7 +3,7 @@ import { CheckIcon, StarIcon } from "lucide-react";
 import { ComboboxItem } from "../ui/combobox";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { Kbd } from "../ui/kbd";
+import { MenuShortcut } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
 import { modelPickerModelKey } from "./modelPickerKeys";
@@ -48,7 +48,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
       value={modelPickerModelKey(model.instanceId, model.slug)}
       disabled={Boolean(props.disabledReason)}
       className={cn(
-        "group relative w-full !min-w-0 max-w-full cursor-pointer",
+        "group relative mx-1.5 w-[calc(100%-0.75rem)] !min-w-0 max-w-full cursor-pointer",
         props.disabledReason &&
           "data-disabled:pointer-events-auto data-disabled:cursor-not-allowed",
       )}
@@ -77,7 +77,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
         </TooltipPopup>
       </Tooltip>
       <div className="flex shrink-0 items-center gap-1.5">
-        {props.jumpLabel ? <Kbd>{props.jumpLabel}</Kbd> : null}
+        {props.jumpLabel ? <MenuShortcut>{props.jumpLabel}</MenuShortcut> : null}
         {isRole ? null : (
           <Tooltip>
             <TooltipTrigger

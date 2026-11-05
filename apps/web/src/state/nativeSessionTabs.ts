@@ -44,15 +44,51 @@ export function closeNativeSessionTab(
   return { tabs: remaining, active: remaining[index] ?? remaining[index - 1] ?? null };
 }
 
-/** Wraps around. With no active tab, next starts at the first and previous at the last. */
-export function cycleNativeSessionTab(
+/** Drags a tab to `toIndex`, the position it holds afterwards. */
+export function moveNativeSessionTab(
   tabs: NativeSessionTabs,
+  moving: NativeSessionTarget,
+  toIndex: number,
+): NativeSessionTabs {
+  const from = indexOfTab(tabs, moving);
+  const to = Math.max(0, Math.min(toIndex, tabs.length - 1));
+  if (from === -1 || from === to) return tabs;
+  const next = tabs.filter((_, index) => index !== from);
+  next.splice(to, 0, tabs[from]!);
+  return next;
+}
+
+/** The most-recently-used stack of session keys: the activated one goes to the front. */
+export function recordRecentSession(recent: readonly string[], key: string): readonly string[] {
+  return recent[0] === key ? recent : [key, ...recent.filter((entry) => entry !== key)];
+}
+
+/**
+ * The open tabs from most to least recently used, starting with the active one.
+ * Tabs never activated in this run (restored from a previous one) follow in tab order.
+ */
+export function recentSessionOrder(
+  tabs: NativeSessionTabs,
+  recent: readonly string[],
   active: NativeSessionTarget | null,
+): NativeSessionTabs {
+  const keyed = new Map(tabs.map((tab) => [nativeSessionKey(tab), tab]));
+  const keys = new Set<string>();
+  for (const key of [...(active ? [nativeSessionKey(active)] : []), ...recent])
+    if (keyed.has(key)) keys.add(key);
+  for (const key of keyed.keys()) keys.add(key);
+  return [...keys].map((key) => keyed.get(key)!);
+}
+
+/**
+ * One Tab press while Ctrl is held. Next walks back through the recency order
+ * (Ctrl+Tab), previous walks forward (Ctrl+Shift+Tab); both wrap.
+ */
+export function stepRecentIndex(
+  count: number,
+  index: number,
   direction: "previous" | "next",
-): NativeSessionTarget | null {
-  if (tabs.length === 0) return null;
-  const index = active ? indexOfTab(tabs, active) : -1;
-  if (index === -1) return (direction === "next" ? tabs[0] : tabs.at(-1)) ?? null;
-  const step = direction === "next" ? 1 : -1;
-  return tabs[(index + step + tabs.length) % tabs.length] ?? null;
+): number {
+  if (count === 0) return 0;
+  return (index + (direction === "next" ? 1 : -1) + count) % count;
 }

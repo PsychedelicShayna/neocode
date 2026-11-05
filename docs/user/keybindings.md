@@ -166,10 +166,17 @@ terminals so native undo keeps working there.
 through the pages you have visited, like a browser's back and forward buttons.
 
 `sessionTab.next` (`ctrl+tab` by default) and `sessionTab.previous`
-(`ctrl+shift+tab`) switch between the session tabs at the top of the window and
-wrap around at either end. They work from the composer and are skipped while the
-terminal has focus. Browsers reserve `ctrl+tab` for their own tabs, so this is a
-desktop shortcut; assign another binding to use it on the web.
+(`ctrl+shift+tab`) switch between session tabs in recently-used order, like
+Firefox. While you hold `ctrl`, each `tab` press steps one session further back
+(`shift` steps forward) and a list shows where you are; releasing `ctrl` opens
+that session and makes it the most recent, so a single `ctrl+tab` afterwards
+returns to the one you left. `escape` cancels. They work from the composer and
+are skipped while the terminal has focus. Browsers reserve `ctrl+tab` for their
+own tabs, so this is a desktop shortcut; assign another binding to use it on the
+web.
+
+Drag session tabs, and the tabs in the right panel, to reorder them. The order
+is kept between launches.
 
 `chat.new` may ask you to choose a project when there is more than one.
 `chat.newLocal` skips that chooser. Both use your

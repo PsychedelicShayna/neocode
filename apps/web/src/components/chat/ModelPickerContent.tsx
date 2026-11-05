@@ -341,7 +341,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
   return (
     <TooltipProvider delay={0}>
       <div
-        className="flex h-[min(26rem,var(--available-height,70vh))] min-h-0 w-[min(36rem,calc(100vw-2rem))] overflow-hidden bg-background"
+        className="flex h-[min(26rem,var(--available-height,70vh))] min-h-0 w-[min(36rem,calc(100vw-2rem))] overflow-hidden rounded-[calc(var(--radius-lg)-1px)]"
         data-model-picker-content="true"
       >
         <ModelPickerSidebar

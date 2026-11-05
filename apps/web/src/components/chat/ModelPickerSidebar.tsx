@@ -19,7 +19,7 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
 }) {
   return (
     <Toolbar.Root
-      className="w-28 shrink-0 overflow-y-auto border-r border-border bg-background p-1.5 sm:w-36"
+      className="w-28 shrink-0 overflow-y-auto border-r border-border p-1.5 sm:w-36"
       data-model-picker-sidebar="true"
       aria-label="Roles, favorites and inference providers"
       orientation="vertical"
@@ -39,7 +39,7 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
             type="button"
             aria-pressed={props.selectedKey === entry.key}
             className={cn(
-              "flex w-full cursor-pointer items-center gap-1.5 rounded-sm px-2.5 py-2 text-left text-xs outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
+              "flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-2 text-left text-xs text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring",
               props.selectedKey === entry.key && "bg-accent font-medium text-accent-foreground",
             )}
             onClick={() => props.onSelect(entry.key)}

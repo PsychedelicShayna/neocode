@@ -2109,6 +2109,10 @@ function PullRequestsRouteView() {
             onActivate={(surface) => {
               if (surface.kind === "pull-request") activateSurface(surface);
             }}
+            onMoveSurface={(surface, toIndex) => {
+              if (rightPanelRef !== null)
+                useRightPanelStore.getState().moveSurface(rightPanelRef, surface.id, toIndex);
+            }}
             onCloseSurface={(surface) => {
               if (surface.kind === "pull-request") closeSurface(surface);
             }}

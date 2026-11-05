@@ -1,14 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
-  nativeRecord,
   nativeSessionKey,
-  type NativeSessionFeed,
   type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
-import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { PlusIcon } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { isElectron } from "../../env";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { resolveShortcutCommand } from "../../keybindings";
@@ -17,56 +13,29 @@ import { isTerminalFocused } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { isModelPickerOpen } from "../../modelPickerVisibility";
 import {
+  cancelNativeSessionSwitcher,
+  commitNativeSessionSwitcher,
+  stepNativeSessionSwitcher,
+  useNativeSessionSwitcher,
+} from "../../state/nativeSessionSwitcher";
+import {
   closeNativeSession,
-  cycleNativeSession,
+  moveNativeSession,
   nativeSessionAtoms,
   selectNativeSession,
   useNativeSessionSelection,
 } from "../../state/neopiNativeSessions";
-import { useEnvironmentQuery } from "../../state/query";
 import { primaryServerKeybindingsAtom } from "../../state/server";
+import { SortableTab, SortableTabs } from "../SortableTabs";
 import { Button } from "../ui/button";
 import { PanelTabCloseButton } from "../ui/panel-tab-close-button";
-import { Tab, TAB_BASELINE_CLASS } from "../ui/tab";
+import { TAB_BASELINE_CLASS } from "../ui/tab";
 import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
-
-const TAB_STATUS = {
-  attention: { label: "Waiting for your answer", dot: "bg-primary" },
-  working: { label: "Working", dot: "bg-warning" },
-  terminal: { label: "Following a terminal", dot: "bg-info" },
-  ready: { label: "Ready", dot: "bg-success" },
-  connecting: { label: "Connecting", dot: "bg-muted-foreground/50" },
-  offline: { label: "Reconnecting · showing cached conversation", dot: "bg-muted-foreground/50" },
-  // Watching a session attaches it, so only sessions opened in this run are watched.
-  idle: { label: "Not connected", dot: "bg-muted-foreground/30" },
-} as const;
-type TabStatus = keyof typeof TAB_STATUS;
-
-type FeedResult = AsyncResult.AsyncResult<NativeSessionFeed, unknown>;
-const UNWATCHED = Atom.make(AsyncResult.initial<NativeSessionFeed, never>());
-
-// Selectors return primitives so a tab re-renders only when what it shows changes,
-// not on every streamed delta.
-const selectStatus = (result: FeedResult): TabStatus => {
-  if (!AsyncResult.isSuccess(result))
-    return AsyncResult.isInitial(result) ? "connecting" : "offline";
-  const feed = result.value;
-  if (!feed.connected) return "offline";
-  if (feed.dialogs.length > 0) return "attention";
-  if (feed.busy) return "working";
-  return feed.session?.attachment === "terminal" ? "terminal" : "ready";
-};
-const selectSessionName = (result: FeedResult): string => {
-  if (!AsyncResult.isSuccess(result)) return "";
-  const name = nativeRecord(result.value.session?.state).sessionName;
-  return typeof name === "string" ? name.trim() : "";
-};
-
-const selectSessionId = (result: FeedResult): string =>
-  AsyncResult.isSuccess(result) ? (result.value.session?.sessionId ?? "") : "";
+import { NativeSessionSwitcher } from "./NativeSessionSwitcher";
+import { useNativeSessionTabPresentation } from "./useNativeSessionTabPresentation";
 
 function NativeSessionTab({
   tab,
@@ -77,42 +46,11 @@ function NativeSessionTab({
   readonly active: boolean;
   readonly watched: boolean;
 }) {
-  const listedSessions = useEnvironmentQuery(
-    nativeSessionAtoms.list({ environmentId: tab.environmentId, input: {} }),
-  ).data?.sessions;
-  const feed: Atom.Atom<FeedResult> = watched
-    ? nativeSessionAtoms.watch({ environmentId: tab.environmentId, input: { ref: tab.ref } })
-    : UNWATCHED;
-  const watchedStatus = useAtomValue(feed, selectStatus);
-  const status = TAB_STATUS[watched ? watchedStatus : "idle"];
-  const sessionName = useAtomValue(feed, selectSessionName);
-  const sessionId = useAtomValue(feed, selectSessionId);
-  // A moved session (`/wt`) keeps its id while its file changes, and the list
-  // can still hold the previous file's row, so the id finds its title too.
-  const listed =
-    listedSessions?.find(
-      (entry) =>
-        entry.ref.sessionFile === tab.ref.sessionFile &&
-        entry.ref.providerInstanceId === tab.ref.providerInstanceId,
-    ) ??
-    (sessionId
-      ? listedSessions?.find(
-          (entry) =>
-            entry.sessionId === sessionId &&
-            entry.ref.providerInstanceId === tab.ref.providerInstanceId,
-        )
-      : undefined);
-  const title =
-    listed?.title || sessionName || listed?.firstMessage.split("\n")[0]?.trim() || "New session";
-  const identity = agentIdentity(
-    nativeSessionIdentityKey({
-      sessionId: sessionId || listed?.sessionId,
-      sessionFile: tab.ref.sessionFile,
-    }),
-  );
+  const { title, identity, status, cwd } = useNativeSessionTabPresentation(tab, watched);
   const close = () => closeNativeSession(tab);
   return (
-    <Tab
+    <SortableTab
+      id={nativeSessionKey(tab)}
       active={active}
       className="[-webkit-app-region:no-drag]"
       onMouseDown={(event) => {
@@ -144,7 +82,9 @@ function NativeSessionTab({
           }
         >
           <span className="truncate">{title}</span>
-          <span className="truncate text-3xs text-muted-foreground">{identity.label}</span>
+          <span className="truncate text-3xs leading-3 text-muted-foreground">
+            {identity.label}
+          </span>
         </TooltipTrigger>
         <TooltipPopup>
           <div className="flex max-w-80 flex-col gap-0.5">
@@ -152,22 +92,32 @@ function NativeSessionTab({
             <span className="text-muted-foreground">
               {identity.label} · {identity.pronouns}
             </span>
-            {listed?.cwd ? (
-              <span className="break-all text-muted-foreground">{listed.cwd}</span>
-            ) : null}
+            {cwd ? <span className="break-all text-muted-foreground">{cwd}</span> : null}
             <span className="text-muted-foreground">{status.label}</span>
           </div>
         </TooltipPopup>
       </Tooltip>
-    </Tab>
+    </SortableTab>
   );
 }
 
-/** Ctrl+Tab and Ctrl+Shift+Tab by default. Capture phase: the composer consumes Tab itself. */
+/**
+ * Ctrl+Tab and Ctrl+Shift+Tab by default, in recently-used order: each press
+ * steps the switcher while the modifier is held and releasing it commits.
+ * Capture phase: the composer consumes Tab itself.
+ */
 function useNativeSessionTabShortcuts() {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   useEffect(() => {
+    // The modifiers that were down when the switcher opened; letting go of any commits.
+    let held = { ctrl: false, meta: false, alt: false };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (useNativeSessionSwitcher.getState().order && event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelNativeSessionSwitcher();
+        return;
+      }
       if (event.isComposing || isCommandPaletteOpen()) return;
       const command = resolveShortcutCommand(event, keybindings, {
         context: {
@@ -177,12 +127,31 @@ function useNativeSessionTabShortcuts() {
         },
       });
       if (command !== "sessionTab.next" && command !== "sessionTab.previous") return;
-      if (!cycleNativeSession(command === "sessionTab.next" ? "next" : "previous")) return;
+      if (!stepNativeSessionSwitcher(command === "sessionTab.next" ? "next" : "previous")) return;
       event.preventDefault();
       event.stopPropagation();
+      held = { ctrl: event.ctrlKey, meta: event.metaKey, alt: event.altKey };
+      // A binding without a modifier has no release to wait for.
+      if (!held.ctrl && !held.meta && !held.alt) commitNativeSessionSwitcher();
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (!useNativeSessionSwitcher.getState().order) return;
+      if (
+        (held.ctrl && !event.ctrlKey) ||
+        (held.meta && !event.metaKey) ||
+        (held.alt && !event.altKey)
+      )
+        commitNativeSessionSwitcher();
     };
     window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", cancelNativeSessionSwitcher);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("blur", cancelNativeSessionSwitcher);
+      cancelNativeSessionSwitcher();
+    };
   }, [keybindings]);
 }
 
@@ -201,6 +170,14 @@ export function NativeSessionTabBar({
   const create = useCreateNativeSession();
   const listRef = useRef<HTMLDivElement>(null);
   const activeKey = target ? nativeSessionKey(target) : null;
+  const tabIds = useMemo(() => tabs.map(nativeSessionKey), [tabs]);
+  const onMove = useCallback(
+    (id: string, toIndex: number) => {
+      const moving = tabs.find((tab) => nativeSessionKey(tab) === id);
+      if (moving) moveNativeSession(moving, toIndex);
+    },
+    [tabs],
+  );
   useEffect(() => {
     if (activeKey === null) return;
     listRef.current
@@ -231,22 +208,24 @@ export function NativeSessionTabBar({
         ref={listRef}
         className="flex min-w-0 items-end gap-1 self-stretch overflow-x-auto [scrollbar-width:none]"
       >
-        {tabs.map((tab) => {
-          const key = nativeSessionKey(tab);
-          const active = key === activeKey;
-          return (
-            <NativeSessionTab
-              key={key}
-              tab={tab}
-              active={active}
-              watched={active || nativeSessionAtoms.cached(tab) !== undefined}
-            />
-          );
-        })}
+        <SortableTabs ids={tabIds} onMove={onMove}>
+          {tabs.map((tab) => {
+            const key = nativeSessionKey(tab);
+            const active = key === activeKey;
+            return (
+              <NativeSessionTab
+                key={key}
+                tab={tab}
+                active={active}
+                watched={active || nativeSessionAtoms.cached(tab) !== undefined}
+              />
+            );
+          })}
+        </SortableTabs>
       </div>
       <Button
         aria-label="New thread"
-        className="mb-1.5 shrink-0 self-end"
+        className="mb-1 shrink-0 self-end"
         size="icon-xs"
         variant="ghost-muted"
         onClick={() =>
@@ -256,6 +235,7 @@ export function NativeSessionTabBar({
         <PlusIcon className="size-3.5" />
       </Button>
       <div ref={actionsRef} className="ml-auto flex shrink-0 items-center" />
+      <NativeSessionSwitcher />
     </WorkspacePageHeader>
   );
 }

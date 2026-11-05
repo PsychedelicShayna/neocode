@@ -45,7 +45,9 @@ export function NativeSessionBrowser({
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const legacy = useThreadShells();
+  const legacy = useThreadShells().filter(
+    (thread) => !environmentId || thread.environmentId === environmentId,
+  );
   const filtered = environments.filter(
     (environment) => !environmentId || environment.environmentId === environmentId,
   );

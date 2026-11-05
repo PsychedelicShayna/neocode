@@ -1637,6 +1637,16 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
     --contrast-secondary-label: var(--chat-harness-foreground);
     --contrast-icon-muted: var(--chat-harness-foreground);
   }
+
+  /* The work rail: a slim line on the assistant bubble's left edge that joins
+     consecutive work rows into one quiet block. Each row draws its own slice,
+     and rows sit flush, so the line runs unbroken through a run of them. */
+  .chat-harness-rail {
+    margin-inline-start: 0.75rem;
+    padding-inline-start: 0.375rem;
+    border-inline-start: 1px solid
+      color-mix(in oklab, var(--chat-harness-foreground) 26%, transparent);
+  }
 }
 
 /* Inline code inside a bubble sits in the bubble: a translucent tint of its

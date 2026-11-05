@@ -1700,7 +1700,10 @@ function TimelineMinimapNavigationButton({
 type TimelineWorkEntry = Extract<MessagesTimelineRow, { kind: "work" }>["groupedEntries"][number];
 type TimelineRow = MessagesTimelineRow;
 
-/** Rows that are the harness's own work, not someone's speech. They sit grey between the bubbles. */
+/**
+ * Rows that are the harness's own work, not someone's speech. They sit grey
+ * between the bubbles, in the harness tone.
+ */
 function isHarnessRow(row: TimelineRow): boolean {
   switch (row.kind) {
     case "work":
@@ -1721,24 +1724,54 @@ function isHarnessRow(row: TimelineRow): boolean {
 }
 
 /**
- * Bubbles breathe; harness rows pack tight so a run of them reads as one quiet
- * stretch between two bubbles. An open tool group keeps its header glued to
- * its list.
+ * Work rows share one rail: a slim line on the assistant bubble's left edge.
+ * Consecutive rows join into one quiet block between two bubbles, and every
+ * header, thought, tool group, notice and divider reads from the same column.
+ * The reply meta under a bubble keeps the harness tone but not the rail.
+ */
+function isRailRow(row: TimelineRow): boolean {
+  return row.kind !== "assistant-meta" && isHarnessRow(row);
+}
+
+/**
+ * Bubbles breathe; rail rows pack tight so a run of them reads as one block.
+ * The bubble rows' own padding is what sets the block apart. An open tool
+ * group keeps its header glued to its list.
  */
 function timelineRowSpacingClass(row: TimelineRow): string {
-  if (row.kind === "work" && row.isExpandedToolGroup) return "pt-0 pb-1";
+  if (row.kind === "work" && row.isExpandedToolGroup) return "pt-0 pb-0.5";
   if ((row.kind === "work-toggle" || row.kind === "work-live") && row.expanded) {
-    return "pt-1 pb-0";
+    return "pt-0.5 pb-0";
   }
+  if (isRailRow(row)) return "py-0.5";
   return isHarnessRow(row) || row.kind === "worktree-setup" ? "py-1" : "py-3";
 }
 
 /**
- * Harness rows are centred, so their hover-only timestamp is pinned to the end
- * instead of joining the row's flow and nudging the centred label.
+ * The one header line every work row uses: icon, short label, status, all in
+ * the harness grey. The whole line is the click target; hover and keyboard
+ * focus only tint it.
  */
-const HARNESS_TIMESTAMP_CLASS =
-  "end-0 group-hover/timeline-row:absolute group-focus-within/timeline-row:absolute";
+const HARNESS_HEADER_CLASS =
+  "group/timeline-row flex min-h-6 w-full min-w-0 cursor-pointer select-none items-center gap-1.5 rounded-md px-1.5 text-start text-xs leading-relaxed text-secondary-label transition-colors hover:bg-accent/20 focus-visible:bg-accent/30 focus-visible:outline-none";
+
+/** Indent of everything a header opens: it lines up under the header's label. */
+const HARNESS_BODY_CLASS = "ms-7";
+
+/** The neutral surface an opened thought or tool output reads on. */
+const HARNESS_PANEL_CLASS = "rounded-md bg-muted/40 px-3 py-2";
+
+function HarnessChevron({ expanded }: { expanded: boolean }) {
+  return (
+    <ChevronRightIcon
+      aria-hidden
+      className={cn(
+        "size-3 shrink-0 text-icon-muted opacity-70 transition-transform duration-200",
+        expanded && "rotate-90",
+      )}
+    />
+  );
+}
 
 const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: TimelineRow }) {
   return (
@@ -1746,6 +1779,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       className={cn(
         timelineRowSpacingClass(row),
         isHarnessRow(row) ? "chat-harness" : null,
+        isRailRow(row) ? "chat-harness-rail" : null,
         (row.kind === "message" && row.message.role === "assistant") ||
           row.kind === "assistant-meta"
           ? "group/assistant"
@@ -1759,12 +1793,14 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       data-message-role={row.kind === "message" ? row.message.role : undefined}
     >
       {row.kind === "work" ? (
-        <WorkGroupSection
-          anchorKey={row.id}
-          groupedEntries={row.groupedEntries}
-          isExpandedToolGroup={row.isExpandedToolGroup}
-          displayLabel={row.displayLabel}
-        />
+        <div className={row.isExpandedToolGroup ? HARNESS_BODY_CLASS : undefined}>
+          <WorkGroupSection
+            anchorKey={row.id}
+            groupedEntries={row.groupedEntries}
+            isExpandedToolGroup={row.isExpandedToolGroup}
+            displayLabel={row.displayLabel}
+          />
+        </div>
       ) : null}
       {row.kind === "work-live" ? <LiveWorkEntryTimelineRow row={row} /> : null}
       {row.kind === "activity-group" ? <ActivityGroupTimelineRow row={row} /> : null}
@@ -1925,14 +1961,10 @@ function ContextCompactionTimelineRow({
     <div
       role="separator"
       aria-label={row.label}
-      className="mx-auto flex w-full max-w-(--chat-max-width) items-center gap-3 py-1 text-secondary-label text-xs"
+      className="flex min-h-6 min-w-0 items-center gap-1.5 px-1.5 text-secondary-label text-xs leading-relaxed"
     >
-      <span className="h-px flex-1 bg-border/70" />
-      <span className="flex shrink-0 items-center gap-1.5">
-        <Minimize2Icon aria-hidden="true" className="size-3" />
-        {row.label}
-      </span>
-      <span className="h-px flex-1 bg-border/70" />
+      <Minimize2Icon aria-hidden="true" className="size-4 shrink-0 stroke-2 text-icon-muted" />
+      <span className="min-w-0 truncate">{row.label}</span>
     </div>
   );
 }
@@ -2358,30 +2390,21 @@ function RevertUserMessageButton({
  * Hover-revealed wall-clock time with a full-date tooltip — the same metadata
  * presentation as message rows, for work entries and turn folds. The parent
  * carries `group/timeline-row`; hover or focus on an existing control reveals
- * the time without adding a tab stop. Hidden timestamps stay outside the row
- * layout. Visibility changes immediately so leaving flow cannot overlap text
- * during a fade-out. Place it before any trailing disclosure control so
- * revealing the time does not move the chevron.
+ * the time without adding a tab stop. It owns the end of the header line and
+ * only fades, so revealing it never moves the label or the chevron.
  */
 function TimelineRowTimestamp({
   createdAt,
   timestampFormat,
-  className,
 }: {
   createdAt: string;
   timestampFormat: TimestampFormat;
-  className?: string;
 }) {
   return (
     <Tooltip>
       <TooltipTrigger
         render={
-          <span
-            className={cn(
-              "pointer-events-none absolute me-1 shrink-0 whitespace-nowrap rounded-md text-muted-foreground text-xs tabular-nums opacity-0 group-hover/timeline-row:pointer-events-auto group-hover/timeline-row:static group-hover/timeline-row:opacity-100 group-focus-within/timeline-row:pointer-events-auto group-focus-within/timeline-row:static group-focus-within/timeline-row:opacity-100",
-              className,
-            )}
-          />
+          <span className="pointer-events-none ms-auto shrink-0 whitespace-nowrap ps-2 text-secondary-label text-xs tabular-nums opacity-0 transition-opacity group-hover/timeline-row:pointer-events-auto group-hover/timeline-row:opacity-100 group-focus-within/timeline-row:pointer-events-auto group-focus-within/timeline-row:opacity-100" />
         }
       >
         {formatDayAwareTimestamp(createdAt, timestampFormat)}
@@ -2393,28 +2416,20 @@ function TimelineRowTimestamp({
 
 function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-fold" }> }) {
   const ctx = use(TimelineRowCtx);
-  const Icon = row.expanded ? ChevronDownIcon : ChevronRightIcon;
 
   return (
-    <div className="group/timeline-row relative flex items-center gap-3 pe-0.5">
-      <span aria-hidden className="h-px flex-1 bg-border/60" />
-      <button
-        type="button"
-        aria-expanded={row.expanded}
-        data-scroll-anchor-ignore
-        onClick={() => ctx.onToggleTurnFold(row.turnId)}
-        className="flex shrink-0 cursor-pointer select-none items-center gap-1 rounded-md px-1 text-xs leading-relaxed text-secondary-label tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
-      >
-        <span>{row.label}</span>
-        <Icon className="size-3.5" />
-      </button>
-      <span aria-hidden className="h-px flex-1 bg-border/60" />
-      <TimelineRowTimestamp
-        createdAt={row.createdAt}
-        timestampFormat={ctx.timestampFormat}
-        className={cn(HARNESS_TIMESTAMP_CLASS, "bg-background")}
-      />
-    </div>
+    <button
+      type="button"
+      aria-expanded={row.expanded}
+      data-scroll-anchor-ignore
+      onClick={() => ctx.onToggleTurnFold(row.turnId)}
+      className={HARNESS_HEADER_CLASS}
+    >
+      <ClockIcon aria-hidden className="size-4 shrink-0 stroke-2 text-icon-muted" />
+      <span className="min-w-0 truncate tabular-nums">{row.label}</span>
+      <HarnessChevron expanded={row.expanded} />
+      <TimelineRowTimestamp createdAt={row.createdAt} timestampFormat={ctx.timestampFormat} />
+    </button>
   );
 }
 
@@ -2601,7 +2616,8 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
   );
   return (
     <div className="pt-1">
-      <div className="flex h-6 min-w-0 items-baseline justify-center gap-2 px-1 text-xs leading-relaxed text-secondary-label tabular-nums">
+      <div className="flex h-6 min-w-0 items-center gap-1.5 px-1.5 text-xs leading-relaxed text-secondary-label tabular-nums">
+        <ClockIcon aria-hidden className="size-4 shrink-0 stroke-2 text-icon-muted" />
         <span
           ref={shimmer ? observeVisibleAnimation : undefined}
           className="relative shrink-0 overflow-hidden whitespace-nowrap"
@@ -2740,7 +2756,7 @@ function ActivityGroupTimelineRow({
     <div>
       <button
         type="button"
-        className="group/live-work flex min-h-6 w-full max-w-full cursor-pointer items-center justify-center rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        className={HARNESS_HEADER_CLASS}
         aria-label={failed ? `${label}, tool call failed` : undefined}
         aria-expanded={row.expanded}
         onClick={() => ctx.onToggleWorkGroup(row.groupId, row.id)}
@@ -2753,8 +2769,9 @@ function ActivityGroupTimelineRow({
           active={row.active}
           shimmer={thinking}
         />
+        <HarnessChevron expanded={row.expanded} />
       </button>
-      {row.expanded ? <div className="mt-2">{details}</div> : null}
+      {row.expanded ? <div className={cn("mt-1", HARNESS_BODY_CLASS)}>{details}</div> : null}
     </div>
   );
 }
@@ -2763,7 +2780,7 @@ function ThinkingTimelineRow() {
   const { isCompacting, isPreparingWorktree } = use(TimelineRowActivityCtx);
   // Reserve the activity row during setup so the handoff keeps the same height.
   return (
-    <div className="flex min-h-7 justify-center">
+    <div className="flex min-h-7 items-end px-1.5">
       {isPreparingWorktree || isCompacting ? null : (
         <LiveActivityRow label="Thinking" iconName="brain" active shimmer />
       )}
@@ -2840,30 +2857,27 @@ function ReasoningTraceBlock({
           type="button"
           aria-expanded={expanded}
           onClick={() => ctx.onToggleReasoning(first.id, !expanded, anchorKey)}
-          className="flex min-h-6 cursor-pointer select-none items-center gap-1.5 self-center rounded-md ps-0.5 pe-2 text-start text-xs leading-relaxed transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+          className={HARNESS_HEADER_CLASS}
         >
-          <span className="flex size-6 shrink-0 items-center justify-center text-icon-muted">
-            <BrainIcon aria-hidden className="block size-4 shrink-0 stroke-2 opacity-70" />
-          </span>
+          <BrainIcon aria-hidden className="block size-4 shrink-0 stroke-2 text-icon-muted" />
           <span
             ref={streaming ? observeVisibleAnimation : undefined}
-            className="relative min-w-0 truncate text-secondary-label"
+            className="relative min-w-0 truncate"
           >
             {headerText}
             {streaming ? <ActivityShimmerOverlay>{headerText}</ActivityShimmerOverlay> : null}
           </span>
-          <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
-            <ChevronRightIcon
-              className={cn(
-                "size-3 shrink-0 text-icon-muted opacity-70 transition-transform duration-200",
-                expanded && "rotate-90",
-              )}
-            />
-          </span>
+          <HarnessChevron expanded={expanded} />
         </button>
       ) : null}
       {expanded ? (
-        <div className="ms-7 flex max-h-96 flex-col gap-3 overflow-auto px-0.5 py-1 select-text">
+        <div
+          className={cn(
+            HARNESS_PANEL_CLASS,
+            "flex max-h-96 flex-col gap-3 overflow-auto select-text",
+            showHeader && cn("mt-1", HARNESS_BODY_CLASS),
+          )}
+        >
           {messages.map((reasoningMessage) => (
             <ChatMarkdown
               key={reasoningMessage.id}
@@ -2913,27 +2927,20 @@ const ReasoningTimelineRow = memo(function ReasoningTimelineRow({
         type="button"
         aria-expanded={expanded}
         onClick={toggle}
-        className="flex cursor-pointer select-none items-center gap-1.5 self-center rounded-md px-0.5 py-0.5 text-start transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        className={HARNESS_HEADER_CLASS}
       >
-        <span className="flex size-6 shrink-0 items-center justify-center text-icon-muted">
-          <BrainIcon aria-hidden className="block size-4 shrink-0 stroke-2 opacity-70" />
-        </span>
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className="relative min-w-0 truncate text-secondary-label text-xs leading-relaxed">
-            Thought
-          </span>
-          <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
-            <ChevronRightIcon
-              className={cn(
-                "size-3 shrink-0 text-icon-muted opacity-70 transition-transform duration-200",
-                expanded && "rotate-90",
-              )}
-            />
-          </span>
-        </span>
+        <BrainIcon aria-hidden className="block size-4 shrink-0 stroke-2 text-icon-muted" />
+        <span className="min-w-0 truncate">Thought</span>
+        <HarnessChevron expanded={expanded} />
       </button>
       {expanded ? (
-        <div className="mt-1 ms-7 flex max-h-96 flex-col gap-3 overflow-auto px-0.5 py-1 select-text">
+        <div
+          className={cn(
+            HARNESS_PANEL_CLASS,
+            "mt-1 flex max-h-96 flex-col gap-3 overflow-auto select-text",
+            HARNESS_BODY_CLASS,
+          )}
+        >
           <ChatMarkdown
             className="text-foreground"
             text={message.text}
@@ -3031,19 +3038,17 @@ const WorkGroupSection = memo(function WorkGroupSection({
   }
 
   return (
-    <section className="-mx-1 space-y-0.5 px-1 py-0.5" aria-label="Activity">
-      <div className="space-y-px">
-        {nonEmptyEntries.map((workEntry) => (
-          <SimpleWorkEntryRow
-            key={workEntry.id}
-            workEntry={workEntry}
-            workspaceRoot={workspaceRoot}
-            isExpandedToolGroupEntry={false}
-            displayLabel={displayLabel}
-            onToggleEntry={onToggleStandaloneEntry}
-          />
-        ))}
-      </div>
+    <section className="space-y-px" aria-label="Activity">
+      {nonEmptyEntries.map((workEntry) => (
+        <SimpleWorkEntryRow
+          key={workEntry.id}
+          workEntry={workEntry}
+          workspaceRoot={workspaceRoot}
+          isExpandedToolGroupEntry={false}
+          displayLabel={displayLabel}
+          onToggleEntry={onToggleStandaloneEntry}
+        />
+      ))}
     </section>
   );
 });
@@ -3182,7 +3187,7 @@ function ExpandedWorkGroupEntries({
         aria-label="Tool calls"
         data-tool-group-scroll
         className={cn(
-          "scrollbar-gutter-stable max-h-[min(18rem,50dvh)] scroll-py-6 overflow-x-hidden rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+          "scrollbar-gutter-stable max-h-[min(18rem,50dvh)] scroll-py-6 overflow-x-hidden rounded-md focus-visible:bg-accent/10 focus-visible:outline-none",
           getVirtualizedScrollFadeClassName(fades),
         )}
       />
@@ -3278,15 +3283,14 @@ function LiveActivityContent({
   return (
     <span
       className={cn(
-        "flex min-h-6 min-w-0 items-center gap-1.5 py-0.5",
-        iconName ? "px-0.5" : "px-1",
+        "flex min-h-6 min-w-0 items-center gap-1.5",
         highlighted ? "text-foreground" : "text-secondary-label",
       )}
     >
       {iconName ? (
         <span
           className={cn(
-            "flex size-6 shrink-0 items-center justify-center",
+            "flex size-4 shrink-0 items-center justify-center",
             failed ? failedToolIconClassName : highlighted ? "text-foreground" : "text-icon-muted",
           )}
           role={announceFailure ? "img" : undefined}
@@ -3325,7 +3329,7 @@ function LiveWorkEntryTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "
   return (
     <button
       type="button"
-      className="group/live-work flex min-h-6 w-full max-w-full cursor-pointer items-center justify-center rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      className={HARNESS_HEADER_CLASS}
       aria-label={failed ? `${label}, tool call failed` : undefined}
       aria-expanded={row.expanded}
       onClick={() => ctx.onToggleWorkGroup(row.groupId, row.id)}
@@ -3355,6 +3359,7 @@ function LiveWorkEntryTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "
         failed={failed}
         active={row.active}
       />
+      <HarnessChevron expanded={row.expanded} />
     </button>
   );
 }
@@ -3405,12 +3410,12 @@ function WorkGroupToggleTimelineRow({
   return (
     <button
       type="button"
-      className="group/tool-group group/timeline-row relative flex min-h-6 w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-xs leading-relaxed transition-colors duration-150 hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      className={HARNESS_HEADER_CLASS}
       aria-label={row.hasFailure ? `${row.summary}, tool call failed` : undefined}
       aria-expanded={row.expanded}
       onClick={() => ctx.onToggleWorkGroup(row.groupId, row.id)}
     >
-      <span className="flex size-6 shrink-0 items-center justify-center text-icon-muted">
+      <span className="flex size-4 shrink-0 items-center justify-center text-icon-muted">
         <ToolActivityIconView
           icon={row.toolIcon}
           fallbackName={
@@ -3420,12 +3425,9 @@ function WorkGroupToggleTimelineRow({
           muted
         />
       </span>
-      <span className="min-w-0 truncate text-secondary-label">{row.summary}</span>
-      <TimelineRowTimestamp
-        createdAt={row.createdAt}
-        timestampFormat={ctx.timestampFormat}
-        className={HARNESS_TIMESTAMP_CLASS}
-      />
+      <span className="min-w-0 truncate">{row.summary}</span>
+      <HarnessChevron expanded={row.expanded} />
+      <TimelineRowTimestamp createdAt={row.createdAt} timestampFormat={ctx.timestampFormat} />
     </button>
   );
 }
@@ -4613,7 +4615,7 @@ const AgentSpawnRow = memo(function AgentSpawnRow(props: {
         type="button"
         aria-expanded={expanded}
         onClick={toggleExpanded}
-        className="flex cursor-pointer select-none justify-center rounded-md text-left transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        className={HARNESS_HEADER_CLASS}
       >
         <LiveActivityRow
           label={workflowName ? `${lead} · ${workflowName}` : lead}
@@ -4621,9 +4623,10 @@ const AgentSpawnRow = memo(function AgentSpawnRow(props: {
           active={live && props.active !== false}
           failed={failed}
         />
+        <HarnessChevron expanded={expanded} />
       </button>
       {expanded ? (
-        <div className="ms-7 mt-0.5 flex flex-col">
+        <div className={cn("mt-0.5 flex flex-col", HARNESS_BODY_CLASS)}>
           {agents.map((agent) => (
             <AgentSpawnMemberRow key={agent.id} agent={agent} onToggleEntry={props.onToggleEntry} />
           ))}
@@ -4717,7 +4720,7 @@ function AgentSpawnMemberRow({
       className={cn(
         "flex flex-col rounded-md px-1 py-0.5 transition-colors",
         canExpand &&
-          "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+          "cursor-pointer hover:bg-accent/20 focus-visible:bg-accent/30 focus-visible:outline-none",
       )}
     >
       <div className="flex select-none items-center gap-1.5">
@@ -4745,7 +4748,7 @@ function AgentSpawnMemberRow({
       ) : null}
       {open ? (
         <div
-          className="mt-1 cursor-default rounded-md bg-muted/40 px-3 py-2"
+          className={cn("mt-1 cursor-default", HARNESS_PANEL_CLASS)}
           onClick={stopRowToggle}
           onPointerDown={stopRowToggle}
         >
@@ -4778,7 +4781,6 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     <PlainWorkEntryRow
       workEntry={workEntry}
       workspaceRoot={workspaceRoot}
-      isExpandedToolGroupEntry={isExpandedToolGroupEntry}
       displayLabel={displayLabel}
       onToggleEntry={props.onToggleEntry}
     />
@@ -4788,11 +4790,10 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
 const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
-  isExpandedToolGroupEntry: boolean;
   displayLabel?: string | undefined;
   onToggleEntry?: ((collapsed: boolean) => void) | undefined;
 }) {
-  const { workEntry, workspaceRoot, isExpandedToolGroupEntry, displayLabel } = props;
+  const { workEntry, workspaceRoot, displayLabel } = props;
   const { threadRef, onImageExpand, timestampFormat, toolBulk, workGroupViewState } =
     use(TimelineRowCtx);
   const groupView = use(WorkGroupViewCtx);
@@ -4815,8 +4816,6 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
     setExpandedState(next);
   };
   const iconConfig = workToneIcon(workEntry.tone);
-  // A standalone row is a centred line between bubbles; rows inside an open group form a left-aligned list.
-  const centered = !isExpandedToolGroupEntry;
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const showFailedIndicator = workEntryDisplayIndicatesToolFailure(workEntry);
   const showDestructiveRowStyle =
@@ -4863,7 +4862,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
     : null;
   // Reserve destructive row styling for severe failures, not routine tool errors.
   const iconWrapperClass = cn(
-    "flex size-6 shrink-0 items-center justify-center",
+    "flex size-4 shrink-0 items-center justify-center",
     showWarningIndicator
       ? "text-warning"
       : showDestructiveRowStyle
@@ -4900,21 +4899,10 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
     : {};
 
   return (
-    <div
-      className={cn(
-        "group/timeline-row relative flex flex-col rounded-md px-0.5 transition-colors",
-        isExpandedToolGroupEntry ? "py-0" : "py-0.5",
-        expanded && "mb-1",
-        canExpand &&
-          "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
-      )}
-      {...rowToggleProps}
-    >
+    <div className={cn("flex flex-col", expanded && "mb-1")}>
       <div
-        className={cn(
-          "flex select-none items-center gap-1.5 transition-[opacity,translate] duration-200",
-          centered && "justify-center",
-        )}
+        className={cn(HARNESS_HEADER_CLASS, !canExpand && "cursor-default hover:bg-transparent")}
+        {...rowToggleProps}
       >
         <span
           className={iconWrapperClass}
@@ -4928,67 +4916,46 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
             muted
           />
         </span>
-        <div
-          className={cn("flex min-w-0 items-center gap-1.5", centered ? "max-w-full" : "flex-1")}
-        >
-          <div className={cn("min-w-0 overflow-hidden", !centered && "flex-1")}>
-            <p className="flex min-w-0 w-full items-baseline gap-1.5 text-xs leading-relaxed">
+        <div className="min-w-0 overflow-hidden">
+          <p className="flex min-w-0 w-full items-baseline gap-1.5 text-xs leading-relaxed">
+            <span
+              className={cn(
+                answerPreview ? "shrink-0" : "min-w-0",
+                expanded ? "whitespace-pre-wrap break-words select-text" : "truncate",
+                headingClass,
+              )}
+              onClick={expanded ? stopRowToggleWhileSelectingText : undefined}
+              onPointerDown={expanded ? stopRowToggle : undefined}
+            >
+              {previewText}
+            </span>
+            {answerPreview ? (
               <span
                 className={cn(
-                  answerPreview ? "shrink-0" : "min-w-0 flex-1",
-                  expanded ? "whitespace-pre-wrap break-words select-text" : "truncate",
-                  headingClass,
+                  "min-w-0 truncate",
+                  !expanded &&
+                    workEntry.questionAnswer &&
+                    hasQuestionAnswer(workEntry.questionAnswer)
+                    ? "text-foreground"
+                    : "text-muted-foreground",
                 )}
-                onClick={expanded ? stopRowToggleWhileSelectingText : undefined}
-                onPointerDown={expanded ? stopRowToggle : undefined}
               >
-                {previewText}
+                {answerPreview}
               </span>
-              {answerPreview ? (
-                <span
-                  className={cn(
-                    "min-w-0 truncate",
-                    !expanded &&
-                      workEntry.questionAnswer &&
-                      hasQuestionAnswer(workEntry.questionAnswer)
-                      ? "text-foreground"
-                      : "text-muted-foreground",
-                  )}
-                >
-                  {answerPreview}
-                </span>
-              ) : null}
-            </p>
-          </div>
-          {showFailedIndicator &&
-          !showDestructiveRowStyle &&
-          !toolIconAcceptsTint(entryIconName, entryToolIcon) ? (
-            <XIcon aria-hidden className={cn("size-3 shrink-0", failedToolIconClassName)} />
-          ) : null}
-          <TimelineRowTimestamp
-            createdAt={workEntry.createdAt}
-            timestampFormat={timestampFormat}
-            {...(centered ? { className: HARNESS_TIMESTAMP_CLASS } : {})}
-          />
-          <span
-            className={cn(
-              "flex size-4 shrink-0 items-center justify-center",
-              !canExpand && (centered ? "hidden" : "invisible"),
-            )}
-            aria-hidden
-          >
-            <ChevronRightIcon
-              className={cn(
-                "size-3 shrink-0 text-icon-muted opacity-70 transition-transform duration-200",
-                expanded && "rotate-90",
-              )}
-            />
-          </span>
+            ) : null}
+          </p>
         </div>
+        {showFailedIndicator &&
+        !showDestructiveRowStyle &&
+        !toolIconAcceptsTint(entryIconName, entryToolIcon) ? (
+          <XIcon aria-hidden className={cn("size-3 shrink-0", failedToolIconClassName)} />
+        ) : null}
+        {canExpand ? <HarnessChevron expanded={expanded} /> : null}
+        <TimelineRowTimestamp createdAt={workEntry.createdAt} timestampFormat={timestampFormat} />
       </div>
       {expanded && viewedImage && threadRef ? (
         <div
-          className="mt-1 ms-7 cursor-default"
+          className={cn("mt-1 cursor-default", HARNESS_BODY_CLASS)}
           onClick={stopRowToggle}
           onPointerDown={stopRowToggle}
         >
@@ -5008,7 +4975,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
       ) : null}
       {expanded && canExpand && expandedBody && !workEntry.questionAnswer ? (
         <div
-          className="mt-1 ms-7 cursor-default rounded-md bg-muted/40 px-3 py-2"
+          className={cn("mt-1 cursor-default", HARNESS_BODY_CLASS, HARNESS_PANEL_CLASS)}
           onClick={stopRowToggle}
           onPointerDown={stopRowToggle}
         >

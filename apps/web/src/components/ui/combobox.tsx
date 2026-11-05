@@ -226,7 +226,11 @@ function ComboboxEmpty({ className, ...props }: ComboboxPrimitive.Empty.Props) {
 
 function ComboboxList({ className, ...props }: ComboboxPrimitive.List.Props) {
   return (
-    <ScrollArea scrollbarGutter scrollFade>
+    // The popup only has a max-height, so its height is indefinite and the
+    // viewport's `h-full` would resolve to auto and grow to the whole list
+    // (clipped, never scrolling). A flex column root bounds the viewport to the
+    // space the popup leaves it.
+    <ScrollArea className="flex flex-col" scrollbarGutter scrollFade>
       <ComboboxPrimitive.List
         className={cn("not-empty:scroll-py-1 not-empty:px-1 not-empty:py-1", className)}
         data-slot="combobox-list"

@@ -55,6 +55,13 @@ connection nor overwrite newer live data during a reconnect. Loading and
 resuming snapshots belongs to the shared state services, so every view agrees
 on which data is current.
 
+The [native feed](../../packages/client-runtime/src/state/neopiNativeSessions.ts)
+processes every raw frame for reconciliation and cache side effects, but only
+publishes changed projections. Preserve feed identity for ignored child-agent
+streaming deltas and deduplicate after those side effects; deduplicating raw
+frames first can skip a required state or branch read. Settled child steps
+still publish refresh ticks.
+
 [Thread detail](../../packages/client-runtime/src/state/threads.ts) separates
 subscription lifetime from cache lifetime. Mounted consumers share one live
 stream, which stops when the last consumer unmounts; hidden mounted routes still

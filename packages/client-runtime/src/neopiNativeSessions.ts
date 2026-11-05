@@ -455,11 +455,11 @@ export function reduceNativeSessionFeed(
     { conversation: feed.conversation, busy: feed.busy, connection: null },
     { type: "native", event: frame },
   );
-  let next: NativeSessionFeed = {
-    ...feed,
-    conversation: projected.conversation,
-    busy: projected.busy ?? feed.busy,
-  };
+  const busy = projected.busy ?? feed.busy;
+  let next: NativeSessionFeed =
+    projected.conversation === feed.conversation && busy === feed.busy
+      ? feed
+      : { ...feed, conversation: projected.conversation, busy };
   if (frame.type === "subagent_lifecycle" || frame.type === "subagent_progress") {
     const agents = reduceNativeSubagents(
       next.agents,

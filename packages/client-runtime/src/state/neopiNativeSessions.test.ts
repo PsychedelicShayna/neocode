@@ -87,16 +87,19 @@ const harness = <E, R>(
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<NativeSessionUpdate>();
     const feeds = yield* Queue.unbounded<NativeSessionFeed>();
+    const reduced = yield* Queue.unbounded<NativeSessionFeed>();
     yield* reconcileNativeSessionFeed(
       Stream.fromQueue(events).pipe(Stream.takeUntil((update) => update.type === "closed")),
       read,
       seed,
-      () => {},
+      (feed) => {
+        Queue.offerUnsafe(reduced, feed);
+      },
     ).pipe(
       Stream.runForEach((feed) => Queue.offer(feeds, feed)),
       Effect.forkScoped,
     );
-    return { events, feeds };
+    return { events, feeds, reduced };
   });
 
 const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function* () {
@@ -423,6 +426,66 @@ describe("native session observation lifetime", () => {
 });
 
 describe("native feed reconciliation lifetime", () => {
+  it.effect("publishes meaningful feed changes but not intervening child streaming deltas", () =>
+    Effect.gen(function* () {
+      const ignored = ["message_start", "message_update", "tool_execution_update"].map((type) =>
+        event({ type: "subagent_event", payload: { id: "child", event: { type } } }),
+      );
+      const settled = ["message_end", "tool_execution_end", "agent_end"].map((type) =>
+        event({ type: "subagent_event", payload: { id: "child", event: { type } } }),
+      );
+      const updates = [
+        event({ type: "command_output", text: "Visible result" }),
+        ...ignored,
+        settled[0]!,
+        ...ignored,
+        settled[1]!,
+        ...ignored,
+        settled[2]!,
+        ...ignored,
+        event({ type: "queue_update", steering: ["Next"], followUp: [], liveSteered: 0 }),
+        event({ type: "agent_start" }),
+        event({
+          type: "message_update",
+          messageId: "main",
+          message: { role: "assistant", content: "Parent reply" },
+        }),
+      ];
+      let reductions = 0;
+      const feeds = yield* reconcileNativeSessionFeed(
+        Stream.fromIterable(updates),
+        () => Effect.never,
+        initial(),
+        () => {
+          reductions++;
+        },
+      ).pipe(Stream.runCollect);
+      expect(reductions).toBe(updates.length);
+      expect(feeds).toHaveLength(7);
+      expect(feeds.map((feed) => feed.agentTicks.child ?? 0)).toEqual([0, 1, 2, 3, 3, 3, 3]);
+      expect(feeds[0]?.commandOutputs[0]?.text).toBe("Visible result");
+      expect(feeds[4]?.queue.steering).toEqual(["Next"]);
+      expect(feeds[5]?.busy).toBe(true);
+      expect(feeds[6]?.conversation.pending[0]?.message.content).toBe("Parent reply");
+    }),
+  );
+
+  it.effect("reconciles state after an ignored control frame without publishing that frame", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { events, feeds } = yield* harness(() =>
+          Effect.succeed({ model: { id: "reconciled" } }),
+        );
+        yield* Queue.offer(events, event({ type: "command_output", text: "Before model change" }));
+        yield* nextFeed(feeds, (feed) => feed.commandOutputs.length === 1);
+        yield* Queue.offer(events, event({ type: "model_changed" }));
+        const next = yield* Queue.take(feeds);
+        expect(next.session?.state.model).toEqual({ id: "reconciled" });
+        expect(next.commandOutputs[0]?.text).toBe("Before model change");
+      }),
+    ),
+  );
+
   it.effect(
     "delivers raw updates while get_state is blocked and coalesces subsequent state reads",
     () =>
@@ -625,7 +688,7 @@ describe("native feed reconciliation lifetime", () => {
         const latest = { ...user, id: "latest", parentId: first.id };
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<NeoPiJournalPage>();
-        const { events, feeds } = yield* harness(() =>
+        const { events, feeds, reduced } = yield* harness(() =>
           Effect.gen(function* () {
             yield* Deferred.succeed(started, undefined);
             return yield* Deferred.await(release);
@@ -644,11 +707,14 @@ describe("native feed reconciliation lifetime", () => {
         ]);
         const durable = yield* nextFeed(feeds, (feed) => feed.busy);
         expect(durable.conversation.entries).toEqual([user, first, latest]);
+        yield* Queue.takeAll(reduced);
         yield* Deferred.succeed(release, { ...page([user, first]), nextCursor: "stale-cursor" });
-        const afterReply = yield* Queue.take(feeds);
+        const afterReply = yield* Queue.take(reduced);
         expect(afterReply.conversation).toBe(durable.conversation);
         expect(afterReply.conversation.identity?.leafId).toBe(latest.id);
         expect(afterReply.conversation.cursor).not.toBe("stale-cursor");
+        expect(afterReply).toBe(durable);
+        expect(yield* Queue.takeAll(feeds)).toEqual([]);
       }),
     ),
   );

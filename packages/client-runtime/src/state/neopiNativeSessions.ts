@@ -207,6 +207,9 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
           }
           return current;
         }),
+        // Reconciliation and cache updates still consume every raw frame;
+        // unchanged projections must not republish fresh stream-atom results.
+        Stream.changes,
       );
     }),
   );

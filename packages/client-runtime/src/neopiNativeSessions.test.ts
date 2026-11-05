@@ -50,6 +50,35 @@ const initial = () =>
   });
 
 describe("canonical native client projection", () => {
+  it.each(["message_start", "message_update", "tool_execution_update", "unknown"])(
+    "retains feed identity for ignored child %s frames",
+    (type) => {
+      const feed = initial();
+      const next = reduceNativeSessionFeed(feed, {
+        type: "event",
+        frame: { type: "subagent_event", payload: { id: "child", event: { type } } },
+      });
+      expect(next).toBe(feed);
+    },
+  );
+
+  it.each(["message_end", "tool_execution_end", "agent_end"])(
+    "publishes a child refresh tick for settled %s frames",
+    (type) => {
+      const feed = initial();
+      const update = {
+        type: "event" as const,
+        frame: { type: "subagent_event", payload: { id: "child", event: { type } } },
+      };
+      const next = reduceNativeSessionFeed(feed, update);
+      expect(next).not.toBe(feed);
+      expect(next.agentTicks.child).toBe(1);
+      expect(next.conversation).toBe(feed.conversation);
+      expect(next.busy).toBe(feed.busy);
+      expect(reduceNativeSessionFeed(next, update).agentTicks.child).toBe(2);
+    },
+  );
+
   it("keeps command output between messages across hidden entries and reconnect", () => {
     let feed = initial();
     const bookkeeping = { ...user, id: "config", parentId: user.id, type: "model_change" };

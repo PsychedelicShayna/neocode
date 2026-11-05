@@ -425,6 +425,61 @@ describe("scoped settings writes", () => {
     ]);
     expect(persistServer).toHaveBeenCalledTimes(4);
   });
+
+  it("waits for a client-only write and reports its rejection", async () => {
+    let failClient!: (error: Error) => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const persistClient = vi.fn(
+      () =>
+        new Promise<void>((_, reject) => {
+          failClient = reject;
+          signalStarted();
+        }),
+    );
+    const persistServer = vi.fn().mockResolvedValue({ _tag: "Success" });
+    let settled = false;
+    const pending = persistScopedSettingsPatch(
+      planScopedSettingsPatch(named, environments, { diffIgnoreWhitespace: false }),
+      persistServer,
+      persistClient,
+    ).then((result) => {
+      settled = true;
+      return result;
+    });
+    await started;
+    expect(settled).toBe(false);
+    failClient(new Error("Storage unavailable"));
+
+    expect(await pending).toEqual({
+      failedEnvironments: [],
+      failedClientWrite: true,
+      savedEnvironmentCount: 0,
+    });
+    expect(persistServer).not.toHaveBeenCalled();
+  });
+
+  it("collects client and server failures without losing successful server writes", async () => {
+    const persistServer = vi
+      .fn()
+      .mockResolvedValueOnce({ _tag: "Success" })
+      .mockResolvedValueOnce({ _tag: "Failure" });
+    const result = await persistScopedSettingsPatch(
+      planScopedSettingsPatch(all, environments, {
+        diffIgnoreWhitespace: false,
+        enableProviderUpdateChecks: false,
+      }),
+      persistServer,
+      vi.fn().mockRejectedValue(new Error("Storage unavailable")),
+    );
+
+    expect(result.failedClientWrite).toBe(true);
+    expect(result.savedEnvironmentCount).toBe(1);
+    expect(result.failedEnvironments.map(({ label }) => label)).toEqual([server.label]);
+    expect(persistServer).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("scoped settings mixed values", () => {

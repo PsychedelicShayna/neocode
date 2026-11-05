@@ -388,27 +388,32 @@ export function planProjectOverridesClear(
   };
 }
 
-/** Wait for every target so a failed environment does not hide successful or later writes. */
+/** Wait for every backing store so one failure cannot hide the other writes. */
 export async function persistScopedSettingsPatch(
   plan: ReturnType<typeof planScopedSettingsPatch>,
   persistServer: (input: {
     environmentId: EnvironmentId;
     input: { patch: ServerSettingsPatch };
   }) => Promise<{ readonly _tag: "Success" | "Failure" }>,
-  persistClient: (patch: ClientSettingsPatch) => void,
+  persistClient: (patch: ClientSettingsPatch) => Promise<void>,
 ) {
-  if (plan.hasClientWrite) persistClient(plan.clientPatch);
-  const results = await Promise.allSettled(
-    plan.serverWrites.map(({ environmentId, patch }) =>
-      persistServer({ environmentId, input: { patch } }),
+  const [results, clientResults] = await Promise.all([
+    Promise.allSettled(
+      plan.serverWrites.map(({ environmentId, patch }) =>
+        persistServer({ environmentId, input: { patch } }),
+      ),
     ),
-  );
+    Promise.allSettled(
+      plan.hasClientWrite ? [Promise.resolve().then(() => persistClient(plan.clientPatch))] : [],
+    ),
+  ]);
   const failedEnvironments = plan.serverWrites.filter((_, index) => {
     const result = results[index];
     return result?.status !== "fulfilled" || result.value._tag === "Failure";
   });
   return {
     failedEnvironments,
+    failedClientWrite: clientResults[0]?.status === "rejected",
     savedEnvironmentCount: plan.serverWrites.length - failedEnvironments.length,
   };
 }

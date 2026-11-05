@@ -64,15 +64,18 @@ function useRunScopedPlan() {
         return;
       }
       void persistScopedSettingsPatch(plan, persistServer, persistClientSettingsPatch).then(
-        ({ failedEnvironments, savedEnvironmentCount }) => {
-          if (failedEnvironments.length === 0) return;
+        ({ failedEnvironments, failedClientWrite, savedEnvironmentCount }) => {
+          if (failedEnvironments.length === 0 && !failedClientWrite) return;
+          const partiallySaved =
+            savedEnvironmentCount > 0 || (plan.hasClientWrite && !failedClientWrite);
+          const failedTargets = [
+            ...(failedClientWrite ? ["this client"] : []),
+            ...failedEnvironments.map((environment) => environment.label),
+          ];
           toastManager.add({
             type: "error",
-            title:
-              savedEnvironmentCount > 0
-                ? "Setting saved on some environments"
-                : "Setting not saved",
-            description: `Could not update ${failedEnvironments.map((environment) => environment.label).join(", ")}.${savedEnvironmentCount > 0 ? " The other selected environments saved the change." : ""}`,
+            title: partiallySaved ? "Setting saved in some locations" : "Setting not saved",
+            description: `Could not update ${failedTargets.join(", ")}.${partiallySaved ? " The other selected locations saved the change." : ""}${failedClientWrite ? " Client changes may only last for this session; try again before closing." : ""}`,
           });
         },
       );

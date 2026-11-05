@@ -101,8 +101,10 @@ describe("client settings hydration", () => {
     persistenceMocks.getClientSettings.mockRejectedValue(failure);
 
     const hydration = ensureClientSettingsHydrated();
-    persistClientSettingsPatch({ wordWrap: false });
+    const patch = persistClientSettingsPatch({ wordWrap: false });
+    const patchFailure = expect(patch).rejects.toBe(failure);
     await expect(hydration).rejects.toBe(failure);
+    await patchFailure;
     expect(persistenceMocks.setClientSettings).not.toHaveBeenCalled();
 
     persistenceMocks.getClientSettings.mockResolvedValue(savedSettings);
@@ -187,6 +189,39 @@ describe("persistClientSettingsPatch", () => {
 
     expect(persistenceMocks.setClientSettings).toHaveBeenNthCalledWith(1, firstSettings);
     expect(persistenceMocks.setClientSettings).toHaveBeenNthCalledWith(2, secondSettings);
+  });
+
+  it("rejects a failed save without rolling back newer session preferences", async () => {
+    __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failure = new Error("disk full");
+    let failFirst!: (error: Error) => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    persistenceMocks.setClientSettings.mockImplementationOnce(() => {
+      signalStarted();
+      return new Promise<void>((_, reject) => {
+        failFirst = reject;
+      });
+    });
+
+    const first = persistClientSettingsPatch({ snapShotFlash: false });
+    const rejected = expect(first).rejects.toBe(failure);
+    await started;
+    const second = persistClientSettingsPatch({ snapShotPlaySound: false });
+    failFirst(failure);
+    await rejected;
+    await second;
+
+    const expected = {
+      ...DEFAULT_CLIENT_SETTINGS,
+      snapShotFlash: false,
+      snapShotPlaySound: false,
+    };
+    expect(getClientSettings()).toEqual(expected);
+    expect(persistenceMocks.setClientSettings).toHaveBeenLastCalledWith(expected);
   });
 });
 

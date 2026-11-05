@@ -163,6 +163,7 @@ function enqueueClientSettingsPersistence<A>(work: () => Promise<A>): Promise<A>
   return result;
 }
 
+/** Optimistic changes stay session-visible on failure; callers must report the rejected save. */
 export function persistClientSettingsPatch(
   patch: ClientSettingsPatch,
   persist: (settings: ClientSettings) => Promise<void> = defaultClientSettingsPersistence,
@@ -192,6 +193,7 @@ export function persistClientSettingsPatch(
       operation: "persist",
       ...safeErrorLogAttributes(error),
     });
+    throw error;
   });
 }
 
@@ -218,6 +220,15 @@ export async function persistClientSettingsUpdate(
         return next;
       }
     }
+  });
+}
+
+function reportClientSettingsSaveFailure() {
+  toastManager.add({
+    type: "error",
+    title: "Client setting not saved",
+    description:
+      "Could not save this client's preferences. Changes may only last for this session; try again before closing.",
   });
 }
 
@@ -455,7 +466,7 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
         }
       }
       if (Object.keys(clientPatch).length > 0) {
-        void persistClientSettingsPatch(clientPatch);
+        void persistClientSettingsPatch(clientPatch).catch(reportClientSettingsSaveFailure);
       }
     },
     [environmentId, environments, persistServerSettings],
@@ -474,7 +485,10 @@ export function useUpdatePrimarySettings() {
 
 export function useUpdateClientSettings() {
   return useCallback((patch: ClientSettingsPatch) => {
-    return persistClientSettingsPatch(patch);
+    const pending = persistClientSettingsPatch(patch);
+    // Most controls are fire-and-forget; callers that await still receive the failure.
+    void pending.catch(reportClientSettingsSaveFailure);
+    return pending;
   }, []);
 }
 

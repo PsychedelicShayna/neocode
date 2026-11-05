@@ -1650,10 +1650,11 @@ describe("MessagesTimeline", () => {
           );
         });
         await act(() => renderer!.root.findByProps({ "aria-expanded": false }).props.onClick());
-        const text = renderer!.root.findByProps({
-          className: "relative min-w-0 truncate text-secondary-label",
-        });
-        const preview = text.parent!;
+        // The whole header button is the preview: icon, plain-text label, chevron.
+        const preview = renderer!.root.find(
+          (node) => node.type === "button" && node.props["aria-expanded"] === false,
+        );
+        const text = preview;
         expect(
           text
             .findAll(() => true)

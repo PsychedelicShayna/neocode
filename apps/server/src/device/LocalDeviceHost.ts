@@ -341,7 +341,7 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
   const spawnHub = Effect.fn("LocalDeviceHost.spawnHub")(function* (
     hubTool: DeviceToolPaths,
     nodePath: string,
-  ): Effect.fn.Return<HubProcess, DeviceHost.DeviceHostError> {
+  ): Effect.fn.Return<HubProcess, DeviceHost.DeviceHostError, Scope.Scope> {
     yield* reapStaleHub;
     yield* fs
       .makeDirectory(agentDeviceStateDir(path, config.stateDir), { recursive: true })
@@ -357,7 +357,15 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
       ),
     );
     const origin = `http://127.0.0.1:${port}`;
-    const scope = yield* Scope.make("sequential");
+    // Startup owns the child until runningRef takes over, including interruptible
+    // readiness and helper discovery before that handoff.
+    const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+      Ref.get(runningRef).pipe(
+        Effect.flatMap((running) =>
+          running?.hub.scope === scope ? Effect.void : Scope.close(scope, Exit.void),
+        ),
+      ),
+    );
     const child = yield* spawner
       .spawn(
         ChildProcess.make(
@@ -404,10 +412,7 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
           step: "waiting for the device hub to answer",
           cause: info.cause,
         }),
-    }).pipe(
-      Effect.provideService(HttpClient.HttpClient, httpClient),
-      Effect.tapError(() => stopHub(hub)),
-    );
+    }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
     yield* recordHub(hub, hubTool);
     yield* Effect.logInfo("Device hub started", { pid: Number(child.pid), port });
     return hub;
@@ -450,9 +455,12 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
           const current = yield* Ref.get(runningRef);
           if (current?.hub.child.pid !== hub.child.pid) return;
           const replacement = yield* spawnHub(hubTool, hub.nodePath);
-          yield* Ref.set(runningRef, { ...current, hub: replacement });
-          yield* Effect.forkDetach(superviseHub(replacement, hubTool));
-        }),
+          yield* Effect.uninterruptible(
+            Ref.set(runningRef, { ...current, hub: replacement }).pipe(
+              Effect.andThen(Effect.forkDetach(superviseHub(replacement, hubTool))),
+            ),
+          );
+        }).pipe(Effect.scoped),
       );
     }).pipe(
       Effect.catchCause((cause) => Effect.logWarning("Device hub supervisor failed", { cause })),
@@ -559,7 +567,11 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
 
   const ensureHubReady = Effect.fn("LocalDeviceHost.ensureHubReady")(function* (
     onPhase: (phase: "installing" | "starting", detail?: string) => Effect.Effect<void>,
-  ): Effect.fn.Return<RunningHost, DeviceHost.DeviceHostError | NodeRuntimeUnavailableError> {
+  ): Effect.fn.Return<
+    RunningHost,
+    DeviceHost.DeviceHostError | NodeRuntimeUnavailableError,
+    Scope.Scope
+  > {
     const running = yield* Ref.get(runningRef);
     if (running) {
       const alive = yield* running.hub.child.isRunning.pipe(Effect.orElseSucceed(() => false));
@@ -612,11 +624,14 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
         serveSimCli: cliExists ? candidate.serveSimCli : null,
       },
     };
-    yield* Ref.set(runningRef, next);
-    yield* Ref.set(restartDelayRef, 0);
-    yield* Effect.forkDetach(superviseHub(hub, hubTool));
+    yield* Effect.uninterruptible(
+      Ref.set(runningRef, next).pipe(
+        Effect.andThen(Ref.set(restartDelayRef, 0)),
+        Effect.andThen(Effect.forkDetach(superviseHub(hub, hubTool))),
+      ),
+    );
     return next;
-  });
+  }, Effect.scoped);
 
   const ensureReady: DeviceHost.DeviceHost["Service"]["ensureReady"] = (onPhase) =>
     startLock.withPermits(1)(ensureHubReady(onPhase).pipe(Effect.map(toReady)));

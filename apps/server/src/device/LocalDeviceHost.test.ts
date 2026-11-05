@@ -5,18 +5,24 @@ import {
   HostProcessPlatform,
   HostProcessIsExecutable,
 } from "@t3tools/shared/hostProcess";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as FileSystem from "effect/FileSystem";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
 
 import * as LocalDeviceHost from "./LocalDeviceHost.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { HttpClient } from "effect/unstable/http";
+import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import * as NetService from "@t3tools/shared/Net";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import { DEVICE_HUB_VERSION } from "./DeviceToolchain.ts";
 
 const diagnose = (
   files: ReadonlyArray<string>,
@@ -169,4 +175,73 @@ it.effect(
       yield* host.stop;
       expect(yield* fs.exists(`${baseDir}/tools`)).toBe(false);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("closes a provisional hub when readiness or post-ready setup is interrupted", () =>
+  Effect.gen(function* () {
+    for (const stage of ["readiness", "maintenance"]) {
+      yield* Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hub-ownership-" });
+        const installDir = `${baseDir}/tools/expo-device-hub/${DEVICE_HUB_VERSION}`;
+        const entryDir = `${installDir}/node_modules/expo-device-hub/dist/server`;
+        yield* fs.makeDirectory(entryDir, { recursive: true });
+        yield* fs.writeFileString(`${entryDir}/cli.mjs`, "");
+        yield* fs.writeFileString(`${installDir}/.install-complete`, DEVICE_HUB_VERSION);
+        const paused = yield* Deferred.make<void>();
+        let children = 0;
+        const host = yield* LocalDeviceHost.make().pipe(
+          Effect.provide(
+            Layer.mergeAll(ServerConfig.layerTest(baseDir, baseDir), NetService.layer),
+          ),
+          Effect.provideService(HostProcessEnvironment, { HOME: baseDir, PATH: "" }),
+          Effect.provideService(HostProcessPlatform, "linux"),
+          Effect.provideService(HostProcessIsExecutable, false),
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.gen(function* () {
+                children++;
+                yield* Effect.addFinalizer(() =>
+                  Effect.sync(() => {
+                    children--;
+                  }),
+                );
+                return ChildProcessSpawner.makeHandle({
+                  pid: ChildProcessSpawner.ProcessId(123),
+                  stdout: Stream.empty,
+                  stderr: Stream.empty,
+                  all: Stream.empty,
+                  exitCode: Effect.never,
+                  isRunning: Effect.succeed(true),
+                  kill: () => Effect.void,
+                  stdin: Sink.drain,
+                  getInputFd: () => Sink.drain,
+                  getOutputFd: () => Stream.empty,
+                  unref: Effect.succeed(Effect.void),
+                });
+              }),
+            ),
+          ),
+          Effect.provideService(ProcessRunner.ProcessRunner, {
+            run: () => Deferred.succeed(paused, undefined).pipe(Effect.andThen(Effect.never)),
+          }),
+          Effect.provideService(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              stage === "readiness"
+                ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.succeed(HttpClientResponse.fromWeb(request, new Response("ok"))),
+            ),
+          ),
+        );
+        const startup = yield* host.ensureReady(() => Effect.void).pipe(Effect.forkChild);
+        yield* Deferred.await(paused);
+        expect(children).toBe(1);
+        yield* Fiber.interrupt(startup);
+        expect(children).toBe(0);
+        expect(yield* host.current).toBeNull();
+      }).pipe(Effect.scoped);
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

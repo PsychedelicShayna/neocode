@@ -67,6 +67,10 @@ vi.mock("../../state/neopiNativeSessions", () => ({
   get nativeSessionAtoms() {
     return fixture.current!.atoms;
   },
+  useNativeSessionReconnect(target: NativeSessionTarget) {
+    const { atoms, registry } = fixture.current!;
+    return useCallback(() => atoms.reconnect(registry, target), [atoms, registry, target]);
+  },
   useNativeSession(target: NativeSessionTarget) {
     const { atoms, registry } = fixture.current!;
     const watch = atoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } });
@@ -219,13 +223,14 @@ const makeHarness = Effect.fnUntraced(function* () {
   const publish = (update: NativeSessionUpdate) => {
     for (const events of active) Queue.offerUnsafe(events, update);
   };
-  const closeOwner = () => publish({ type: "closed", reason: closedReason });
+  const closeOwner = (code?: string) =>
+    publish({ type: "closed", reason: closedReason, ...(code ? { code } : {}) });
   const client = {
     [WS_METHODS.neopiNativeSessionsOpen]: () => Effect.succeed(session),
     [WS_METHODS.neopiNativeSessionsClose]: () =>
       Effect.sync(() => {
         closes++;
-        closeOwner();
+        closeOwner("detached");
         return { closed: true };
       }),
     [WS_METHODS.neopiNativeSessionsRequest]: (input: {
@@ -311,162 +316,205 @@ const makeHarness = Effect.fnUntraced(function* () {
   };
 });
 
+/** Mounts the real screen on a stack router, as the app's NativeStack keeps its routes. */
+const mountScreen = (h: Effect.Success<ReturnType<typeof makeHarness>>) => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  fixture.current = h;
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const router = StackRouter({ initialRouteName: "Home" });
+  const options = {
+    routeNames: ["Home", "NativeSession"],
+    routeParamList: {},
+    routeGetIdList: {},
+  };
+  let state = router.getInitialState(options);
+  const render = () => root.render(<RouteHost />);
+  const dispatch = (action: Action) => {
+    const next = router.getStateForAction(state, action, options);
+    if (!next) throw new Error(`Unhandled navigation action: ${action.type}`);
+    state = router.getRehydratedState(next, options);
+    render();
+  };
+  fixture.navigation = {
+    dispatch,
+    navigate: (name, params) => dispatch(CommonActions.navigate(name, params)),
+    addListener: () => () => {},
+  };
+  function RouteHost() {
+    // NativeStack keeps every retained route mounted. Only removed route
+    // keys unmount their real screen and release its registry listener.
+    return state.routes.map((route, index) => (
+      <section key={route.key} hidden={index !== state.index} data-focused={index === state.index}>
+        {route.name === "Home" ? (
+          <h1>Sessions</h1>
+        ) : (
+          <NativeSessionScreen
+            route={{
+              params: route.params as {
+                environmentId: string;
+                providerInstanceId: string;
+                sessionFile: string;
+              },
+            }}
+          />
+        )}
+      </section>
+    ));
+  }
+  const focused = () => container.querySelector<HTMLElement>('[data-focused="true"]')!;
+  const click = (label: string) => {
+    const button = Array.from(focused().querySelectorAll("button")).find(
+      (button) => button.textContent === label,
+    );
+    expect(button).toBeDefined();
+    button!.click();
+  };
+  const selectCanonicalSession = async () => {
+    // Match the browser's open-before-navigate flow, using the server's
+    // returned canonical ref rather than a different session/route key.
+    const opened = await h.atoms.open.run(h.registry, {
+      environmentId: h.target.environmentId,
+      input: ref,
+    });
+    expect(opened._tag).toBe("Success");
+    if (opened._tag === "Failure") throw Cause.squash(opened.cause);
+    fixture.navigation!.navigate("NativeSession", {
+      environmentId: h.target.environmentId,
+      ...opened.value.ref,
+    });
+  };
+  const cleanup = async () => {
+    await act(async () => {
+      root.unmount();
+    });
+    h.registry.dispose();
+    h.flush();
+    container.remove();
+    fixture.current = undefined;
+    fixture.navigation = undefined;
+    vi.unstubAllGlobals();
+  };
+  return { render, focused, click, selectCanonicalSession, cleanup };
+};
+
 describe("NativeSessionScreen exit and canonical reselection", () => {
-  it.effect.each(["Disconnect session", "Back"])(
-    "%s releases the closed watch boundary before reopening the same session",
-    (exit) =>
-      Effect.gen(function* () {
-        const h = yield* makeHarness();
-        yield* Effect.promise(async () => {
-          vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-          fixture.current = h;
-          const container = document.createElement("div");
-          document.body.append(container);
-          const root = createRoot(container);
-          const router = StackRouter({ initialRouteName: "Home" });
-          const options = {
-            routeNames: ["Home", "NativeSession"],
-            routeParamList: {},
-            routeGetIdList: {},
-          };
-          let state = router.getInitialState(options);
-          const render = () => root.render(<RouteHost />);
-          const dispatch = (action: Action) => {
-            const next = router.getStateForAction(state, action, options);
-            if (!next) throw new Error(`Unhandled navigation action: ${action.type}`);
-            state = router.getRehydratedState(next, options);
-            render();
-          };
-          fixture.navigation = {
-            dispatch,
-            navigate: (name, params) => dispatch(CommonActions.navigate(name, params)),
-            addListener: () => () => {},
-          };
-          function RouteHost() {
-            // NativeStack keeps every retained route mounted. Only removed route
-            // keys unmount their real screen and release its registry listener.
-            return state.routes.map((route, index) => (
-              <section
-                key={route.key}
-                hidden={index !== state.index}
-                data-focused={index === state.index}
-              >
-                {route.name === "Home" ? (
-                  <h1>Sessions</h1>
-                ) : (
-                  <NativeSessionScreen
-                    route={{
-                      params: route.params as {
-                        environmentId: string;
-                        providerInstanceId: string;
-                        sessionFile: string;
-                      },
-                    }}
-                  />
-                )}
-              </section>
-            ));
-          }
-          const focused = () => container.querySelector<HTMLElement>('[data-focused="true"]')!;
-          const selectCanonicalSession = async () => {
-            // Match the browser's open-before-navigate flow, using the server's
-            // returned canonical ref rather than a different session/route key.
-            const opened = await h.atoms.open.run(h.registry, {
-              environmentId: h.target.environmentId,
-              input: ref,
-            });
-            expect(opened._tag).toBe("Success");
-            if (opened._tag === "Failure") throw Cause.squash(opened.cause);
-            fixture.navigation!.navigate("NativeSession", {
-              environmentId: h.target.environmentId,
-              ...opened.value.ref,
-            });
-          };
-          try {
-            await act(async () => {
-              render();
-              await selectCanonicalSession();
-            });
-            await act(async () => {
-              h.flush();
-            });
-            expect(focused().textContent).toContain("Keep this question after reopening");
-            expect(focused().textContent).not.toContain("Reconnecting");
-            await act(async () => {
-              h.publish({
-                type: "event",
-                frame: { type: "command_output", text: "Retained native output" },
-              });
-              h.flush();
-            });
-            expect(focused().textContent).toContain("Retained native output");
-            expect(h.counts()).toEqual({ watches: 1, closes: 0, active: 1 });
-
-            await act(async () => {
-              const button = Array.from(focused().querySelectorAll("button")).find(
-                (button) => button.textContent === exit,
-              );
-              expect(button).toBeDefined();
-              button!.click();
-            });
-            await act(async () => {
-              h.flush();
-            });
-            expect(focused().textContent).toBe("Sessions");
-            expect(h.counts().closes).toBe(exit === "Back" ? 0 : 1);
-            if (exit === "Back") {
-              // Back itself must leave the owner running. Its terminal can close
-              // while we're away; a warm observation still records that closure.
-              await act(async () => {
-                h.closeOwner();
-                h.flush();
-              });
-            }
-            expect(h.atoms.cached(h.target)?.error).toBe(closedReason);
-            expect(h.counts().active).toBe(0);
-
-            // This drain is essential: idleTTL=0 removes the mount boundary only
-            // after its last listener leaves and the disposal dispatcher runs.
+  it.effect("Back releases the closed watch boundary before reopening the same session", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* Effect.promise(async () => {
+        const screen = mountScreen(h);
+        const { focused } = screen;
+        try {
+          await act(async () => {
+            screen.render();
+            await screen.selectCanonicalSession();
+          });
+          await act(async () => {
             h.flush();
-            await act(async () => {
-              await selectCanonicalSession();
+          });
+          expect(focused().textContent).toContain("Keep this question after reopening");
+          expect(focused().textContent).not.toContain("Reconnecting");
+          await act(async () => {
+            h.publish({
+              type: "event",
+              frame: { type: "command_output", text: "Retained native output" },
             });
-            await act(async () => {
-              h.flush();
-            });
-
-            // Bounded RED on navigate('Home'): the retained old screen keeps the
-            // closed boundary alive, so the newly focused real screen still shows
-            // Reconnecting. Never wait forever for an impossible second watch.
-            expect(focused().textContent).not.toContain("Reconnecting");
-            expect(focused().textContent).not.toContain(closedReason);
-            expect(focused().textContent).toContain("Keep this question after reopening");
-            expect(focused().textContent).toContain("Retained native output");
-            expect(h.counts()).toEqual({ watches: 2, closes: exit === "Back" ? 0 : 1, active: 1 });
-            await act(async () => {
-              h.publish({
-                type: "event",
-                frame: {
-                  type: "message_update",
-                  messageId: "new-live",
-                  message: { role: "assistant", content: "Live after reopening" },
-                },
-              });
-              h.flush();
-            });
-            expect(focused().textContent).toContain("Live after reopening");
-          } finally {
-            await act(async () => {
-              root.unmount();
-            });
-            h.registry.dispose();
             h.flush();
-            container.remove();
-            fixture.current = undefined;
-            fixture.navigation = undefined;
-            vi.unstubAllGlobals();
-          }
-        });
-      }),
+          });
+          expect(focused().textContent).toContain("Retained native output");
+          expect(h.counts()).toEqual({ watches: 1, closes: 0, active: 1 });
+
+          await act(async () => {
+            screen.click("Back");
+          });
+          await act(async () => {
+            h.flush();
+          });
+          expect(focused().textContent).toBe("Sessions");
+          expect(h.counts().closes).toBe(0);
+          // Back itself must leave the owner running. Its terminal can close
+          // while we're away; a warm observation still records that closure.
+          await act(async () => {
+            h.closeOwner();
+            h.flush();
+          });
+          expect(h.atoms.cached(h.target)?.error).toBe(closedReason);
+          expect(h.counts().active).toBe(0);
+
+          // This drain is essential: idleTTL=0 removes the mount boundary only
+          // after its last listener leaves and the disposal dispatcher runs.
+          h.flush();
+          await act(async () => {
+            await screen.selectCanonicalSession();
+          });
+          await act(async () => {
+            h.flush();
+          });
+
+          // Bounded RED on navigate('Home'): the retained old screen keeps the
+          // closed boundary alive, so the newly focused real screen still shows
+          // Reconnecting. Never wait forever for an impossible second watch.
+          expect(focused().textContent).not.toContain("Reconnecting");
+          expect(focused().textContent).not.toContain(closedReason);
+          expect(focused().textContent).toContain("Keep this question after reopening");
+          expect(focused().textContent).toContain("Retained native output");
+          expect(h.counts()).toEqual({ watches: 2, closes: 0, active: 1 });
+          await act(async () => {
+            h.publish({
+              type: "event",
+              frame: {
+                type: "message_update",
+                messageId: "new-live",
+                message: { role: "assistant", content: "Live after reopening" },
+              },
+            });
+            h.flush();
+          });
+          expect(focused().textContent).toContain("Live after reopening");
+        } finally {
+          await screen.cleanup();
+        }
+      });
+    }),
+  );
+
+  it.effect("Detach stays on the screen as detached, offering Reconnect", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* Effect.promise(async () => {
+        const screen = mountScreen(h);
+        const { focused } = screen;
+        try {
+          await act(async () => {
+            screen.render();
+            await screen.selectCanonicalSession();
+          });
+          await act(async () => {
+            h.flush();
+          });
+          expect(focused().textContent).toContain("Keep this question after reopening");
+
+          await act(async () => {
+            screen.click("Detach from terminal session (the terminal keeps it)");
+          });
+          await act(async () => {
+            h.flush();
+          });
+          // The terminal owns this session (the fixture attaches to one): the screen
+          // stays, says so, and offers the way back instead of an error.
+          expect(h.counts().closes).toBe(1);
+          expect(focused().textContent).toContain("Keep this question after reopening");
+          expect(focused().textContent).toContain(
+            "Detached from the terminal session. The terminal still owns it.",
+          );
+          expect(focused().textContent).not.toContain(closedReason);
+          expect(focused().textContent).toContain("Reconnect session");
+        } finally {
+          await screen.cleanup();
+        }
+      });
+    }),
   );
 });

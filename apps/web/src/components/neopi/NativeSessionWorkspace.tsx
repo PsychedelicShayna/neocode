@@ -5,6 +5,8 @@ import {
   nativeCommandCompletions,
   nativeRecord,
   nativeSessionKey,
+  nativeDisconnectLabel,
+  nativeOwnerNotice,
   nativeSlashCommands,
   type NativeSessionTarget,
   type NativeSlashCommand,
@@ -32,7 +34,6 @@ import {
   useNativeSessionReconnect,
   useNativeSessionSelection,
 } from "../../state/neopiNativeSessions";
-import { nativeDisconnectLabel, nativeOwnerNotice } from "./nativeOwnerNotice";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";

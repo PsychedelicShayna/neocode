@@ -12,6 +12,7 @@ import {
 } from "effect-neopi-rpc/client";
 import type { PlanProposalResponseFrame } from "effect-neopi-rpc/schema";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
+import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -23,6 +24,7 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import { ChildProcess } from "effect/unstable/process";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { buildNeoPiLaunchPlan, isSharedNeoPiCursor } from "./NeoPiLaunchArgs.ts";
@@ -34,6 +36,7 @@ import {
 import { NEOPI_CAPABILITIES, neopiCompatibility } from "./NeoPiCompatibility.ts";
 import { neoPiRoleFromModelSlug } from "./NeoPiModelCatalog.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
+import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import type {
   NeoPiResumeCursor,
@@ -88,6 +91,8 @@ export interface NeoPiRuntimeInput {
   readonly hostBridge?: HostBridge;
   readonly requestTimeoutMs?: number;
   readonly closeGraceMs?: number;
+  /** Bounds the waits after the grace close for the child's exit and its scope's release. */
+  readonly closeExitWaitMs?: number;
 }
 
 const rpcError = (cause: unknown): NeoPiRuntimeError =>
@@ -104,6 +109,8 @@ const record = (value: unknown): Record<string, unknown> =>
 const identityError = (message: string) =>
   new NeoPiRuntimeError({ code: "identity_mismatch", message });
 const unknownCommand = (error: NeoPiRuntimeError) => /unknown command/i.test(error.message);
+/** The longest a runtime close waits for a child to exit, or for its scope to release it. */
+const DEFAULT_CLOSE_EXIT_WAIT_MS = 5_000;
 const activeUiMethods = new Set(["select", "confirm", "input", "editor"]);
 const decodeOwnerCatalog = Schema.decodeUnknownSync(
   Schema.fromJsonString(
@@ -671,8 +678,20 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     yield* cancelPending;
     const closing = client;
     if (closing) yield* closing.close(input.closeGraceMs ?? 150).pipe(Effect.ignore);
-    const exit = closing ? yield* Deferred.await(closing.exit) : undefined;
-    if (lifetime) yield* Scope.close(lifetime, Exit.void).pipe(Effect.ignore);
+    // A child that ignores the grace close must not wedge stop and restart: the scope
+    // below still kills it, but neither wait may be unbounded.
+    const exit = closing
+      ? Option.getOrUndefined(
+          yield* Deferred.await(closing.exit).pipe(
+            Effect.timeoutOption(input.closeExitWaitMs ?? DEFAULT_CLOSE_EXIT_WAIT_MS),
+          ),
+        )
+      : undefined;
+    if (lifetime)
+      yield* Scope.close(lifetime, Exit.void).pipe(
+        Effect.timeoutOption(input.closeExitWaitMs ?? DEFAULT_CLOSE_EXIT_WAIT_MS),
+        Effect.ignore,
+      );
     client = undefined;
     earlyUi = undefined;
     lifetime = undefined;
@@ -815,7 +834,16 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
                         },
                       ),
                     );
-                    const text = yield* Stream.mkString(Stream.decodeText(process.stdout));
+                    const listing = yield* collectUint8StreamText({
+                      stream: process.stdout,
+                      maxBytes: MAX_RPC_REASSEMBLED_BYTES,
+                    });
+                    const text = listing.text;
+                    if (listing.truncated)
+                      return yield* new NeoPiRuntimeError({
+                        code: "rpc",
+                        message: "The session catalog output exceeded its size limit.",
+                      });
                     const code = yield* process.exitCode;
                     if (code !== 0) return undefined;
                     const catalog = yield* Effect.try(() => decodeOwnerCatalog(text));

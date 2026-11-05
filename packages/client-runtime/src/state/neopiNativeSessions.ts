@@ -1,11 +1,12 @@
 import { WS_METHODS, type NeoPiNativeSessionRef } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as Schedule from "effect/Schedule";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { request as rpcRequest, subscribe } from "../rpc/client.ts";
@@ -218,7 +219,7 @@ export function createNativeSessionAtoms<R, E>(
   const cache = new Map<string, NativeSessionFeed>();
   const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
   const endedObservations = new Set<string>();
-  /** Sessions the user detached from; a revisit leaves them detached until `release`. */
+  /** Sessions the user detached from; a revisit leaves them detached until `reconnect`. */
   const detachedObservations = new Set<string>();
   const publish = (key: string, update: NativeSessionUpdate) =>
     Effect.sync(() => {
@@ -447,16 +448,15 @@ export function createNativeSessionAtoms<R, E>(
         return value;
       }),
   });
+  const open = createEnvironmentRpcCommand(runtime, {
+    label: "native-sessions:open",
+    tag: WS_METHODS.neopiNativeSessionsOpen,
+    onSuccess: (target, registry) =>
+      Effect.sync(() => registry.refresh(list({ environmentId: target.environmentId, input: {} }))),
+  });
   return {
     list,
-    open: createEnvironmentRpcCommand(runtime, {
-      label: "native-sessions:open",
-      tag: WS_METHODS.neopiNativeSessionsOpen,
-      onSuccess: (target, registry) =>
-        Effect.sync(() =>
-          registry.refresh(list({ environmentId: target.environmentId, input: {} })),
-        ),
-    }),
+    open,
     request,
     close: createEnvironmentRpcCommand(runtime, {
       label: "native-sessions:close",
@@ -476,9 +476,45 @@ export function createNativeSessionAtoms<R, E>(
     }),
     watch,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
-    /** Lets a detached session's observation reopen; the caller refreshes `watch` afterwards. */
-    release: (target: NativeSessionTarget) => {
+    /**
+     * Opens the session again after its owner is gone or the user detached, and restarts the
+     * observation. The server attaches to a live terminal owner when there is one and otherwise
+     * starts NeoCode's own, so this is also how a quit terminal is taken over. Rejects with the
+     * open failure; otherwise resolves once the feed has a live owner, or after `timeoutMs`.
+     */
+    reconnect: async (
+      registry: AtomRegistry.AtomRegistry,
+      target: NativeSessionTarget,
+      timeoutMs = 15_000,
+    ) => {
+      const result = await open.run(registry, {
+        environmentId: target.environmentId,
+        input: target.ref,
+      });
+      if (result._tag === "Failure") throw Cause.squash(result.cause);
       detachedObservations.delete(nativeSessionKey(target));
+      const atom = watch({ environmentId: target.environmentId, input: { ref: target.ref } });
+      registry.refresh(atom);
+      await new Promise<void>((resolve) => {
+        let unsubscribe: (() => void) | undefined;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          unsubscribe?.();
+          resolve();
+        };
+        const timer = setTimeout(finish, timeoutMs);
+        unsubscribe = registry.subscribe(
+          atom,
+          (value) => {
+            if (AsyncResult.isSuccess(value) && value.value.connected) finish();
+          },
+          { immediate: true },
+        );
+        if (done) unsubscribe();
+      });
     },
   };
 }

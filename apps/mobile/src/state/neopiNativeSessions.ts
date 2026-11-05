@@ -11,8 +11,17 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback } from "react";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useAtomCommand } from "./use-atom-command";
+import { appAtomRegistry } from "./atom-registry";
 
 export const nativeSessionAtoms = createNativeSessionAtoms(connectionAtomRuntime);
+
+/** Reopens a detached or ownerless session; see `nativeSessionAtoms.reconnect`. */
+export function useNativeSessionReconnect(target: NativeSessionTarget) {
+  return useCallback(
+    () => nativeSessionAtoms.reconnect(appAtomRegistry, target),
+    [target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
+  );
+}
 export function useNativeSession(target: NativeSessionTarget) {
   const result = useAtomValue(
     nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),

@@ -5,6 +5,8 @@ import {
   nativeCatalogModels,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
+  nativeDisconnectLabel,
+  nativeOwnerNotice,
   nativeRecord,
   nativeSessionKey,
   nativeSlashArgument,
@@ -23,7 +25,11 @@ import { FlatList, KeyboardAvoidingView, Platform, ScrollView, View } from "reac
 import { AppText as Text } from "../../components/AppText";
 import { MaterialButton } from "../../components/MaterialButton";
 import { ScreenHeader } from "../../components/ScreenHeader";
-import { nativeSessionAtoms, useNativeSession } from "../../state/neopiNativeSessions";
+import {
+  nativeSessionAtoms,
+  useNativeSession,
+  useNativeSessionReconnect,
+} from "../../state/neopiNativeSessions";
 import { useNativeComposerState } from "../../state/use-native-composer-state";
 import {
   getComposerDraftSnapshot,
@@ -98,8 +104,13 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     submissionFollow.cancel();
   }, [submissionFollow]);
   useEffect(() => cancelSubmissionFollow, [cancelSubmissionFollow]);
+  const reconnect = useNativeSessionReconnect(target);
+  const ownerlessRef = useRef(false);
+  ownerlessRef.current = !feed.connected;
   const submit = useCallback<Request>(
     async (command, attachments) => {
+      // Nothing owns the session: take it over first, so the prompt lands in a live one.
+      if (command.type === "prompt" && ownerlessRef.current) await reconnect();
       if (command.type !== "prompt") {
         cancelSubmissionFollow();
         return request(command, attachments);
@@ -120,12 +131,23 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const composer = useNativeComposerState({
     target,
     request: submit,
-    connected: feed.connected,
+    // A reconnecting session holds sends on the server; an orphaned one takes them by
+    // starting an owner first (see `submit`).
+    connected: feed.connected || feed.ownerLoss === "orphaned",
     busy: feed.busy,
   });
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const [paging, setPaging] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectNow = useCallback(() => {
+    setReconnecting(true);
+    setLocalError(null);
+    void reconnect()
+      .catch((cause) => setLocalError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setReconnecting(false));
+  }, [reconnect]);
+  const ownerNotice = nativeOwnerNotice(feed.ownerLoss, feed.session?.attachment);
   const [models, setModels] = useState(false);
   const [tree, setTree] = useState(false);
   const [debug, setDebug] = useState(false);
@@ -297,7 +319,21 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           },
         ]}
       />
-      {!feed.connected || feed.busy ? (
+      {ownerNotice ? (
+        <View className="gap-1 px-4 py-1">
+          <Text accessibilityLiveRegion="polite" className="text-xs text-foreground-muted">
+            {ownerNotice.text}
+          </Text>
+          {ownerNotice.action ? (
+            <MaterialButton
+              label={ownerNotice.action}
+              tone="text"
+              disabled={reconnecting}
+              onPress={reconnectNow}
+            />
+          ) : null}
+        </View>
+      ) : !feed.connected || feed.busy ? (
         <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
           {feed.connected ? "Working" : "Reconnecting · showing cached conversation"}
         </Text>
@@ -485,19 +521,28 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           />
         </View>
         <NeoPiModelsEntry environmentId={target.environmentId} target={target.ref} />
-        <MaterialButton
-          label="Disconnect session"
-          tone="text"
-          onPress={() =>
-            void close({ environmentId: target.environmentId, input: { ref: target.ref } }).then(
-              (result) => {
-                if (result._tag === "Failure")
-                  setLocalError(String(squashAtomCommandFailure(result)));
-                else navigation.dispatch(StackActions.popTo("Home"));
-              },
-            )
-          }
-        />
+        {feed.ownerLoss === "detached" || feed.ownerLoss === "orphaned" ? (
+          <MaterialButton
+            label="Reconnect session"
+            tone="text"
+            disabled={reconnecting}
+            onPress={reconnectNow}
+          />
+        ) : (
+          // Stays on this screen: the feed shows the session as detached, with a way back.
+          <MaterialButton
+            label={nativeDisconnectLabel(feed.session?.attachment)}
+            tone="text"
+            onPress={() =>
+              void close({ environmentId: target.environmentId, input: { ref: target.ref } }).then(
+                (result) => {
+                  if (result._tag === "Failure")
+                    setLocalError(String(squashAtomCommandFailure(result)));
+                },
+              )
+            }
+          />
+        )}
       </View>
       {agents ? (
         <NativeSessionAgents agents={feed.agents} onClose={() => setAgents(false)} />

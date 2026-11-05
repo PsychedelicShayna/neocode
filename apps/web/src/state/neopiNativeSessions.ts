@@ -92,51 +92,12 @@ export function useNativeSessionRequest(target: NativeSessionTarget) {
   );
 }
 
-const RECONNECT_WAIT_MS = 15_000;
-/** Resolves when the feed reports a live owner, or after `timeoutMs`; never rejects. */
-function waitForNativeConnection(target: NativeSessionTarget, timeoutMs: number) {
-  const watch = nativeSessionAtoms.watch({
-    environmentId: target.environmentId,
-    input: { ref: target.ref },
-  });
-  return new Promise<void>((resolve) => {
-    let unsubscribe: (() => void) | null = null;
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      unsubscribe?.();
-      resolve();
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    unsubscribe = appAtomRegistry.subscribe(
-      watch,
-      (result) => {
-        if (AsyncResult.isSuccess(result) && result.value.connected) finish();
-      },
-      { immediate: true },
-    );
-    if (done) unsubscribe();
-  });
-}
-
-/**
- * Opens the session again after its owner is gone or NeoCode detached, and restarts
- * the observation. The server attaches to a live terminal owner when there is one and
- * otherwise starts NeoCode's own, so it is also how a quit terminal is taken over.
- */
+/** Reopens a detached or ownerless session; see `nativeSessionAtoms.reconnect`. */
 export function useNativeSessionReconnect(target: NativeSessionTarget) {
-  const open = useAtomCommand(nativeSessionAtoms.open, { reportFailure: false });
-  return useCallback(async () => {
-    const result = await open({ environmentId: target.environmentId, input: target.ref });
-    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-    nativeSessionAtoms.release(target);
-    appAtomRegistry.refresh(
-      nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
-    );
-    await waitForNativeConnection(target, RECONNECT_WAIT_MS);
-  }, [open, target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile]);
+  return useCallback(
+    () => nativeSessionAtoms.reconnect(appAtomRegistry, target),
+    [target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
+  );
 }
 
 export function useNativeSession(target: NativeSessionTarget) {

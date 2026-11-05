@@ -50,6 +50,8 @@ const testPeer = Effect.fn("testPeer")(function* (
   ready: unknown = defaultReady,
   startup?: { stdout?: unknown; stderr?: unknown },
   closeOnStdin: boolean = false,
+  /** The child ignores every kill and never reports an exit. */
+  stubborn: boolean = false,
 ) {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
@@ -98,14 +100,18 @@ const testPeer = Effect.fn("testPeer")(function* (
     ),
     isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
     kill: (options) =>
-      Effect.gen(function* () {
-        signals.push(options?.killSignal ?? "SIGTERM");
-        if (options?.forceKillAfter) {
-          yield* Effect.sleep(options.forceKillAfter);
-          signals.push("SIGKILL");
-          yield* finish("SIGKILL");
-        } else yield* finish(options?.killSignal ?? "SIGTERM");
-      }),
+      stubborn
+        ? Effect.sync(() => {
+            signals.push(options?.killSignal ?? "SIGTERM");
+          })
+        : Effect.gen(function* () {
+            signals.push(options?.killSignal ?? "SIGTERM");
+            if (options?.forceKillAfter) {
+              yield* Effect.sleep(options.forceKillAfter);
+              signals.push("SIGKILL");
+              yield* finish("SIGKILL");
+            } else yield* finish(options?.killSignal ?? "SIGTERM");
+          }),
     stdin: Sink.forEach((chunk: Uint8Array) => Queue.offer(stdin, chunk)).pipe(
       Sink.ensuring(closeOnStdin ? finish(null) : Effect.void),
     ),
@@ -151,6 +157,7 @@ const make = (
     ...(hostBridge ? { hostBridge } : {}),
     ...(sharedSessionCapabilities ? { sharedSessionCapabilities } : {}),
     closeGraceMs: 20,
+    closeExitWaitMs: 100,
   });
 const turn = (id: string) => ({ turnId: id as TurnId, text: "hello", images: [] });
 const capture = (runtime: Effect.Success<ReturnType<typeof make>>) =>
@@ -571,6 +578,20 @@ it.live("answers correlated login confirmations through an attached runtime boun
       const ownerError = yield* Effect.flip(runtime.respondUi({ id: "owner-ui", confirmed: true }));
       NodeAssert.match(ownerError.message, /attached.*owned by another process/);
       yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("stops within a bounded wait when the child never reports its exit", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      // Ignores stdin EOF and every signal, like a process stuck in uninterruptible I/O.
+      const peer = yield* testPeer(basicHandler, defaultReady, undefined, false, true);
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      yield* runtime.start;
+      yield* runtime.stop.pipe(Effect.timeout("5 seconds"));
+      NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "stopped");
+      NodeAssert.ok(peer.signals.length > 0);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

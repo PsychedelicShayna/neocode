@@ -331,4 +331,38 @@ describe("native main conversation", () => {
       "canonical native file",
     );
   });
+
+  it("keeps a failed turn's error with that turn and off every later turn", () => {
+    const failure = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "404 0 endpoints out of 5 requested are available",
+    };
+    const reply = { role: "assistant", content: "Fine", stopReason: "stop" };
+    const stream = (type: string, messageId: string, message: Record<string, unknown>) =>
+      ({ type: "native", event: { type, ...identity, messageId, message } }) as const;
+    let feed = applyNativeConversationEvent(emptyNativeConversationFeed(), {
+      type: "snapshot",
+      page: page(),
+    });
+    // The failed turn: its live copy shows while the turn is the latest.
+    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_start" } });
+    feed = applyNativeConversationEvent(feed, stream("message_end", "failed", failure));
+    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_end" } });
+    expect(feed.conversation.pending.map((message) => message.messageId)).toEqual(["failed"]);
+    // The next turn starts and succeeds: the failure is not carried into it.
+    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_start" } });
+    expect(feed.conversation.pending).toEqual([]);
+    feed = applyNativeConversationEvent(feed, stream("message_end", "ok", reply));
+    expect(feed.conversation.pending.map((message) => message.messageId)).toEqual(["ok"]);
+    // A durable failed entry stays where the journal put it.
+    const failed = { ...entry("c", "b"), message: failure };
+    const settled = reduceNativeConversation(feed.conversation, {
+      type: "entry",
+      identity: { ...identity, leafId: "c" },
+      entry: failed,
+    });
+    expect(settled.entries.map((item) => item.id)).toEqual(["a", "b", "c"]);
+  });
 });

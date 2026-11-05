@@ -1116,6 +1116,24 @@ describe("canonical native client projection", () => {
     expect(feed.activity.accumulatedMs).toBeGreaterThanOrEqual(idle);
   });
 
+  it("clears a failed prompt's banner when the next turn starts, but keeps a failed read", () => {
+    const failedPrompt = {
+      type: "event" as const,
+      frame: { type: "prompt_result", status: "error", error: { message: "404 no endpoints" } },
+    };
+    let feed = reduceNativeSessionFeed(initial(), failedPrompt);
+    expect(feed.error).toBe("404 no endpoints");
+    feed = reduceNativeSessionFeed(feed, { type: "event", frame: { type: "agent_start" } });
+    expect(feed.error).toBeNull();
+    feed = reduceNativeSessionFeed(feed, {
+      type: "reconciliation",
+      operation: "state",
+      error: "State read failed",
+    });
+    feed = reduceNativeSessionFeed(feed, { type: "event", frame: { type: "agent_start" } });
+    expect(feed.error).toBe("State read failed");
+  });
+
   it("adopts NeoPi's reported active time and restarts it for another session", () => {
     let feed = reduceNativeSessionFeed(initial(), {
       type: "state",

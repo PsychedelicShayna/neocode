@@ -484,6 +484,9 @@ export function reduceNativeSessionFeed(
     const at = nowMs();
     next = {
       ...next,
+      // A new turn starts clean: the last prompt's failure does not outlive it.
+      // A failed state or branch read stays until that read recovers.
+      ...(frame.type === "agent_start" && !next.reconciliationError ? { error: null } : {}),
       activity:
         frame.type === "agent_start"
           ? openNativeActivity(next.activity, at)

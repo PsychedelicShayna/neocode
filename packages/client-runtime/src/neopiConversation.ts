@@ -46,7 +46,17 @@ export type NativeConversationAction =
       identity: NativeIdentity;
       messageEntryIds: ReadonlyArray<{ messageId: string; entryId: string }>;
     }
-  | { type: "message"; messageId: string; message: Readonly<Record<string, unknown>> };
+  | { type: "message"; messageId: string; message: Readonly<Record<string, unknown>> }
+  | { type: "turn_started" };
+
+/**
+ * A failed or interrupted assistant message. Its error belongs to the turn that
+ * produced it, which lives in the journal from then on; a live copy of it must
+ * not outlast that turn.
+ */
+const isFailedAssistantMessage = (message: Readonly<Record<string, unknown>>) =>
+  message.role === "assistant" &&
+  (message.stopReason === "error" || message.stopReason === "aborted");
 
 function uniqueEntries(entries: ReadonlyArray<NeoPiJournalEntry>) {
   const seen = new Set<string>();
@@ -174,6 +184,12 @@ export function reduceNativeConversation(
           ? state.pending.filter((message) => message.messageId !== action.messageId)
           : state.pending,
       };
+    }
+    case "turn_started": {
+      // Live copies of an earlier turn's failure would otherwise render at the
+      // tail of every later turn: a failed message may never get a persistence ID.
+      const pending = state.pending.filter(({ message }) => !isFailedAssistantMessage(message));
+      return pending.length === state.pending.length ? state : { ...state, pending };
     }
     case "message": {
       if (!state.identity) return state;

@@ -1,4 +1,4 @@
-import { BracesIcon, GitForkIcon, UnplugIcon } from "lucide-react";
+import { BracesIcon, GitForkIcon, UnplugIcon, XIcon } from "lucide-react";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
@@ -190,6 +190,8 @@ export function NativeSessionView({
   actionsSlot?: HTMLElement | null;
 }) {
   const { feed, session, conversation, request, loading, error } = useNativeSession(target);
+  // Dismissing hides that one message; a different failure shows again.
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const key = nativeSessionKey(target);
   const assistantName = agentIdentity(
@@ -692,9 +694,20 @@ export function NativeSessionView({
         dictationActive={dictation.phase !== "idle"}
         onNativeCommand={runNativeCommand}
       >
-        {error || localError ? (
-          <p role="alert" className="shrink-0 px-5 py-1 text-xs text-destructive">
-            {localError ?? error}
+        {localError || (error && error !== dismissedError) ? (
+          <p
+            role="alert"
+            className="flex shrink-0 items-start gap-2 px-5 py-1 text-xs text-destructive"
+          >
+            <span className="min-w-0 flex-1">{localError ?? error}</span>
+            <button
+              type="button"
+              aria-label="Dismiss error"
+              className="shrink-0 rounded-sm p-0.5 hover:bg-destructive/10"
+              onClick={() => (localError ? setLocalError(null) : setDismissedError(error))}
+            >
+              <XIcon aria-hidden className="size-3" />
+            </button>
           </p>
         ) : null}
         <div className="relative flex min-h-0 flex-1 flex-col">

@@ -57,7 +57,12 @@ export function applyNativeConversationEvent(
   if (event.type === "snapshot")
     return { ...feed, conversation: reduceNativeConversation(state, event) };
   const frame = event.event;
-  if (frame.type === "agent_start") return { ...feed, busy: true };
+  if (frame.type === "agent_start")
+    return {
+      ...feed,
+      busy: true,
+      conversation: reduceNativeConversation(state, { type: "turn_started" }),
+    };
   if (frame.type === "agent_end") return { ...feed, busy: false };
   let conversation = state;
   if (

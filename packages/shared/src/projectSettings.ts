@@ -1,4 +1,5 @@
 import {
+  isNullableProjectSettingsOverride,
   type ModelSelection,
   PROJECT_FILE_BACKED_SETTINGS,
   PROJECT_SCOPED_SERVER_SETTING_KEYS,
@@ -6,8 +7,10 @@ import {
   type ProjectId,
   type ProjectScopedServerSettingKey,
   type ProjectSettingsOverrides,
+  type ProjectSettingsOverridesPatch,
   type ResolvedServerSettings,
   type ServerSettings,
+  type ServerSettingsPatch,
   type T3ProjectFile,
   type ThreadEnvMode,
   type WorktreeCleanupRules,
@@ -182,34 +185,28 @@ function resolveProjectOverrides(
     ) {
       continue;
     }
-    effective[key] =
-      key === "actions" ? { ...settings.actions, ...overrides.actions } : value;
+    effective[key] = key === "actions" ? { ...settings.actions, ...overrides.actions } : value;
     sources[key] = "project";
   }
   return { settings: effective as ServerSettings, sources, overrides };
 }
 
-/** Replace the project's entry, dropping it entirely when nothing is overridden. */
-export function withProjectSettingsOverrides(
-  settings: Pick<ServerSettings, "projectSettingsOverrides">,
-  projectId: ProjectId,
-  next: ProjectSettingsOverrides | null,
-): ServerSettings["projectSettingsOverrides"] {
-  const { [projectId]: _removed, ...rest } = settings.projectSettingsOverrides;
-  return next === null || Object.keys(next).length === 0 ? rest : { ...rest, [projectId]: next };
-}
-
-/** The project's entry with `keys` removed; `null` when that leaves it empty. */
-export function clearProjectSettingsOverrides(
-  settings: Pick<ServerSettings, "projectSettingsOverrides">,
-  projectId: ProjectId,
-  keys: readonly ProjectScopedServerSettingKey[],
-): ProjectSettingsOverrides | null {
-  const current = settings.projectSettingsOverrides[projectId];
-  if (current === undefined) return null;
-  const next = { ...current };
-  for (const key of keys) delete next[key];
-  return Object.keys(next).length === 0 ? null : next;
+/** Project edits name only changed keys; resets never resend a stale entry. */
+export function projectSettingsOverridePatch(
+  patch: ServerSettingsPatch,
+): ProjectSettingsOverridesPatch {
+  const set: Record<string, unknown> = {};
+  const clear: ProjectScopedServerSettingKey[] = [];
+  for (const key of PROJECT_SCOPED_SERVER_SETTING_KEYS) {
+    const value = patch[key];
+    if (value === undefined) continue;
+    if (value === null && !isNullableProjectSettingsOverride(key)) clear.push(key);
+    else set[key] = value;
+  }
+  return {
+    ...(Object.keys(set).length > 0 || clear.length === 0 ? { set } : {}),
+    ...(clear.length > 0 ? { clear } : {}),
+  } as ProjectSettingsOverridesPatch;
 }
 
 /** Worktree rules are project-scoped; artifact and log retention stays environment-wide. */

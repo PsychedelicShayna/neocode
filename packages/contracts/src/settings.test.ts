@@ -27,10 +27,13 @@ describe("scoped action settings", () => {
     const actions = { "open-neovide": null };
     const patch = {
       actions,
-      projectSettingsOverrides: { project: { actions } },
+      projectSettingsOverrides: { project: { set: { actions } } },
     };
     expect(decodeServerSettingsPatch(patch)).toEqual(patch);
-    const stored = decodeServerSettings(patch);
+    const stored = decodeServerSettings({
+      actions,
+      projectSettingsOverrides: { project: { actions } },
+    });
     const reloaded = decodeServerSettings(encodeServerSettings(stored));
     expect(reloaded.actions).toEqual(actions);
     expect(reloaded.projectSettingsOverrides[ProjectId.make("project")]?.actions).toEqual(actions);
@@ -82,6 +85,17 @@ describe("storage cleanup settings", () => {
     ).toThrow();
   });
 
+  it("accepts partial custom rules in project key mutations", () => {
+    const patch = {
+      projectSettingsOverrides: {
+        project: {
+          set: { worktreeCleanup: { mode: "custom", rules: { worktreeAfterDays: 8 } } },
+        },
+      },
+    };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+  });
+
   it.each([0, -1, 1.5, 3651])("rejects invalid retention %s", (days) => {
     expect(() =>
       decodeServerSettingsPatch({ storageCleanup: { browserArtifactsAfterDays: days } }),
@@ -116,7 +130,11 @@ describe("ServerSettings default permissions", () => {
         projectSettingsOverrides: { project: { defaultRuntimeMode } },
       };
       expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
-      expect(decodeServerSettingsPatch(input)).toEqual(input);
+      const patch = {
+        ...input,
+        projectSettingsOverrides: { project: { set: { defaultRuntimeMode } } },
+      };
+      expect(decodeServerSettingsPatch(patch)).toEqual(patch);
     },
   );
 
@@ -125,7 +143,39 @@ describe("ServerSettings default permissions", () => {
     expect(() => decodeServerSettingsPatch({ defaultRuntimeMode: "unsupported" })).toThrow();
     expect(() =>
       decodeServerSettingsPatch({
-        projectSettingsOverrides: { project: { defaultRuntimeMode: "unsupported" } },
+        projectSettingsOverrides: { project: { set: { defaultRuntimeMode: "unsupported" } } },
+      }),
+    ).toThrow();
+  });
+});
+
+describe("atomic project settings patches", () => {
+  it("retains partial fields and distinguishes null values from clears", () => {
+    const patch = {
+      projectSettingsOverrides: {
+        project: {
+          set: {
+            sourceControlWritingStyle: { customInstructions: "Be terse." },
+            textGenerationModelSelection: { options: [] },
+            defaultModelSelection: null,
+          },
+          clear: ["defaultThreadEnvMode"],
+        },
+        removed: null,
+      },
+    };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+  });
+
+  it("rejects obsolete whole-entry replacements and non-project clear keys", () => {
+    expect(() =>
+      decodeServerSettingsPatch({
+        projectSettingsOverrides: { project: { defaultAutoPull: true } },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeServerSettingsPatch({
+        projectSettingsOverrides: { project: { clear: ["providers"] } },
       }),
     ).toThrow();
   });

@@ -200,7 +200,8 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
   };
   const supportsProjectOverrides = targets.every(
     (target) =>
-      target.environment.serverConfig.environment.capabilities.projectSettingsOverrides === true,
+      target.environment.serverConfig.environment.capabilities.projectSettingsOverridePatches ===
+      true,
   );
   const disabled =
     pendingWrites > 0 || !hasConnectedSelection || (projectSelected && !supportsProjectOverrides);

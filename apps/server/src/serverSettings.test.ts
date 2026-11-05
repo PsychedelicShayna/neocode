@@ -1640,6 +1640,42 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     });
   }
 
+  it.effect("rebases concurrent project key mutations before persisting them", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const projectId = ProjectId.make("concurrent-project");
+      yield* Effect.all(
+        [
+          service.updateSettings({
+            projectSettingsOverrides: { [projectId]: { set: { defaultAutoPull: true } } },
+          }),
+          service.updateSettings({
+            projectSettingsOverrides: { [projectId]: { set: { enableAgentBrowserAccess: false } } },
+          }),
+        ],
+        { concurrency: "unbounded" },
+      );
+      const current = yield* service.getSettings;
+      assert.deepEqual(current.projectSettingsOverrides[projectId], {
+        defaultAutoPull: true,
+        enableAgentBrowserAccess: false,
+      });
+      yield* service.updateSettings({
+        projectSettingsOverrides: { [projectId]: { clear: ["defaultAutoPull"] } },
+      });
+      const persisted = yield* decodeServerSettings(
+        yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+          yield* fs.readFileString(config.settingsPath),
+        ),
+      );
+      assert.deepEqual(persisted.projectSettingsOverrides[projectId], {
+        enableAgentBrowserAccess: false,
+      });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("folds legacy project overrides into projectSettingsOverrides once", () =>
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig.ServerConfig;

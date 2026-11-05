@@ -4181,7 +4181,7 @@ export default function ChatView(props: ChatViewProps) {
 
   const supportsProjectSettingsOverrides =
     environmentById.get(environmentId)?.serverConfig?.environment.capabilities
-      .projectSettingsOverrides === true;
+      .projectSettingsOverridePatches === true;
   const persistProjectScripts = useCallback(
     async (input: {
       projectId: ProjectId;

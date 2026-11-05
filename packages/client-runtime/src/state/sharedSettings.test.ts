@@ -46,7 +46,7 @@ describe("supportsSharedSettingsSync", () => {
 describe("splitSharedServerPatch", () => {
   it("keeps project overrides local: project ids belong to one environment", () => {
     const patch = {
-      projectSettingsOverrides: { [ProjectId.make("project")]: { defaultAutoPull: true } },
+      projectSettingsOverrides: { [ProjectId.make("project")]: { set: { defaultAutoPull: true } } },
       sidebarAutoSettleOnMerge: false,
     };
     expect(splitSharedServerPatch(patch)).toEqual({

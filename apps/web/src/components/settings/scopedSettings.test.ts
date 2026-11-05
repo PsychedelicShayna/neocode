@@ -43,7 +43,10 @@ function environment(
         : {
             settings: { ...DEFAULT_SERVER_SETTINGS, ...options.settings },
             environment: {
-              capabilities: { projectSettingsOverrides: options.projectOverrides !== false },
+              capabilities: {
+                projectSettingsOverrides: true,
+                projectSettingsOverridePatches: options.projectOverrides !== false,
+              },
             },
           },
   };
@@ -258,14 +261,16 @@ describe("scoped settings writes", () => {
         label: server.label,
         patch: {
           projectSettingsOverrides: {
-            [projectId]: { enableAgentBrowserAccess: false, defaultAutoPull: true },
+            [projectId]: { set: { defaultAutoPull: true } },
           },
         },
       },
       {
         environmentId: laptop.environmentId,
         label: laptop.label,
-        patch: { projectSettingsOverrides: { [laptopProjectId]: { defaultAutoPull: true } } },
+        patch: {
+          projectSettingsOverrides: { [laptopProjectId]: { set: { defaultAutoPull: true } } },
+        },
       },
     ]);
     expect(
@@ -302,39 +307,37 @@ describe("scoped settings writes", () => {
     const plan = planScopedSettingsPatch(project, [machine, customized], {
       worktreeCleanup: { mode: "custom", rules: { worktreeOnDelete: true } },
     });
-    expect(plan.serverWrites.map((write) => write.patch.projectSettingsOverrides)).toEqual([
-      {
-        [projectId]: {
-          defaultAutoPull: true,
-          worktreeCleanup: {
-            mode: "custom",
-            rules: {
-              worktreeAfterDays: 8,
-              worktreeOnDelete: true,
-              worktreeOnMerge: true,
-              worktreeUnchanged: false,
-            },
-          },
-        },
-      },
-      {
-        [laptopProjectId]: {
-          worktreeCleanup: {
-            mode: "custom",
-            rules: {
-              worktreeAfterDays: 30,
-              worktreeOnDelete: true,
-              worktreeOnMerge: false,
-              worktreeUnchanged: false,
-            },
-          },
-        },
-      },
-    ]);
+    const serverWrite = plan.serverWrites.find(
+      (write) => write.environmentId === server.environmentId,
+    )!;
+    const laptopWrite = plan.serverWrites.find(
+      (write) => write.environmentId === laptop.environmentId,
+    )!;
+    const updatedServer = applyServerSettingsPatch(
+      customized.serverConfig!.settings,
+      serverWrite.patch,
+    );
+    const updatedLaptop = applyServerSettingsPatch(
+      machine.serverConfig!.settings,
+      laptopWrite.patch,
+    );
+    expect(resolveWorktreeCleanup(updatedServer, projectId)).toEqual({
+      worktreeAfterDays: 8,
+      worktreeOnDelete: true,
+      worktreeOnMerge: true,
+      worktreeUnchanged: false,
+    });
+    expect(resolveWorktreeCleanup(updatedLaptop, laptopProjectId)).toEqual({
+      worktreeAfterDays: 30,
+      worktreeOnDelete: true,
+      worktreeOnMerge: false,
+      worktreeUnchanged: false,
+    });
+    expect(updatedServer.projectSettingsOverrides[projectId]?.defaultAutoPull).toBe(true);
     expect(
       planScopedSettingsClear(checkout, [customized], ["worktreeCleanup"]).serverWrites[0]?.patch,
     ).toEqual({
-      projectSettingsOverrides: { [projectId]: { defaultAutoPull: true } },
+      projectSettingsOverrides: { [projectId]: { clear: ["worktreeCleanup"] } },
     });
     expect(
       planScopedSettingsPatch(project, [machine, customized], {
@@ -348,8 +351,10 @@ describe("scoped settings writes", () => {
       enableAgentDeviceAccess: true,
     });
     expect(plan.serverWrites.map((write) => write.patch)).toEqual([
-      { projectSettingsOverrides: { [projectId]: { enableAgentDeviceAccess: true } } },
-      { projectSettingsOverrides: { [laptopProjectId]: { enableAgentDeviceAccess: true } } },
+      { projectSettingsOverrides: { [projectId]: { set: { enableAgentDeviceAccess: true } } } },
+      {
+        projectSettingsOverrides: { [laptopProjectId]: { set: { enableAgentDeviceAccess: true } } },
+      },
     ]);
     for (const patch of [{ enableDeviceSupport: true }, { deviceHosts: [] }]) {
       expect(planScopedSettingsPatch(project, environments, patch).serverWrites).toEqual([]);
@@ -382,7 +387,7 @@ describe("scoped settings writes", () => {
       {
         environmentId: server.environmentId,
         label: server.label,
-        patch: { projectSettingsOverrides: { [projectId]: { enableAgentBrowserAccess: false } } },
+        patch: { projectSettingsOverrides: { [projectId]: { clear: ["defaultAutoPull"] } } },
       },
     ]);
     expect(
@@ -391,7 +396,30 @@ describe("scoped settings writes", () => {
         [laptop, withOverrides],
         ["defaultAutoPull", "enableAgentBrowserAccess"],
       ).serverWrites[0]?.patch,
-    ).toEqual({ projectSettingsOverrides: { [projectId]: null } });
+    ).toEqual({
+      projectSettingsOverrides: {
+        [projectId]: { clear: ["defaultAutoPull", "enableAgentBrowserAccess"] },
+      },
+    });
+  });
+
+  it("preserves independent edits and resets planned before the configuration refreshes", () => {
+    const first = planScopedSettingsPatch(checkout, [server], { defaultAutoPull: true });
+    const second = planScopedSettingsPatch(checkout, [server], { enableAgentBrowserAccess: false });
+    const reset = planScopedSettingsClear(checkout, [server], ["defaultAutoPull"]);
+    let settings = server.serverConfig!.settings;
+    for (const write of [...first.serverWrites, ...second.serverWrites]) {
+      settings = applyServerSettingsPatch(settings, write.patch);
+    }
+    expect(settings.projectSettingsOverrides[projectId]).toEqual({
+      defaultAutoPull: true,
+      enableAgentBrowserAccess: false,
+    });
+    for (const write of reset.serverWrites)
+      settings = applyServerSettingsPatch(settings, write.patch);
+    expect(settings.projectSettingsOverrides[projectId]).toEqual({
+      enableAgentBrowserAccess: false,
+    });
   });
 
   it("never substitutes an environment-default write for an invalid scope", () => {
@@ -463,7 +491,7 @@ describe("project overrides at environment scope", () => {
     connection: { phase: "connected" as const },
     serverConfig: {
       settings: { ...DEFAULT_SERVER_SETTINGS, projectSettingsOverrides: overrides },
-      environment: { capabilities: { projectSettingsOverrides: true } },
+      environment: { capabilities: { projectSettingsOverridePatches: true } },
     },
   });
 
@@ -503,7 +531,10 @@ describe("project overrides at environment scope", () => {
         environmentId: laptop,
         label: laptop,
         patch: {
-          projectSettingsOverrides: { [fleet]: { defaultThreadEnvMode: "local" }, [t3]: null },
+          projectSettingsOverrides: {
+            [fleet]: { clear: ["defaultAutoPull"] },
+            [t3]: { clear: ["defaultAutoPull"] },
+          },
         },
       },
     ]);
@@ -534,31 +565,27 @@ describe("null patches at project scope", () => {
               [projectId]: { defaultThreadEnvMode: "worktree" as const, defaultAutoPull: true },
             },
           },
-          environment: { capabilities: { projectSettingsOverrides: true } },
+          environment: { capabilities: { projectSettingsOverridePatches: true } },
         },
       },
     ];
     expect(
       planScopedSettingsPatch(scope, environments, { defaultThreadEnvMode: null }).serverWrites[0]
         ?.patch,
-    ).toEqual({ projectSettingsOverrides: { [projectId]: { defaultAutoPull: true } } });
+    ).toEqual({ projectSettingsOverrides: { [projectId]: { clear: ["defaultThreadEnvMode"] } } });
     expect(
       planScopedSettingsPatch(scope, environments, { defaultModelSelection: null }).serverWrites[0]
         ?.patch,
     ).toEqual({
       projectSettingsOverrides: {
-        [projectId]: {
-          defaultThreadEnvMode: "worktree",
-          defaultAutoPull: true,
-          defaultModelSelection: null,
-        },
+        [projectId]: { set: { defaultModelSelection: null } },
       },
     });
   });
 });
 
 describe("partial object patches at project scope", () => {
-  it("completes a writing style field patch from the target's effective value", () => {
+  it("leaves partial writing style edits for the server to rebase", () => {
     const environmentId = EnvironmentId.make("laptop");
     const projectId = ProjectId.make("fleet");
     const member = {
@@ -601,7 +628,7 @@ describe("partial object patches at project scope", () => {
           connection: { phase: "connected" },
           serverConfig: {
             settings,
-            environment: { capabilities: { projectSettingsOverrides: true } },
+            environment: { capabilities: { projectSettingsOverridePatches: true } },
           },
         },
       ],
@@ -610,13 +637,15 @@ describe("partial object patches at project scope", () => {
     expect(plan.serverWrites[0]?.patch).toEqual({
       projectSettingsOverrides: {
         [projectId]: {
-          sourceControlWritingStyle: {
-            mode: "custom",
-            customInstructions: "Be terse.",
-            followChangeRequestTemplates: false,
-          },
+          set: { sourceControlWritingStyle: { customInstructions: "Be terse." } },
         },
       },
+    });
+    const saved = applyServerSettingsPatch(settings, plan.serverWrites[0]!.patch);
+    expect(saved.projectSettingsOverrides[projectId]?.sourceControlWritingStyle).toEqual({
+      mode: "custom",
+      customInstructions: "Be terse.",
+      followChangeRequestTemplates: false,
     });
   });
 });

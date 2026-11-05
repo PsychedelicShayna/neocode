@@ -118,7 +118,8 @@ function AutoSettleSettingsRows() {
 
   const supportsProjectOverrides = syncTargets.every(
     (target) =>
-      target.environment.serverConfig.environment.capabilities.projectSettingsOverrides === true,
+      target.environment.serverConfig.environment.capabilities.projectSettingsOverridePatches ===
+      true,
   );
   const disabled = pendingWrites > 0 || (projectSelected && !supportsProjectOverrides);
   const hasProjectOverrides =

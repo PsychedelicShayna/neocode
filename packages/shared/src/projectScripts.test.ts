@@ -65,7 +65,7 @@ describe("scoped actions", () => {
   it("preserves legacy project lists and unrelated overrides through action edits and reset", () => {
     const legacy = applyServerSettingsPatch(settings, {
       projectSettingsOverrides: {
-        [project.id]: { defaultProjectScripts: [check], defaultAutoPull: true },
+        [project.id]: { set: { defaultProjectScripts: [check], defaultAutoPull: true } },
       },
     });
     expect(resolveProjectScripts(legacy, project)).toEqual([check, open]);
@@ -76,6 +76,19 @@ describe("scoped actions", () => {
     expect(reset.projectSettingsOverrides[project.id]).toEqual({ defaultAutoPull: true });
     expect(resolveProjectScripts(reset, project)).toEqual([open]);
     expect(legacy.projectSettingsOverrides[project.id]?.defaultProjectScripts).toEqual([check]);
+  });
+
+  it("does not replace unrelated project settings changed after an action edit was planned", () => {
+    const actions = projectActionsPatch(settings, project, [open, check]);
+    const changed = applyServerSettingsPatch(settings, {
+      projectSettingsOverrides: { [project.id]: { set: { defaultAutoPull: true } } },
+    });
+    const saved = applyServerSettingsPatch(changed, actions);
+    expect(saved.projectSettingsOverrides[project.id]?.defaultAutoPull).toBe(true);
+    const reset = projectActionsPatch(settings, project, null);
+    expect(applyServerSettingsPatch(saved, reset).projectSettingsOverrides[project.id]).toEqual({
+      defaultAutoPull: true,
+    });
   });
 
   it("does not resurrect removed environment actions through deep merge", () => {

@@ -4,7 +4,6 @@ import type {
   ServerSettings,
   ServerSettingsPatch,
 } from "@t3tools/contracts";
-import { clearProjectSettingsOverrides } from "./projectSettings.ts";
 
 type ProjectScriptSettings = Pick<
   ServerSettings,
@@ -37,7 +36,9 @@ export function resolveProjectScripts(
   settings: ProjectScriptSettings,
   project: ScriptProject | null,
 ): readonly ProjectScript[] {
-  const baseline = project ? legacyProjectScripts(settings, project) : settings.defaultProjectScripts;
+  const baseline = project
+    ? legacyProjectScripts(settings, project)
+    : settings.defaultProjectScripts;
   const local = project ? settings.projectSettingsOverrides[project.id]?.actions : undefined;
   if (Object.keys(settings.actions).length === 0 && !local) return baseline;
   const scripts = new Map(baseline.map((script) => [script.id, script]));
@@ -73,7 +74,10 @@ export function projectActionsPatch(
       const updated = next.get(script.id);
       if (JSON.stringify(updated) !== JSON.stringify(script)) {
         if (updated) actions[script.id] = updated;
-        else if (project || settings.defaultProjectScripts.some((entry) => entry.id === script.id)) {
+        else if (
+          project ||
+          settings.defaultProjectScripts.some((entry) => entry.id === script.id)
+        ) {
           actions[script.id] = null;
         } else {
           delete actions[script.id];
@@ -84,11 +88,14 @@ export function projectActionsPatch(
     for (const [id, script] of next) actions[id] = script;
   }
   if (!project) return { actions: nextScripts === null ? {} : actions };
-  const entry =
-    nextScripts === null
-      ? clearProjectSettingsOverrides(settings, project.id, ["actions", "defaultProjectScripts"])
-      : { ...settings.projectSettingsOverrides[project.id], actions };
-  return { projectSettingsOverrides: { [project.id]: entry } };
+  return {
+    projectSettingsOverrides: {
+      [project.id]:
+        nextScripts === null
+          ? { clear: ["actions", "defaultProjectScripts"] }
+          : { set: { actions } },
+    },
+  };
 }
 
 export function projectScriptsInheritDefaults(

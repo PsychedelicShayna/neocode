@@ -1493,23 +1493,50 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 
-export const ServerSettingsPatch = Schema.Struct({
-  worktreeCleanup: Schema.optionalKey(
-    Schema.NullOr(
-      Schema.Union([
-        Schema.Struct({ mode: Schema.Literal("off") }),
-        Schema.Struct({
-          mode: Schema.Literal("custom"),
-          rules: Schema.Struct({
-            worktreeAfterDays: Schema.optionalKey(StorageRetentionDays),
-            worktreeOnMerge: Schema.optionalKey(Schema.Boolean),
-            worktreeOnDelete: Schema.optionalKey(Schema.Boolean),
-            worktreeUnchanged: Schema.optionalKey(Schema.Boolean),
-          }),
-        }),
-      ]),
-    ),
+const WorktreeCleanupPatch = Schema.NullOr(
+  Schema.Union([
+    Schema.Struct({ mode: Schema.Literal("off") }),
+    Schema.Struct({
+      mode: Schema.Literal("custom"),
+      rules: Schema.Struct({
+        worktreeAfterDays: Schema.optionalKey(StorageRetentionDays),
+        worktreeOnMerge: Schema.optionalKey(Schema.Boolean),
+        worktreeOnDelete: Schema.optionalKey(Schema.Boolean),
+        worktreeUnchanged: Schema.optionalKey(Schema.Boolean),
+      }),
+    }),
+  ]),
+);
+
+const SourceControlWritingStylePatch = Schema.Struct({
+  mode: Schema.optionalKey(SourceControlWritingStyleMode),
+  customInstructions: Schema.optionalKey(TrimmedString),
+  followChangeRequestTemplates: Schema.optionalKey(Schema.Boolean),
+});
+
+/** Mutate only named keys against the server's current project overrides. */
+export const ProjectSettingsOverridesPatch = Schema.Struct({
+  set: Schema.optionalKey(
+    Schema.Struct({
+      ...ProjectSettingsOverrides.fields,
+      worktreeCleanup: Schema.optionalKey(WorktreeCleanupPatch),
+      textGenerationModelSelection: Schema.optionalKey(ModelSelectionPatch),
+      sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStylePatch),
+    }),
   ),
+  clear: Schema.optionalKey(Schema.Array(Schema.Literals(PROJECT_SCOPED_SERVER_SETTING_KEYS))),
+}).check(
+  Schema.makeFilter(
+    (patch) =>
+      patch.set !== undefined ||
+      patch.clear !== undefined ||
+      "Provide project keys to set or clear.",
+  ),
+);
+export type ProjectSettingsOverridesPatch = typeof ProjectSettingsOverridesPatch.Type;
+
+export const ServerSettingsPatch = Schema.Struct({
+  worktreeCleanup: Schema.optionalKey(WorktreeCleanupPatch),
   storageCleanup: Schema.optionalKey(
     Schema.Struct({
       worktreeAfterDays: Schema.optionalKey(StorageRetentionDays),
@@ -1540,14 +1567,12 @@ export const ServerSettingsPatch = Schema.Struct({
   defaultModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   defaultRuntimeMode: Schema.optionalKey(RuntimeMode),
   /**
-   * Per-project entry replacement: each entry replaces that project's whole
-   * override set and `null` removes it. Clearing one override means resending
-   * the entry without that key. Per-key null cannot express "clear" for the
-   * keys whose value type is itself nullable, and clients always hold the
-   * current entry from the last settings snapshot.
+   * Per-project key mutations, rebased under the server's settings write lock.
+   * `set` changes only its named keys; `clear` restores inheritance, including
+   * for keys with nullable values. `null` removes the entire project's entry.
    */
   projectSettingsOverrides: Schema.optionalKey(
-    Schema.Record(ProjectId, Schema.NullOr(ProjectSettingsOverrides)),
+    Schema.Record(ProjectId, Schema.NullOr(ProjectSettingsOverridesPatch)),
   ),
   enableAgentDeviceAccess: Schema.optionalKey(Schema.Boolean),
   enableDeviceSupport: Schema.optionalKey(Schema.Boolean),
@@ -1572,13 +1597,7 @@ export const ServerSettingsPatch = Schema.Struct({
   worktreeSubmodules: Schema.optionalKey(Schema.NullOr(WorktreeSubmodules)),
   addProjectBaseDirectory: Schema.optionalKey(TrimmedString),
   textGenerationModelSelection: Schema.optionalKey(ModelSelectionPatch),
-  sourceControlWritingStyle: Schema.optionalKey(
-    Schema.Struct({
-      mode: Schema.optionalKey(SourceControlWritingStyleMode),
-      customInstructions: Schema.optionalKey(TrimmedString),
-      followChangeRequestTemplates: Schema.optionalKey(Schema.Boolean),
-    }),
-  ),
+  sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStylePatch),
   sourceControlWriterModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   pullRequestMergeMethod: Schema.optionalKey(Schema.NullOr(PullRequestMergeMethod)),
   observability: Schema.optionalKey(

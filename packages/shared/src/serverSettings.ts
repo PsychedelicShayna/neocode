@@ -5,6 +5,7 @@ import {
   type ProjectId,
   type ProjectScopedServerSettingKey,
   type ProjectSettingsOverrides,
+  type ProjectSettingsOverridesPatch,
   type ProviderDriverKind,
   type ServerProvider,
   ServerSettings,
@@ -225,10 +226,7 @@ export function deriveLegacyProjectOverrides(
  * values the server actually reads. `null` in a legacy map clears that one
  * override.
  */
-function translateLegacyProjectOverridePatch(
-  current: Pick<ServerSettings, "projectSettingsOverrides">,
-  patch: ServerSettingsPatch,
-): ServerSettingsPatch {
+function translateLegacyProjectOverridePatch(patch: ServerSettingsPatch): ServerSettingsPatch {
   const {
     projectAgentBrowserAccessOverrides,
     projectAutoPullOverrides,
@@ -242,13 +240,10 @@ function translateLegacyProjectOverridePatch(
   ) {
     return patch;
   }
-  const currentEntries: Readonly<Record<string, ProjectSettingsOverrides>> =
-    current.projectSettingsOverrides;
-  const entries = new Map<string, ProjectSettingsOverrides | null>(
+  const entries = new Map<string, ProjectSettingsOverridesPatch | null>(
     Object.entries(rest.projectSettingsOverrides ?? {}),
   );
-  // A canonical entry in the same patch is the newer representation; a legacy
-  // map must not resurrect a key that entry deliberately omits.
+  // Explicit canonical mutations take precedence over a legacy map.
   const canonicalProjectIds = new Set(Object.keys(rest.projectSettingsOverrides ?? {}));
   const applyKey = <K extends ProjectScopedServerSettingKey>(
     map: Readonly<Record<string, ProjectSettingsOverrides[K] | null>> | undefined,
@@ -257,15 +252,13 @@ function translateLegacyProjectOverridePatch(
     if (map === undefined) return;
     for (const [projectId, value] of Object.entries(map)) {
       if (canonicalProjectIds.has(projectId)) continue;
-      const entry: ProjectSettingsOverrides = {
-        ...(entries.get(projectId) ?? currentEntries[projectId] ?? {}),
-      };
-      if (value === null || value === undefined) {
-        delete entry[key];
-      } else {
-        entry[key] = value;
-      }
-      entries.set(projectId, Object.keys(entry).length === 0 ? null : entry);
+      const entry = entries.get(projectId) ?? {};
+      entries.set(
+        projectId,
+        value === null || value === undefined
+          ? { ...entry, clear: [...(entry.clear ?? []), key] }
+          : { ...entry, set: { ...entry.set, [key]: value } },
+      );
     }
   };
   applyKey(projectAgentBrowserAccessOverrides, "enableAgentBrowserAccess");
@@ -277,11 +270,10 @@ function translateLegacyProjectOverridePatch(
   } as ServerSettingsPatch;
 }
 
-export function applyServerSettingsPatch(
+function applySettingsValuesPatch(
   current: ServerSettings,
-  rawPatch: ServerSettingsPatch,
+  patch: ServerSettingsPatch,
 ): ServerSettings {
-  const patch = translateLegacyProjectOverridePatch(current, rawPatch);
   const selectionPatch = patch.textGenerationModelSelection;
   const {
     automaticGitFetchInterval,
@@ -292,13 +284,6 @@ export function applyServerSettingsPatch(
     // Merged per entry below; its `null` removals must not reach deepMerge.
     usageLimitSources: usageLimitSourcesPatch,
     usagePriceOverrides: usagePriceOverridesPatch,
-    // Entry replacement: deepMerge would keep keys the client meant to clear.
-    projectSettingsOverrides: projectSettingsOverridesPatch,
-    // Already translated into `projectSettingsOverrides` above; the legacy
-    // maps are derived views and must never be merged directly.
-    projectAgentBrowserAccessOverrides: _legacyBrowserAccess,
-    projectAutoPullOverrides: _legacyAutoPull,
-    projectScriptOverrides: _legacyScripts,
     ...patchForMerge
   } = patch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
@@ -375,15 +360,6 @@ export function applyServerSettingsPatch(
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
       : {}),
-    ...(projectSettingsOverridesPatch !== undefined
-      ? {
-          projectSettingsOverrides: Object.fromEntries(
-            Object.entries(
-              mergeSettingsEntries(current.projectSettingsOverrides, projectSettingsOverridesPatch),
-            ).filter(([, entry]) => Object.keys(entry).length > 0),
-          ),
-        }
-      : {}),
     ...(patch.defaultModelSelection !== undefined
       ? { defaultModelSelection: patch.defaultModelSelection }
       : {}),
@@ -421,7 +397,6 @@ export function applyServerSettingsPatch(
   );
   const nextWithReplacements = {
     ...nextWithReplacementsBase,
-    ...deriveLegacyProjectOverrides(nextWithReplacementsBase),
     backgroundActivity: normalizedBackgroundActivity,
     automaticGitFetchInterval: resolvedBackgroundActivity.automaticGitFetchInterval,
     providerHealthRefreshInterval: resolvedBackgroundActivity.providerHealthRefreshInterval,
@@ -444,4 +419,41 @@ export function applyServerSettingsPatch(
     ...nextWithReplacements,
     textGenerationModelSelection: createModelSelection(instanceId, model, options),
   };
+}
+
+export function applyServerSettingsPatch(
+  current: ServerSettings,
+  rawPatch: ServerSettingsPatch,
+): ServerSettings {
+  const { projectSettingsOverrides: updates, ...patch } =
+    translateLegacyProjectOverridePatch(rawPatch);
+  const next = applySettingsValuesPatch(current, patch);
+  if (updates === undefined) {
+    return { ...next, ...deriveLegacyProjectOverrides(next) };
+  }
+
+  const overrides = new Map(Object.entries(next.projectSettingsOverrides));
+  for (const [projectId, update] of Object.entries(updates)) {
+    if (update === null) {
+      overrides.delete(projectId);
+      continue;
+    }
+
+    const currentEntry = overrides.get(projectId) ?? {};
+    const entry: Record<string, unknown> = { ...currentEntry };
+    if (update.set !== undefined) {
+      // Complete partial object-valued settings from the authoritative project
+      // value, not the client's potentially stale settings snapshot.
+      const values = applySettingsValuesPatch({ ...next, ...currentEntry }, update.set);
+      for (const key of Object.keys(update.set) as ProjectScopedServerSettingKey[]) {
+        entry[key] = values[key];
+      }
+    }
+    for (const key of update.clear ?? []) delete entry[key];
+    if (Object.keys(entry).length === 0) overrides.delete(projectId);
+    else overrides.set(projectId, entry as ProjectSettingsOverrides);
+  }
+
+  const result = { ...next, projectSettingsOverrides: Object.fromEntries(overrides) };
+  return { ...result, ...deriveLegacyProjectOverrides(result) };
 }

@@ -71,12 +71,11 @@ export function ProjectActionsSettings() {
       );
       if (!environment?.serverConfig) return [];
       const member = candidate.projectId ? memberById.get(candidate.projectId) : undefined;
-      // An older server ignores the override record, so a project edit there
-      // would report success and vanish; such environments are left out and
-      // the legacy per-project map keeps serving them.
+      // Older servers replace entire entries instead of mutating named keys.
+      // Leave them out rather than send a patch they could misinterpret.
       if (
         member &&
-        environment.serverConfig.environment?.capabilities.projectSettingsOverrides !== true
+        environment.serverConfig.environment?.capabilities.projectSettingsOverridePatches !== true
       ) {
         return [];
       }
@@ -235,18 +234,21 @@ export function ProjectActionsSettings() {
           onEdit={(script) => setRequest(editorRequestForScript(script, keybindings))}
         />
       )}
-      {!mixed && hiddenIds.map((id) => (
-        <SettingsRow
-          key={id}
-          title={`Hidden: ${rawSettings?.actions[id]?.name ?? rawSettings?.defaultProjectScripts.find((script) => script.id === id)?.name ?? id}`}
-          description={isProjectScope ? "Hidden for this project only." : "Hidden at environment scope."}
-          control={
-            <Button size="xs" variant="ghost" disabled={saving} onClick={() => void reset(id)}>
-              Restore action
-            </Button>
-          }
-        />
-      ))}
+      {!mixed &&
+        hiddenIds.map((id) => (
+          <SettingsRow
+            key={id}
+            title={`Hidden: ${rawSettings?.actions[id]?.name ?? rawSettings?.defaultProjectScripts.find((script) => script.id === id)?.name ?? id}`}
+            description={
+              isProjectScope ? "Hidden for this project only." : "Hidden at environment scope."
+            }
+            control={
+              <Button size="xs" variant="ghost" disabled={saving} onClick={() => void reset(id)}>
+                Restore action
+              </Button>
+            }
+          />
+        ))}
       {t3File.status === "invalid" ? (
         <SettingsRow
           title="t3.json is invalid"

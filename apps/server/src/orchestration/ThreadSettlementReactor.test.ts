@@ -1919,7 +1919,9 @@ describe("storage cleanup", () => {
                                 ...(protection === "project-policy-disabled"
                                   ? {
                                       projectSettingsOverrides: {
-                                        [PROJECT_ID]: { worktreeCleanup: { mode: "off" as const } },
+                                        [PROJECT_ID]: {
+                                          set: { worktreeCleanup: { mode: "off" as const } },
+                                        },
                                       },
                                     }
                                   : {}),

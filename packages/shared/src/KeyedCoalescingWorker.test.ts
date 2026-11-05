@@ -6,6 +6,67 @@ import * as Effect from "effect/Effect";
 import { makeKeyedCoalescingWorker } from "./KeyedCoalescingWorker.ts";
 
 describe("makeKeyedCoalescingWorker", () => {
+  for (const firstFails of [false, true]) {
+    it.live(
+      `drains queued keys before recursive same-key work after ${firstFails ? "failure" : "success"}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const processed: string[] = [];
+            const firstStarted = yield* Deferred.make<void>();
+            const releaseFirst = yield* Deferred.make<void>();
+            const continuationStarted = yield* Deferred.make<void>();
+            const releaseContinuation = yield* Deferred.make<void>();
+
+            const worker = yield* makeKeyedCoalescingWorker<string, number, string, never>({
+              merge: Math.max,
+              process: (key, value): Effect.Effect<void, string> =>
+                Effect.gen(function* () {
+                  processed.push(`${key}:${value}`);
+
+                  if (key === "busy") {
+                    if (value === 0) {
+                      yield* Deferred.succeed(firstStarted, undefined);
+                      yield* Deferred.await(releaseFirst);
+                    }
+                    if (value === 2) {
+                      yield* Deferred.succeed(continuationStarted, undefined);
+                      yield* Deferred.await(releaseContinuation);
+                    }
+                    if (value < 4) {
+                      yield* worker.enqueue(key, value + 1);
+                      yield* worker.enqueue(key, value + 2);
+                    }
+                    if (value === 0 && firstFails) {
+                      return yield* Effect.fail("boom");
+                    }
+                  } else if (key === "closing") {
+                    // Merge into the busy key while it is queued for another turn.
+                    yield* worker.enqueue("busy", 1);
+                  }
+                }),
+            });
+
+            yield* worker.enqueue("busy", 0);
+            yield* Deferred.await(firstStarted);
+            yield* worker.enqueue("closing", 1);
+            yield* worker.enqueue("closing", 0);
+            yield* worker.enqueue("other", 7);
+            yield* Deferred.succeed(releaseFirst, undefined);
+            yield* Deferred.await(continuationStarted);
+
+            expect(processed).toEqual(["busy:0", "closing:1", "other:7", "busy:2"]);
+            yield* worker.drainKey("closing");
+            yield* worker.drainKey("other");
+
+            yield* Deferred.succeed(releaseContinuation, undefined);
+            yield* worker.drainKey("busy");
+            expect(processed).toEqual(["busy:0", "closing:1", "other:7", "busy:2", "busy:4"]);
+          }),
+        ),
+    );
+  }
+
   it.live("waits for latest work enqueued during active processing before draining the key", () =>
     Effect.scoped(
       Effect.gen(function* () {

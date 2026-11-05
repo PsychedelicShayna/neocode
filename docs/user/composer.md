@@ -10,6 +10,11 @@ On web and desktop, scroll inside the composer to reach the rest of a long draft
 or its attachments. Scrolling the conversation leaves the draft and its controls
 in place.
 
+To give a long draft more room, drag the composer's top edge, or focus **Resize
+prompt** with `Tab` and use `Up` or `Down`. The chosen height is remembered but
+stays within the window. Double-click the edge or press `Enter` while it has
+focus to return to fitting the draft automatically.
+
 Pasting 32 KiB or more of text adds that fragment as a text-file attachment so
 the agent can inspect it without filling the model context. A smaller paste also
 becomes an attachment when inserting it would exceed the message limit. On a

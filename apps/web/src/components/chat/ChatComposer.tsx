@@ -5532,11 +5532,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           role="separator"
           aria-orientation="horizontal"
           aria-label="Resize prompt"
-          title="Drag to resize · double-click to fit the draft"
-          className="group/composer-resize absolute inset-x-0 -top-2.5 z-30 mx-auto flex h-2.5 max-w-(--chat-max-width) cursor-row-resize touch-none justify-center"
+          title="Drag or use Up/Down to resize · double-click or Enter to fit the draft"
+          className="group/composer-resize absolute inset-x-0 -top-2.5 z-30 mx-auto flex h-2.5 max-w-(--chat-max-width) cursor-row-resize touch-none justify-center outline-none focus-visible:ring-2 focus-visible:ring-ring"
           {...composerBodyResize.handleProps}
         >
-          <span className="mt-[3px] h-0.5 w-10 rounded-full bg-border opacity-0 transition-opacity group-hover/composer-resize:opacity-100" />
+          <span className="mt-[3px] h-0.5 w-10 rounded-full bg-border opacity-0 transition-opacity group-hover/composer-resize:opacity-100 group-focus-visible/composer-resize:opacity-100" />
         </div>
         <ComposerSurface.Main>
           <div

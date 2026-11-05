@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type PointerEvent,
+} from "react";
 
 const STORAGE_KEY = "t3code:composer-body-height";
 const MIN_HEIGHT = 64;
@@ -63,10 +70,38 @@ export function useComposerBodyResize() {
     event.currentTarget.releasePointerCapture(event.pointerId);
   }, []);
 
+  const onKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      setHeight(null);
+      return;
+    }
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const measured = bodyRef.current?.getBoundingClientRect().height ?? MIN_HEIGHT;
+    const delta = event.key === "ArrowUp" ? 16 : -16;
+    setHeight((current) => clampHeight(clampHeight(current ?? measured) + delta));
+  }, []);
+
   return {
     bodyRef,
-    bodyStyle: height === null ? undefined : { height: clampHeight(height) },
+    bodyStyle:
+      height === null
+        ? undefined
+        : { height: clampHeight(height), maxHeight: `${MAX_VIEWPORT_SHARE * 100}dvh` },
     pinned: height !== null,
-    handleProps: { onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp },
+    handleProps: {
+      tabIndex: 0,
+      "aria-valuemin": MIN_HEIGHT,
+      "aria-valuemax": Math.round(window.innerHeight * MAX_VIEWPORT_SHARE),
+      "aria-valuenow": clampHeight(height ?? MIN_HEIGHT),
+      "aria-valuetext": height === null ? "Fits the draft" : `${clampHeight(height)} pixels`,
+      onKeyDown,
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel: onPointerUp,
+    },
   };
 }

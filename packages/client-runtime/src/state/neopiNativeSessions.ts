@@ -218,6 +218,8 @@ export function createNativeSessionAtoms<R, E>(
   const cache = new Map<string, NativeSessionFeed>();
   const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
   const endedObservations = new Set<string>();
+  /** Sessions the user detached from; a revisit leaves them detached until `release`. */
+  const detachedObservations = new Set<string>();
   const publish = (key: string, update: NativeSessionUpdate) =>
     Effect.sync(() => {
       const queue = updates.get(key);
@@ -274,6 +276,15 @@ export function createNativeSessionAtoms<R, E>(
                     { type: "reconciliation", operation: "state", error: error.message },
                   ]);
                 }),
+                // The server closing the watch without a `closed` event still ends this
+                // observation; a revisit must reopen it rather than reuse the dead feed.
+                (source) =>
+                  Stream.concat(
+                    source,
+                    Stream.fromEffect(Effect.sync(() => endedObservations.add(key))).pipe(
+                      Stream.drain,
+                    ),
+                  ),
               );
               return reconcileNativeSessionFeed(
                 Stream.merge(
@@ -305,9 +316,13 @@ export function createNativeSessionAtoms<R, E>(
                   Stream.takeUntil((event) => {
                     if (event.type === "closed") {
                       endedObservations.add(key);
+                      if (event.code === "detached") detachedObservations.add(key);
                       return true;
                     }
-                    if (event.type === "snapshot") endedObservations.delete(key);
+                    if (event.type === "snapshot") {
+                      endedObservations.delete(key);
+                      detachedObservations.delete(key);
+                    }
                     // Another session id on a different file is a new owner. The same
                     // session on a different file is a move, which the feed follows.
                     return (
@@ -356,6 +371,7 @@ export function createNativeSessionAtoms<R, E>(
       get.subscribe(source, (value) => get.setSelf(value));
       if (
         endedObservations.has(sessionKey) &&
+        !detachedObservations.has(sessionKey) &&
         AsyncResult.isSuccess(current) &&
         !current.value.connected
       )
@@ -460,5 +476,9 @@ export function createNativeSessionAtoms<R, E>(
     }),
     watch,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
+    /** Lets a detached session's observation reopen; the caller refreshes `watch` afterwards. */
+    release: (target: NativeSessionTarget) => {
+      detachedObservations.delete(nativeSessionKey(target));
+    },
   };
 }

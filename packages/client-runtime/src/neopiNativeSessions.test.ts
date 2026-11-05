@@ -1101,6 +1101,60 @@ describe("canonical native client projection", () => {
     });
   });
 
+  describe("owner loss", () => {
+    it("keeps a feed connected but idle while a terminal owner is replaced, then clears on its snapshot", () => {
+      const live = initial();
+      expect(live.busy).toBe(true);
+      let feed = reduceNativeSessionFeed(live, { type: "reconnecting", reason: "exited (0)" });
+      expect(feed).toMatchObject({
+        connected: true,
+        ownerLoss: "reconnecting",
+        busy: false,
+        dialogs: [],
+        error: null,
+      });
+      expect(feed.queue).toEqual({ steering: [], followUp: [], liveSteered: 0 });
+      expect(feed.activity.openedAt).toBeNull();
+
+      feed = reduceNativeSessionFeed(feed, {
+        type: "snapshot",
+        session: live.session!,
+        journal: null,
+      });
+      expect(feed).toMatchObject({ connected: true, ownerLoss: null, error: null });
+    });
+
+    it("reads a detach and an exited terminal as states, not errors", () => {
+      const detached = reduceNativeSessionFeed(initial(), {
+        type: "closed",
+        reason: "The native connection was explicitly closed.",
+        code: "detached",
+      });
+      expect(detached).toMatchObject({ connected: false, ownerLoss: "detached", error: null });
+      const orphaned = reduceNativeSessionFeed(
+        reduceNativeSessionFeed(initial(), { type: "reconnecting", reason: "x" }),
+        {
+          type: "closed",
+          reason: "No NeoPi is running this session now.",
+          code: "owner_exited",
+        },
+      );
+      expect(orphaned).toMatchObject({ connected: false, ownerLoss: "orphaned", error: null });
+      // A restarted observation begins with `disconnected`; the state stands until a snapshot.
+      expect(reduceNativeSessionFeed(orphaned, { type: "disconnected" }).ownerLoss).toBe(
+        "orphaned",
+      );
+    });
+
+    it("still reports an unexpected close as an error", () => {
+      const feed = reduceNativeSessionFeed(initial(), {
+        type: "closed",
+        reason: "Profile replaced",
+      });
+      expect(feed).toMatchObject({ connected: false, ownerLoss: null, error: "Profile replaced" });
+    });
+  });
+
   it("accumulates working time across turns and closes the window with the connection", () => {
     const frame = (type: string) => ({ type: "event" as const, frame: { type } });
     // The snapshot's state is streaming, so the first window is already open.

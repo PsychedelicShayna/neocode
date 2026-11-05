@@ -13,6 +13,7 @@ import { useCallback } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { connectionAtomRuntime } from "../connection/runtime";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import {
   closeNativeSessionTab,
   cycleNativeSessionTab,
@@ -41,11 +42,19 @@ export const useNativeSessionSelection = create(
   }),
 );
 /** Selecting opens the session's tab when it has none. */
-export const selectNativeSession = (target: NativeSessionTarget) =>
+export const selectNativeSession = (target: NativeSessionTarget) => {
   useNativeSessionSelection.setState((state) => ({
     target,
     tabs: openNativeSessionTab(state.tabs, target),
   }));
+  // Selecting a session whose feed went dead (an exited owner, a failed open) retries it.
+  // A detach stays until Reconnect, and a reconnecting session is already being retried.
+  const feed = nativeSessionAtoms.cached(target);
+  if (feed && !feed.connected && feed.ownerLoss !== "detached")
+    appAtomRegistry.refresh(
+      nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
+    );
+};
 export const closeNativeSession = (target: NativeSessionTarget) =>
   useNativeSessionSelection.setState((state) => {
     const next = closeNativeSessionTab(state.tabs, state.target, target);
@@ -81,6 +90,53 @@ export function useNativeSessionRequest(target: NativeSessionTarget) {
     },
     [send, target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
   );
+}
+
+const RECONNECT_WAIT_MS = 15_000;
+/** Resolves when the feed reports a live owner, or after `timeoutMs`; never rejects. */
+function waitForNativeConnection(target: NativeSessionTarget, timeoutMs: number) {
+  const watch = nativeSessionAtoms.watch({
+    environmentId: target.environmentId,
+    input: { ref: target.ref },
+  });
+  return new Promise<void>((resolve) => {
+    let unsubscribe: (() => void) | null = null;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsubscribe?.();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    unsubscribe = appAtomRegistry.subscribe(
+      watch,
+      (result) => {
+        if (AsyncResult.isSuccess(result) && result.value.connected) finish();
+      },
+      { immediate: true },
+    );
+    if (done) unsubscribe();
+  });
+}
+
+/**
+ * Opens the session again after its owner is gone or NeoCode detached, and restarts
+ * the observation. The server attaches to a live terminal owner when there is one and
+ * otherwise starts NeoCode's own, so it is also how a quit terminal is taken over.
+ */
+export function useNativeSessionReconnect(target: NativeSessionTarget) {
+  const open = useAtomCommand(nativeSessionAtoms.open, { reportFailure: false });
+  return useCallback(async () => {
+    const result = await open({ environmentId: target.environmentId, input: target.ref });
+    if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+    nativeSessionAtoms.release(target);
+    appAtomRegistry.refresh(
+      nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
+    );
+    await waitForNativeConnection(target, RECONNECT_WAIT_MS);
+  }, [open, target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile]);
 }
 
 export function useNativeSession(target: NativeSessionTarget) {

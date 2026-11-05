@@ -1,4 +1,4 @@
-import { BracesIcon, GitForkIcon, UnplugIcon } from "lucide-react";
+import { BracesIcon, GitForkIcon, PlugIcon, UnplugIcon } from "lucide-react";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
@@ -27,11 +27,12 @@ import { ComposerSurface } from "../chat/ComposerSurface";
 import { cn } from "../../lib/utils";
 import {
   nativeSessionAtoms,
-  closeNativeSession,
   replaceNativeSession,
   useNativeSession,
+  useNativeSessionReconnect,
   useNativeSessionSelection,
 } from "../../state/neopiNativeSessions";
+import { nativeDisconnectLabel, nativeOwnerNotice } from "./nativeOwnerNotice";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
@@ -270,6 +271,19 @@ export function NativeSessionView({
   const [state, setState] = useState<Record<string, unknown>>({});
   const [commands, setCommands] = useState<readonly NativeSlashCommand[]>([]);
   const [dismissed, setDismissed] = useState(() => answeredDialogs.get(key) ?? new Set<string>());
+  const reconnect = useNativeSessionReconnect(target);
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectNow = useCallback(() => {
+    setReconnecting(true);
+    setLocalError(null);
+    void reconnect()
+      .catch((cause) => setLocalError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setReconnecting(false));
+  }, [reconnect]);
+  // A reconnecting session still takes sends (the server holds them); an orphaned one
+  // takes them by starting an owner first.
+  const canSend = feed.connected || feed.ownerLoss === "orphaned";
+  const ownerNotice = nativeOwnerNotice(feed.ownerLoss, session?.attachment);
   useEffect(() => {
     if (session) setState(session.state);
   }, [session]);
@@ -355,12 +369,7 @@ export function NativeSessionView({
   const send = useCallback(
     async (intent?: ComposerSubmissionIntent) => {
       const snapshot = draftStore.getState().getComposerDraft(target);
-      if (
-        !composerDraftHasUserContent(snapshot) ||
-        !snapshot ||
-        sendingRef.current ||
-        !feed.connected
-      )
+      if (!composerDraftHasUserContent(snapshot) || !snapshot || sendingRef.current || !canSend)
         return;
       if (composerRef.current?.hasPendingAttachments()) {
         setLocalError("Wait for the attachment to finish preparing before sending.");
@@ -371,6 +380,8 @@ export function NativeSessionView({
       setLocalError(null);
       try {
         const prompt = await prepareNativePrompt(target, snapshot);
+        // Nothing owns the session: take it over first, so the prompt lands in a live one.
+        if (!feed.connected) await reconnect();
         const busy = nativeSessionAtoms.cached(target)?.busy ?? feed.busy;
         await submit(
           {
@@ -389,7 +400,7 @@ export function NativeSessionView({
         focusComposer();
       }
     },
-    [target, feed.connected, feed.busy, submit, composerRef, focusComposer],
+    [target, canSend, feed.connected, feed.busy, submit, reconnect, composerRef, focusComposer],
   );
   const commandOutputs = useMemo(() => {
     // Command results are local display history anchored after the entry they followed.
@@ -652,21 +663,27 @@ export function NativeSessionView({
               >
                 <BracesIcon className="size-4" />
               </HeaderIconButton>
-              <HeaderIconButton
-                label="Disconnect session"
-                onClick={() =>
-                  void close({
-                    environmentId: target.environmentId,
-                    input: { ref: target.ref },
-                  }).then((result) => {
-                    if (result._tag === "Failure")
-                      setLocalError(String(squashAtomCommandFailure(result)));
-                    else closeNativeSession(target);
-                  })
-                }
-              >
-                <UnplugIcon className="size-4" />
-              </HeaderIconButton>
+              {feed.ownerLoss === "detached" || feed.ownerLoss === "orphaned" ? (
+                <HeaderIconButton label="Reconnect session" onClick={reconnectNow}>
+                  <PlugIcon className="size-4" />
+                </HeaderIconButton>
+              ) : (
+                // Stays on this tab: the feed shows the session as detached, with a way back.
+                <HeaderIconButton
+                  label={nativeDisconnectLabel(session?.attachment)}
+                  onClick={() =>
+                    void close({
+                      environmentId: target.environmentId,
+                      input: { ref: target.ref },
+                    }).then((result) => {
+                      if (result._tag === "Failure")
+                        setLocalError(String(squashAtomCommandFailure(result)));
+                    })
+                  }
+                >
+                  <UnplugIcon className="size-4" />
+                </HeaderIconButton>
+              )}
             </div>,
             actionsSlot,
           )
@@ -717,6 +734,24 @@ export function NativeSessionView({
           />
         </div>
         <ComposerSurface.Shell ref={setComposerElement} contextStrip className="shrink-0">
+          {ownerNotice ? (
+            <div
+              role="status"
+              className="flex items-center gap-2 ps-(--workspace-gutter-start) pe-(--workspace-gutter-end) pt-2 text-xs text-muted-foreground"
+            >
+              <p className="min-w-0 flex-1">{ownerNotice.text}</p>
+              {ownerNotice.action ? (
+                <Button
+                  size="compact"
+                  variant="outline"
+                  disabled={reconnecting}
+                  onClick={reconnectNow}
+                >
+                  {ownerNotice.action}
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
           {Object.values(feed.notices).some(Boolean) ? (
             <div className="flex flex-col gap-0.5 ps-(--workspace-gutter-start) pe-(--workspace-gutter-end) pt-2 text-xs text-muted-foreground">
               {Object.values(feed.notices)
@@ -743,10 +778,18 @@ export function NativeSessionView({
                   ? null
                   : clampFileAttachmentUploadBytes(fileAttachmentBytes)
               }
-              phase={feed.connected ? (feed.busy ? "running" : "ready") : "disconnected"}
+              phase={
+                feed.connected
+                  ? feed.busy
+                    ? "running"
+                    : "ready"
+                  : feed.ownerLoss === "orphaned"
+                    ? "ready"
+                    : "disconnected"
+              }
               isConnecting={loading}
               isSendBusy={sending}
-              sendDisabledReason={feed.connected ? null : "Reconnect NeoPi before sending."}
+              sendDisabledReason={canSend ? null : "Reconnect NeoPi before sending."}
               settings={settings}
               resolvedTheme={resolvedTheme}
               keybindings={keybindings}

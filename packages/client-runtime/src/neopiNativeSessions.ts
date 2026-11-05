@@ -156,6 +156,7 @@ function reduceNativeDictation(
     };
   return current;
 }
+export type NativeOwnerLoss = "reconnecting" | "orphaned" | "detached";
 export interface NativeSessionFeed {
   readonly session: NativeSession | null;
   readonly conversation: NativeConversation;
@@ -183,6 +184,14 @@ export interface NativeSessionFeed {
    * observation of the old ref ends here; the web layer repoints to this ref.
    */
   readonly movedTo: NeoPiNativeSessionRef | null;
+  /**
+   * Why the session has no live owner, when that is expected rather than a failure.
+   * `reconnecting`: the terminal that owned it exited and a successor is awaited (the
+   * session still accepts sends, which wait). `orphaned`: it exited and nothing
+   * replaced it. `detached`: NeoCode let go on request. The last two end with
+   * `connected: false`; any snapshot clears them.
+   */
+  readonly ownerLoss: NativeOwnerLoss | null;
   readonly error: string | null;
   readonly reconciliationError: {
     readonly operation: "state" | "branch" | "subagents" | "jobs";
@@ -209,6 +218,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   dictation: null,
   movedTo: null,
   error: null,
+  ownerLoss: null,
   reconciliationError: null,
 });
 
@@ -340,10 +350,46 @@ export function reduceNativeSessionFeed(
         }
       : next;
   }
-  if (event.type === "disconnected" || event.type === "closed")
+  if (event.type === "reconnecting")
+    // The session stays connected to the server, which is waiting for the owner's
+    // successor: sends are held there. Nothing the old owner was doing continues.
+    return {
+      ...feed,
+      ownerLoss: "reconnecting",
+      busy: false,
+      queue: EMPTY_NATIVE_QUEUE,
+      dialogs: [],
+      agents: disconnectNativeSubagents(
+        feed.agents,
+        feed.agentsRevision + 1,
+        DateTime.formatIso(DateTime.nowUnsafe()),
+      ),
+      agentsRevision: feed.agentsRevision + 1,
+      agentsEpoch: feed.agentsEpoch + 1,
+      activity: closeNativeActivity(feed.activity, nowMs()),
+      error: null,
+      dictation:
+        feed.dictation && feed.dictation.phase !== "ended"
+          ? { ...feed.dictation, phase: "ended" as const, error: event.reason }
+          : feed.dictation,
+    };
+  if (event.type === "disconnected" || event.type === "closed") {
+    // A detach and an exited terminal are states of their own, not failures: the
+    // composer offers the way back instead of an error.
+    const ownerLoss: NativeOwnerLoss | null =
+      event.type === "closed"
+        ? event.code === "detached"
+          ? "detached"
+          : event.code === "owner_exited"
+            ? "orphaned"
+            : null
+        : feed.ownerLoss === "reconnecting"
+          ? null
+          : feed.ownerLoss;
     return {
       ...feed,
       connected: false,
+      ownerLoss,
       // Pending UI replays independently and may precede the next snapshot.
       // Retire stale requests here so that snapshot cannot erase a live replay.
       dialogs: [],
@@ -359,7 +405,7 @@ export function reduceNativeSessionFeed(
         ? {
             busy: false,
             queue: EMPTY_NATIVE_QUEUE,
-            error: event.reason,
+            error: ownerLoss === null ? event.reason : null,
             // The owner is gone, so no end frame is coming for a live capture.
             dictation:
               feed.dictation && feed.dictation.phase !== "ended"
@@ -368,6 +414,7 @@ export function reduceNativeSessionFeed(
           }
         : {}),
     };
+  }
   if (event.type === "snapshot") {
     const page = nativeJournalPage(event.journal);
     const previous = feed.conversation;
@@ -409,6 +456,7 @@ export function reduceNativeSessionFeed(
       busy: event.session.state.isStreaming === true,
       queue: nativePromptQueue(event.session.state.queuedMessages) ?? EMPTY_NATIVE_QUEUE,
       error: null,
+      ownerLoss: null,
       reconciliationError: null,
     };
   }

@@ -419,6 +419,8 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       label: string;
+      /** What the compaction kept; the row expands to it when present. */
+      detail?: string;
     }
   | {
       kind: "message";
@@ -1265,6 +1267,7 @@ export function deriveMessagesTimelineRows(input: {
         id: timelineEntry.id,
         createdAt: timelineEntry.createdAt,
         label: timelineEntry.entry.label,
+        ...(timelineEntry.entry.detail ? { detail: timelineEntry.entry.detail } : {}),
       });
       continue;
     }
@@ -1694,7 +1697,7 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "context-compaction": {
       const bc = b as typeof a;
-      return a.createdAt === bc.createdAt && a.label === bc.label;
+      return a.createdAt === bc.createdAt && a.label === bc.label && a.detail === bc.detail;
     }
 
     case "proposed-plan":

@@ -14,6 +14,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -26,6 +27,8 @@ import {
   type NativeSessionFeed,
   type NativeSessionUpdate,
 } from "../neopiNativeSessions.ts";
+import { nativeStatusFacts } from "../neopiNativeStatus.ts";
+import { projectTranscript } from "../neopiTranscript.ts";
 import { createNativeSessionAtoms, reconcileNativeSessionFeed } from "./neopiNativeSessions.ts";
 
 class StateReadError extends Schema.TaggedError<StateReadError>()("StateReadError", {
@@ -83,6 +86,7 @@ const nextFeed = (
 const harness = <E, R>(
   read: (command: Record<string, unknown> & { type: string }) => Effect.Effect<unknown, E, R>,
   seed = initial(),
+  options: Parameters<typeof reconcileNativeSessionFeed>[4] = { stateReadGapMs: 0 },
 ) =>
   Effect.gen(function* () {
     const events = yield* Queue.unbounded<NativeSessionUpdate>();
@@ -92,6 +96,7 @@ const harness = <E, R>(
       read,
       seed,
       () => {},
+      options,
     ).pipe(
       Stream.runForEach((feed) => Queue.offer(feeds, feed)),
       Effect.forkScoped,
@@ -549,7 +554,7 @@ describe("native feed reconciliation lifetime", () => {
         );
         expect(settled.conversation.entries).toEqual([user, reply]);
         expect(settled.conversation.needsSnapshot).toBe(false);
-        expect(reads).toEqual([]);
+        expect(reads.filter((type) => type !== "get_state")).toEqual([]);
       }),
     ),
   );
@@ -802,5 +807,182 @@ describe("native feed reconciliation lifetime", () => {
           expect(refreshed.conversation.pending).toEqual(completed.conversation.pending);
         }),
       ),
+  );
+});
+
+describe("live telemetry reconciliation", () => {
+  const telemetry = (tokens: number, cost = 0.01) => ({
+    contextUsage: { tokens, contextWindow: 1_000, percent: tokens / 10 },
+    sessionUsage: { cost, input: 10, cacheRead: 90 },
+  });
+  const reader =
+    (current: { tokens: number; cost?: number }) =>
+    (command: Record<string, unknown> & { type: string }) =>
+      Effect.sync(() => {
+        if (command.type === "get_state") return telemetry(current.tokens, current.cost);
+        if (command.type === "get_subagents") return { subagents: [] };
+        return {};
+      });
+  const contextTokens = (feed: NativeSessionFeed) =>
+    nativeStatusFacts(feed.session?.state ?? {}).context?.tokens ?? null;
+
+  it.effect("refreshes context usage when a terminal-run compaction commits", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const current = { tokens: 30_786 };
+        const { events, feeds } = yield* harness(reader(current));
+        const compaction = {
+          ...user,
+          id: "compaction",
+          parentId: user.id,
+          type: "compaction",
+          summary: "<context-window-rollover>\nKept the plan.\n</context-window-rollover>",
+          tokensBefore: 30_786,
+          tokensAfter: 28_909,
+        };
+        current.tokens = 28_909;
+        yield* Queue.offerAll(events, [
+          event({ type: "manual_compaction_start" }),
+          event({ type: "journal_state", reason: "leaf", ...identity(compaction.id) }),
+          event({ type: "journal_entry", ...identity(compaction.id), entry: compaction }),
+          event({ type: "manual_compaction_end", result: { tokensBefore: 30_786 } }),
+        ]);
+        const refreshed = yield* nextFeed(feeds, (feed) => contextTokens(feed) === 28_909);
+        expect(nativeStatusFacts(refreshed.session?.state ?? {}).context?.percent).toBeCloseTo(
+          2_890.9,
+        );
+        expect(refreshed.conversation.entries.at(-1)).toEqual(compaction);
+        expect(
+          projectTranscript(
+            {
+              entries: refreshed.conversation.entries,
+              pending: refreshed.conversation.pending,
+              leafId: refreshed.conversation.identity?.leafId ?? null,
+            },
+            { debug: false },
+          ).at(-1),
+        ).toMatchObject({
+          kind: "divider",
+          text: "Context compacted · 31k → 29k tokens",
+          summary: "Kept the plan.",
+        });
+      }),
+    ),
+  );
+
+  it.effect("refreshes cost and cache rate when a terminal-run turn ends", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const current = { tokens: 100, cost: 0.5 };
+        const { events, feeds } = yield* harness(reader(current));
+        yield* Queue.offer(events, event({ type: "agent_end" }));
+        const settled = yield* nextFeed(
+          feeds,
+          (feed) => nativeStatusFacts(feed.session?.state ?? {}).cost?.amount === 0.5,
+        );
+        expect(nativeStatusFacts(settled.session?.state ?? {}).cacheHitPercent).toBe(90);
+      }),
+    ),
+  );
+
+  it.effect("re-reads state on branch navigation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const current = { tokens: 700 };
+        const { events, feeds } = yield* harness(reader(current));
+        yield* Queue.offer(
+          events,
+          event({ type: "journal_state", reason: "leaf", ...identity(user.id) }),
+        );
+        yield* nextFeed(feeds, (feed) => contextTokens(feed) === 700);
+      }),
+    ),
+  );
+
+  it.effect("polls a visible terminal-attached session without waiting for frames", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const current = { tokens: 100 };
+        const { events, feeds } = yield* harness(reader(current), initial(), {
+          stateReadGapMs: 0,
+          pollIntervalMs: 5_000,
+        });
+        // A processed frame proves the poll fiber is sleeping before the clock moves.
+        yield* Queue.offer(events, event({ type: "queue_update" }));
+        yield* Queue.take(feeds);
+        current.tokens = 250;
+        yield* TestClock.adjust("5 seconds");
+        yield* nextFeed(feeds, (feed) => contextTokens(feed) === 250);
+      }),
+    ),
+  );
+
+  it.effect("does not poll while the tab is hidden", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const target = globalThis as unknown as { document?: unknown };
+        const previous = target.document;
+        target.document = { visibilityState: "hidden" };
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (previous === undefined) delete target.document;
+            else target.document = previous;
+          }),
+        );
+        let stateReads = 0;
+        const { events, feeds } = yield* harness(
+          (command) =>
+            Effect.sync(() => {
+              if (command.type === "get_state") stateReads++;
+              return command.type === "get_subagents" ? { subagents: [] } : {};
+            }),
+          initial(),
+          { stateReadGapMs: 0, pollIntervalMs: 5_000 },
+        );
+        yield* Queue.offer(events, event({ type: "queue_update" }));
+        yield* Queue.take(feeds);
+        yield* TestClock.adjust("20 seconds");
+        yield* Effect.yieldNow;
+        expect(stateReads).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect("spaces a burst of journal commits into trailing reads", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let stateReads = 0;
+        const { events, feeds } = yield* harness(
+          (command) =>
+            Effect.sync(() => {
+              if (command.type === "get_state") stateReads++;
+              return {};
+            }),
+          initial(),
+          { stateReadGapMs: 1_000, pollIntervalMs: 60_000 },
+        );
+        const entries = ["a", "b", "c", "d"].map((id, index, all) => ({
+          ...user,
+          id,
+          parentId: index === 0 ? user.id : all[index - 1]!,
+        }));
+        for (const entry of entries)
+          yield* Queue.offer(
+            events,
+            event({ type: "journal_entry", ...identity(entry.id), entry }),
+          );
+        yield* nextFeed(feeds, (feed) => feed.conversation.entries.at(-1)?.id === "d");
+        // Four commits cost at most a leading and one trailing read, however they interleave.
+        yield* TestClock.adjust("1 second");
+        yield* Effect.yieldNow;
+        expect(stateReads).toBeGreaterThanOrEqual(1);
+        expect(stateReads).toBeLessThanOrEqual(2);
+        const settled = stateReads;
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        expect(stateReads).toBeLessThanOrEqual(2);
+        expect(stateReads).toBeGreaterThanOrEqual(settled);
+      }),
+    ),
   );
 });

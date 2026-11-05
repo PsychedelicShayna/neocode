@@ -315,6 +315,7 @@ export function projectNativeTimeline(
             label: row.text,
             tone: "info",
             sourceActivityKind: "context-compaction",
+            ...(row.summary ? { detail: boundedOutput(row.summary) } : {}),
           }),
         );
         lastSetting = setting ? { id: row.id, ...setting } : null;

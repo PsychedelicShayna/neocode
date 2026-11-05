@@ -96,6 +96,8 @@ export interface NoteRow extends RowBase {
 export interface DividerRow extends RowBase {
   readonly kind: "divider";
   readonly text: string;
+  /** What a compaction kept, for the row to expand to. */
+  readonly summary?: string;
 }
 
 export interface RecordRow extends RowBase {
@@ -612,7 +614,17 @@ export function projectTranscript(
       const mergeable = next && !options.commandOutputs?.get(entry.id)?.length ? next : undefined;
       const divider = dividerText(entry, mergeable);
       if (divider) {
-        push({ ...base, kind: "divider", id: `${entry.id}:divider`, text: divider.text });
+        const summary =
+          entry.type === "compaction" && typeof entry.summary === "string"
+            ? stripNoticeTags(entry.summary)
+            : "";
+        push({
+          ...base,
+          kind: "divider",
+          id: `${entry.id}:divider`,
+          text: divider.text,
+          ...(summary ? { summary } : {}),
+        });
         if (divider.consumed > 0 && next) {
           if (options.debug)
             push({
@@ -629,15 +641,6 @@ export function projectTranscript(
           continue;
         }
       }
-      if (entry.type === "compaction" && options.debug && typeof entry.summary === "string")
-        push({
-          ...base,
-          kind: "note",
-          id: `${entry.id}:summary`,
-          label: "Compaction summary",
-          text: stripNoticeTags(entry.summary),
-          tone: "system",
-        });
     } else if (options.debug) {
       push({ ...base, kind: "record", id: `${entry.id}:record`, label: bookkeepingLabel(entry) });
     }

@@ -83,3 +83,31 @@ describe("native turn duration", () => {
     expect(labels).toEqual(["Worked for 1m 9s", "Worked for 20s"]);
   });
 });
+
+describe("native compaction row", () => {
+  it("expands to the compaction summary through the context-compaction row", () => {
+    const compaction: TranscriptRow = {
+      kind: "divider",
+      id: "c1:divider",
+      entry: entry("c1", "compaction"),
+      timestamp: at(100),
+      live: false,
+      text: "Context compacted · 31k → 29k tokens",
+      summary: "Kept the plan.",
+    };
+    const timeline = projectNativeTimeline([user("u1", 0), assistant("a1", 10), compaction], false);
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: timeline.entries,
+      latestTurn: timeline.latestTurn,
+      runningTurnId: timeline.runningTurnId,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    expect(rows.find((row) => row.kind === "context-compaction")).toMatchObject({
+      label: "Context compacted · 31k → 29k tokens",
+      detail: "Kept the plan.",
+    });
+  });
+});

@@ -1905,18 +1905,43 @@ function ContextCompactionTimelineRow({
 }: {
   row: Extract<TimelineRow, { kind: "context-compaction" }>;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = (
+    <span className="flex shrink-0 items-center gap-1.5">
+      <Minimize2Icon aria-hidden="true" className="size-3" />
+      {row.label}
+      {row.detail ? (
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn("size-3 transition-transform duration-200", expanded && "rotate-90")}
+        />
+      ) : null}
+    </span>
+  );
   return (
-    <div
-      role="separator"
-      aria-label={row.label}
-      className="mx-auto flex w-full max-w-(--chat-max-width) items-center gap-3 py-1 text-secondary-label text-xs"
-    >
-      <span className="h-px flex-1 bg-border/70" />
-      <span className="flex shrink-0 items-center gap-1.5">
-        <Minimize2Icon aria-hidden="true" className="size-3" />
-        {row.label}
-      </span>
-      <span className="h-px flex-1 bg-border/70" />
+    <div className="mx-auto w-full max-w-(--chat-max-width) py-1 text-secondary-label text-xs">
+      <div role="separator" aria-label={row.label} className="flex items-center gap-3">
+        <span className="h-px flex-1 bg-border/70" />
+        {row.detail ? (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            data-scroll-anchor-ignore
+            onClick={() => setExpanded((open) => !open)}
+            className="cursor-pointer select-none rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          >
+            {label}
+          </button>
+        ) : (
+          label
+        )}
+        <span className="h-px flex-1 bg-border/70" />
+      </div>
+      {expanded && row.detail ? (
+        <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/40 px-3 py-2 font-sans select-text">
+          {row.detail}
+        </pre>
+      ) : null}
     </div>
   );
 }

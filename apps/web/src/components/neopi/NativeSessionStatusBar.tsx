@@ -17,7 +17,7 @@ import {
 import { useEffect, useMemo, useReducer, useRef, type ReactNode } from "react";
 import { APP_BASE_NAME } from "../../branding";
 import { cn } from "../../lib/utils";
-import { useNativeSessionSlice } from "../../state/neopiNativeSessions";
+import { useNativeSessionRequest, useNativeSessionSlice } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
 import { vcsEnvironment } from "../../state/vcs";
 import { useRightPanelStore } from "../../rightPanelStore";
@@ -222,13 +222,23 @@ function ContextMeter({
 
 /**
  * Compact session status under the composer, spanning the main column. Facts come
- * from NeoPi's `get_state` (refreshed after each prompt) and the feed's lifecycle
- * frames; a value NeoPi did not report is left out rather than guessed.
+ * from NeoPi's `get_state`, re-read by the feed after turns, compaction, journal
+ * commits, model changes and (for a terminal-owned session) on a slow timer while
+ * the tab is visible, plus the feed's lifecycle frames; a value NeoPi did not
+ * report is left out rather than guessed.
  */
 export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget }) {
   const state = useNativeSessionSlice(target, selectState);
   const cwd = useNativeSessionSlice(target, selectCwd);
   const connected = useNativeSessionSlice(target, selectConnected);
+  const request = useNativeSessionRequest(target);
+  // Selecting a session (or its connection coming back) reads NeoPi's current
+  // telemetry; the reconciler's own reads cover everything after that. The
+  // result lands in the feed through the request atom.
+  useEffect(() => {
+    if (!connected) return;
+    void request({ type: "get_state", includeDump: false }).catch(() => undefined);
+  }, [connected, request]);
   const facts = useMemo(() => (state ? nativeStatusFacts(state) : null), [state]);
   const gitStatus = useEnvironmentQuery(
     cwd ? vcsEnvironment.status({ environmentId: target.environmentId, input: { cwd } }) : null,

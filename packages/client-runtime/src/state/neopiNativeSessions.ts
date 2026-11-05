@@ -3,7 +3,6 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
-import * as Schedule from "effect/Schedule";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -26,6 +25,12 @@ import {
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
 
+/**
+ * Frames after which NeoPi's `get_state` carries different telemetry: context
+ * usage, cost, cache rate and output speed move with turns, compaction and any
+ * journal commit (navigation included). A terminal-driven turn emits no
+ * `prompt_result` to this client, so the turn and journal frames must trigger it.
+ */
 const stateReconciliationEvents = new Set([
   "model_changed",
   "models_configuration_changed",
@@ -33,15 +38,41 @@ const stateReconciliationEvents = new Set([
   "chat_mode_changed",
   "mode_changed",
   "prompt_result",
+  "agent_end",
+  "session_settled",
+  "manual_compaction_end",
+  "auto_compaction_end",
+  "advisor_cost_changed",
+  "journal_state",
+  "journal_entry",
 ]);
-/** A terminal-owned session's control connection carries no `job_lifecycle` frames. */
-const JOBS_POLL_INTERVAL = "5 seconds";
+/**
+ * Minimum spacing between telemetry reads, so a burst of journal commits costs
+ * one trailing read. A read is always scheduled after the last trigger.
+ */
+const STATE_READ_MIN_GAP_MS = 1_000;
+/**
+ * A terminal-owned session's control connection carries no `job_lifecycle`
+ * frames and can miss telemetry changes made elsewhere, so a visible tab
+ * re-reads state, jobs and agents on this cadence.
+ */
+const TERMINAL_POLL_INTERVAL_MS = 5_000;
 const branchReconciliationEvents = new Set([
   "journal_state",
   "journal_entry",
   "agent_end",
   "prompt_result",
 ]);
+
+interface VisibilitySource {
+  readonly visibilityState?: string;
+  addEventListener?(type: "visibilitychange", listener: () => void): void;
+  removeEventListener?(type: "visibilitychange", listener: () => void): void;
+}
+const visibilitySource = (): VisibilitySource | undefined =>
+  (globalThis as unknown as { document?: VisibilitySource }).document;
+/** Hosts without a document (mobile, server) count as visible. */
+const tabVisible = () => visibilitySource()?.visibilityState !== "hidden";
 
 /** Native reads run beside the event reducer, never in its delivery path. */
 export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
@@ -51,7 +82,10 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
   ) => Effect.Effect<unknown, ReadE, ReadR>,
   initial: NativeSessionFeed,
   onFeed: (feed: NativeSessionFeed) => void,
+  options: { readonly stateReadGapMs?: number; readonly pollIntervalMs?: number } = {},
 ) {
+  const stateReadGapMs = options.stateReadGapMs ?? STATE_READ_MIN_GAP_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? TERMINAL_POLL_INTERVAL_MS;
   return Stream.unwrap(
     Effect.gen(function* () {
       const replies = yield* Effect.acquireRelease(
@@ -64,6 +98,8 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
       const jobReads = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown);
       let current = initial;
       let divergentEntry = false;
+      // Subagent progress is subscribed once per connection; polls only re-read the roster.
+      let agentsSubscribed = false;
       const needsBranch = () => {
         const conversation = current.conversation;
         return (
@@ -91,7 +127,11 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
             const state = nativeRecord(yield* read({ type: "get_state", includeDump: false }));
             yield* Queue.offer(replies, { type: "state", state });
             yield* recovered("state");
-          }).pipe(Effect.catch((error) => failed("state", error))),
+          }).pipe(
+            Effect.catch((error) => failed("state", error)),
+            // Triggers that land meanwhile wait in the sliding queue and run once after the gap.
+            Effect.andThen(stateReadGapMs > 0 ? Effect.sleep(stateReadGapMs) : Effect.void),
+          ),
         ),
         Effect.forkScoped,
       );
@@ -127,7 +167,10 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
             const epoch = current.agentsEpoch;
             // This is the existing native owner's control connection, not a
             // new session/stream. Control subscription levels are per peer.
-            yield* read({ type: "set_subagent_subscription", level: "progress" });
+            if (!agentsSubscribed) {
+              yield* read({ type: "set_subagent_subscription", level: "progress" });
+              agentsSubscribed = true;
+            }
             if (!current.connected || current.agentsEpoch !== epoch) return;
             const revision = current.agentsRevision;
             const result = nativeRecord(yield* read({ type: "get_subagents" }));
@@ -165,9 +208,27 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
         ),
         Effect.forkScoped,
       );
-      yield* Effect.sync(() => {
-        if (current.session?.attachment === "terminal") Queue.offerUnsafe(jobReads, undefined);
-      }).pipe(Effect.repeat(Schedule.spaced(JOBS_POLL_INTERVAL)), Effect.forkScoped);
+      const pollTerminalTelemetry = () => {
+        if (current.session?.attachment !== "terminal" || !tabVisible()) return;
+        Queue.offerUnsafe(stateReads, undefined);
+        Queue.offerUnsafe(jobReads, undefined);
+        Queue.offerUnsafe(subagentReads, undefined);
+      };
+      yield* Effect.sleep(pollIntervalMs).pipe(
+        Effect.andThen(Effect.sync(pollTerminalTelemetry)),
+        Effect.forever,
+        Effect.forkScoped,
+      );
+      // A tab that was hidden catches up the moment it is shown again.
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          visibilitySource()?.addEventListener?.("visibilitychange", pollTerminalTelemetry),
+        ),
+        () =>
+          Effect.sync(() =>
+            visibilitySource()?.removeEventListener?.("visibilitychange", pollTerminalTelemetry),
+          ),
+      );
       return Stream.merge(source, Stream.fromQueue(replies), { haltStrategy: "left" }).pipe(
         Stream.map((event) => {
           current = reduceNativeSessionFeed(current, event);
@@ -184,6 +245,7 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
           }
           onFeed(current);
           if (event.type === "snapshot") {
+            agentsSubscribed = false;
             Queue.offerUnsafe(subagentReads, undefined);
             Queue.offerUnsafe(jobReads, undefined);
           }

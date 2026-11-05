@@ -2,6 +2,7 @@ import { BracesIcon, GitForkIcon, UnplugIcon } from "lucide-react";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
+  deferNativeEditorText,
   nativeCommandCompletions,
   nativeRecord,
   nativeSessionKey,
@@ -331,12 +332,24 @@ export function NativeSessionView({
     [request],
   );
   useEffect(() => {
-    if (!feed.editor || consumedEditors.get(key) === feed.editor.id) return;
-    consumedEditors.set(key, feed.editor.id);
-    // A native menu's editor text must not destroy a prompt the user is still composing.
-    if (!composerDraftHasUserContent(draftStore.getState().getComposerDraft(target))) {
-      draftStore.getState().setPrompt(target, feed.editor.text);
-    }
+    const editor = feed.editor;
+    if (!editor || consumedEditors.get(key) === editor.id) return;
+    return deferNativeEditorText({
+      hasDraft: () => composerDraftHasUserContent(draftStore.getState().getComposerDraft(target)),
+      apply: () => {
+        consumedEditors.set(key, editor.id);
+        draftStore.getState().setPrompt(target, editor.text);
+      },
+      subscribe: (changed) => draftStore.subscribe(changed),
+      onDeferred: () =>
+        toastManager.add({
+          id: "native-editor-draft-kept",
+          title: "Draft kept",
+          description:
+            "NeoPi provided editor text. It will be inserted after you clear or send your draft.",
+          timeout: 6000,
+        }),
+    });
   }, [feed.editor, key, target]);
   const execute = useCallback(
     async (command: Record<string, unknown> & { type: string }) => {

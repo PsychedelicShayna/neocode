@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
@@ -6,6 +6,7 @@ import {
 } from "@t3tools/contracts";
 import {
   emptyNativeSessionFeed,
+  deferNativeEditorText,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
   nativeSessionKey,
@@ -16,6 +17,84 @@ import {
   reduceNativeSessionFeed,
   type NativeSession,
 } from "./neopiNativeSessions.ts";
+
+describe("deferred native editor text", () => {
+  function fixture(initialDraft: string) {
+    let draft = initialDraft;
+    const listeners = new Set<() => void>();
+    const deferred = vi.fn();
+    const applied = vi.fn();
+    const setDraft = (value: string) => {
+      draft = value;
+      for (const changed of listeners) changed();
+    };
+    const cancel = deferNativeEditorText({
+      hasDraft: () => draft.length > 0,
+      apply: () => {
+        applied();
+        setDraft("Native requested text");
+      },
+      onDeferred: deferred,
+      subscribe: (changed) => {
+        listeners.add(changed);
+        return () => listeners.delete(changed);
+      },
+    });
+    return { applied, deferred, setDraft, cancel, listeners, draft: () => draft };
+  }
+
+  it("inserts immediately into an empty draft without retaining a subscription", () => {
+    const test = fixture("");
+    expect(test.draft()).toBe("Native requested text");
+    expect(test.applied).toHaveBeenCalledTimes(1);
+    expect(test.deferred).not.toHaveBeenCalled();
+    expect(test.listeners.size).toBe(0);
+  });
+
+  it("preserves a draft and its further edits, then applies exactly once after it is cleared", () => {
+    const test = fixture("Unsent draft");
+    expect(test.draft()).toBe("Unsent draft");
+    expect(test.applied).not.toHaveBeenCalled();
+    expect(test.deferred).toHaveBeenCalledTimes(1);
+    test.setDraft("Still editing the unsent draft");
+    expect(test.applied).not.toHaveBeenCalled();
+    test.setDraft("");
+    expect(test.draft()).toBe("Native requested text");
+    expect(test.applied).toHaveBeenCalledTimes(1);
+    expect(test.listeners.size).toBe(0);
+    test.setDraft("");
+    expect(test.applied).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops a superseded or unmounted request without consuming it", () => {
+    const test = fixture("Draft");
+    test.cancel();
+    test.setDraft("");
+    expect(test.applied).not.toHaveBeenCalled();
+    expect(test.listeners.size).toBe(0);
+    test.cancel();
+  });
+
+  it("handles an empty-draft notification delivered synchronously during subscription", () => {
+    let occupied = true;
+    const apply = vi.fn();
+    const unsubscribe = vi.fn();
+    const cancel = deferNativeEditorText({
+      hasDraft: () => occupied,
+      apply,
+      onDeferred: vi.fn(),
+      subscribe: (changed) => {
+        occupied = false;
+        changed();
+        return unsubscribe;
+      },
+    });
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    cancel();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+});
 
 const ref = {
   providerInstanceId: ProviderInstanceId.make("neopi"),

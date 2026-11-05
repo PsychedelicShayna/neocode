@@ -2,6 +2,7 @@ import { StackActions, useNavigation, type StaticScreenProps } from "@react-navi
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
+  deferNativeEditorText,
   nativeCatalogModels,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
@@ -26,6 +27,7 @@ import { ScreenHeader } from "../../components/ScreenHeader";
 import { nativeSessionAtoms, useNativeSession } from "../../state/neopiNativeSessions";
 import { useNativeComposerState } from "../../state/use-native-composer-state";
 import {
+  composerDraftsAtom,
   getComposerDraftSnapshot,
   setComposerDraftText,
   waitForComposerDraftsLoaded,
@@ -42,6 +44,7 @@ import { NativeSessionMobileTree } from "./NativeSessionMobileTree";
 import { NeoPiModelsEntry } from "./NeoPiModelsScreen";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import { appAtomRegistry } from "../../state/atom-registry";
 
 type Params = { environmentId: string; providerInstanceId: string; sessionFile: string };
 type Request = ReturnType<typeof useNativeSession>["request"];
@@ -126,6 +129,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const [paging, setPaging] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [models, setModels] = useState(false);
   const [tree, setTree] = useState(false);
   const [debug, setDebug] = useState(false);
@@ -226,21 +230,36 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   }, [argumentCommand, argumentPrefix, request]);
   useEffect(() => {
     const editor = feed.editor;
+    setEditorNotice(null);
     if (!editor || editors.get(key) === editor.id) return;
     let active = true;
+    let cancel = () => {};
     void waitForComposerDraftsLoaded()
       .then(() => {
         if (!active || editors.get(key) === editor.id) return;
-        editors.set(key, editor.id);
-        const draft = getComposerDraftSnapshot(composer.key);
-        if (!draft.text && !draft.attachments.length && !draft.context?.records.length)
-          setComposerDraftText(composer.key, editor.text);
+        cancel = deferNativeEditorText({
+          hasDraft: () => {
+            const draft = getComposerDraftSnapshot(composer.key);
+            return !!(draft.text || draft.attachments.length || draft.context?.records.length);
+          },
+          apply: () => {
+            editors.set(key, editor.id);
+            setEditorNotice(null);
+            setComposerDraftText(composer.key, editor.text);
+          },
+          subscribe: (changed) => appAtomRegistry.subscribe(composerDraftsAtom, changed),
+          onDeferred: () =>
+            setEditorNotice(
+              "Draft kept. NeoPi's editor text will be inserted after you clear or send your draft.",
+            ),
+        });
       })
       .catch((cause) => {
         if (active) setLocalError(String(cause));
       });
     return () => {
       active = false;
+      cancel();
     };
   }, [feed.editor, key, composer.key]);
   const execute = useCallback<Request>(
@@ -305,6 +324,11 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       <View className="px-4">
         <NativeError message={localError ?? error} />
       </View>
+      {editorNotice ? (
+        <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
+          {editorNotice}
+        </Text>
+      ) : null}
       <FlatList
         ref={timelineRef}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}

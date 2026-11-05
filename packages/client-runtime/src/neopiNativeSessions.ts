@@ -85,6 +85,40 @@ export const nativeRecord = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+
+/** Keep an editor handoff pending until it can be applied without replacing a draft. */
+export function deferNativeEditorText(input: {
+  readonly hasDraft: () => boolean;
+  readonly apply: () => void;
+  readonly subscribe: (changed: () => void) => () => void;
+  readonly onDeferred: () => void;
+}): () => void {
+  let pending = true;
+  let unsubscribe: (() => void) | undefined;
+  const stopWatching = () => {
+    const stop = unsubscribe;
+    unsubscribe = undefined;
+    stop?.();
+  };
+  const attempt = () => {
+    if (!pending || input.hasDraft()) return;
+    pending = false;
+    stopWatching();
+    input.apply();
+  };
+  attempt();
+  if (pending) {
+    input.onDeferred();
+    unsubscribe = input.subscribe(attempt);
+    // Account for a store that changes or notifies synchronously on subscribe.
+    if (pending) attempt();
+    else stopWatching();
+  }
+  return () => {
+    pending = false;
+    stopWatching();
+  };
+}
 interface NativeCommandOutput {
   readonly id: string;
   readonly text: string;

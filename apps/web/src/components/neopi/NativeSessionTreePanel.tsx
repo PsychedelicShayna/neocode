@@ -211,7 +211,8 @@ const TreeBody = memo(function TreeBody({
     [projection],
   );
 
-  const activeId = selectedId ?? snapshot?.leafId ?? null;
+  const candidateId = selectedId ?? snapshot?.leafId ?? null;
+  const activeId = candidateId !== null && indexById.has(candidateId) ? candidateId : null;
   const selected = activeId === null ? undefined : itemById.get(activeId);
   const treeLeafId = snapshot?.leafId ?? null;
   const leafIndex = treeLeafId === null ? undefined : indexById.get(treeLeafId);

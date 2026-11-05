@@ -319,6 +319,8 @@ summarize** or Shift+Enter carries a branch summary along. Click a chevron, or
 press Left and Right, to fold a branch. The filter offers Default, No tools, User
 only, Labeled and All, and the search box narrows the rows; press `/` in the tree
 to reach it. Up, Down, Page Up, Page Down, Home and End move through rows.
+Navigation applies only to a visible selected row; filtering or folding it out
+of view hides its preview and prevents Enter from navigating to it.
 Going to a message you wrote puts it back in the composer for editing, unless the
 composer already holds a draft; that draft is kept.
 

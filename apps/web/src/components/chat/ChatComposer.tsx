@@ -2926,7 +2926,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (activePendingProgress.activeQuestion.allowCustomAnswer === false) return;
         setComposerCursor(nextCursor);
         setComposerTrigger(
-          cursorAdjacentToMention ? null : detectComposerTrigger(nextPrompt, expandedCursor),
+          cursorAdjacentToMention
+            ? null
+            : detectComposerTrigger(nextPrompt, expandedCursor, Boolean(completeCommandArgument)),
         );
         onChangeActivePendingUserInputCustomAnswer?.(
           activePendingProgress.activeQuestion.id,
@@ -3018,11 +3020,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       setComposerCursor(nextCursor);
       setComposerTrigger(
-        cursorAdjacentToMention ? null : detectComposerTrigger(nextPrompt, expandedCursor),
+        cursorAdjacentToMention
+          ? null
+          : detectComposerTrigger(nextPrompt, expandedCursor, Boolean(completeCommandArgument)),
       );
     },
     [
       activePendingProgress?.activeQuestion,
+      completeCommandArgument,
       pendingUserInputs.length,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,

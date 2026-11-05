@@ -11,26 +11,23 @@ import {
 
 describe("ThreadErrorBanner", () => {
   it("stays hidden after its current error is dismissed", () => {
-    const bannerKey = getThreadErrorBannerKey("env:thread-a", "Aborted");
+    const bannerKey = getThreadErrorBannerKey("env:thread-a", "Aborted", "failure-1");
     dismissThreadErrorBannerForSession(bannerKey);
 
     expect(
-      shouldShowThreadErrorBanner(
-        "env:thread-a",
-        "Aborted",
-        isThreadErrorBannerDismissedForSession(bannerKey),
-      ),
+      shouldShowThreadErrorBanner("Aborted", isThreadErrorBannerDismissedForSession(bannerKey)),
     ).toBe(false);
   });
 
   it("reappears when a new error arrives on the same thread", () => {
-    dismissThreadErrorBannerForSession(getThreadErrorBannerKey("env:thread-b", "Turn failed"));
-    const newErrorKey = getThreadErrorBannerKey("env:thread-b", "Provider crashed");
+    dismissThreadErrorBannerForSession(
+      getThreadErrorBannerKey("env:thread-b", "Turn failed", "failure-1"),
+    );
+    const newErrorKey = getThreadErrorBannerKey("env:thread-b", "Provider crashed", "failure-2");
 
     expect(isThreadErrorBannerDismissedForSession(newErrorKey)).toBe(false);
     expect(
       shouldShowThreadErrorBanner(
-        "env:thread-b",
         "Provider crashed",
         isThreadErrorBannerDismissedForSession(newErrorKey),
       ),
@@ -38,13 +35,14 @@ describe("ThreadErrorBanner", () => {
   });
 
   it("scopes dismissals to the thread that dismissed them", () => {
-    dismissThreadErrorBannerForSession(getThreadErrorBannerKey("env:thread-c", "Aborted"));
-    const otherThreadKey = getThreadErrorBannerKey("env:other-thread", "Aborted");
+    dismissThreadErrorBannerForSession(
+      getThreadErrorBannerKey("env:thread-c", "Aborted", "failure-1"),
+    );
+    const otherThreadKey = getThreadErrorBannerKey("env:other-thread", "Aborted", "failure-1");
 
     expect(isThreadErrorBannerDismissedForSession(otherThreadKey)).toBe(false);
     expect(
       shouldShowThreadErrorBanner(
-        "env:other-thread",
         "Aborted",
         isThreadErrorBannerDismissedForSession(otherThreadKey),
       ),
@@ -52,23 +50,45 @@ describe("ThreadErrorBanner", () => {
   });
 
   it("keeps a dismissal across visiting threads with no error", () => {
-    const bannerKey = getThreadErrorBannerKey("env:thread-d", "Aborted");
+    const bannerKey = getThreadErrorBannerKey("env:thread-d", "Aborted", "failure-1");
     dismissThreadErrorBannerForSession(bannerKey);
 
-    expect(shouldShowThreadErrorBanner("env:thread-d", null, false)).toBe(false);
+    expect(shouldShowThreadErrorBanner(null, false)).toBe(false);
     expect(isThreadErrorBannerDismissedForSession(bannerKey)).toBe(true);
     expect(
-      shouldShowThreadErrorBanner(
-        "env:thread-d",
-        "Aborted",
-        isThreadErrorBannerDismissedForSession(bannerKey),
-      ),
+      shouldShowThreadErrorBanner("Aborted", isThreadErrorBannerDismissedForSession(bannerKey)),
     ).toBe(false);
   });
 
   it("never shows a null error", () => {
-    expect(shouldShowThreadErrorBanner("env:thread-e", null, false)).toBe(false);
+    expect(shouldShowThreadErrorBanner(null, false)).toBe(false);
   });
+
+  it.each(["local:101", "server:2026-11-05T01:00:00.000Z"])(
+    "shows a later identical failure after dismissing occurrence %s",
+    (occurrence) => {
+      const threadKey = `env:repeat-${occurrence}`;
+      const oldKey = getThreadErrorBannerKey(threadKey, "Connection lost", occurrence);
+      dismissThreadErrorBannerForSession(oldKey);
+      expect(
+        shouldShowThreadErrorBanner(
+          "Connection lost",
+          isThreadErrorBannerDismissedForSession(oldKey),
+        ),
+      ).toBe(false);
+      expect(shouldShowThreadErrorBanner(null, false)).toBe(false);
+
+      const nextKey = getThreadErrorBannerKey(threadKey, "Connection lost", `${occurrence}:next`);
+      expect(
+        shouldShowThreadErrorBanner(
+          "Connection lost",
+          isThreadErrorBannerDismissedForSession(nextKey),
+        ),
+      ).toBe(true);
+      // Revisiting the original occurrence still does not resurrect it.
+      expect(isThreadErrorBannerDismissedForSession(oldKey)).toBe(true);
+    },
+  );
   it("aligns the warning and dismiss icons with the first line of a multi-line error", () => {
     const markup = renderToStaticMarkup(
       <ThreadErrorBanner

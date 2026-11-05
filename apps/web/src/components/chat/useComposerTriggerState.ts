@@ -12,6 +12,7 @@ export function useComposerTriggerState(initialTrigger: () => ComposerTrigger | 
     return candidate &&
       dismissed &&
       candidate.kind === dismissed.kind &&
+      candidate.command === dismissed.command &&
       candidate.rangeStart === dismissed.rangeStart
       ? null
       : candidate;

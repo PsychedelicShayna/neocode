@@ -20,8 +20,8 @@ function ComposerProbe() {
   return null;
 }
 
-async function updatePrompt(text: string, cursor = text.length) {
-  await act(() => composer.setTrigger(detectComposerTrigger(text, cursor)));
+async function updatePrompt(text: string, cursor = text.length, completeSlashArguments = false) {
+  await act(() => composer.setTrigger(detectComposerTrigger(text, cursor, completeSlashArguments)));
 }
 
 beforeEach(async () => {
@@ -141,5 +141,30 @@ describe("composer suggestion dismissal", () => {
     expect(composer.trigger).toBeNull();
     await updatePrompt("@src");
     expect(composer.trigger?.kind).toBe("path");
+  });
+
+  it("keeps native argument suggestions dismissed through edits until leaving the argument", async () => {
+    const prompt = "/model Anth";
+    await updatePrompt(prompt, prompt.length, true);
+    expect(composer.trigger?.kind).toBe("slash-argument");
+    await act(() => composer.dismissTrigger(composer.trigger));
+
+    const changed = `${prompt}ropic`;
+    await updatePrompt(changed, changed.length, true);
+    expect(composer.trigger).toBeNull();
+    expect(
+      composer.resolveTrigger(detectComposerTrigger(changed, changed.length, true)),
+    ).toBeNull();
+
+    await updatePrompt("/model", 6, true);
+    await updatePrompt(changed, changed.length, true);
+    expect(composer.trigger?.kind).toBe("slash-argument");
+  });
+
+  it("does not carry an argument dismissal into another command at the same position", async () => {
+    await updatePrompt("/model An", 9, true);
+    await act(() => composer.dismissTrigger(composer.trigger));
+    await updatePrompt("/theme Da", 9, true);
+    expect(composer.trigger?.command).toBe("theme");
   });
 });

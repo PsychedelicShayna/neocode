@@ -1800,23 +1800,29 @@ export default function ChatView(props: ChatViewProps) {
   const threadError = isServerThread
     ? (localServerError ?? activeServerThread?.session?.lastError ?? null)
     : localDraftError;
-  // Dismissals can only mask the shown error, never clear it: a server thread
-  // keeps its error in session.lastError, so clearing the local shadow would
-  // just fall through to the persisted one. Mask the current error until a
-  // different error arrives, mirroring the provider status banner.
-  const threadErrorBannerKey = getThreadErrorBannerKey(routeThreadKey, threadError);
-  const visibleThreadError = shouldShowThreadErrorBanner(
+  // Mask this occurrence without clearing its local shadow into a persisted
+  // error. A later failure, even with identical text, has a different timestamp.
+  const localErrorAt = isServerThread
+    ? localServerErrorsByThreadKey[routeThreadKey]?.at
+    : draftId
+      ? localDraftErrorsByDraftId[draftId]?.at
+      : undefined;
+  const threadErrorOccurrence =
+    (isServerThread ? localServerError : localDraftError) !== null
+      ? `local:${localErrorAt}`
+      : `server:${activeServerThread?.session?.updatedAt ?? ""}`;
+  const threadErrorBannerKey = getThreadErrorBannerKey(
     routeThreadKey,
+    threadError,
+    threadErrorOccurrence,
+  );
+  const visibleThreadError = shouldShowThreadErrorBanner(
     threadError,
     isThreadErrorBannerDismissedForSession(threadErrorBannerKey),
   )
     ? threadError
     : null;
-  // Dismissing only mutates the session-scoped mask set, which does not
-  // trigger a render on its own; setThreadError(null) can also bail when the
-  // local shadow is already empty and the banner is driven purely by
-  // session.lastError. Bump a tick so the banner hides immediately. Mirrors
-  // the branch mismatch banner.
+  // The session-scoped mask is outside React state; repaint after dismissing it.
   const [, setThreadErrorBannerDismissTick] = useState(0);
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
@@ -3783,24 +3789,30 @@ export default function ChatView(props: ChatViewProps) {
         })
       ) {
         setLocalServerErrorsByThreadKey((existing) => {
-          if ((existing[routeThreadKey]?.message ?? null) === nextError) {
+          if (nextError === null && (existing[routeThreadKey]?.message ?? null) === null) {
             return existing;
           }
           return {
             ...existing,
-            [routeThreadKey]: nextEntry,
+            [routeThreadKey]: {
+              ...nextEntry,
+              at: Math.max(nextEntry.at, (existing[routeThreadKey]?.at ?? 0) + 1),
+            },
           };
         });
         return;
       }
       const localDraftErrorKey = draftId ?? targetThreadId;
       setLocalDraftErrorsByDraftId((existing) => {
-        if ((existing[localDraftErrorKey]?.message ?? null) === nextError) {
+        if (nextError === null && (existing[localDraftErrorKey]?.message ?? null) === null) {
           return existing;
         }
         return {
           ...existing,
-          [localDraftErrorKey]: nextEntry,
+          [localDraftErrorKey]: {
+            ...nextEntry,
+            at: Math.max(nextEntry.at, (existing[localDraftErrorKey]?.at ?? 0) + 1),
+          },
         };
       });
     },
@@ -9511,7 +9523,6 @@ export default function ChatView(props: ChatViewProps) {
               <ThreadErrorBanner
                 error={visibleThreadError}
                 onDismiss={() => {
-                  setThreadError(activeThread.id, null);
                   dismissThreadErrorBannerForSession(threadErrorBannerKey);
                   setThreadErrorBannerDismissTick((tick) => tick + 1);
                 }}

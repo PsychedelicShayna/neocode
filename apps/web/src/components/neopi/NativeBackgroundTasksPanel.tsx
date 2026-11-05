@@ -9,6 +9,7 @@ import {
   applyNativeJobOutput,
   emptyNativeJobOutput,
   nativeJobElapsedMs,
+  nativeJobOutputRequest,
   orderNativeJobs,
   type NativeJob,
 } from "@t3tools/client-runtime/neopi-native-jobs";
@@ -113,11 +114,7 @@ function JobDetail(props: {
     if (reading.current) return;
     reading.current = true;
     try {
-      const response = await request({
-        type: "get_job_output",
-        jobId: job.id,
-        fromByte: accumulated.current.nextByte,
-      });
+      const response = await request(nativeJobOutputRequest(accumulated.current));
       setError(null);
       const next = applyNativeJobOutput(accumulated.current, response);
       if (next !== accumulated.current) {

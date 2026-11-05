@@ -165,18 +165,30 @@ export interface NativeJobOutput {
   readonly text: string;
   /** Pass as `fromByte` on the next read. */
   readonly nextByte: number;
+  /** Opaque token for the bytes before `nextByte`; null on older NeoPi. */
+  readonly revision: string | null;
 }
 
 export const emptyNativeJobOutput = (jobId: string): NativeJobOutput => ({
   jobId,
   text: "",
   nextByte: 0,
+  revision: null,
+});
+
+/** Keep the byte cursor and its revision paired; old servers need offset-only reads. */
+export const nativeJobOutputRequest = (current: NativeJobOutput) => ({
+  type: "get_job_output" as const,
+  jobId: current.jobId,
+  fromByte: current.nextByte,
+  ...(current.revision === null ? {} : { revision: current.revision }),
 });
 
 /**
- * `get_job_output` response `{ jobId, fromByte, nextByte, reset, output }`:
- * the slice appends, unless NeoPi says the snapshot restarted. A response for
- * another job, or one that no longer lines up with what we hold, is dropped.
+ * `get_job_output` response `{ jobId, fromByte, nextByte, revision?, reset, output }`:
+ * the slice appends, unless NeoPi says the snapshot restarted. Retain the returned
+ * revision even on an empty slice. A response for another job, or one that no
+ * longer lines up with what we hold, is dropped.
  */
 export function applyNativeJobOutput(current: NativeJobOutput, response: unknown): NativeJobOutput {
   const body = record(response);
@@ -184,9 +196,10 @@ export function applyNativeJobOutput(current: NativeJobOutput, response: unknown
   const fromByte = count(body.fromByte);
   const nextByte = count(body.nextByte);
   if (body.jobId !== current.jobId || output === null || nextByte === null) return current;
-  if (body.reset === true) return { jobId: current.jobId, text: output, nextByte };
+  const revision = text(body.revision);
+  if (body.reset === true) return { jobId: current.jobId, text: output, nextByte, revision };
   if (fromByte !== current.nextByte) return current;
-  return output === "" && nextByte === current.nextByte
+  return output === "" && nextByte === current.nextByte && revision === current.revision
     ? current
-    : { jobId: current.jobId, text: current.text + output, nextByte };
+    : { jobId: current.jobId, text: current.text + output, nextByte, revision };
 }

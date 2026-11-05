@@ -35,3 +35,11 @@ Applications should import the narrowest relevant subpath. There is no broad
 `state` export: use domain paths such as `state/shell`, `state/threads`,
 `state/terminal`, or `state/vcs`. Subpath indices and explicitly exported domain
 files are public API boundaries; all other files remain implementation details.
+
+## Native job output compatibility
+
+NeoPi's job-output revision is an opaque token paired with its returned byte
+cursor, not a revision of the job inventory. Send both on the next read so NeoPi
+can detect replaced progress snapshots and return `reset: true`. Older NeoPi
+omits the token and retains offset-only behavior; detecting equal-length snapshot
+replacements requires the newer NeoPi protocol.

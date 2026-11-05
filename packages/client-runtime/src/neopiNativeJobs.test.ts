@@ -4,6 +4,7 @@ import {
   applyNativeJobOutput,
   emptyNativeJobOutput,
   nativeJobElapsedMs,
+  nativeJobOutputRequest,
   orderNativeJobs,
   parseNativeJob,
   reduceNativeJobs,
@@ -133,7 +134,7 @@ describe("native job output", () => {
     let output = emptyNativeJobOutput("bg_1");
     output = applyNativeJobOutput(output, slice(0, 5, "hello"));
     output = applyNativeJobOutput(output, slice(5, 11, " world"));
-    expect(output).toEqual({ jobId: "bg_1", text: "hello world", nextByte: 11 });
+    expect(output).toEqual({ jobId: "bg_1", text: "hello world", nextByte: 11, revision: null });
   });
 
   it("restarts when NeoPi resets, and drops stale or foreign slices", () => {
@@ -141,11 +142,102 @@ describe("native job output", () => {
     expect(applyNativeJobOutput(output, slice(0, 5, "hello"))).toBe(output);
     expect(applyNativeJobOutput(output, { ...slice(5, 9, "more"), jobId: "bg_2" })).toBe(output);
     output = applyNativeJobOutput(output, slice(99, 3, "new", true));
-    expect(output).toEqual({ jobId: "bg_1", text: "new", nextByte: 3 });
+    expect(output).toEqual({ jobId: "bg_1", text: "new", nextByte: 3, revision: null });
   });
 
   it("returns the same value for an empty slice so nothing re-renders", () => {
     const output = applyNativeJobOutput(emptyNativeJobOutput("bg_1"), slice(0, 5, "hello"));
     expect(applyNativeJobOutput(output, slice(5, 5, ""))).toBe(output);
+  });
+
+  it("round-trips each revision with its byte cursor across Unicode output pages", () => {
+    let output = emptyNativeJobOutput("bg_1");
+    expect(nativeJobOutputRequest(output)).toEqual({
+      type: "get_job_output",
+      jobId: "bg_1",
+      fromByte: 0,
+    });
+    output = applyNativeJobOutput(output, {
+      ...slice(0, 4, "🌱"),
+      totalBytes: 7,
+      revision: "4:seed",
+    });
+    expect(nativeJobOutputRequest(output)).toEqual({
+      type: "get_job_output",
+      jobId: "bg_1",
+      fromByte: 4,
+      revision: "4:seed",
+    });
+    output = applyNativeJobOutput(output, {
+      ...slice(4, 7, "花"),
+      revision: "7:flower",
+    });
+    expect(output.text).toBe("🌱花");
+    expect(nativeJobOutputRequest(output)).toEqual({
+      type: "get_job_output",
+      jobId: "bg_1",
+      fromByte: 7,
+      revision: "7:flower",
+    });
+  });
+
+  it.each(["BBBB", "longer replacement", "短"])(
+    "replaces a changed snapshot with %s and sends its new revision",
+    (replacement) => {
+      const before = applyNativeJobOutput(emptyNativeJobOutput("bg_1"), {
+        ...slice(0, 4, "AAAA"),
+        revision: "4:old",
+      });
+      const nextByte = new TextEncoder().encode(replacement).length;
+      const output = applyNativeJobOutput(before, {
+        ...slice(0, nextByte, replacement, true),
+        revision: `${nextByte}:new`,
+      });
+      expect(output.text).toBe(replacement);
+      expect(nativeJobOutputRequest(output)).toEqual({
+        type: "get_job_output",
+        jobId: "bg_1",
+        fromByte: nextByte,
+        revision: `${nextByte}:new`,
+      });
+    },
+  );
+
+  it("retains a new revision on an empty slice without changing displayed output", () => {
+    const before = applyNativeJobOutput(emptyNativeJobOutput("bg_1"), slice(0, 5, "hello"));
+    const output = applyNativeJobOutput(before, { ...slice(5, 5, ""), revision: "5:hello" });
+    expect(output.text).toBe(before.text);
+    expect(nativeJobOutputRequest(output)).toMatchObject({ fromByte: 5, revision: "5:hello" });
+    expect(applyNativeJobOutput(output, { ...slice(5, 5, ""), revision: "5:hello" })).toBe(output);
+    expect(applyNativeJobOutput(output, { ...slice(0, 5, "stale"), revision: "5:stale" })).toBe(
+      output,
+    );
+    expect(
+      applyNativeJobOutput(output, {
+        ...slice(5, 9, "more"),
+        jobId: "bg_2",
+        revision: "9:foreign",
+      }),
+    ).toBe(output);
+  });
+
+  it("keeps offset-only reads for older NeoPi, clearing any previous revision", () => {
+    let output = applyNativeJobOutput(emptyNativeJobOutput("bg_1"), {
+      ...slice(0, 5, "hello"),
+      revision: "5:hello",
+    });
+    output = applyNativeJobOutput(output, slice(5, 5, ""));
+    expect(nativeJobOutputRequest(output)).toEqual({
+      type: "get_job_output",
+      jobId: "bg_1",
+      fromByte: 5,
+    });
+    output = applyNativeJobOutput(output, slice(5, 11, " world"));
+    expect(output.text).toBe("hello world");
+    expect(nativeJobOutputRequest(output)).toEqual({
+      type: "get_job_output",
+      jobId: "bg_1",
+      fromByte: 11,
+    });
   });
 });

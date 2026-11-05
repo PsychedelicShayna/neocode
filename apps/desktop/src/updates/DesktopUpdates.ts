@@ -298,30 +298,36 @@ export const make = Effect.gen(function* () {
   );
 
   const stateChanges = yield* PubSub.sliding<DesktopUpdateState>(16);
-  // Makes ref writes + publishes atomic against subscribe, so a snapshot
-  // never overlaps with the first change a subscriber receives.
+  // Serialize each read-transform-write with publication and subscription
+  // snapshots so queued transitions never overwrite a newer state.
   const stateMutex = yield* Semaphore.make(1);
 
   const emitState = Ref.get(updateStateRef).pipe(
     Effect.flatMap((state) => electronWindow.sendAll(IpcChannels.UPDATE_STATE_CHANNEL, state)),
   );
 
-  const setState = (state: DesktopUpdateState): Effect.Effect<void> =>
-    stateMutex
-      .withPermits(1)(
-        Ref.set(updateStateRef, state).pipe(Effect.andThen(PubSub.publish(stateChanges, state))),
-      )
-      .pipe(Effect.andThen(emitState));
-
   const updateState = (
     f: (state: DesktopUpdateState) => DesktopUpdateState,
   ): Effect.Effect<DesktopUpdateState> =>
-    Ref.get(updateStateRef).pipe(
-      Effect.flatMap((state) => {
-        const nextState = f(state);
-        return setState(nextState).pipe(Effect.as(nextState));
-      }),
-    );
+    stateMutex
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const state = yield* Ref.get(updateStateRef);
+          const next = f(state);
+          if (next === state) return [state, false] as const;
+          yield* Ref.set(updateStateRef, next);
+          yield* PubSub.publish(stateChanges, next);
+          return [next, true] as const;
+        }),
+      )
+      .pipe(
+        Effect.flatMap(([state, changed]) =>
+          changed ? emitState.pipe(Effect.as(state)) : Effect.succeed(state),
+        ),
+      );
+
+  const setState = (state: DesktopUpdateState): Effect.Effect<void> =>
+    updateState(() => state).pipe(Effect.asVoid);
 
   const readAppUpdateYml = fileSystem.readFileString(environment.appUpdateYmlPath, "utf-8").pipe(
     Effect.option,
@@ -414,20 +420,25 @@ export const make = Effect.gen(function* () {
     if (yield* Ref.get(desktopState.quitting)) return false;
     if (!(yield* Ref.get(updaterConfiguredRef))) return false;
 
-    const state = yield* Ref.get(updateStateRef);
-    if (state.status === "downloading") {
-      yield* logUpdaterInfo("skipping update check while update is active", {
-        reason,
-        status: state.status,
-      });
-      return false;
-    }
-
     if (actionReservation === "acquire" && !(yield* tryStartUpdateAction("check"))) return false;
+    let previousState: DesktopUpdateState | undefined;
+    let checkingState: DesktopUpdateState | undefined;
 
     const check = Effect.gen(function* () {
       const checkedAt = yield* currentIsoTimestamp;
-      yield* setState(reduceDesktopUpdateStateOnCheckStart(state, checkedAt));
+      const state = yield* updateState((current) => {
+        if (current.status === "downloading") return current;
+        previousState = current;
+        checkingState = reduceDesktopUpdateStateOnCheckStart(current, checkedAt);
+        return checkingState;
+      });
+      if (checkingState === undefined) {
+        yield* logUpdaterInfo("skipping update check while update is active", {
+          reason,
+          status: state.status,
+        });
+        return false;
+      }
       yield* logUpdaterInfo("checking for updates", { reason });
 
       return yield* electronUpdater.checkForUpdates.pipe(
@@ -453,23 +464,32 @@ export const make = Effect.gen(function* () {
     return yield* actionReservation === "held"
       ? check
       : check.pipe(
-          Effect.onInterrupt(() => setState(state)),
+          Effect.onInterrupt(() =>
+            updateState((current) =>
+              previousState && current === checkingState ? previousState : current,
+            ),
+          ),
           Effect.ensuring(finishUpdateAction("check")),
         );
   });
 
   const downloadAvailableUpdate = Effect.gen(function* () {
-    const state = yield* Ref.get(updateStateRef);
-    if (!(yield* Ref.get(updaterConfiguredRef)) || state.status !== "available") {
+    if (!(yield* Ref.get(updaterConfiguredRef))) {
       return { accepted: false, completed: false };
     }
 
     if (!(yield* tryStartUpdateAction("download"))) {
       return { accepted: false, completed: false };
     }
+    let state: DesktopUpdateState | undefined;
 
     return yield* Effect.gen(function* () {
-      yield* setState(reduceDesktopUpdateStateOnDownloadStart(state));
+      yield* updateState((current) => {
+        if (current.status !== "available") return current;
+        state = current;
+        return reduceDesktopUpdateStateOnDownloadStart(current);
+      });
+      if (state === undefined) return { accepted: false, completed: false };
       yield* electronUpdater.setDisableDifferentialDownload(
         isArm64HostRunningIntelBuild(environment.runtimeInfo),
       );
@@ -492,9 +512,9 @@ export const make = Effect.gen(function* () {
         ),
       }),
       Effect.onInterrupt(() =>
-        updateState((current) => (current.status === "downloading" ? state : current)).pipe(
-          Effect.asVoid,
-        ),
+        updateState((current) =>
+          state && current.status === "downloading" ? state : current,
+        ).pipe(Effect.asVoid),
       ),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -740,38 +760,36 @@ export const make = Effect.gen(function* () {
     yield* decodeUpdateInfo(raw).pipe(
       Effect.flatMap(
         Effect.fn("desktop.updates.applyUpdateAvailable")(function* (info) {
-          const state = yield* Ref.get(updateStateRef);
+          const checkedAt = yield* currentIsoTimestamp;
+          const state = yield* updateState((current) => {
+            if (resolveDefaultDesktopUpdateChannel(info.version) !== current.channel)
+              return reduceDesktopUpdateStateOnNoUpdate(current, checkedAt);
+            const { releaseNotes, omittedReleaseCount } = normalizeDesktopUpdateReleaseNotes(
+              info.releaseNotes,
+              info.version,
+              current.channel,
+            );
+            return reduceDesktopUpdateStateOnUpdateAvailable(
+              current,
+              info.version,
+              checkedAt,
+              releaseNotes,
+              omittedReleaseCount,
+            );
+          });
           if (resolveDefaultDesktopUpdateChannel(info.version) !== state.channel) {
             yield* logUpdaterInfo("ignoring update that does not match selected channel", {
               version: info.version,
               channel: state.channel,
             });
-            const checkedAt = yield* currentIsoTimestamp;
-            yield* setState(reduceDesktopUpdateStateOnNoUpdate(state, checkedAt));
             yield* Ref.set(lastLoggedDownloadMilestoneRef, -1);
             return;
           }
-
-          const checkedAt = yield* currentIsoTimestamp;
-          const { releaseNotes, omittedReleaseCount } = normalizeDesktopUpdateReleaseNotes(
-            info.releaseNotes,
-            info.version,
-            state.channel,
-          );
-          yield* setState(
-            reduceDesktopUpdateStateOnUpdateAvailable(
-              state,
-              info.version,
-              checkedAt,
-              releaseNotes,
-              omittedReleaseCount,
-            ),
-          );
           yield* Ref.set(lastLoggedDownloadMilestoneRef, -1);
           yield* logUpdaterInfo("update available", {
             version: info.version,
-            releaseNoteGroups: releaseNotes.length,
-            omittedReleaseCount,
+            releaseNoteGroups: state.releaseNotes.length,
+            omittedReleaseCount: state.omittedReleaseCount,
           });
         }),
       ),
@@ -790,8 +808,7 @@ export const make = Effect.gen(function* () {
 
   const handleUpdateNotAvailable = Effect.gen(function* () {
     const checkedAt = yield* currentIsoTimestamp;
-    const state = yield* Ref.get(updateStateRef);
-    yield* setState(reduceDesktopUpdateStateOnNoUpdate(state, checkedAt));
+    yield* updateState((current) => reduceDesktopUpdateStateOnNoUpdate(current, checkedAt));
     yield* Ref.set(lastLoggedDownloadMilestoneRef, -1);
     yield* logUpdaterInfo("no updates available");
   }).pipe(Effect.withSpan("desktop.updates.handleUpdateNotAvailable"));
@@ -841,11 +858,12 @@ export const make = Effect.gen(function* () {
     yield* decodeDownloadProgressInfo(raw).pipe(
       Effect.flatMap(
         Effect.fn("desktop.updates.applyDownloadProgress")(function* (progress) {
-          const state = yield* Ref.get(updateStateRef);
           const percent = Math.floor(progress.percent);
-          if (shouldBroadcastDownloadProgress(state, progress.percent) || state.message !== null) {
-            yield* setState(reduceDesktopUpdateStateOnDownloadProgress(state, progress.percent));
-          }
+          yield* updateState((current) =>
+            shouldBroadcastDownloadProgress(current, progress.percent) || current.message !== null
+              ? reduceDesktopUpdateStateOnDownloadProgress(current, progress.percent)
+              : current,
+          );
           const milestone = percent - (percent % 10);
           const lastLoggedMilestone = yield* Ref.get(lastLoggedDownloadMilestoneRef);
           if (milestone > lastLoggedMilestone) {
@@ -873,8 +891,9 @@ export const make = Effect.gen(function* () {
     yield* decodeUpdateInfo(raw).pipe(
       Effect.flatMap(
         Effect.fn("desktop.updates.applyUpdateDownloaded")(function* (info) {
-          const state = yield* Ref.get(updateStateRef);
-          yield* setState(reduceDesktopUpdateStateOnDownloadComplete(state, info.version));
+          yield* updateState((current) =>
+            reduceDesktopUpdateStateOnDownloadComplete(current, info.version),
+          );
           yield* logUpdaterInfo("update downloaded", { version: info.version });
         }),
       ),

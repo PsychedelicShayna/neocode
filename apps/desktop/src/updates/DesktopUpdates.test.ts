@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { DESKTOP_UPDATE_RESTART_MARKER_FILE } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -248,6 +249,78 @@ describe("DesktopUpdates", () => {
       }),
     ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
+
+  it.effect("admits a delayed check against the latest updater event state", () =>
+    Effect.gen(function* () {
+      for (const event of ["update-downloaded", "download-progress"] as const) {
+        const harness = makeHarness();
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const updates = yield* DesktopUpdates.DesktopUpdates;
+            yield* updates.configure;
+            const clock = yield* Clock.Clock;
+            const paused = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const check = yield* updates.check("manual").pipe(
+              Effect.provideService(Clock.Clock, {
+                ...clock,
+                currentTimeMillis: Deferred.succeed(paused, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(clock.currentTimeMillis),
+                ),
+              }),
+              Effect.forkChild,
+            );
+            yield* Deferred.await(paused);
+            harness.emit(
+              event,
+              event === "update-downloaded" ? { version: "1.2.4" } : { percent: 42 },
+            );
+            yield* flushCallbacks;
+            yield* Deferred.succeed(release, undefined);
+            const result = yield* Fiber.join(check);
+
+            if (event === "update-downloaded") {
+              assert.isTrue(result.checked);
+              assert.equal(result.state.downloadedVersion, "1.2.4");
+              assert.equal(result.state.downloadPercent, 100);
+              assert.equal(harness.checkCount(), 1);
+            } else {
+              assert.isFalse(result.checked);
+              assert.equal(result.state.status, "downloading");
+              assert.equal(result.state.downloadPercent, 42);
+              assert.equal(harness.checkCount(), 0);
+            }
+          }),
+        ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+      }
+    }),
+  );
+
+  it.effect("does not roll a newer downloaded state back when a check is interrupted", () =>
+    Effect.gen(function* () {
+      const checking = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        checkForUpdates: Deferred.succeed(checking, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          const check = yield* updates.check("manual").pipe(Effect.forkChild);
+          yield* Deferred.await(checking);
+          harness.emit("update-downloaded", { version: "1.2.4" });
+          yield* flushCallbacks;
+          yield* Fiber.interrupt(check);
+
+          const state = yield* updates.getState;
+          assert.equal(state.status, "downloaded");
+          assert.equal(state.downloadedVersion, "1.2.4");
+          assert.isFalse(yield* updates.isActionActive);
+        }),
+      ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    }),
+  );
 
   it.effect("preserves a queued installer when the feed has no update", () => {
     const harness = makeHarness();

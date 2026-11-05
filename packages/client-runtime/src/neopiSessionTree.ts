@@ -155,12 +155,16 @@ export function projectSessionTree(
     if (index <= 0) return siblings;
     return [siblings[index]!, ...siblings.slice(0, index), ...siblings.slice(index + 1)];
   };
-  /** Hides a collapsed branch from the walk, so it is not mistaken for a cycle. */
+  /**
+   * Hides a collapsed branch from the walk, so it is not mistaken for a cycle.
+   * Already visited ancestors stay visible when malformed parent links cycle.
+   */
   const foldDescendants = (id: string) => {
     let count = 0;
     const pending = [...(children.get(id) ?? [])];
     while (pending.length > 0) {
       const descendant = pending.pop()!;
+      if (visited.has(descendant.entry.id)) continue;
       count++;
       visited.add(descendant.entry.id);
       pending.push(...(children.get(descendant.entry.id) ?? []));

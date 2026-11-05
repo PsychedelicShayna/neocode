@@ -100,6 +100,22 @@ describe("projectSessionTree", () => {
     expect(rows.map((row) => row.id).toSorted()).toEqual(["a", "o", "p", "q"]);
   });
 
+  it.each([
+    { collapsedId: "a", visibleIds: ["a"], hiddenCount: 2 },
+    { collapsedId: "b", visibleIds: ["a", "b"], hiddenCount: 1 },
+  ])("folds a cycle at $collapsedId", ({ collapsedId, visibleIds, hiddenCount }) => {
+    const rows = projectSessionTree(
+      [item("a", "b"), item("b", "a"), item("c", "b")],
+      "c",
+      new Set([collapsedId]),
+    ).rows;
+    expect(rows.map((row) => row.id)).toEqual(visibleIds);
+    expect(rows.find((row) => row.id === collapsedId)).toMatchObject({
+      collapsed: true,
+      hiddenCount,
+    });
+  });
+
   it("walks a very long chain without recursion", () => {
     const chain = Array.from({ length: 50_000 }, (_, index) =>
       item(`n${index}`, index === 0 ? null : `n${index - 1}`),

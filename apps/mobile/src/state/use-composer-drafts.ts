@@ -1284,6 +1284,26 @@ export function replaceComposerDraftFromNative(
   });
 }
 
+/** Withdrawn input is recovery: retain every attachment, even above the normal send limit. */
+export function prependRecoveredComposerDraft(
+  draftKey: string,
+  content: ComposerDraftContent,
+): void {
+  updateComposerDrafts((current) => {
+    const previous = normalizeDraft(current[draftKey]);
+    const text =
+      content.text && previous.text
+        ? `${content.text}\n\n${previous.text}`
+        : content.text || previous.text;
+    return withComposerDraft(current, draftKey, {
+      ...previous,
+      text,
+      context: mergeReferencedComposerContext(text, content.context, previous.context),
+      attachments: [...previous.attachments, ...content.attachments],
+    });
+  });
+}
+
 export function updateNativeTreeDraft(
   draftKey: string,
   update: (draft: NativeTreeDraft) => NativeTreeDraft,

@@ -6,6 +6,7 @@ import {
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   ThreadId,
 } from "@t3tools/contracts";
 import { onTestFinished, vi } from "vite-plus/test";
@@ -176,6 +177,7 @@ import {
   flushComposerDrafts,
   getComposerDraftSnapshot,
   mergeComposerDraftContentState,
+  prependRecoveredComposerDraft,
   migrateLegacyNewTaskDraft,
   releaseUnusedComposerAttachmentFiles,
   removeComposerDraftsForEnvironment,
@@ -240,6 +242,35 @@ function contextDraft(start: number, count: number): ComposerDraft {
 }
 
 describe("mobile composer drafts", () => {
+  it("prepends withdrawn native input without replacing a newer draft or truncating attachments", async () => {
+    await waitForComposerDraftsLoaded();
+    const existing = { ...contextDraft(0, 1), nativeSessionKey: "native-file" };
+    appAtomRegistry.set(composerDraftsAtom, { native: existing });
+    const incoming = contextDraft(10, 1);
+    const attachments = Array.from(
+      { length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS + 2 },
+      (_, index) => ({
+        type: "image" as const,
+        id: `restored-${index}`,
+        name: `restored-${index}.png`,
+        mimeType: "image/png",
+        sizeBytes: 3,
+        dataUrl: "data:image/png;base64,YWJj",
+        previewUri: "data:image/png;base64,YWJj",
+      }),
+    );
+    prependRecoveredComposerDraft("native", { ...incoming, attachments });
+    const restored = getComposerDraftSnapshot("native");
+    expect(restored.text).toBe(`${incoming.text}\n\n${existing.text}`);
+    expect(restored.context?.records).toHaveLength(2);
+    expect(restored.attachments).toEqual(attachments);
+    expect(restored.nativeSessionKey).toBe("native-file");
+    await flushComposerDrafts();
+    expect(JSON.parse(composerDraftFileMocks.getDocument()).drafts.native.attachments).toHaveLength(
+      attachments.length,
+    );
+  });
+
   it.each([false, true])(
     "restores visible file chips from legacy drafts (archived: %s)",
     async (archived) => {

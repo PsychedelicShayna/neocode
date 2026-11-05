@@ -74,6 +74,15 @@ the oldest queued message now. Change `thread.steerQueuedMessage` in
 **Settings → Keybindings** to use another shortcut. It leaves the current draft
 in the composer and waits if the agent needs an approval or an answer.
 
+In native NeoPi sessions, cancelling queued input returns its text, context and
+attachments without replacing a draft you are still writing. Input that has
+already been dispatched is not copied back into the composer. With a current
+NeoPi, **Stop** (or Escape on web and desktop) also withdraws queued steering
+and follow-up messages before stopping the turn, then returns them oldest first.
+Older NeoPi versions keep their original abort behavior and do not withdraw the
+queue. If an attachment is no longer available on its server, the composer names
+it so you can attach it again.
+
 ## Queue messages offline on mobile
 
 Mobile keeps local copies of draft attachments, so you can preview them and queue

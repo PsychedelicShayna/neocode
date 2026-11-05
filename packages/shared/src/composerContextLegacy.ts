@@ -1,6 +1,8 @@
 import {
-  type ComposerContextId,
+  ComposerContextId,
   ComposerContextRecord,
+  FileContextRecord,
+  ImageContextRecord,
   type ElementContextRecord,
   type PreviewAnnotationContextRecord,
   ReviewCommentContextRecord,
@@ -11,10 +13,9 @@ import * as Schema from "effect/Schema";
 import { formatComposerContextReference } from "./composerContextReferences.ts";
 
 /**
- * Upgrades a message written before inline context references: trailing
- * `<terminal_context>`, `<element_context>` and `<preview_annotation>` blocks, inline or
- * trailing `<review_comment>` blocks, and U+FFFC terminal placeholders. Produces canonical
- * reference links plus records so old messages render and copy through the new path.
+ * Upgrades legacy trailing context blocks and inline review comments, plus attachment
+ * metadata and U+FFFC terminal placeholders. Produces canonical reference links and
+ * records so old messages render, copy and recover through the current path.
  * Event history is never rewritten; this runs in memory on read.
  */
 
@@ -26,6 +27,7 @@ export interface UpgradedLegacyContext {
 const PLACEHOLDER = "￼";
 const TRAILING_TERMINAL = /\n*<terminal_context>\n([\s\S]*?)\n<\/terminal_context>\s*$/;
 const TRAILING_ELEMENT = /\n*<element_context>\n([\s\S]*?)\n<\/element_context>\s*$/;
+const TRAILING_ATTACHMENTS = /\n*<attachment_context>\n([^\n]*)\n<\/attachment_context>\s*$/;
 const TRAILING_PREVIEW =
   /\n*<preview_annotation>\n((?:(?!\n<\/preview_annotation>)[\s\S])*)\n<\/preview_annotation>\s*$/;
 const REVIEW_OR_CONTEXT_BLOCK =
@@ -34,11 +36,34 @@ const REVIEW_ATTRIBUTE = /([a-zA-Z][a-zA-Z0-9_-]*)="([^"]*)"/g;
 const REVIEW_FENCE = /(`{3,})([^\s`]*)[^\n]*\n([\s\S]*?)\n\1/g;
 const REVIEW_TOKEN = "\uE000";
 const LEGACY_MARKERS =
-  /<(?:terminal_context|element_context|preview_annotation|review_comment)\b|￼/;
+  /<(?:terminal_context|element_context|preview_annotation|review_comment|attachment_context)\b|￼/;
 const isReviewCommentContextRecord = Schema.is(ReviewCommentContextRecord);
 const isLegacyContextRecords = Schema.is(
   Schema.Array(ComposerContextRecord).check(Schema.isMaxLength(200)),
 );
+const decodeAttachmentContext = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      attachments: Schema.Array(Schema.Union([ImageContextRecord, FileContextRecord])).check(
+        Schema.isMaxLength(200),
+      ),
+      screenshots: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            annotationId: Schema.String,
+            screenshotContextId: ComposerContextId,
+          }),
+        ).check(Schema.isMaxLength(200)),
+      ),
+    }),
+  ),
+);
+
+/** Keeps recovery metadata out of simple native transcript renderers. Invalid blocks stay visible. */
+export function stripLegacyAttachmentMetadata(text: string): string {
+  const block = stripTrailing(text, TRAILING_ATTACHMENTS);
+  return block && decodeAttachmentContext(block.match[1])._tag === "Some" ? block.text : text;
+}
 
 interface ParsedEntry {
   header: string;
@@ -320,6 +345,14 @@ export function upgradeLegacyContextMessage(text: string): UpgradedLegacyContext
   const elementEntries: ParsedEntry[] = [];
   const previewBodies: string[] = [];
   const reviews: ReviewCommentContextRecord[] = [];
+  const attachmentBlock = stripTrailing(text, TRAILING_ATTACHMENTS);
+  const attachmentContext = attachmentBlock
+    ? decodeAttachmentContext(attachmentBlock.match[1])
+    : null;
+  if (attachmentContext?._tag === "None") return { text, records: [] };
+  const attachments = attachmentContext?._tag === "Some" ? attachmentContext.value.attachments : [];
+  const screenshots =
+    attachmentContext?._tag === "Some" ? (attachmentContext.value.screenshots ?? []) : [];
 
   // A literal private-use token in the message must never be mistaken for our placeholder.
   let reviewToken = REVIEW_TOKEN;
@@ -329,7 +362,7 @@ export function upgradeLegacyContextMessage(text: string): UpgradedLegacyContext
 
   // Review blocks become tokens in place first so they neither hide the trailing blocks
   // behind them nor lose their position. Unparseable blocks stay as text.
-  let rest = replaceReviewBlocks(text, (whole, attributes, rawBody) => {
+  let rest = replaceReviewBlocks(attachmentBlock?.text ?? text, (whole, attributes, rawBody) => {
     const record = reviewRecord(attributes, rawBody, reviews.length + 1);
     // Keep the original prose if converting it would produce a record the wire drops.
     if (!record || !isReviewCommentContextRecord(record)) return whole;
@@ -394,7 +427,10 @@ export function upgradeLegacyContextMessage(text: string): UpgradedLegacyContext
   for (const [index, previewBody] of previewBodies.entries()) {
     const record = previewRecord(previewBody, index + 1);
     if (record === null) return { text, records: [] };
-    previews.push(record);
+    const screenshot = screenshots.find((binding) => binding.annotationId === record.annotationId);
+    previews.push(
+      screenshot ? { ...record, screenshotContextId: screenshot.screenshotContextId } : record,
+    );
   }
   const appendedReviews = trailingReviewTokens.map((index) => reviews[index]!);
 
@@ -442,7 +478,7 @@ export function upgradeLegacyContextMessage(text: string): UpgradedLegacyContext
         ? `${body}\n\n${appended.join(" ")}`
         : appended.join(" ");
 
-  const records = [...terminals, ...elements, ...previews, ...reviews];
+  const records = [...terminals, ...elements, ...previews, ...reviews, ...attachments];
   // Conversion is atomic: keep the source if any record would be dropped on the wire.
   if (!isLegacyContextRecords(records)) return { text, records: [] };
   return {

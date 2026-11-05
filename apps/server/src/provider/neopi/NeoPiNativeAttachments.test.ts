@@ -4,6 +4,7 @@ import * as NodePath from "node:path";
 import { NodeFileSystem } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
 import {
+  ComposerContextId,
   ProviderInstanceId,
   type ChatFileAttachment,
   type ChatImageAttachment,
@@ -12,8 +13,14 @@ import {
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
-import { createPendingAttachmentId, resolveAttachmentPath } from "../../attachmentStore.ts";
+import {
+  createPendingAttachmentId,
+  resolveAttachmentPath,
+  resolveAttachmentPathById,
+} from "../../attachmentStore.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
+import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
+import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
 
 const ref = {
   providerInstanceId: ProviderInstanceId.make("native"),
@@ -84,6 +91,59 @@ describe("native prompt attachments", () => {
         yield* fs.remove(image.path);
         expect(yield* fs.readFileString(retriedPath)).toBe("original notes");
         expect(yield* fs.readFileString(delivered)).toBe("agent edit");
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect(
+    "writes durable attachment IDs into queued context so another client can restore after upload cleanup",
+    () =>
+      Effect.gen(function* () {
+        const { fs, directory, upload, prepare } = yield* fixture;
+        const image = yield* upload("image", "image-bytes");
+        const file = yield* upload("file", "notes");
+        const message = serializeLegacyContextMessage({
+          text: "Inspect the queued attachments",
+          records: [
+            {
+              version: 1,
+              kind: "image",
+              contextId: ComposerContextId.make("image_draft"),
+              label: "Image",
+              attachmentId: image.attachment.id,
+              name: image.attachment.name,
+              mimeType: image.attachment.mimeType,
+              sizeBytes: image.attachment.sizeBytes,
+            },
+            {
+              version: 1,
+              kind: "file",
+              contextId: ComposerContextId.make("file_draft"),
+              label: "Notes",
+              attachmentId: file.attachment.id,
+              name: file.attachment.name,
+              mimeType: file.attachment.mimeType,
+              sizeBytes: file.attachment.sizeBytes,
+            },
+          ],
+        });
+        const command = yield* prepare([image.attachment, file.attachment], message);
+        if (typeof command.message !== "string") throw new Error("Missing native prompt");
+        const restored = upgradeLegacyContextMessage(command.message);
+        const ids = restored.records.flatMap((record) =>
+          "attachmentId" in record && typeof record.attachmentId === "string"
+            ? [record.attachmentId]
+            : [],
+        );
+        expect(ids).toHaveLength(2);
+        expect(ids).not.toContain(image.attachment.id);
+        expect(ids).not.toContain(file.attachment.id);
+        yield* fs.remove(image.path);
+        yield* fs.remove(file.path);
+        for (const id of ids) {
+          const path = resolveAttachmentPathById({ attachmentsDir: directory, attachmentId: id });
+          if (!path) throw new Error("Promoted attachment is not addressable");
+          expect(yield* fs.exists(path)).toBe(true);
+        }
       }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 

@@ -17,13 +17,14 @@ export function serializeLegacyContextMessage(input: {
   const recordsById = new Map(input.records.map((record) => [record.contextId, record]));
   const used = new Set<string>();
 
-  // Inline references become the plain label the old composer wrote; the payload follows in a
-  // trailing block, which is where the legacy format carried it.
+  // Legacy context uses readable labels; media keeps its canonical references and
+  // small metadata block so another client can recover the same attachments.
   let text = input.text;
   const occurrences = collectComposerContextReferences(text);
   for (const occurrence of [...occurrences].reverse()) {
     const record = recordsById.get(occurrence.contextId);
     if (!record) continue;
+    if (record.kind === "image" || record.kind === "file") continue;
     used.add(occurrence.contextId);
     const replacement =
       record.kind === "review-comment" ? renderReviewComment(record) : inlineLabel(record);
@@ -45,6 +46,27 @@ export function serializeLegacyContextMessage(input: {
     ...input.records
       .filter((record) => record.kind === "review-comment" && !used.has(record.contextId))
       .map(renderReviewComment),
+    ...(input.records.some((record) => record.kind === "image" || record.kind === "file")
+      ? [
+          `<attachment_context>\n${JSON.stringify({
+            attachments: input.records.filter(
+              (record) => record.kind === "image" || record.kind === "file",
+            ),
+            screenshots: input.records.flatMap((record) =>
+              record.kind === "preview-annotation" &&
+              "screenshotContextId" in record &&
+              record.screenshotContextId
+                ? [
+                    {
+                      annotationId: record.annotationId,
+                      screenshotContextId: record.screenshotContextId,
+                    },
+                  ]
+                : [],
+            ),
+          })}\n</attachment_context>`,
+        ]
+      : []),
   ].filter((block) => block.length > 0);
 
   // Review comments already inlined their payload above; anything else unreferenced still ships

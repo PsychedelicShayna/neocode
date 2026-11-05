@@ -5,6 +5,8 @@ import {
   type NeoPiNativeSessionsRequestInput,
 } from "@t3tools/contracts";
 import { nativeWorkspaceResourceId } from "@t3tools/shared/neopiWorkspace";
+import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
+import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Exit from "effect/Exit";
@@ -54,6 +56,7 @@ export const prepareNeoPiNativePrompt = Effect.fn("NeoPiNativeSessions.preparePr
   return yield* Effect.gen(function* () {
     const images = [...(prompt.images ?? [])];
     const text = [prompt.message];
+    const promotedIds = new Map<string, string>();
     const namespace = nativeWorkspaceResourceId(input.ref);
     for (const attachment of attachments) {
       const claim = planAttachmentClaim({
@@ -84,6 +87,7 @@ export const prepareNeoPiNativePrompt = Effect.fn("NeoPiNativeSessions.preparePr
       // Keep the pending upload retryable and isolated from edits to the delivered file.
       claimedPaths.push(claim.finalPath);
       yield* fs.copyFile(claim.currentPath, claim.finalPath);
+      promotedIds.set(attachment.id, claim.finalId);
       if (attachment.type === "image") {
         const bytes = yield* fs.readFile(claim.finalPath);
         images.push({ type: "image", data: Encoding.encodeBase64(bytes), mimeType });
@@ -91,9 +95,23 @@ export const prepareNeoPiNativePrompt = Effect.fn("NeoPiNativeSessions.preparePr
         text.push(`Attached file "${attachment.name}": "${claim.finalPath}"`);
       }
     }
+    const context = upgradeLegacyContextMessage(prompt.message);
+    const message =
+      context.records.length > 0
+        ? serializeLegacyContextMessage({
+            text: [context.text, ...text.slice(1)].filter(Boolean).join("\n\n"),
+            records: context.records.map((record) =>
+              "attachmentId" in record &&
+              typeof record.attachmentId === "string" &&
+              promotedIds.has(record.attachmentId)
+                ? { ...record, attachmentId: promotedIds.get(record.attachmentId)! }
+                : record,
+            ),
+          })
+        : text.filter(Boolean).join("\n\n");
     return {
       ...input.command,
-      message: text.filter(Boolean).join("\n\n"),
+      message,
       ...(images.length ? { images } : {}),
     };
   }).pipe(

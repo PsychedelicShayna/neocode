@@ -10,6 +10,10 @@ import {
   type NativeSlashCommand,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
+  interruptNativeQueuedInput,
+  takeNativeQueuedInput,
+} from "@t3tools/client-runtime/neopi-native-queue";
+import {
   projectTranscript,
   transcriptUserText,
   type CommandRow,
@@ -98,6 +102,7 @@ import {
 } from "../../state/nativeTranscriptView";
 import { consumeNativeDraft, prepareNativePrompt } from "./neopiNativeComposer";
 import { restoreNativeEditor } from "./neopiNativeDraft";
+import { restoreNativeQueuedDraft } from "./neopiNativeQueueDraft";
 import type { ComposerSubmissionIntent } from "../../composer-logic";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../../terminalUiStateStore";
 
@@ -448,27 +453,20 @@ export function NativeSessionView({
   const removeQueued = useCallback(
     (id: string) => {
       const queued = parseNativeQueuedMessageId(id);
-      const parsed = queuedMessages.find((message) => message.id === id);
-      if (!queued || !parsed) return;
-      void request({ type: "remove_queued_message", message: queued.text, queue: queued.lane })
-        .then(() => {
-          // Cancel returns the draft, context included, without destroying a newer one.
-          const store = draftStore.getState();
-          const current = store.getComposerDraft(target)?.prompt ?? "";
-          store.setPrompt(
-            target,
-            current.trim() ? `${parsed.prompt}\n\n${current}` : parsed.prompt,
-          );
-          if (parsed.terminalContexts.length > 0)
-            store.addTerminalContexts(target, parsed.terminalContexts);
-          for (const annotation of parsed.previewAnnotations)
-            store.addPreviewAnnotation(target, annotation);
-          for (const comment of parsed.reviewComments) store.addReviewComment(target, comment);
+      if (!queued) return;
+      void takeNativeQueuedInput(request, queued)
+        .then(async (restoration) => {
+          if (restoration === null) {
+            setLocalError("That queued message has already been dispatched.");
+            return;
+          }
+          const notice = await restoreNativeQueuedDraft(target, restoration);
+          if (notice) setLocalError(notice);
           focusComposer();
         })
         .catch((cause) => setLocalError(String(cause)));
     },
-    [request, draftStore, target, focusComposer, queuedMessages],
+    [request, target, focusComposer],
   );
   // Selecting a user message in the tree hands its text back for editing, as the
   // TUI does. A draft already in the composer stays; the notice says why.
@@ -582,8 +580,14 @@ export function NativeSessionView({
     [execute],
   );
   const interrupt = useCallback(() => {
-    void execute({ type: "abort" }).catch((cause) => setLocalError(String(cause)));
-  }, [execute]);
+    void interruptNativeQueuedInput(request, session?.capabilities ?? [])
+      .then(async (restoration) => {
+        const notice = await restoreNativeQueuedDraft(target, restoration);
+        if (notice) setLocalError(notice);
+        focusComposer();
+      })
+      .catch((cause) => setLocalError(String(cause)));
+  }, [request, session?.capabilities, target, focusComposer]);
   const hideThinking = useNativeTranscriptView((state) => state.hideThinking);
   const [toolOutputSerial, setToolOutputSerial] = useState(0);
   const canCycleRole = session?.capabilities.includes(NATIVE_CYCLE_ROLE_CAPABILITY) === true;

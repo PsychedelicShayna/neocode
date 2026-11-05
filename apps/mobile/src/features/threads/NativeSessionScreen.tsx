@@ -15,6 +15,10 @@ import {
   type NativeSlashCommand,
   type NativeTranscriptRow,
 } from "@t3tools/client-runtime/neopi-native-sessions";
+import {
+  interruptNativeQueuedInput,
+  takeNativeQueuedInput,
+} from "@t3tools/client-runtime/neopi-native-queue";
 import { journalEntryLabel } from "@t3tools/client-runtime/neopi-journal";
 import { createNativeSubmissionFollow } from "@t3tools/client-runtime/neopi-submission-follow";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
@@ -30,6 +34,7 @@ import {
   setComposerDraftText,
   waitForComposerDraftsLoaded,
 } from "../../state/use-composer-drafts";
+import { restoreNativeMobileQueuedDraft } from "../../state/native-queued-draft";
 import { NativeSessionComposer } from "./NativeSessionComposer";
 import {
   NativeSessionWorkspaceControls,
@@ -252,6 +257,29 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     },
     [request, submit],
   );
+  const removeQueued = useCallback(
+    (queued: { text: string; lane: "steering" | "followUp" }) => {
+      void takeNativeQueuedInput(request, queued)
+        .then(async (restoration) => {
+          if (restoration === null) {
+            setLocalError("That queued message has already been dispatched.");
+            return;
+          }
+          const notice = await restoreNativeMobileQueuedDraft(target, restoration);
+          if (notice) setLocalError(notice);
+        })
+        .catch((cause) => setLocalError(String(cause)));
+    },
+    [request, target],
+  );
+  const interrupt = useCallback(() => {
+    void interruptNativeQueuedInput(request, feed.session?.capabilities ?? [])
+      .then(async (restoration) => {
+        const notice = await restoreNativeMobileQueuedDraft(target, restoration);
+        if (notice) setLocalError(notice);
+      })
+      .catch((cause) => setLocalError(String(cause)));
+  }, [request, target, feed.session?.capabilities]);
   const rows = useMemo(
     () =>
       nativeTranscriptRows(
@@ -396,17 +424,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             {queued.lane === "steering" && queued.index < feed.queue.liveSteered ? (
               <Text className="text-xs text-foreground-muted">Sending</Text>
             ) : (
-              <MaterialButton
-                label="Cancel"
-                tone="text"
-                onPress={() =>
-                  void execute({
-                    type: "remove_queued_message",
-                    message: queued.text,
-                    queue: queued.lane,
-                  }).catch((cause) => setLocalError(String(cause)))
-                }
-              />
+              <MaterialButton label="Cancel" tone="text" onPress={() => removeQueued(queued)} />
             )}
           </View>
         ))}
@@ -464,9 +482,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           cwd={feed.session?.cwd ?? null}
           composer={composer}
           busy={feed.busy}
-          onStop={() =>
-            void execute({ type: "abort" }).catch((cause) => setLocalError(String(cause)))
-          }
+          onStop={interrupt}
         />
         <View className="flex-row flex-wrap items-center gap-2">
           <MaterialButton

@@ -7,6 +7,7 @@ import type {
 import { journalRecord, nativeJournalImageSource } from "@t3tools/client-runtime/neopi-journal";
 import { resolveMediaSource } from "@t3tools/client-runtime/media-source";
 import { resolveMarkdownLinkPresentation } from "@t3tools/mobile-markdown-text/links";
+import { stripLegacyAttachmentMetadata } from "@t3tools/shared/composerContextLegacy";
 import { useNavigation } from "@react-navigation/native";
 import { useCallback, useState } from "react";
 import { Alert, View } from "react-native";
@@ -39,6 +40,7 @@ type ContentContext = {
   threadRef?: ScopedThreadRef;
   environmentId?: EnvironmentId;
   nativeRef?: NeoPiNativeSessionRef;
+  userContent?: boolean;
   cwd: string | null;
 };
 
@@ -48,6 +50,7 @@ function NativeMarkdown({
   environmentId: explicitEnvironmentId,
   nativeRef,
   cwd,
+  userContent,
 }: ContentContext & { text: string }) {
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   const [video, setVideo] = useState<VideoPreviewSource | null>(null);
@@ -144,11 +147,12 @@ function NativeMarkdown({
     [cwd, environmentId, nativeRef, threadRef],
   );
   const styles = useMarkdownPreviewStyles(renderImage);
+  const markdown = userContent ? stripLegacyAttachmentMetadata(text) : text;
   return (
     <View>
       {hasNativeSelectableMarkdownText() ? (
         <SelectableMarkdownText
-          markdown={text}
+          markdown={markdown}
           textStyle={styles.nativeTextStyle}
           renderImage={renderImage}
           onLinkPress={openLink}
@@ -173,7 +177,7 @@ function NativeMarkdown({
           styles={styles.styles}
           theme={styles.theme}
         >
-          {text}
+          {markdown}
         </Markdown>
       )}
       <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
@@ -311,7 +315,11 @@ export function NeoPiJournalContent({
               {message.isError ? "error" : "result"}
             </Text>
           ) : null}
-          <NativeContent content={message.content} {...context} />
+          <NativeContent
+            content={message.content}
+            {...context}
+            userContent={message.role === "user"}
+          />
           {Array.isArray(message.images) ? (
             <NativeContent content={message.images} {...context} />
           ) : null}

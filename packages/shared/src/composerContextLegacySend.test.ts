@@ -1,7 +1,10 @@
 import { ComposerContextId, type ComposerContextRecord } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { upgradeLegacyContextMessage } from "./composerContextLegacy.ts";
+import {
+  upgradeLegacyContextMessage,
+  stripLegacyAttachmentMetadata,
+} from "./composerContextLegacy.ts";
 import { formatComposerContextReference } from "./composerContextReferences.ts";
 import { serializeLegacyContextMessage } from "./composerContextLegacySend.ts";
 
@@ -64,6 +67,71 @@ const annotation = {
 } satisfies ComposerContextRecord;
 
 describe("serializeLegacyContextMessage", () => {
+  it("roundtrips image and file identities, Unicode names and screenshot bindings without embedding bytes", () => {
+    const image = {
+      version: 1 as const,
+      contextId: ComposerContextId.make("image_ann1"),
+      kind: "image" as const,
+      label: "Screenshot",
+      attachmentId: "durable-image",
+      name: "shot.png",
+      mimeType: "image/png",
+      sizeBytes: 3,
+    };
+    const file = {
+      version: 1 as const,
+      contextId: ComposerContextId.make("file_notes"),
+      kind: "file" as const,
+      label: "手順",
+      attachmentId: "durable-file",
+      name: '手順 "one".pdf',
+      mimeType: "application/pdf",
+      sizeBytes: 5,
+    };
+    const screenshotAnnotation = { ...annotation, screenshotContextId: image.contextId };
+    const text = [image, file, screenshotAnnotation].map(formatComposerContextReference).join(" ");
+    const encoded = serializeLegacyContextMessage({
+      text,
+      records: [image, file, screenshotAnnotation],
+    });
+    const restored = upgradeLegacyContextMessage(encoded);
+    expect(
+      restored.records.filter((record) => record.kind === "image" || record.kind === "file"),
+    ).toEqual([image, file]);
+    expect(restored.records.find((record) => record.kind === "preview-annotation")).toHaveProperty(
+      "screenshotContextId",
+      image.contextId,
+    );
+    expect(restored.text).toContain(formatComposerContextReference(image));
+    expect(restored.text).toContain(formatComposerContextReference(file));
+    expect(stripLegacyAttachmentMetadata(encoded)).not.toContain("<attachment_context>");
+    expect(stripLegacyAttachmentMetadata(encoded)).toContain("<preview_annotation>");
+  });
+
+  it("preserves unreferenced attachment metadata for image-only native input", () => {
+    const image = {
+      version: 1 as const,
+      contextId: ComposerContextId.make("image_only"),
+      kind: "image" as const,
+      label: "Image",
+      attachmentId: "durable-image",
+      name: "only.png",
+      mimeType: "image/png",
+      sizeBytes: 3,
+    };
+    const restored = upgradeLegacyContextMessage(
+      serializeLegacyContextMessage({ text: "", records: [image] }),
+    );
+    expect(restored.records).toEqual([image]);
+  });
+
+  it("leaves malformed attachment metadata visible and does not partly convert the message", () => {
+    const text =
+      'Keep this\n\n<attachment_context>\n{\"attachments\":[{\"kind\":\"file\"}]}\n</attachment_context>';
+    expect(upgradeLegacyContextMessage(text)).toEqual({ text, records: [] });
+    expect(stripLegacyAttachmentMetadata(text)).toBe(text);
+  });
+
   it("carries terminal payloads an older server would otherwise discard", () => {
     const text = `Look at ${formatComposerContextReference(terminal)} please`;
     const legacy = serializeLegacyContextMessage({ text, records: [terminal] });

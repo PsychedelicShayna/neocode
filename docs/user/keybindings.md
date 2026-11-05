@@ -43,6 +43,9 @@ on macOS and Ctrl on Windows and Linux, including GNOME, KDE Plasma, Niri, and
 Hyprland. If a custom desktop shortcut takes the same keys, choose another binding
 in Settings.
 
+`mod+u` (`usage.open`) opens Stats. NeoPi's embedded dashboard owns its metric
+and period controls; the former local-chart shortcuts are not available.
+
 ## Native NeoPi sessions
 
 Native sessions use NeoPi's own terminal chords. They run only while a native

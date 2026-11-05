@@ -82,13 +82,6 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
     command,
     when: "modelPickerOpen && isDesktop",
   })),
-  { key: "c", command: "usage.cost", when: "usagePageOpen" },
-  { key: "t", command: "usage.tokens", when: "usagePageOpen" },
-  { key: "l", command: "usage.limits", when: "usagePageOpen" },
-  { key: "mod+shift+1", command: "usage.period.day", when: "usagePageOpen" },
-  { key: "mod+shift+2", command: "usage.period.week", when: "usagePageOpen" },
-  { key: "mod+shift+3", command: "usage.period.month", when: "usagePageOpen" },
-  { key: "mod+shift+4", command: "usage.period.quarter", when: "usagePageOpen" },
   // Native NeoPi sessions mirror NeoPi's TUI chords. `nativeSession` is true only while a native
   // session workspace has the keyboard. These sit after the generic rules they shadow (mod+p file
   // picker, mod+shift+p pin) because the last matching rule wins.

@@ -1455,18 +1455,12 @@ describe("composer and pull request shortcuts", () => {
   }
 });
 
-describe("Usage shortcuts", () => {
-  it("scopes letter shortcuts to Usage", () => {
-    assert.strictEqual(
-      resolveShortcutCommand(event({ key: "t" }), DEFAULT_RESOLVED_KEYBINDINGS, {
-        platform: "Linux",
-        context: { usagePageOpen: true },
-      }),
-      "usage.tokens",
-    );
+describe("Stats shortcuts", () => {
+  it("leaves retired local dashboard shortcuts unbound", () => {
     assert.isNull(
       resolveShortcutCommand(event({ key: "t" }), DEFAULT_RESOLVED_KEYBINDINGS, {
         platform: "Linux",
+        context: { usagePageOpen: true },
       }),
     );
   });
@@ -1495,18 +1489,12 @@ describe("Usage shortcuts", () => {
     },
   );
 
-  it("matches shifted number keys for periods and only on Usage", () => {
+  it("leaves retired local dashboard period shortcuts unbound", () => {
     const shortcut = event({ key: "!", code: "Digit1", ctrlKey: true, shiftKey: true });
-    assert.strictEqual(
-      resolveShortcutCommand(shortcut, DEFAULT_RESOLVED_KEYBINDINGS, {
-        platform: "Linux",
-        context: { usagePageOpen: true },
-      }),
-      "usage.period.day",
-    );
     assert.isNull(
       resolveShortcutCommand(shortcut, DEFAULT_RESOLVED_KEYBINDINGS, {
         platform: "Linux",
+        context: { usagePageOpen: true },
       }),
     );
   });

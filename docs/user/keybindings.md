@@ -181,6 +181,8 @@ In the desktop app, `mod+w` closes the focused terminal or the active right-pane
 tab. When nothing remains to close, it closes the window. In a browser, `mod+w`
 closes the browser tab; rebind `rightPanel.close` and `terminal.close` to an available
 shortcut such as `alt+w`.
+If closing an integrated terminal fails, its tab stays open so you can retry once
+the environment is available. A failed close does not type `exit` into the shell.
 
 Many defaults include `!terminalFocus` so they do not intercept terminal input.
 Keep that condition when remapping them if you want the same behavior.

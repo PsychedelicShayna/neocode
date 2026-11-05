@@ -1,6 +1,5 @@
 import { workspaceKey, workspaceResourceId } from "@t3tools/client-runtime/environment";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
-import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime";
 import type { ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
 import {
@@ -100,7 +99,6 @@ function NativeSessionTerminalBody({
       });
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const closeTerminal = useAtomCommand(terminalEnvironment.close, "terminal close");
-  const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const [localFocusRequestId, setLocalFocusRequestId] = useState(0);
   const [hasOpened, setHasOpened] = useState(visible);
 
@@ -181,23 +179,18 @@ function NativeSessionTerminalBody({
 
   const removeTerminal = useCallback(
     (terminalId: string) => {
-      useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
-      if (surface) useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
-      setLocalFocusRequestId((value) => value + 1);
       void (async () => {
         const result = await closeTerminal({
           environmentId: target.environmentId,
           input: { threadId, terminalId, deleteHistory: true },
         });
-        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-          await writeTerminal({
-            environmentId: target.environmentId,
-            input: { threadId, terminalId, data: "exit\n" },
-          });
-        }
+        if (result._tag === "Failure") return;
+        useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
+        if (surface) useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
+        setLocalFocusRequestId((value) => value + 1);
       })();
     },
-    [closeTerminal, target, threadId, writeTerminal, surface],
+    [closeTerminal, target, threadId, surface],
   );
 
   useImperativeHandle(

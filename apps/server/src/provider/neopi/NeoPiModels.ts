@@ -149,13 +149,19 @@ export const queryNativeModelSelector = Effect.fnUntraced(function* (
   return result;
 });
 
-/** Native login state and resources share one lifetime, independent of any one observer. */
+/**
+ * Native login state and resources share one lifetime, independent of any one observer.
+ *
+ * That lifetime is the auth's own scope, never the caller's: the server builds its handlers in a
+ * scope that closes as soon as they exist, and a login forked into a closed scope dies instantly.
+ * A flow ends with its last observer or its native result; `close` ends every flow at once.
+ */
 export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* (
   connection: (
     target: NeoPiModelsTarget,
   ) => Effect.Effect<NeoPiModelsConnection, NeoPiModelsError, Scope.Scope>,
 ) {
-  const lifetime = yield* Effect.scope;
+  const lifetime = yield* Scope.make();
   const flows = new Map<string, AuthFlow>();
   const requireFlow = (flowId: string) =>
     flows.has(flowId)
@@ -399,7 +405,7 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
         state.prompt?.id === input.requestId ? { ...state, prompt: null } : state,
       );
     });
-  yield* Effect.addFinalizer(() =>
+  const close = Effect.suspend(() =>
     Effect.forEach(
       [...flows],
       ([flowId, flow]) =>
@@ -409,8 +415,8 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
         ),
       { discard: true },
     ),
-  );
-  return { startAuth, watchAuth, respondAuth, cancelAuth };
+  ).pipe(Effect.andThen(Scope.close(lifetime, Exit.void)));
+  return { startAuth, watchAuth, respondAuth, cancelAuth, close };
 });
 
 /** Routes explicit graphical model operations to their native owner; it stores no model policy or credentials. */

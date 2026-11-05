@@ -73,11 +73,14 @@ const fixture = Effect.fnUntraced(function* (
         return yield* new NeoPiRpcError({ message: "Unexpected auth command" });
       }),
   };
-  const auth = yield* makeNativeModelsAuth(() =>
-    Effect.gen(function* () {
-      yield* Effect.addFinalizer(() => Ref.update(releases, (count) => count + 1));
-      return native;
-    }),
+  // Built in a scope that closes at once, as the server's handlers are.
+  const auth = yield* Effect.scoped(
+    makeNativeModelsAuth(() =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Ref.update(releases, (count) => count + 1));
+        return native;
+      }),
+    ),
   );
   const flow = yield* auth.startAuth({ target, providerId: "fixture-provider" });
   return {
@@ -485,6 +488,34 @@ describe("native Models login lifecycle", () => {
           expect(yield* Ref.get(cancelCalls)).toBe(1);
         }),
       ),
+  );
+
+  it.live("keeps a login alive after the scope that built the auth has closed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { auth, flow, result, releases, cancelCalls, requestEnded } = yield* fixture(
+          Effect.void,
+        );
+        yield* Effect.sleep("50 millis");
+        expect(yield* Ref.get(cancelCalls)).toBe(0);
+        expect(yield* Ref.get(releases)).toBe(0);
+        expect(yield* Deferred.isDone(requestEnded)).toBe(false);
+        const watch = yield* auth.watchAuth(flow).pipe(Stream.runCollect, Effect.forkScoped);
+        yield* Deferred.succeed(result, {});
+        expect((yield* Fiber.join(watch)).at(-1)?.status).toBe("complete");
+      }),
+    ),
+  );
+
+  it.effect("ends every live login when the auth is closed explicitly", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { auth, cancelCalls, releases } = yield* fixture();
+        yield* auth.close;
+        expect(yield* Ref.get(cancelCalls)).toBe(1);
+        expect(yield* Ref.get(releases)).toBe(1);
+      }),
+    ),
   );
 
   it.effect("keeps login alive until the last observer leaves", () =>

@@ -223,6 +223,31 @@ describe("detectComposerTrigger", () => {
     expect(detectComposerSlashArgument("say /personality An", 19)).toBeNull();
   });
 
+  it.each([
+    { text: "/cmd foobar", cursor: 7, query: "fo", expected: "/cmd foo" },
+    { text: "/cmd foobar", cursor: 5, query: "", expected: "/cmd foo" },
+    {
+      text: "/cmd foobar\nkeep this line",
+      cursor: 7,
+      query: "fo",
+      expected: "/cmd foo\nkeep this line",
+    },
+    { text: "/cmd 👋世界", cursor: 7, query: "👋", expected: "/cmd foo" },
+  ])(
+    "replaces the whole slash argument at caret $cursor in $text",
+    ({ text, cursor, query, expected }) => {
+      const trigger = detectComposerSlashArgument(text, cursor);
+      expect(trigger).toMatchObject({ kind: "slash-argument", command: "cmd", query });
+      if (!trigger) throw new Error("Expected a slash argument trigger");
+
+      // This is the replacement consumed by both insert-only and immediate-submit items.
+      expect(replaceTextRange(text, trigger.rangeStart, trigger.rangeEnd, "foo")).toEqual({
+        text: expected,
+        cursor: 8,
+      });
+    },
+  );
+
   it("detects non-model slash commands while typing", () => {
     const text = "/pl";
     const trigger = detectComposerTrigger(text, text.length);

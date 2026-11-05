@@ -27,7 +27,10 @@ import {
 } from "../../onboarding/providerReadiness.logic";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useEnvironments, usePrimaryEnvironment } from "../../state/environments";
-import { isOnboardingRelayEnvironment } from "../../onboarding/targetEnvironment.logic";
+import {
+  isOnboardingRelayEnvironment,
+  resolveOnboardingNeoProxyTarget,
+} from "../../onboarding/targetEnvironment.logic";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { connectPairing } from "../../connection/onboarding";
@@ -41,6 +44,7 @@ import { Checkbox } from "../ui/checkbox";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { Input } from "../ui/input";
 import { ScrollArea } from "../ui/scroll-area";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { WizardPanel, WizardSteps, WizardPopup, WizardHeader } from "../ui/wizard";
 import { Dialog } from "../ui/dialog";
 import { toastManager } from "../ui/toast";
@@ -259,20 +263,81 @@ function NeoProxyStep({
   readonly onBack: () => void;
   readonly onContinue: () => void;
 }) {
-  const environmentId = environmentIds[0];
+  const { environments } = useEnvironments();
+  const [targetDraft, setTargetDraft] = useState<EnvironmentId | null>(null);
+  const [chosenTarget, setChosenTarget] = useState<EnvironmentId | null>(null);
+  const environmentId = resolveOnboardingNeoProxyTarget(environmentIds, chosenTarget);
+  const environmentLabel = (id: EnvironmentId) =>
+    environments.find((environment) => environment.environmentId === id)?.label ?? id;
   useEffect(() => {
-    if (!environmentId) onContinue();
-  }, [environmentId, onContinue]);
-  if (!environmentId) return null;
-  return <NeoProxyStepBody environmentId={environmentId} onBack={onBack} onContinue={onContinue} />;
+    if (environmentIds.length === 0) onContinue();
+  }, [environmentIds.length, onContinue]);
+  if (environmentIds.length === 0) return null;
+  if (!environmentId) {
+    return (
+      <StepShell
+        title="Choose a computer for NeoProxy"
+        description="A NeoProxy connection belongs to a NeoPi runtime. Choose which computer should save it; the other selected computers will not be changed."
+      >
+        <label className="mt-5 flex items-center justify-between gap-4 text-sm">
+          Computer
+          <Select
+            value={targetDraft}
+            onValueChange={(value) =>
+              setTargetDraft(environmentIds.find((id) => id === value) ?? null)
+            }
+          >
+            <SelectTrigger aria-label="Computer for NeoProxy setup">
+              <SelectValue placeholder="Choose a computer" />
+            </SelectTrigger>
+            <SelectPopup>
+              {environmentIds.map((id) => (
+                <SelectItem key={id} value={id}>
+                  {environmentLabel(id)}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+        </label>
+        <p className="mt-3 text-xs text-muted-foreground">
+          You can connect additional computers later from Models on each computer.
+        </p>
+        <div className="mt-6 flex items-center justify-between gap-3">
+          <Button variant="ghost" size="sm" onClick={onBack}>
+            Back
+          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={onContinue}>
+              Not now
+            </Button>
+            <Button disabled={targetDraft === null} onClick={() => setChosenTarget(targetDraft)}>
+              Continue
+              <ArrowRightIcon className="size-3.5" />
+            </Button>
+          </div>
+        </div>
+      </StepShell>
+    );
+  }
+  return (
+    <NeoProxyStepBody
+      key={environmentId}
+      environmentId={environmentId}
+      environmentLabel={environmentLabel(environmentId)}
+      onBack={onBack}
+      onContinue={onContinue}
+    />
+  );
 }
 
 function NeoProxyStepBody({
   environmentId,
+  environmentLabel,
   onBack,
   onContinue,
 }: {
   readonly environmentId: EnvironmentId;
+  readonly environmentLabel: string;
   readonly onBack: () => void;
   readonly onContinue: () => void;
 }) {
@@ -289,7 +354,7 @@ function NeoProxyStepBody({
     {
       id: "host",
       title: "I'll host one myself",
-      detail: "Run it on this computer or a server, then connect from Models.",
+      detail: `Run it on ${environmentLabel} or another server, then connect from Models.`,
     },
     {
       id: "later",
@@ -302,6 +367,11 @@ function NeoProxyStepBody({
       title="NeoCode and NeoProxy work together"
       description="NeoProxy is a model switch for a team: provider accounts and keys go in, and everyone gets neoproxy/… models with their own budget. NeoCode talks to it through NeoPi, so you can pick those models instead of local credentials."
     >
+      <p className="mt-3 text-sm text-muted-foreground">
+        Configuring NeoPi on{" "}
+        <strong className="font-medium text-foreground">{environmentLabel}</strong> only. Your other
+        computers will not be changed.
+      </p>
       <NeoProxyFlowFigure className="mt-5 w-full" />
       <fieldset className="mt-5 space-y-2">
         <legend className="sr-only">How will you use NeoProxy?</legend>
@@ -345,8 +415,8 @@ function NeoProxyStepBody({
                     </p>
                   ) : (
                     <p className="text-xs text-muted-foreground">
-                      NeoPi isn't ready on this computer yet, and the connection runs through it.
-                      Finish the next step, then connect from Models.
+                      NeoPi isn't ready on {environmentLabel} yet, and the connection runs through
+                      it. Finish the next step, then connect from Models.
                     </p>
                   )}
                 </div>

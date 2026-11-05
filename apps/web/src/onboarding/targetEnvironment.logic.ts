@@ -13,6 +13,15 @@ export function isOnboardingRelayEnvironment(
   return environment.entry.target._tag === "RelayConnectionTarget";
 }
 
+/** Never choose a credential destination implicitly when setup includes several computers. */
+export function resolveOnboardingNeoProxyTarget(
+  environmentIds: readonly EnvironmentId[],
+  chosenTarget: EnvironmentId | null,
+): EnvironmentId | null {
+  if (environmentIds.length === 1) return environmentIds[0] ?? null;
+  return chosenTarget !== null && environmentIds.includes(chosenTarget) ? chosenTarget : null;
+}
+
 /** Keep a directly paired machine pinned while its initial connection completes. */
 export function resolveOnboardingTargetEnvironment<TEnvironment extends OnboardingEnvironment>({
   mode,

@@ -31,6 +31,9 @@ executable. Correct or clear an invalid explicit path; enable a disabled runtime
 profile with **Enable NeoPi**. Existing launch settings are preserved.
 
 Choose **Connect to NeoProxy** to connect with your server address and member key.
+If you selected several computers, first choose which one should save the
+connection. Setup names that computer before sign-in and does not copy credentials
+to the others. Connect additional computers later from **Models** on each computer.
 If asked to verify a certificate, compare the complete fingerprints with your
 administrator before accepting. Your administrator controls which models your
 member can use; an upstream-provider login is not needed.

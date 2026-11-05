@@ -9,8 +9,33 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   isOnboardingRelayEnvironment,
+  resolveOnboardingNeoProxyTarget,
   resolveOnboardingTargetEnvironment,
 } from "./targetEnvironment.logic";
+
+describe("resolveOnboardingNeoProxyTarget", () => {
+  const first = EnvironmentId.make("first");
+  const second = EnvironmentId.make("second");
+
+  it("requires an explicit choice instead of selecting the first computer", () => {
+    expect(resolveOnboardingNeoProxyTarget([first, second], null)).toBeNull();
+  });
+
+  it("keeps the chosen computer even when it is not first", () => {
+    expect(resolveOnboardingNeoProxyTarget([first, second], second)).toBe(second);
+  });
+
+  it("does not substitute another computer for an unavailable choice", () => {
+    expect(
+      resolveOnboardingNeoProxyTarget([first, second], EnvironmentId.make("removed")),
+    ).toBeNull();
+    expect(resolveOnboardingNeoProxyTarget([], first)).toBeNull();
+  });
+
+  it("uses the only selected computer without asking a redundant question", () => {
+    expect(resolveOnboardingNeoProxyTarget([second], null)).toBe(second);
+  });
+});
 
 const primaryEnvironment = {
   environmentId: EnvironmentId.make("primary"),

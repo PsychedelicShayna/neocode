@@ -102,6 +102,11 @@ export const makeNeoPiModelsHub = Effect.fn("makeNeoPiModelsHub")(function* (
             ),
           ),
           Stream.runDrain,
+          // NeoPi's change signal only ends with its connection (a closed or replaced session).
+          // A hub that stopped following would serve a frozen catalog, so retire it instead.
+          Effect.andThen(
+            Effect.fail(new NeoPiModelsError({ message: "The native connection closed." })),
+          ),
           Effect.catch((error) =>
             fail(
               Schema.is(NeoPiModelsError)(error)

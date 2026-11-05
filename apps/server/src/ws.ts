@@ -3205,15 +3205,42 @@ const makeWsRpcLayer = (
           ),
         [WS_METHODS.neopiThemesRead]: (input) => neopiThemes.read(input),
         [WS_METHODS.neopiThemesPalette]: (input) => neopiThemes.palette(input),
-        [WS_METHODS.neopiModelsRead]: (input) => neopiModels.read(input),
-        [WS_METHODS.neopiModelsQuerySelector]: (input) => neopiModels.querySelector(input),
-        [WS_METHODS.neopiModelsWatch]: (input) => neopiModels.watch(input),
-        [WS_METHODS.neopiModelsUpdate]: (input) => neopiModels.update(input),
-        [WS_METHODS.neopiModelsAccounts]: (input) => neopiModels.accounts(input),
-        [WS_METHODS.neopiModelsAuthStart]: (input) => neopiModels.startAuth(input),
-        [WS_METHODS.neopiModelsAuthWatch]: (input) => neopiModels.watchAuth(input),
-        [WS_METHODS.neopiModelsAuthRespond]: (input) => neopiModels.respondAuth(input),
-        [WS_METHODS.neopiModelsAuthCancel]: (input) => neopiModels.cancelAuth(input),
+        [WS_METHODS.neopiModelsRead]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsRead, neopiModels.read(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsQuerySelector]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsQuerySelector, neopiModels.querySelector(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsWatch]: (input) =>
+          observeRpcStream(WS_METHODS.neopiModelsWatch, neopiModels.watch(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsUpdate]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsUpdate, neopiModels.update(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsAccounts]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsAccounts, neopiModels.accounts(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsAuthStart]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsAuthStart, neopiModels.startAuth(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsAuthWatch]: (input) =>
+          observeRpcStream(WS_METHODS.neopiModelsAuthWatch, neopiModels.watchAuth(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsAuthRespond]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsAuthRespond, neopiModels.respondAuth(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiModelsAuthCancel]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiModelsAuthCancel, neopiModels.cancelAuth(input), {
+            "rpc.aggregate": "workspace",
+          }),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,

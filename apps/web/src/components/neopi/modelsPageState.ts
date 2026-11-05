@@ -26,6 +26,9 @@ export function validateModelsSearch(raw: Record<string, unknown>): ModelsSearch
 }
 export function useModelsPageTarget() {
   const search = useLocation({ select: (location) => validateModelsSearch(location.search) });
+  // The page stays mounted while the route leaves it. Its search is gone by then, and a target
+  // rebuilt from nothing would start an instance-level watch, a whole NeoPi process, for nothing.
+  const onModelsRoute = useLocation({ select: (location) => location.pathname === "/models" });
   const navigate = useNavigate();
   const { environments } = useEnvironments();
   const primary = usePrimaryEnvironmentId();
@@ -63,14 +66,14 @@ export function useModelsPageTarget() {
   const providerInstanceId = provider?.instanceId;
   const target = useMemo<NeoPiModelsTarget | null>(
     () =>
-      providerInstanceId
+      providerInstanceId && onModelsRoute
         ? {
             providerInstanceId,
             ...(projectId ? { projectId } : {}),
             ...(search.sessionFile ? { sessionFile: search.sessionFile } : {}),
           }
         : null,
-    [providerInstanceId, projectId, search.sessionFile],
+    [providerInstanceId, projectId, search.sessionFile, onModelsRoute],
   );
   const inventory = useEnvironmentQuery(
     environmentId && target?.sessionFile

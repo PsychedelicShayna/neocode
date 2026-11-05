@@ -148,6 +148,33 @@ describe("native Models hub", () => {
     ),
   );
 
+  it.live("retires a hub whose native connection ended instead of freezing its catalog", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const counts = { connections: 0 };
+        const ended = yield* makeNeoPiModelsHub(
+          () =>
+            Effect.sync(() => {
+              counts.connections++;
+              return {
+                capabilities: new Set(["models_configuration"]),
+                request: () => Effect.void,
+                respondUi: () => Effect.void,
+                validate: Effect.void,
+                ui: Stream.empty,
+                changes: Stream.empty,
+              } satisfies NeoPiModelsConnection;
+            }),
+          () => Effect.succeed(snapshot("only-read")),
+        );
+        const error = yield* ended.watch(target).pipe(Stream.runCollect, Effect.flip);
+        expect(error.message).toBe("The native connection closed.");
+        yield* ended.watch(target).pipe(Stream.runCollect, Effect.flip);
+        expect(counts.connections).toBe(2);
+      }),
+    ),
+  );
+
   it.live("fails watchers on a failed read and builds a fresh hub for the next watcher", () =>
     Effect.scoped(
       Effect.gen(function* () {

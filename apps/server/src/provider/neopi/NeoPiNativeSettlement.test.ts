@@ -1,6 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
 import { NodeFileSystem, NodePath } from "@effect/platform-node";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 
@@ -89,12 +91,65 @@ describe("makeNeoPiNativeSettledStore", () => {
         ["/a.jsonl", settled],
         ["/b.jsonl", { ...settled, state: "unsettled" }],
       ]);
-      yield* first.update([["/b.jsonl", null]]);
+      yield* first.update([["/b.jsonl", null, (yield* first.read).get("/b.jsonl")!]]);
       const second = yield* makeNeoPiNativeSettledStore(filePath);
       assert.deepEqual(Array.from(yield* second.read), [["/a.jsonl", settled]]);
 
       yield* fs.writeFileString(filePath, "{not json");
       assert.equal((yield* (yield* makeNeoPiNativeSettledStore(filePath)).read).size, 0);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeFileSystem.layer, NodePath.layer))),
+  );
+
+  it.effect("checks a stale cleanup after a pending decision finishes writing", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped();
+      const filePath = `${dir}/settled.json`;
+      const writing = yield* Deferred.make<void>();
+      const releaseWrite = yield* Deferred.make<void>();
+      let blockWrite = false;
+      const store = yield* makeNeoPiNativeSettledStore(filePath).pipe(
+        Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.FileSystem.of({
+            ...fs,
+            writeFileString: (path, contents, options) =>
+              Effect.gen(function* () {
+                if (blockWrite) {
+                  blockWrite = false;
+                  yield* Deferred.succeed(writing, undefined);
+                  yield* Deferred.await(releaseWrite);
+                }
+                yield* fs.writeFileString(path, contents, options);
+              }),
+          }),
+        ),
+      );
+      yield* store.update([
+        ["/a.jsonl", settled],
+        ["/b.jsonl", settled],
+      ]);
+      const snapshot = yield* store.read;
+      // Even an identical decision is newer than the snapshot used by cleanup.
+      const newer = { ...settled };
+      blockWrite = true;
+      const decision = yield* store.update([["/a.jsonl", newer]]).pipe(Effect.forkChild);
+      yield* Deferred.await(writing);
+      assert.equal((yield* store.read).get("/a.jsonl"), snapshot.get("/a.jsonl"));
+      const cleanup = yield* store
+        .update([
+          ["/a.jsonl", null, snapshot.get("/a.jsonl")!],
+          ["/b.jsonl", null, snapshot.get("/b.jsonl")!],
+        ])
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.succeed(releaseWrite, undefined);
+      yield* Fiber.join(decision);
+      yield* Fiber.join(cleanup);
+
+      assert.equal((yield* store.read).get("/a.jsonl"), newer);
+      assert.equal((yield* store.read).has("/b.jsonl"), false);
+      const restarted = yield* makeNeoPiNativeSettledStore(filePath);
+      assert.deepEqual(Array.from(yield* restarted.read), [["/a.jsonl", newer]]);
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeFileSystem.layer, NodePath.layer))),
   );
 });

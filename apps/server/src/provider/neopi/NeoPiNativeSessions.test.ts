@@ -1008,9 +1008,10 @@ const memorySettledStore = () => {
     read: Effect.sync(() => new Map(records)),
     update: (changes) =>
       Effect.sync(() => {
-        for (const [file, record] of changes) {
-          if (record === null) records.delete(file);
-          else records.set(file, record);
+        for (const [file, record, expected] of changes) {
+          if (record === null) {
+            if (records.get(file) === expected) records.delete(file);
+          } else records.set(file, record);
         }
       }),
   };
@@ -1099,6 +1100,47 @@ describe("native session liveness and settling", () => {
       row = { ...row, modified: "2999-01-02T00:00:00Z" };
       assert.equal(yield* settledAt(), undefined);
       assert.equal(records.size, 0);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not discard a manual decision made while a stale list is paused", () =>
+    Effect.gen(function* () {
+      const { dependencies } = yield* fixture();
+      for (const settled of [true, false]) {
+        const { records, store } = memorySettledStore();
+        records.set(originalRef.sessionFile, {
+          state: "settled",
+          settledAt: "2999-01-01T00:00:00Z",
+          modifiedAt: "2999-01-01T00:00:00Z",
+        });
+        const snapshotRead = yield* Deferred.make<void>();
+        const resumeList = yield* Deferred.make<void>();
+        const row = catalogRow({ modified: "2999-01-02T00:00:00Z" });
+        const service = yield* makeNeoPiNativeSessionsWith({
+          ...dependencies,
+          catalog: (profile) =>
+            Effect.succeed(profile.providerInstanceId === instanceId ? [row] : []),
+          settlement: {
+            store,
+            autoSettleAfterDays: Effect.gen(function* () {
+              yield* Deferred.succeed(snapshotRead, undefined);
+              yield* Deferred.await(resumeList);
+              return null;
+            }),
+          },
+        });
+        const listing = yield* service.list({}).pipe(Effect.forkChild);
+        yield* Deferred.await(snapshotRead);
+        yield* service.setSettled({ ref: originalRef, settled });
+        const decision = records.get(originalRef.sessionFile);
+        yield* Deferred.succeed(resumeList, undefined);
+        yield* Fiber.join(listing);
+
+        assert.equal(records.get(originalRef.sessionFile), decision);
+        assert.equal(decision?.state, settled ? "settled" : "unsettled");
+        const result = yield* service.list({});
+        assert.equal(result.sessions[0]?.settledAt, settled ? decision?.settledAt : undefined);
+      }
     }).pipe(Effect.scoped),
   );
 

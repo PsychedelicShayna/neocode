@@ -76,9 +76,12 @@ export function resolveNativeSettlement(input: NeoPiNativeSettlementInput): {
 
 export interface NeoPiNativeSettledStore {
   readonly read: Effect.Effect<ReadonlyMap<string, NeoPiNativeSettledRecord>>;
-  /** A null record forgets the file. */
+  /** A null record forgets only the exact record returned by a read snapshot. */
   readonly update: (
-    changes: ReadonlyArray<readonly [file: string, record: NeoPiNativeSettledRecord | null]>,
+    changes: ReadonlyArray<
+      | readonly [file: string, record: NeoPiNativeSettledRecord]
+      | readonly [file: string, record: null, expected: NeoPiNativeSettledRecord]
+    >,
   ) => Effect.Effect<void, NeoPiNativeSessionsError>;
 }
 
@@ -105,9 +108,10 @@ export const makeNeoPiNativeSettledStore = Effect.fn("NeoPiNativeSettledStore.ma
       writes.withPermits(1)(
         Effect.gen(function* () {
           const next = new Map(records);
-          for (const [file, record] of changes) {
-            if (record === null) next.delete(file);
-            else next.set(file, record);
+          for (const [file, record, expected] of changes) {
+            if (record === null) {
+              if (next.get(file) === expected) next.delete(file);
+            } else next.set(file, record);
           }
           const contents = yield* encodeSettledFile({
             version: 1,

@@ -44,6 +44,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   makeNeoPiNativeSettledStore,
+  type NeoPiNativeSettledRecord,
   type NeoPiNativeSettledStore,
   resolveNativeSettlement,
 } from "./NeoPiNativeSettlement.ts";
@@ -577,7 +578,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const records = yield* settlement.store.read;
         const autoSettleAfterDays = yield* settlement.autoSettleAfterDays;
         const now = DateTime.toEpochMillis(yield* DateTime.now);
-        const forgotten: Array<readonly [string, null]> = [];
+        const forgotten: Array<readonly [string, null, NeoPiNativeSettledRecord]> = [];
         rows.forEach((row, index) => {
           const record = records.get(row.ref.sessionFile);
           const resolved = resolveNativeSettlement({
@@ -587,7 +588,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             autoSettleAfterDays,
             now,
           });
-          if (record && !resolved.retain) forgotten.push([row.ref.sessionFile, null]);
+          if (record && !resolved.retain) forgotten.push([row.ref.sessionFile, null, record]);
           if (resolved.settledAt !== null) rows[index] = { ...row, settledAt: resolved.settledAt };
         });
         // Waking is bookkeeping: a failed write only means it is retried on the next list.

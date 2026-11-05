@@ -115,7 +115,17 @@ export const NeoPiNativeSessionsStreamEvent = Schema.Union([
   }),
   Schema.Struct({ type: Schema.Literal("event"), frame: NeoPiNativeSessionCommand }),
   Schema.Struct({ type: Schema.Literal("answered"), id: Schema.String }),
-  Schema.Struct({ type: Schema.Literal("closed"), reason: Schema.String }),
+  /**
+   * `code` names why the owner went away: `detached` after an explicit disconnect,
+   * `owner_exited` when the terminal that owned the session quit and nothing replaced it.
+   */
+  Schema.Struct({
+    type: Schema.Literal("closed"),
+    reason: Schema.String,
+    code: Schema.optional(Schema.String),
+  }),
+  /** The terminal owner exited. The server is waiting for a replacement; a fresh `snapshot` follows. */
+  Schema.Struct({ type: Schema.Literal("reconnecting"), reason: Schema.String }),
 ]);
 export type NeoPiNativeSessionsStreamEvent = typeof NeoPiNativeSessionsStreamEvent.Type;
 export const NeoPiNativeSessionsCloseInput = NeoPiNativeSessionsWatchInput;

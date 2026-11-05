@@ -5,6 +5,7 @@ import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
   type NeoPiNativeSessionRef,
+  type NeoPiNativeSessionsStreamEvent,
 } from "@t3tools/contracts";
 import type { ProcessExit, SessionEventFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
@@ -13,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Queue from "effect/Queue";
+import * as TestClock from "effect/testing/TestClock";
 import {
   makeNeoPiNativeSessionsWith,
   type NeoPiNativeConnection,
@@ -47,6 +49,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       generation: 1,
       entries: [] as NeoPiJournalEntry[],
       running: attachment === "terminal",
+      /** A terminal owner is alive and holds the session lease. */
+      ownerAlive: attachment === "terminal",
+      exit: undefined as Deferred.Deferred<ProcessExit> | undefined,
       streaming: false,
       connections: 0,
       starts: 0,
@@ -105,23 +110,30 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       preparePrompt: (input) =>
         prepareNeoPiNativePrompt(input, "/unused").pipe(Effect.provide(NodeFileSystem.layer)),
       catalog: () => Effect.succeed([]),
-      connect: (_profile, input, publish) =>
+      connect: (_profile, input, publish, mode) =>
         Effect.gen(function* () {
           if (native.connections !== 0)
             return yield* new NeoPiNativeSessionsError({
               code: "session_in_use",
               message: "A writer already owns the file",
             });
+          if (mode === "attach" && !native.ownerAlive)
+            return yield* new NeoPiNativeSessionsError({
+              code: "no_owner",
+              message: "No NeoPi owns this session yet.",
+            });
+          const connectionAttachment = native.ownerAlive ? "terminal" : "owned";
           native.starts++;
           native.connections++;
           native.running = true;
           native.sessionFile = input.sessionFile ?? "/native/lazy-created.jsonl";
           native.publish = publish;
           const exit = yield* Deferred.make<ProcessExit>();
+          native.exit = exit;
           yield* Effect.addFinalizer(() =>
             Effect.gen(function* () {
               native.connections--;
-              if (attachment === "owned") {
+              if (connectionAttachment === "owned") {
                 native.disposals++;
                 native.running = false;
               } else native.detaches++;
@@ -222,7 +234,12 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
               method: "confirm",
               title: "Native confirmation",
             });
-          return { client, attachment, cwd: "/workspace-free", readState: Effect.sync(state) };
+          return {
+            client,
+            attachment: connectionAttachment,
+            cwd: "/workspace-free",
+            readState: Effect.sync(state),
+          };
         }),
     };
     const service = yield* makeNeoPiNativeSessionsWith(dependencies);
@@ -983,6 +1000,155 @@ describe("canonical native session lifecycle", () => {
         assert.equal(native.starts, 1);
         assert.deepEqual(yield* service.close({ ref: originalRef }), { closed: true });
         assert.equal(native.disposals, 1);
+      }).pipe(Effect.scoped),
+  );
+});
+
+/** Collects a watch stream so a test can wait on its events in order, never on time. */
+const observe = Effect.fnUntraced(function* (
+  service: Effect.Success<ReturnType<typeof makeNeoPiNativeSessionsWith>>,
+  ref: NeoPiNativeSessionRef,
+) {
+  const events = yield* Queue.unbounded<NeoPiNativeSessionsStreamEvent>();
+  yield* Stream.runForEach(service.watch({ ref }), (event) => Queue.offer(events, event)).pipe(
+    Effect.forkScoped,
+  );
+  return {
+    next: Effect.fnUntraced(function* <Type extends NeoPiNativeSessionsStreamEvent["type"]>(
+      type: Type,
+    ) {
+      while (true) {
+        const event = yield* Queue.take(events);
+        if (event.type === type)
+          return event as Extract<NeoPiNativeSessionsStreamEvent, { type: Type }>;
+      }
+    }),
+  };
+});
+const ownerExited = { code: 0, signal: null, stderrTail: "" } as const;
+
+describe("terminal owner replacement", () => {
+  it.effect(
+    "reattaches in place when a restarted terminal returns, then reads history afresh",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const events = yield* observe(service, originalRef);
+        yield* events.next("snapshot");
+
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        const reconnecting = yield* events.next("reconnecting");
+        assert.match(reconnecting.reason, /exited \(0\)/);
+
+        native.ownerAlive = true;
+        yield* TestClock.adjust("1 second");
+        const snapshot = yield* events.next("snapshot");
+        assert.equal(snapshot.session.attachment, "terminal");
+        assert.equal(native.starts, 2);
+        assert.equal(native.connections, 1);
+        assert.equal(native.disposals, 0);
+
+        yield* service.request({ ref: originalRef, command: { type: "prompt", message: "after" } });
+        assert.equal(native.acceptedPrompts, 1);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("starts no owner during the grace period, then takes over for a waiting prompt", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      const events = yield* observe(service, originalRef);
+      yield* events.next("snapshot");
+
+      native.ownerAlive = false;
+      yield* Deferred.succeed(native.exit!, ownerExited);
+      yield* events.next("reconnecting");
+      const sent = yield* service
+        .request({ ref: originalRef, command: { type: "prompt", message: "queued" } })
+        .pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      yield* TestClock.adjust("5 seconds");
+      assert.equal(native.starts, 1);
+      assert.equal(native.acceptedPrompts, 0);
+
+      yield* TestClock.adjust("6 seconds");
+      yield* Fiber.join(sent);
+      assert.equal(native.starts, 2);
+      assert.equal(native.acceptedPrompts, 1);
+      assert.deepEqual(native.prompts, ["queued"]);
+      const snapshot = yield* events.next("snapshot");
+      assert.equal(snapshot.session.attachment, "owned");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "closes as owner_exited when nothing replaces the terminal, and a revisit reopens",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const events = yield* observe(service, originalRef);
+        yield* events.next("snapshot");
+
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* events.next("reconnecting");
+        yield* TestClock.adjust("9 seconds");
+        assert.equal(native.starts, 1);
+
+        yield* TestClock.adjust("2 seconds");
+        const closed = yield* events.next("closed");
+        assert.equal(closed.code, "owner_exited");
+        assert.equal(native.starts, 1);
+
+        const reopened = yield* service.open(originalRef);
+        assert.equal(reopened.attachment, "owned");
+        assert.equal(native.starts, 2);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("detaches from a terminal on explicit close and leaves the terminal running", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      const events = yield* observe(service, originalRef);
+      yield* events.next("snapshot");
+
+      assert.deepEqual(yield* service.close({ ref: originalRef }), { closed: true });
+      const closed = yield* events.next("closed");
+      assert.equal(closed.code, "detached");
+      assert.equal(native.running, true);
+      assert.equal(native.aborts, 0);
+      assert.equal(native.detaches, 1);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "fails requests held for a replacement owner when the session is closed meanwhile",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const events = yield* observe(service, originalRef);
+        yield* events.next("snapshot");
+
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* events.next("reconnecting");
+        const held = yield* service
+          .request({ ref: originalRef, command: { type: "get_state" } })
+          .pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+
+        assert.deepEqual(yield* service.close({ ref: originalRef }), { closed: true });
+        const result = yield* Fiber.join(held).pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.code, "detached");
+        assert.equal(native.starts, 1);
       }).pipe(Effect.scoped),
   );
 });

@@ -28,6 +28,13 @@ commands run in that terminal as if typed there. After a command name and a
 space, the menu offers NeoPi's completions for its argument: `Tab` takes the
 first, and `Enter` sends what you typed unless you highlight a completion first.
 
+If the terminal NeoPi that owns a session restarts (`/restart`), NeoCode reattaches
+when it comes back; a message you send meanwhile waits for it. If the terminal
+quits and nothing replaces it within about ten seconds, the session stays open: send
+a message or choose **Continue in NeoCode** and NeoCode runs it from then on, but
+never while a terminal still owns it. **Detach from terminal session** lets go
+without ending the terminal's session; the tab stays put with a **Reconnect** button.
+
 When NeoPi fails to start a turn in a saved conversation, web and desktop return
 the unsent prompt and its attachments to an empty composer. If you've already
 started another draft there, it stays unchanged: send or clear it before using

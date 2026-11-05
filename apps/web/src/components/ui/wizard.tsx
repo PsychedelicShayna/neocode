@@ -76,7 +76,7 @@ export function WizardSteps({
   const Step = onStepChange ? "button" : "div";
   return (
     <ol
-      className="grid auto-cols-fr grid-flow-col gap-1 rounded-xl bg-zinc-25 p-1 ring-1 ring-black/5 dark:bg-white/4 dark:ring-white/5"
+      className="grid auto-cols-fr grid-flow-col gap-1 rounded-xl bg-muted p-1 ring-1 ring-border"
       role="list"
       aria-label="Setup progress"
     >
@@ -91,7 +91,7 @@ export function WizardSteps({
               onStepChange &&
                 "cursor-pointer hover:bg-card disabled:cursor-default disabled:hover:bg-transparent",
               index === currentStep &&
-                "bg-card text-foreground shadow-xs ring-1 ring-black/5 hover:bg-card dark:shadow-none dark:ring-white/5",
+                "bg-card text-foreground shadow-xs ring-1 ring-border hover:bg-card dark:shadow-none",
             )}
             aria-current={index === currentStep ? "step" : undefined}
             aria-label={`${step}, step ${index + 1}${index < currentStep && summaries?.[index] ? `, ${summaries?.[index]}` : ""}`}
@@ -104,7 +104,7 @@ export function WizardSteps({
                   ? "bg-primary text-primary-foreground ring-primary"
                   : index === currentStep
                     ? "bg-primary/10 text-primary ring-primary/30"
-                    : "bg-card text-muted-foreground ring-black/10 dark:bg-white/5 dark:ring-white/10",
+                    : "bg-card text-muted-foreground ring-border",
               )}
               aria-hidden
             >
@@ -138,7 +138,7 @@ export function WizardPanel({
   return (
     <div
       data-slot="dialog-panel"
-      className="min-w-0 space-y-4 bg-zinc-25/80 px-6 py-5 ring-1 ring-black/5 dark:bg-white/2 dark:ring-white/5"
+      className="min-w-0 space-y-4 bg-muted/80 px-6 py-5 ring-1 ring-border"
     >
       <AnimatedHeight holdHeight={holdHeight}>{children}</AnimatedHeight>
     </div>

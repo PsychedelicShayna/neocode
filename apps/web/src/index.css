@@ -1561,11 +1561,15 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
      the column's overflow clip never trims it. The fin sweeps out of the
      bubble edge and lands on the bubble's own bottom line at a clear angle:
      a hairline tip hovering above that line leaves a stray pixel step at
-     fractional zoom. Plain geometry: no animation, no extra element, no
-     measurement. */
+     fractional zoom. The bubble owns its radius here rather than through a
+     rounded-* utility: utilities sit in a later cascade layer, so one on the
+     element would round the tail corner back over the fin and leave a notch
+     of canvas between them. Plain geometry: no animation, no extra element,
+     no measurement. */
   .chat-bubble {
     --chat-bubble-tail-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 13 16'%3E%3Cpath d='M0 0H1C1 7 3.5 12.5 13 16H0Z'/%3E%3C/svg%3E");
     position: relative;
+    border-radius: var(--radius-2xl);
     background-color: var(--chat-bubble-fill);
     color: var(--chat-bubble-foreground);
   }

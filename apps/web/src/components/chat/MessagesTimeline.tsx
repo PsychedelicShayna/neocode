@@ -2213,7 +2213,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1 pe-3">
-      <div data-bubble="user" className="chat-bubble max-w-[80%] rounded-2xl p-3">
+      <div data-bubble="user" className="chat-bubble max-w-[80%] p-3">
         <MessageAuthorHeading>You</MessageAuthorHeading>
         {(regularImages.length > 0 || userVideos.length > 0) && (
           <div className="mb-2 grid max-w-[210px] grid-cols-2 gap-2">
@@ -2483,7 +2483,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
       ) : null}
       <div
         data-bubble="assistant"
-        className="chat-bubble min-w-0 w-fit max-w-[85%] rounded-2xl px-3.5 py-2.5"
+        className="chat-bubble min-w-0 w-fit max-w-[85%] px-3.5 py-2.5"
       >
         <AssistantCitationSource
           messageId={row.message.id}

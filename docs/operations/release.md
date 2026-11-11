@@ -59,6 +59,8 @@ is not bundled. The upstream release pipeline below remains separate.
 
 Linux's runtime-created portal/URL entry uses
 `com.psychedelicshayna.NeoCode.desktop` (or `.Development.desktop` for development).
+Linux packages use the `neocode` executable and Debian package name, keeping the
+generated `neocode.desktop` launcher separate from upstream's `t3code.desktop`.
 Local installers must update only NeoCode-owned launchers, never upstream's
 `com.t3tools.T3Code.desktop`. This separates menu files, not saved profiles:
 the default backend home remains `~/.t3`, so upstream T3 Code must use a separate

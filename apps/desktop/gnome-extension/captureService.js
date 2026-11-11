@@ -1,5 +1,7 @@
 // This policy is independent of Shell so lifecycle and authorization can be tested without a desktop.
 export const CLIENT_NAMES = [
+  "com.psychedelicshayna.NeoCode.SnapShot",
+  "com.psychedelicshayna.NeoCode.Development.SnapShot",
   "com.t3tools.T3Code.SnapShot",
   "com.t3tools.T3Code.Development.SnapShot",
 ];

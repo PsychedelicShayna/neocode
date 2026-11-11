@@ -501,7 +501,7 @@ const testLayer = (
           DesktopEnvironment.DesktopEnvironment.of({
             platform,
             stateDir: "/state",
-            linuxDesktopEntryName: "com.t3tools.T3Code.desktop",
+            linuxDesktopEntryName: "com.psychedelicshayna.NeoCode.desktop",
             appRoot: "/repo",
             linuxApplicationsDir: "/test-data/applications",
           } as DesktopEnvironment.DesktopEnvironment["Service"]),

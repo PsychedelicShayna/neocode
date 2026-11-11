@@ -2761,7 +2761,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // resources/package-type into the .deb only, so electron-updater updates
       // each install in its own format.
       target: target === "AppImage" ? [target, "deb"] : [target],
-      executableName: "t3code",
+      executableName: "neocode",
       icon: "icons",
       category: "Development",
       synopsis: "Desktop GUI for coding agents",
@@ -2783,6 +2783,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       },
     };
     buildConfig.deb = {
+      packageName: "neocode",
       // Electron's runtime libraries. Debian 13 and Ubuntu 24.04 renamed some
       // for 64-bit time; the old name is the fallback for older releases.
       depends: [

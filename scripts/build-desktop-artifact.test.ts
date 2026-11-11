@@ -703,6 +703,9 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       });
       // A Linux AppImage build also emits the .deb from the same run.
       assert.deepStrictEqual((linux.linux as Record<string, unknown>).target, ["AppImage", "deb"]);
+      // Installer-owned launchers and package ownership must not replace upstream.
+      assert.equal((linux.linux as Record<string, unknown>).executableName, "neocode");
+      assert.equal((linux.deb as Record<string, unknown>).packageName, "neocode");
       // Linux must register the renderer schemes so the generated .desktop
       // entry advertises MimeType=x-scheme-handler/t3code; for OAuth deep links.
       assert.deepStrictEqual(

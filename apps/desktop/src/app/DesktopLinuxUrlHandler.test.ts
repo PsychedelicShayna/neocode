@@ -38,8 +38,8 @@ const makeFixture = (
     appImagePath: "/Applications/Neo Code.AppImage",
   });
   const name = input.development
-    ? "com.t3tools.T3Code.Development.desktop"
-    : "com.t3tools.T3Code.desktop";
+    ? "com.psychedelicshayna.NeoCode.Development.desktop"
+    : "com.psychedelicshayna.NeoCode.desktop";
   const environment = DesktopEnvironment.DesktopEnvironment.of({
     platform: "linux",
     isPackaged: input.packaged ?? true,
@@ -137,7 +137,7 @@ describe("DesktopLinuxUrlHandler", () => {
     const fixture = makeFixture();
     return Effect.gen(function* () {
       yield* fixture.run;
-      assert.equal(fixture.files[0]?.path, "/xdg/applications/com.t3tools.T3Code.desktop");
+      assert.equal(fixture.files[0]?.path, "/xdg/applications/com.psychedelicshayna.NeoCode.desktop");
       assert.include(fixture.files[0]?.content, '"/Applications/Neo Code.AppImage"');
       assert.notInclude(fixture.files[0]?.content, "/transient/");
       assert.deepEqual(
@@ -146,7 +146,7 @@ describe("DesktopLinuxUrlHandler", () => {
       );
       assert.deepEqual(fixture.commands[0]?.args, [
         "default",
-        "com.t3tools.T3Code.desktop",
+        "com.psychedelicshayna.NeoCode.desktop",
         "x-scheme-handler/t3code",
       ]);
     });
@@ -158,11 +158,11 @@ describe("DesktopLinuxUrlHandler", () => {
       yield* fixture.run;
       assert.equal(
         fixture.files[0]?.path,
-        "/xdg/applications/com.t3tools.T3Code.Development.desktop",
+        "/xdg/applications/com.psychedelicshayna.NeoCode.Development.desktop",
       );
       assert.deepEqual(fixture.commands.at(-1)?.args, [
         "default",
-        "com.t3tools.T3Code.Development.desktop",
+        "com.psychedelicshayna.NeoCode.Development.desktop",
         "x-scheme-handler/t3code-dev",
       ]);
     });
@@ -174,7 +174,7 @@ describe("DesktopLinuxUrlHandler", () => {
       yield* fixture.run;
       assert.equal(
         fixture.files[0]?.path,
-        "/xdg/applications/com.t3tools.T3Code.Development.desktop",
+        "/xdg/applications/com.psychedelicshayna.NeoCode.Development.desktop",
       );
       assert.include(fixture.files[0]?.content, "MimeType=x-scheme-handler/t3code-dev;");
       assert.deepEqual(fixture.commands, []);
@@ -185,7 +185,7 @@ describe("DesktopLinuxUrlHandler", () => {
     const seed = makeFixture();
     const fixture = makeFixture({
       configuredDefault:
-        "[Default Applications]\nx-scheme-handler/t3code=com.t3tools.T3Code.desktop;\n",
+        "[Default Applications]\nx-scheme-handler/t3code=com.psychedelicshayna.NeoCode.desktop;\n",
       existing: renderUrlHandlerDesktopEntry({
         displayName: "NeoCode",
         command: seed.registration.command,

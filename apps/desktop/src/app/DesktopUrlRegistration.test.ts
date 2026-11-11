@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { assert, describe, it } from "vite-plus/test";
+import { resolveLinuxDesktopEntryName } from "./DesktopEarlyElectronStartup.ts";
 import {
   escapeDesktopEntryExecArgument,
   hasConfiguredUrlHandler,
@@ -23,7 +24,7 @@ const withPrivateRoot = (run: (root: string) => void) => {
 
 describe("DesktopUrlRegistration", () => {
   it("skips default writes only for the first configured handler in the default section", () => {
-    const canonical = "com.t3tools.T3Code.desktop";
+    const canonical = "com.psychedelicshayna.NeoCode.desktop";
     assert.isTrue(
       hasConfiguredUrlHandler(
         `[Default Applications]\nx-scheme-handler/t3code=${canonical};older.desktop;\n`,
@@ -104,8 +105,11 @@ describe("DesktopUrlRegistration", () => {
         execPath: '/real path/electron "quoted"',
         appPath: '/source app/main "entry".cjs',
       });
-      const canonical = "com.t3tools.T3Code.desktop";
+      const canonical = resolveLinuxDesktopEntryName(false);
       const applications = join(root, "data/applications");
+      const upstreamPath = join(applications, "com.t3tools.T3Code.desktop");
+      const upstreamEntry = "[Desktop Entry]\nType=Application\nName=T3 Code\nExec=/usr/bin/t3code %U\n";
+      writeFileSync(upstreamPath, upstreamEntry);
       const entry = renderUrlHandlerDesktopEntry({
         displayName: "NeoCode",
         command: plan.command,
@@ -150,6 +154,7 @@ describe("DesktopUrlRegistration", () => {
       assert.equal(effective.status, 0, effective.stderr);
       assert.equal(effective.stdout.trim(), canonical);
       assert.equal(readFileSync(join(applications, effective.stdout.trim()), "utf8"), entry);
+      assert.equal(readFileSync(upstreamPath, "utf8"), upstreamEntry);
       assert.include(entry, '"/source app/main \\\\"entry\\\\".cjs" %U');
     }));
 });

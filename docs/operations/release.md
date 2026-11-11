@@ -57,6 +57,15 @@ that provider. No upstream npm, AUR, production relay, Vercel, Discord, or
 version-bump publisher runs in the fork. T3 Connect production configuration
 is not bundled. The upstream release pipeline below remains separate.
 
+Linux's runtime-created portal/URL entry uses
+`com.psychedelicshayna.NeoCode.desktop` (or `.Development.desktop` for development).
+Local installers must update only NeoCode-owned launchers, never upstream's
+`com.t3tools.T3Code.desktop`. This separates menu files, not saved profiles:
+the default backend home remains `~/.t3`, so upstream T3 Code must use a separate
+`T3CODE_HOME` before running alongside NeoCode. Isolate its `XDG_CONFIG_HOME` and
+`XDG_DATA_HOME` too when retaining an older NeoCode install whose runtime still
+writes upstream's handler filename. Do not migrate a live database by copying it.
+
 ### Fork desktop feed assets
 
 The resolved fork channel is passed unchanged to both desktop build jobs.

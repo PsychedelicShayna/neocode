@@ -1,7 +1,6 @@
 import { type ModelCapabilities, type ProviderOptionDescriptor } from "@t3tools/contracts";
 import { type CustomModelDefinition, createModelCapabilities } from "@t3tools/shared/model";
 
-/** Editable mirror of a `ProviderOptionChoice`. `key` is only a React key. */
 export interface EditorChoice {
   readonly key: string;
   readonly id: string;
@@ -10,7 +9,6 @@ export interface EditorChoice {
   readonly description?: string;
 }
 
-/** Editable mirror of a `ProviderOptionDescriptor`. `key` is only a React key. */
 export interface EditorDescriptor {
   readonly key: string;
   readonly type: "select" | "boolean";
@@ -83,10 +81,6 @@ export function descriptorsFromCapabilities(
   return (capabilities?.optionDescriptors ?? []).map(descriptorToEditor);
 }
 
-/**
- * Validate the draft before saving. Returns the first problem in reading
- * order so the message is actionable, or `null` when the draft is sound.
- */
 export function validateDraft(draft: CustomModelDraft): string | null {
   const seenIds = new Set<string>();
   for (const [index, descriptor] of draft.descriptors.entries()) {
@@ -111,7 +105,6 @@ export function validateDraft(draft: CustomModelDraft): string | null {
   return null;
 }
 
-/** Convert a validated draft back into a definition. Blank name → slug. */
 export function definitionFromDraft(draft: CustomModelDraft): CustomModelDefinition {
   const descriptors: ProviderOptionDescriptor[] = draft.descriptors.map((descriptor) => {
     const id = descriptor.id.trim();

@@ -4,11 +4,12 @@ import {
   cliArchiveFileName,
   cliArchivePlatformKey,
   cliArchiveTarCommand,
-  cliReleaseDownloadBaseUrl,
+  cliReleaseAssetUrl,
   cliReleaseChannelOf,
-  cliReleaseIndexPageUrl,
+  cliReleaseDownloadBaseUrl,
   newestCliReleaseVersion,
   parseChecksums,
+  releaseAssetUrl,
 } from "./cliRelease.ts";
 
 const publishedRelease = (version: string, draft = false) => ({
@@ -37,12 +38,15 @@ describe("cliRelease", () => {
     expect(cliArchivePlatformKey("linux", "ia32")).toBeUndefined();
   });
 
-  it("resolves download URLs under the tagged release, honoring a mirror", () => {
-    expect(cliReleaseDownloadBaseUrl("1.2.3")).toBe(
-      "https://github.com/PsychedelicShayna/neocode/releases/download/v1.2.3",
+  it("preserves signed mirror queries while encoding release and asset paths", () => {
+    const mirror = "https://mirror.example/releases/?token=a%2Bb";
+    const version = "1.2.3+build.4.1";
+    const fileName = `t3-${version}-linux-x64.tar.gz`;
+    expect(cliReleaseAssetUrl(version, fileName, mirror)).toBe(
+      "https://mirror.example/releases/v1.2.3%2Bbuild.4.1/t3-1.2.3%2Bbuild.4.1-linux-x64.tar.gz?token=a%2Bb",
     );
-    expect(cliReleaseDownloadBaseUrl("1.2.3", "https://mirror.example/t3/")).toBe(
-      "https://mirror.example/t3/v1.2.3",
+    expect(releaseAssetUrl(mirror, "a/b?#", "space name")).toBe(
+      "https://mirror.example/releases/a%2Fb%3F%23/space%20name?token=a%2Bb",
     );
   });
 
@@ -77,6 +81,10 @@ describe("cliRelease", () => {
     expect(cliReleaseChannelOf("1.2.3+build.39488899088.1")).toBe("stable");
     expect(cliReleaseChannelOf("1.2.3-nightly.20261020.39488899088.1+build.2")).toBe("nightly");
     expect(cliReleaseChannelOf("1.2.3-preview.20261020.39488899088.1+build.2")).toBe("preview");
+    expect(cliReleaseChannelOf("0.0.15-nightly.20260907.1757236816.beb7e0771a")).toBe("nightly");
+    expect(cliReleaseChannelOf("0.0.15-preview.20260907.1757236816.beb7e0771a")).toBe("preview");
+    expect(cliReleaseChannelOf("1.2.3-nightly.20261020.4.not-a-sha")).toBe("stable");
+    expect(cliReleaseChannelOf("1.2.3-preview.20261020.4.1.extra")).toBe("stable");
     // A prerelease that is not one of our trains is not silently a nightly.
     expect(cliReleaseChannelOf("1.2.3-rc.1")).toBe("stable");
   });
@@ -133,12 +141,5 @@ describe("cliRelease", () => {
         "linux-x64",
       ),
     ).toBe("1.2.2");
-  });
-
-  it("pages through the release index at the largest page GitHub allows", () => {
-    expect(cliReleaseIndexPageUrl(1)).toBe(
-      "https://api.github.com/repos/PsychedelicShayna/neocode/releases?per_page=100&page=1",
-    );
-    expect(cliReleaseIndexPageUrl(3)).toContain("page=3");
   });
 });

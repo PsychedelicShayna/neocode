@@ -3,11 +3,10 @@ import {
   type AgentHubAgent,
   type AgentHubSource,
 } from "@t3tools/client-runtime/neopi-native-agent-hub";
-import {
-  formatSubagentModelLabel,
-  formatSubagentTokenCount,
-} from "@t3tools/client-runtime/state/subagentRuntime";
-import { useMemo, type ReactNode } from "react";
+import { formatModelSlugName } from "@t3tools/shared/model";
+import { formatTokens } from "@t3tools/shared/usageFormat";
+import type { ReactNode } from "react";
+import { nativeValueItems } from "@t3tools/client-runtime/neopi-native-sessions";
 
 import { cn } from "~/lib/utils";
 import { AgentElapsed, AgentStatusDot, agentStatusLabel } from "./AgentRoster";
@@ -34,8 +33,7 @@ function ContextMeter({ agent }: { agent: AgentHubAgent }) {
       <div className="flex items-baseline justify-between text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
         <span>Context</span>
         <span className="font-mono normal-case tabular-nums">
-          {formatSubagentTokenCount(agent.contextTokens)} /{" "}
-          {formatSubagentTokenCount(agent.contextWindow)} · {percent}%
+          {formatTokens(agent.contextTokens)} / {formatTokens(agent.contextWindow)} · {percent}%
         </span>
       </div>
       <div
@@ -70,7 +68,7 @@ function TranscriptPreview({
   lines: number;
 }) {
   const { rows, loading, error } = useAgentTranscript(source, agent);
-  const preview = useMemo(() => previewLines(rows, lines), [rows, lines]);
+  const preview = previewLines(rows, lines);
   return (
     <section className="flex min-h-0 flex-col gap-1.5 rounded-lg border border-border/50 bg-card/30 p-2.5">
       <h3 className="text-3xs font-medium uppercase tracking-wider text-muted-foreground/70">
@@ -121,7 +119,7 @@ export function AgentDetail({
   actions?: ReactNode;
   className?: string;
 }) {
-  const model = formatSubagentModelLabel(agent.model, null);
+  const model = agent.model ? formatModelSlugName(agent.model) : null;
   return (
     <div className={cn("flex flex-col gap-3 p-3", className)}>
       <header className="flex items-start gap-2">
@@ -142,16 +140,16 @@ export function AgentDetail({
         {actions ? <div className="flex shrink-0 items-center gap-1">{actions}</div> : null}
       </header>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-2 rounded-lg border border-border/50 bg-card/30 p-2.5">
-        <Fact label="Model">{model ?? "—"}</Fact>
-        <Fact label="Effort">{agent.effort ?? "—"}</Fact>
-        <Fact label="Fast">{agent.fast === null ? "—" : agent.fast.enabled ? "on" : "off"}</Fact>
-        <Fact label="Runs">{agent.runs}</Fact>
-        <Fact label="Tokens">
-          {agent.tokens !== null ? formatSubagentTokenCount(agent.tokens) : "—"}
+        <Fact label="Model">{model ?? "Unknown"}</Fact>
+        <Fact label="Effort">{agent.effort ?? "Unknown"}</Fact>
+        <Fact label="Fast">
+          {agent.fast === null ? "Unknown" : agent.fast.enabled ? "on" : "off"}
         </Fact>
-        <Fact label="Requests">{agent.requests ?? "—"}</Fact>
-        <Fact label="Tools">{agent.toolUses ?? "—"}</Fact>
-        <Fact label="Cost">{agent.cost !== null ? formatCost(agent.cost) : "—"}</Fact>
+        <Fact label="Runs">{agent.runs}</Fact>
+        <Fact label="Tokens">{agent.tokens !== null ? formatTokens(agent.tokens) : "Unknown"}</Fact>
+        <Fact label="Requests">{agent.requests ?? "Unknown"}</Fact>
+        <Fact label="Tools">{agent.toolUses ?? "Unknown"}</Fact>
+        <Fact label="Cost">{agent.cost !== null ? formatCost(agent.cost) : "Unknown"}</Fact>
       </dl>
       <ContextMeter agent={agent} />
       {agent.task ? (
@@ -181,9 +179,9 @@ export function AgentDetail({
           ) : null}
           {agent.recentTools.length > 0 ? (
             <ul className="flex flex-col gap-0.5 rounded-md bg-muted/40 p-1.5 font-mono text-2xs text-muted-foreground">
-              {agent.recentTools.slice(-5).map((tool, index) => (
+              {nativeValueItems(agent.recentTools.slice(-5)).map(({ key, value: tool }) => (
                 <li
-                  key={`${index}:${tool.tool}`}
+                  key={key}
                   className={cn("truncate", tool.isError && "text-destructive-foreground")}
                 >
                   ▸ {tool.tool}

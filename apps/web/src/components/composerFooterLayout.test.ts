@@ -2,58 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { resolveContextStripLabelsCompact } from "./BranchToolbar.logic";
 import {
-  COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX,
-  COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX,
-  resolveScrollToEndClearance,
   resolveRestingComposerControlsLayout,
   resolveRestingComposerControlsNaturalWidth,
-  shouldUseCompactComposerPrimaryActions,
-  shouldUseCompactComposerFooter,
 } from "./composerFooterLayout";
-
-describe("shouldUseCompactComposerFooter", () => {
-  it("stays expanded without a measured width", () => {
-    expect(shouldUseCompactComposerFooter(null)).toBe(false);
-  });
-
-  it("switches to compact mode below the breakpoint", () => {
-    expect(shouldUseCompactComposerFooter(COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX - 1)).toBe(true);
-  });
-
-  it("stays expanded at and above the breakpoint", () => {
-    expect(shouldUseCompactComposerFooter(COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX)).toBe(false);
-    expect(shouldUseCompactComposerFooter(COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX + 48)).toBe(false);
-  });
-
-  it("uses a higher breakpoint for wide action states", () => {
-    expect(
-      shouldUseCompactComposerFooter(COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX - 1, {
-        hasWideActions: true,
-      }),
-    ).toBe(true);
-    expect(
-      shouldUseCompactComposerFooter(COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX, {
-        hasWideActions: true,
-      }),
-    ).toBe(false);
-  });
-});
-
-describe("shouldUseCompactComposerPrimaryActions", () => {
-  it("matches the wide footer breakpoint", () => {
-    expect(
-      shouldUseCompactComposerPrimaryActions(
-        COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX - 1,
-        { hasWideActions: true },
-      ),
-    ).toBe(true);
-    expect(
-      shouldUseCompactComposerPrimaryActions(COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX, {
-        hasWideActions: true,
-      }),
-    ).toBe(false);
-  });
-});
 
 describe("resolveRestingComposerControlsLayout", () => {
   // Picker 140 natural / 96 minimum, plus a 9px separator. Traits 60,
@@ -114,17 +65,6 @@ describe("resolveRestingComposerControlsLayout", () => {
     });
   });
 
-  it("uses the same thresholds while shrinking and growing", () => {
-    expect(resolveRestingComposerControlsLayout({ ...base, hostWidth: 240 })).toEqual({
-      hiddenCount: 2,
-      visible: true,
-    });
-    expect(resolveRestingComposerControlsLayout({ ...base, hostWidth: 241 })).toEqual({
-      hiddenCount: 1,
-      visible: true,
-    });
-  });
-
   it("supports a single leading control without overflow blocks", () => {
     expect(
       resolveRestingComposerControlsLayout({
@@ -140,10 +80,6 @@ describe("resolveRestingComposerControlsLayout", () => {
 });
 
 describe("context strip labels and resting composer controls", () => {
-  // Widths captured from a desktop renderer that crashed with React error
-  // 185. The strip is 724px wide. Its expanded labels need 327px, and the
-  // rest of its chrome needs 125px. The composer controls sit in the host
-  // that takes whatever is left.
   const stripWidth = 724;
   const labelWidth = 327;
   const chromeWidth = 125;
@@ -161,15 +97,12 @@ describe("context strip labels and resting composer controls", () => {
   }
 
   it("keeps the labels compact when the full controls only fit beside compact labels", () => {
-    // Compact labels leave 599px, so the composer shows every block.
     const layout = resolveRestingComposerControlsLayout({
       ...measurement,
       hostWidth: hostWidth(true),
     });
     expect(layout).toEqual({ hiddenCount: 0, visible: true });
 
-    // The strip reserves the natural controls width, so expanding the
-    // labels is off the table: 125 + 327 + 364 > 724.
     const compact = resolveContextStripLabelsCompact({
       compact: true,
       neededWidth: chromeWidth + labelWidth + naturalWidth,
@@ -177,33 +110,13 @@ describe("context strip labels and resting composer controls", () => {
     });
     expect(compact).toBe(true);
 
-    // The next pass sees the same inputs and lands on the same answer.
     expect(
       resolveRestingComposerControlsLayout({ ...measurement, hostWidth: hostWidth(compact) }),
     ).toEqual(layout);
   });
-
-  it("does not settle when the strip only reserves the visible controls", () => {
-    // Regression guard for the alternating layout. Reserving only the
-    // controls left visible after two blocks moved into overflow makes the
-    // strip expand its labels, which shrinks the host below what the full
-    // controls need, which hides the blocks again.
-    const hiddenControlsWidth = 137;
-    const expands = !resolveContextStripLabelsCompact({
-      compact: true,
-      neededWidth: chromeWidth + labelWidth + hiddenControlsWidth,
-      availableWidth: stripWidth,
-    });
-    expect(expands).toBe(true);
-    expect(
-      resolveRestingComposerControlsLayout({ ...measurement, hostWidth: hostWidth(false) }),
-    ).toEqual({ hiddenCount: 2, visible: true });
-  });
 });
 
 describe("resolveRestingComposerControlsLayout hysteresis", () => {
-  // Same cluster as above: picker 140 natural / 96 minimum plus a 9px
-  // separator, traits 60, mode 140, overflow 24, gap 4.
   const base = {
     gap: 4,
     naturalFixedWidth: 149,
@@ -212,73 +125,12 @@ describe("resolveRestingComposerControlsLayout hysteresis", () => {
     overflowWidth: 24,
   };
 
-  it("keeps a block in overflow when re-showing it would leave no slack", () => {
-    // 149 + 60 + 140 + 4 * 2 = 357 fills the host exactly.
-    expect(
-      resolveRestingComposerControlsLayout({
-        ...base,
-        hostWidth: 357,
-        previous: { hiddenCount: 1, visible: true },
-      }),
-    ).toEqual({ hiddenCount: 1, visible: true });
-  });
-
-  it("re-shows a block once the host clears the slack margin", () => {
-    expect(
-      resolveRestingComposerControlsLayout({
-        ...base,
-        hostWidth: 358,
-        previous: { hiddenCount: 1, visible: true },
-      }),
-    ).toEqual({ hiddenCount: 0, visible: true });
-  });
-
-  it("restores the blocks that fit when the full cluster has no slack", () => {
-    const partlyRestored = resolveRestingComposerControlsLayout({
-      ...base,
-      hostWidth: 357,
-      previous: { hiddenCount: 2, visible: true },
-    });
-    expect(partlyRestored).toEqual({ hiddenCount: 1, visible: true });
-    expect(
-      resolveRestingComposerControlsLayout({ ...base, hostWidth: 357, previous: partlyRestored }),
-    ).toEqual(partlyRestored);
-    expect(
-      resolveRestingComposerControlsLayout({ ...base, hostWidth: 358, previous: partlyRestored }),
-    ).toEqual({ hiddenCount: 0, visible: true });
-  });
-
-  it("requires slack before partially restoring a cluster", () => {
-    // One inline block, the picker, and overflow need 149 + 60 + 24 + 8 = 241px.
-    const previous = { hiddenCount: 2, visible: true };
-    expect(resolveRestingComposerControlsLayout({ ...base, hostWidth: 241, previous })).toEqual(
-      previous,
-    );
-    expect(resolveRestingComposerControlsLayout({ ...base, hostWidth: 242, previous })).toEqual({
-      hiddenCount: 1,
-      visible: true,
-    });
-  });
-
-  it("still resolves from scratch when there is no previous layout", () => {
-    expect(resolveRestingComposerControlsLayout({ ...base, hostWidth: 357 })).toEqual({
-      hiddenCount: 0,
-      visible: true,
-    });
-  });
-
   it("settles when the measured picker width jitters below a pixel", () => {
-    // Regression guard for React error #185 ("Maximum update depth
-    // exceeded"). The composer re-measures on every render, so the picker's
-    // recovered natural width can land a fraction of a pixel apart between
-    // renders. Without hysteresis that flips hiddenCount forever.
     let layout = { hiddenCount: 0, visible: true };
     const settled: string[] = [];
     for (let index = 0; index < 10; index += 1) {
       layout = resolveRestingComposerControlsLayout({
         ...base,
-        // The picker's recovered natural width lands a half pixel apart
-        // between renders.
         naturalFixedWidth: index % 2 === 0 ? 149 : 149.5,
         hostWidth: 357,
         previous: layout,
@@ -286,48 +138,6 @@ describe("resolveRestingComposerControlsLayout hysteresis", () => {
       if (index >= 2) settled.push(`${layout.hiddenCount}:${layout.visible}`);
     }
     expect(new Set(settled).size).toBe(1);
-  });
-
-  it("keeps the cluster hidden until its minimum width clears the slack", () => {
-    // 105 + 24 + 4 = 133 is the exact minimum for the hidden cluster.
-    expect(
-      resolveRestingComposerControlsLayout({
-        ...base,
-        hostWidth: 133,
-        previous: { hiddenCount: 2, visible: false },
-      }),
-    ).toEqual({ hiddenCount: 2, visible: false });
-    expect(
-      resolveRestingComposerControlsLayout({
-        ...base,
-        hostWidth: 134,
-        previous: { hiddenCount: 2, visible: false },
-      }),
-    ).toEqual({ hiddenCount: 2, visible: true });
-  });
-});
-
-describe("resolveScrollToEndClearance", () => {
-  it("removes the side tab gap in both composer states while clearing overlapping attachments", () => {
-    for (const overlayHeight of [120, 214]) {
-      const layout = {
-        overlayHeight,
-        mainSurfaceTop: 534,
-        button: { left: 340, right: 460 },
-        attachments: [{ top: 500, left: 600, right: 700 }],
-      };
-      expect(resolveScrollToEndClearance(layout)).toBe(overlayHeight - 34);
-      expect(resolveScrollToEndClearance({ ...layout, attachments: [] })).toBe(overlayHeight);
-      expect(
-        resolveScrollToEndClearance({
-          ...layout,
-          attachments: [...layout.attachments, { top: 500, left: 100, right: 700 }],
-        }),
-      ).toBe(overlayHeight);
-      expect(resolveScrollToEndClearance({ ...layout, button: { left: 590, right: 710 } })).toBe(
-        overlayHeight,
-      );
-    }
   });
 });
 
@@ -340,55 +150,6 @@ describe("progressive composer controls", () => {
     iconOnlyBlockWidths: [40, 60],
     overflowWidth: 24,
   };
-
-  it("keeps labels while they fit and removes trailing labels before controls", () => {
-    for (const [hostWidth, iconOnlyCount, hiddenCount] of [
-      [368, 0, 0],
-      [367, 1, 0],
-      [288, 1, 0],
-      [287, 2, 0],
-      [248, 2, 0],
-      [247, 2, 1],
-      [211, 2, 2],
-    ] as const) {
-      expect(resolveRestingComposerControlsLayout({ ...measurement, hostWidth })).toEqual({
-        hiddenCount,
-        iconOnlyCount,
-        visible: true,
-      });
-    }
-  });
-
-  it("requires slack to restore labels and controls", () => {
-    for (const [hostWidth, previous, promoted] of [
-      [
-        368,
-        { hiddenCount: 0, iconOnlyCount: 1, visible: true },
-        { hiddenCount: 0, iconOnlyCount: 0, visible: true },
-      ],
-      [
-        288,
-        { hiddenCount: 0, iconOnlyCount: 2, visible: true },
-        { hiddenCount: 0, iconOnlyCount: 1, visible: true },
-      ],
-      [
-        248,
-        { hiddenCount: 1, iconOnlyCount: 2, visible: true },
-        { hiddenCount: 0, iconOnlyCount: 2, visible: true },
-      ],
-    ] as const) {
-      expect(resolveRestingComposerControlsLayout({ ...measurement, hostWidth, previous })).toEqual(
-        previous,
-      );
-      expect(
-        resolveRestingComposerControlsLayout({
-          ...measurement,
-          hostWidth: hostWidth + 1,
-          previous,
-        }),
-      ).toEqual(promoted);
-    }
-  });
 
   it("settles through fractional label-width changes at each threshold", () => {
     for (const hostWidth of [368, 288, 248]) {

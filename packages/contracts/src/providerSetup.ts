@@ -1,7 +1,6 @@
 import * as Schema from "effect/Schema";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
-/** Client-safe runtime maintenance failure. */
 export class ProviderSetupError extends Schema.TaggedError<ProviderSetupError>()(
   "ProviderSetupError",
   {

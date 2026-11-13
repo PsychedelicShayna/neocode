@@ -5,10 +5,10 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { request as rpcRequest, subscribe } from "../rpc/client.ts";
+import { requestGuarded as rpcRequest, subscribe } from "../rpc/client.ts";
 import { NATIVE_JOBS_CAPABILITY } from "../neopiNativeJobs.ts";
 import { SUBAGENT_HISTORY_CAPABILITY } from "../neopiNativeSubagents.ts";
 import {
@@ -22,6 +22,7 @@ import {
   type NativeSessionUpdate,
 } from "../neopiNativeSessions.ts";
 import {
+  createEnvironmentQueryAtomFamily,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
@@ -180,7 +181,7 @@ export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
             const history = current.session.capabilities.includes(SUBAGENT_HISTORY_CAPABILITY)
               ? nativeRecord(
                   yield* read({ type: "get_subagent_history" }).pipe(
-                    Effect.catch(() => Effect.succeed(null)),
+                    Effect.orElseSucceed(() => null),
                   ),
                 ).subagents
               : undefined;
@@ -295,6 +296,7 @@ export function createNativeSessionAtoms<R, E>(
   const cache = new Map<string, NativeSessionFeed>();
   const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
   const endedObservations = new Set<string>();
+  const restartingObservations = new Set<Queue.Queue<NativeSessionUpdate>>();
   /** Sessions the user detached from; a revisit leaves them detached until `reconnect`. */
   const detachedObservations = new Set<string>();
   const publish = (key: string, update: NativeSessionUpdate) =>
@@ -328,9 +330,10 @@ export function createNativeSessionAtoms<R, E>(
             Effect.sync(() => updates.set(key, queue)),
             () =>
               Effect.sync(() => {
+                const restarting = restartingObservations.delete(queue);
                 if (updates.get(key) !== queue) return;
                 updates.delete(key);
-                cache.delete(key);
+                if (!restarting) cache.delete(key);
                 endedObservations.delete(key);
                 // Unobserved move handoffs live only as long as their source.
                 // A mounted destination owns its own feed and must stay intact.
@@ -387,22 +390,16 @@ export function createNativeSessionAtoms<R, E>(
                   Stream.fromQueue(queue),
                   { haltStrategy: "left" },
                 ).pipe(
-                  Stream.tap((event) =>
-                    Effect.sync(() => {
-                      // A move leaves this observation on the old file, but the
-                      // owner keeps talking on it (`/wt` prints its summary after
-                      // relocating). Hand those frames to the moved file's feed
-                      // until that feed has its own connection.
-                      const moved = cache.get(key)?.movedTo;
-                      if (!moved || event.type !== "event") return;
-                      const movedKey = nativeSessionKey({
-                        environmentId: supervisor.target.environmentId,
-                        ref: moved,
-                      });
-                      if (!cache.get(movedKey)?.connected)
-                        publish(movedKey, event).pipe(Effect.runSync);
-                    }),
-                  ),
+                  Stream.tap((event) => {
+                    // The owner can emit more frames on the old file after relocating.
+                    const moved = cache.get(key)?.movedTo;
+                    if (!moved || event.type !== "event") return Effect.void;
+                    const movedKey = nativeSessionKey({
+                      environmentId: supervisor.target.environmentId,
+                      ref: moved,
+                    });
+                    return cache.get(movedKey)?.connected ? Effect.void : publish(movedKey, event);
+                  }),
                   Stream.takeUntil((event) => {
                     if (event.type === "closed") {
                       endedObservations.add(key);
@@ -466,8 +463,11 @@ export function createNativeSessionAtoms<R, E>(
         !detachedObservations.has(sessionKey) &&
         AsyncResult.isSuccess(current) &&
         !current.value.connected
-      )
+      ) {
+        const queue = updates.get(sessionKey);
+        if (queue) restartingObservations.add(queue);
         get.refresh(source);
+      }
       return get.once(source);
     }).pipe(Atom.setIdleTTL(0));
   });
@@ -477,68 +477,67 @@ export function createNativeSessionAtoms<R, E>(
   const request = createEnvironmentRpcCommand(runtime, {
     label: "native-sessions:request",
     tag: WS_METHODS.neopiNativeSessionsRequest,
-    execute: (input) =>
-      Effect.gen(function* () {
-        const supervisor = yield* EnvironmentSupervisor;
-        const key = nativeSessionKey({
-          environmentId: supervisor.target.environmentId,
-          ref: input.ref,
-        });
-        const revision = cache.get(key)?.conversation.revision ?? 0;
-        const cachedFeed = cache.get(key);
-        const jobsRevision = cachedFeed?.jobs.revision ?? 0;
-        const agentsRevision = cachedFeed?.agentsRevision ?? 0;
-        const value = yield* rpcRequest(WS_METHODS.neopiNativeSessionsRequest, input);
-        if (input.command.type === "get_jobs") {
-          // A panel-initiated read folds into the feed like the reconciler's own.
-          const session = cache.get(key)?.session;
-          if (session)
-            yield* publish(key, {
-              type: "jobs",
-              ref: session.ref,
-              sessionId: session.sessionId,
-              revision: jobsRevision,
-              response: value,
-            });
-          yield* publish(key, { type: "reconciliation", operation: "jobs", error: null });
-        }
-        if (input.command.type === "get_state") {
-          yield* publish(key, { type: "state", state: nativeRecord(value) });
-          yield* publish(key, { type: "reconciliation", operation: "state", error: null });
-        }
-        if (
-          ["extension_ui_response", "tool_approval_response", "plan_proposal_response"].includes(
-            input.command.type,
-          ) &&
-          typeof input.command.id === "string"
-        )
-          yield* publish(key, { type: "answered", id: input.command.id });
-        if (input.command.type === "get_entries_page") {
-          const page = nativeJournalPage(value);
-          if (page)
-            yield* publish(key, {
-              type: "page",
-              page,
-              revision,
-              older: typeof input.command.cursor === "string",
-            });
-        }
-        if (input.command.type === "get_subagents") {
-          // Model, effort and fast changes emit no lifecycle frame; a command-driven re-read folds them in.
-          const feed = cache.get(key);
-          const agents = nativeRecord(value).subagents;
-          if (feed?.session && Array.isArray(agents))
-            yield* publish(key, {
-              type: "subagents",
-              ref: feed.session.ref,
-              sessionId: feed.session.sessionId,
-              epoch: cachedFeed?.agentsEpoch ?? feed.agentsEpoch,
-              revision: agentsRevision,
-              agents,
-            });
-        }
-        return value;
-      }),
+    execute: Effect.fn("nativeSessions.request")(function* (input) {
+      const supervisor = yield* EnvironmentSupervisor;
+      const key = nativeSessionKey({
+        environmentId: supervisor.target.environmentId,
+        ref: input.ref,
+      });
+      const revision = cache.get(key)?.conversation.revision ?? 0;
+      const cachedFeed = cache.get(key);
+      const jobsRevision = cachedFeed?.jobs.revision ?? 0;
+      const agentsRevision = cachedFeed?.agentsRevision ?? 0;
+      const value = yield* rpcRequest(WS_METHODS.neopiNativeSessionsRequest, input);
+      if (input.command.type === "get_jobs") {
+        // A panel-initiated read folds into the feed like the reconciler's own.
+        const session = cache.get(key)?.session;
+        if (session)
+          yield* publish(key, {
+            type: "jobs",
+            ref: session.ref,
+            sessionId: session.sessionId,
+            revision: jobsRevision,
+            response: value,
+          });
+        yield* publish(key, { type: "reconciliation", operation: "jobs", error: null });
+      }
+      if (input.command.type === "get_state") {
+        yield* publish(key, { type: "state", state: nativeRecord(value) });
+        yield* publish(key, { type: "reconciliation", operation: "state", error: null });
+      }
+      if (
+        ["extension_ui_response", "tool_approval_response", "plan_proposal_response"].includes(
+          input.command.type,
+        ) &&
+        typeof input.command.id === "string"
+      )
+        yield* publish(key, { type: "answered", id: input.command.id });
+      if (input.command.type === "get_entries_page") {
+        const page = nativeJournalPage(value);
+        if (page)
+          yield* publish(key, {
+            type: "page",
+            page,
+            revision,
+            older: typeof input.command.cursor === "string",
+          });
+      }
+      if (input.command.type === "get_subagents") {
+        // Model, effort and fast changes emit no lifecycle frame; a command-driven re-read folds them in.
+        const feed = cache.get(key);
+        const agents = nativeRecord(value).subagents;
+        if (feed?.session && Array.isArray(agents))
+          yield* publish(key, {
+            type: "subagents",
+            ref: feed.session.ref,
+            sessionId: feed.session.sessionId,
+            epoch: cachedFeed?.agentsEpoch ?? feed.agentsEpoch,
+            revision: agentsRevision,
+            agents,
+          });
+      }
+      return value;
+    }),
   });
   const open = createEnvironmentRpcCommand(runtime, {
     label: "native-sessions:open",
@@ -549,6 +548,24 @@ export function createNativeSessionAtoms<R, E>(
   return {
     list,
     open,
+    tree: createEnvironmentQueryAtomFamily(runtime, {
+      label: "native-sessions:tree",
+      staleTimeMs: 0,
+      idleTtlMs: 0,
+      execute: (input: { readonly ref: NeoPiNativeSessionRef }) =>
+        rpcRequest(WS_METHODS.neopiNativeSessionsRequest, {
+          ref: input.ref,
+          command: { type: "get_tree" },
+        }),
+    }),
+    launch: createEnvironmentRpcCommand(runtime, {
+      label: "native-sessions:launch",
+      tag: WS_METHODS.neopiNativeSessionsLaunch,
+      onSuccess: (target, registry) =>
+        Effect.sync(() =>
+          registry.refresh(list({ environmentId: target.environmentId, input: {} })),
+        ),
+    }),
     request,
     close: createEnvironmentRpcCommand(runtime, {
       label: "native-sessions:close",

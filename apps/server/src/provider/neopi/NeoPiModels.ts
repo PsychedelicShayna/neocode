@@ -1,4 +1,4 @@
-import * as NodeCrypto from "node:crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import {
   NeoPiModelsError,
   NeoPiModelsConfiguration,
@@ -21,15 +21,20 @@ import * as Exit from "effect/Exit";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { ServerConfig } from "../../config.ts";
-import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
-import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import { ProviderInstanceRegistry } from "../ProviderInstanceRegistry.ts";
+import { makeNeoPiThreadBindingReader } from "./NeoPiThreadBinding.ts";
 import { neoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import { makeNeoPiModelsHub } from "./NeoPiModelsHub.ts";
 
+const isModelsError = Schema.is(NeoPiModelsError);
+const decodeModelsConfiguration = Schema.decodeUnknownEffect(NeoPiModelsConfiguration);
+const decodeModelSelector = Schema.decodeUnknownEffect(NeoPiModelSelectorResult);
+const decodeModelsAccounts = Schema.decodeUnknownEffect(NeoPiModelsAccounts);
+
 const modelError = (cause: unknown) =>
-  Schema.is(NeoPiModelsError)(cause)
+  isModelsError(cause)
     ? cause
     : new NeoPiModelsError({
         message: cause instanceof Error ? cause.message : String(cause),
@@ -40,7 +45,6 @@ const modelError = (cause: unknown) =>
           ? { code: cause.code }
           : {}),
       });
-const Cursor = Schema.Struct({ sessionId: Schema.String, sessionFile: Schema.String });
 interface AuthFlow {
   readonly connection: NeoPiModelsConnection;
   readonly state: SubscriptionRef.SubscriptionRef<NeoPiModelsAuthState>;
@@ -61,7 +65,7 @@ export const readNativeModelsConfiguration = Effect.fnUntraced(function* (
   const result = yield* native
     .request({ type: "get_models_configuration" })
     .pipe(Effect.mapError(modelError));
-  return yield* Schema.decodeUnknownEffect(NeoPiModelsConfiguration)(result, {
+  return yield* decodeModelsConfiguration(result, {
     reportInput: false,
   }).pipe(
     Effect.mapError(
@@ -136,7 +140,7 @@ export const queryNativeModelSelector = Effect.fnUntraced(function* (
   const response = yield* native
     .request({ type: "query_model_selector", query })
     .pipe(Effect.mapError(modelError));
-  const result = yield* Schema.decodeUnknownEffect(NeoPiModelSelectorResult)(response).pipe(
+  const result = yield* decodeModelSelector(response).pipe(
     Effect.mapError(
       () =>
         new NeoPiModelsError({
@@ -161,6 +165,7 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
     target: NeoPiModelsTarget,
   ) => Effect.Effect<NeoPiModelsConnection, NeoPiModelsError, Scope.Scope>,
 ) {
+  const random = yield* SecureRandom.SecureRandom;
   const lifetime = yield* Scope.make();
   const flows = new Map<string, AuthFlow>();
   const requireFlow = (flowId: string) =>
@@ -203,7 +208,7 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
               "This native connection cannot safely run cancellable login. Update NeoPi before logging in here.",
           });
         }
-        const flowId = NodeCrypto.randomUUID();
+        const flowId = yield* random.uuidV4();
         const state = yield* SubscriptionRef.make<NeoPiModelsAuthState>({
           flowId,
           status: "running",
@@ -379,32 +384,33 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
         );
       }),
     ).pipe(Stream.mapError(modelError));
-  const respondAuth = (input: typeof NeoPiModelsAuthRespond.Type) =>
-    Effect.gen(function* () {
-      const flow = yield* requireFlow(input.flowId);
-      yield* flow.connection.validate;
-      const current = yield* SubscriptionRef.get(flow.state);
-      if (current.status !== "running" || current.prompt?.id !== input.requestId)
-        return yield* new NeoPiModelsError({
-          message: "The native login prompt changed. Use its current prompt.",
-        });
-      const response =
-        current.prompt.kind === "input" && "value" in input && typeof input.value === "string"
-          ? { id: input.requestId, value: input.value }
-          : current.prompt.kind === "confirm" &&
-              "confirmed" in input &&
-              typeof input.confirmed === "boolean"
-            ? { id: input.requestId, confirmed: input.confirmed }
-            : null;
-      if (response === null)
-        return yield* new NeoPiModelsError({
-          message: "Answer this native login prompt using its requested input or confirmation.",
-        });
-      yield* flow.connection.respondUi(response).pipe(Effect.mapError(modelError));
-      yield* SubscriptionRef.update(flow.state, (state) =>
-        state.prompt?.id === input.requestId ? { ...state, prompt: null } : state,
-      );
-    });
+  const respondAuth = Effect.fn("NeoPiModels.respondAuth")(function* (
+    input: typeof NeoPiModelsAuthRespond.Type,
+  ) {
+    const flow = yield* requireFlow(input.flowId);
+    yield* flow.connection.validate;
+    const current = yield* SubscriptionRef.get(flow.state);
+    if (current.status !== "running" || current.prompt?.id !== input.requestId)
+      return yield* new NeoPiModelsError({
+        message: "The native login prompt changed. Use its current prompt.",
+      });
+    const response =
+      current.prompt.kind === "input" && "value" in input && typeof input.value === "string"
+        ? { id: input.requestId, value: input.value }
+        : current.prompt.kind === "confirm" &&
+            "confirmed" in input &&
+            typeof input.confirmed === "boolean"
+          ? { id: input.requestId, confirmed: input.confirmed }
+          : null;
+    if (response === null)
+      return yield* new NeoPiModelsError({
+        message: "Answer this native login prompt using its requested input or confirmation.",
+      });
+    yield* flow.connection.respondUi(response).pipe(Effect.mapError(modelError));
+    yield* SubscriptionRef.update(flow.state, (state) =>
+      state.prompt?.id === input.requestId ? { ...state, prompt: null } : state,
+    );
+  });
   const close = Effect.suspend(() =>
     Effect.forEach(
       [...flows],
@@ -426,8 +432,8 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
   ) => Effect.Effect<NeoPiModelsConnection, NeoPiNativeSessionsError | NeoPiModelsError>,
 ) {
   const instances = yield* ProviderInstanceRegistry;
-  const snapshots = yield* ProjectionSnapshotQuery;
-  const directory = yield* ProviderSessionDirectory;
+  const projects = yield* ProjectStore.ProjectStoreV2;
+  const readBinding = yield* makeNeoPiThreadBindingReader();
   const serverConfig = yield* ServerConfig;
   const connection = Effect.fnUntraced(function* (target: NeoPiModelsTarget) {
     if (target.sessionFile !== undefined) {
@@ -449,41 +455,46 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
     let projectId = target.projectId;
     let cwd = serverConfig.cwd;
     let expected: { sessionId: string; sessionFile: string } | undefined;
-    let hasThreadWorktree = false;
+    let validateBinding: Effect.Effect<void, NeoPiModelsError> = Effect.void;
     if (target.threadId) {
-      const binding = yield* directory.getBinding(target.threadId);
-      const thread = yield* snapshots.getThreadShellById(target.threadId);
-      if (
-        Option.isNone(binding) ||
-        Option.isNone(thread) ||
-        binding.value.status !== "running" ||
-        binding.value.providerInstanceId !== target.providerInstanceId
-      )
+      const binding = yield* readBinding(target.threadId);
+      if (!binding?.connected || binding.instance !== instance)
         return yield* new NeoPiModelsError({
           message:
             "The selected thread has no matching connected native session. Reopen Models from a connected thread or choose project configuration.",
         });
-      if (target.projectId && target.projectId !== thread.value.projectId)
+      if (target.projectId && target.projectId !== binding.thread.projectId)
         return yield* new NeoPiModelsError({
           message: "The selected thread's project changed. Reopen Models from that thread.",
         });
-      expected = yield* Schema.decodeUnknownEffect(Cursor)(binding.value.resumeCursor).pipe(
+      expected = binding.expected;
+      projectId = binding.thread.projectId;
+      cwd = binding.cwd;
+      validateBinding = binding.unchanged.pipe(
+        Effect.flatMap((unchanged) =>
+          unchanged
+            ? Effect.void
+            : Effect.fail(
+                new NeoPiModelsError({
+                  message: "The bound native identity changed. Reopen Models.",
+                }),
+              ),
+        ),
         Effect.mapError(modelError),
       );
-      projectId = thread.value.projectId;
-      if (thread.value.worktreePath) {
-        cwd = thread.value.worktreePath;
-        hasThreadWorktree = true;
-      }
     }
-    if (projectId && !hasThreadWorktree) {
-      const project = yield* snapshots.getProjectShellById(projectId);
+    if (projectId && !target.threadId) {
+      const project = yield* projects.get(projectId);
       if (Option.isNone(project))
         return yield* new NeoPiModelsError({ message: "The selected project no longer exists." });
       cwd = project.value.workspaceRoot;
     }
+    yield* validateBinding;
     const native = yield* source.modelsConnection(cwd, target.threadId, expected);
-    return native;
+    return {
+      ...native,
+      validate: validateBinding.pipe(Effect.andThen(native.validate), Effect.mapError(modelError)),
+    };
   }, Effect.mapError(modelError));
   const auth = yield* makeNativeModelsAuth(connection);
   const hub = yield* makeNeoPiModelsHub(connection, readNativeModelsConfiguration);
@@ -513,7 +524,7 @@ export const makeNeoPiModels = Effect.fn("makeNeoPiModels")(function* (
       Effect.gen(function* () {
         const native = yield* connection(input.target);
         yield* native.validate;
-        return yield* Schema.decodeUnknownEffect(NeoPiModelsAccounts)(
+        return yield* decodeModelsAccounts(
           yield* native.request({ type: "get_logout_accounts", providerId: input.providerId }),
         );
       }),

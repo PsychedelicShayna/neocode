@@ -2,143 +2,38 @@
 import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import {
-  CommandId,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  ApprovalRequestId,
-  MessageId,
-  ProviderDriverKind,
-  ProjectId,
-  ProviderInstanceId,
-  ThreadId,
-  type TurnId,
-} from "@t3tools/contracts";
+import { CheckpointId, ProviderInstanceId, ThreadId, type TurnId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as PlatformError from "effect/PlatformError";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
-import * as Schema from "effect/Schema";
-import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess } from "effect/process";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "./NeoPiSessionRuntime.ts";
-import type { NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
 import { readNeoPiSessionConfiguration } from "./NeoPiSessionConfiguration.ts";
-import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
-import { makeNeoPiDiscoveryHub } from "./NeoPiDiscovery.ts";
-import { makeOrchestrationIntegrationHarness } from "../../../integration/OrchestrationEngineHarness.integration.ts";
+import { makeNativeAdapterHarness } from "./NeoPiAdapterTestHarness.ts";
+import {
+  answer,
+  commandArguments,
+  defaultReady,
+  encodeCommand,
+  testPeer,
+  type Command,
+  type Emitter,
+} from "./NeoPiTestPeer.ts";
 
 const root = "/tmp/neopi-runtime-tests";
 const sessionDir = `${root}/neopi/sessions/default/test`;
 const sessionFile = `${sessionDir}/session.jsonl`;
-type Command = { id?: string; type: string; [key: string]: unknown };
-const decodeCommand = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
-const encodeCommand = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
-type Emitter = (frame: unknown) => Effect.Effect<void>;
-const defaultReady = {
-  type: "ready",
-  protocolVersion: 1,
-  supportedProtocolVersions: [1, 2],
-  capabilities: ["rpc-ui"],
-};
-const testPeer = Effect.fn("testPeer")(function* (
-  handler: (cmd: Command, emit: Emitter) => Effect.Effect<void>,
-  ready: unknown = defaultReady,
-  startup?: { stdout?: unknown; stderr?: unknown },
-  closeOnStdin: boolean = false,
-  /** The child ignores every kill and never reports an exit. */
-  stubborn: boolean = false,
-) {
-  const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const exited = yield* Deferred.make<string | null>();
-  const commands: Command[] = [];
-  const signals: string[] = [];
-  const emit: Emitter = (frame) =>
-    Queue.offer(stdout, new TextEncoder().encode(`${JSON.stringify(frame)}\n`)).pipe(Effect.asVoid);
-  const finish = (signal: string | null) =>
-    Effect.gen(function* () {
-      yield* Queue.end(stdout).pipe(Effect.ignore);
-      yield* Deferred.succeed(exited, signal).pipe(Effect.ignore);
-    });
-  if (!startup) yield* emit(ready);
-  yield* Effect.gen(function* () {
-    let pending = "";
-    while (true) {
-      pending += new TextDecoder().decode(yield* Queue.take(stdin));
-      let newline: number;
-      while ((newline = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        const command = decodeCommand(line) as Command;
-        commands.push(command);
-        yield* ready === defaultReady && command.type === "negotiate_protocol"
-          ? answer(command, emit, { protocolVersion: 2 })
-          : handler(command, emit);
-      }
-    }
-  }).pipe(Effect.ignore, Effect.forkScoped);
-  const handle = ChildProcessSpawner.makeHandle({
-    pid: ChildProcessSpawner.ProcessId(123),
-    exitCode: Deferred.await(exited).pipe(
-      Effect.flatMap((signal) =>
-        signal
-          ? Effect.fail(
-              PlatformError.systemError({
-                _tag: "Unknown",
-                module: "ChildProcess",
-                method: "exitCode",
-                cause: new Error(`Process interrupted due to receipt of signal: '${signal}'`),
-              }),
-            )
-          : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-      ),
-    ),
-    isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
-    kill: (options) =>
-      stubborn
-        ? Effect.sync(() => {
-            signals.push(options?.killSignal ?? "SIGTERM");
-          })
-        : Effect.gen(function* () {
-            signals.push(options?.killSignal ?? "SIGTERM");
-            if (options?.forceKillAfter) {
-              yield* Effect.sleep(options.forceKillAfter);
-              signals.push("SIGKILL");
-              yield* finish("SIGKILL");
-            } else yield* finish(options?.killSignal ?? "SIGTERM");
-          }),
-    stdin: Sink.forEach((chunk: Uint8Array) => Queue.offer(stdin, chunk)).pipe(
-      Sink.ensuring(closeOnStdin ? finish(null) : Effect.void),
-    ),
-    stdout: startup
-      ? startup.stdout === undefined
-        ? Stream.empty
-        : Stream.make(new TextEncoder().encode(`${encodeCommand(startup.stdout)}\n`))
-      : Stream.fromQueue(stdout),
-    stderr:
-      startup?.stderr === undefined
-        ? Stream.empty
-        : Stream.make(new TextEncoder().encode(`${encodeCommand(startup.stderr)}\n`)),
-    all: Stream.empty,
-    getInputFd: () => Sink.drain,
-    getOutputFd: () => Stream.empty,
-    unref: Effect.succeed(Effect.void),
-  });
-  return { handle, commands, emit, finish, signals };
-});
-const answer = (cmd: Command, emit: Emitter, data: unknown = {}) =>
-  emit({ type: "response", id: cmd.id, command: cmd.type, success: true, data });
 const basicHandler = (cmd: Command, emit: Emitter) =>
   cmd.type === "get_state"
     ? answer(cmd, emit, { sessionId: "s1", sessionFile, messageCount: 0 })
     : cmd.type === "get_entries"
       ? answer(cmd, emit, { entries: [], leafId: null })
-      : answer(cmd, emit);
+      : answer(cmd, emit, cmd.type === "prompt" ? { agentInvoked: true } : {});
 const make = (
   spawn: NeoPiRuntimeInput["spawn"],
   cursor?: { sessionId: string; sessionFile: string; sessionDir: string; v: 1; turnBoundaries: [] },
@@ -160,27 +55,29 @@ const make = (
     closeExitWaitMs: 100,
   });
 const turn = (id: string) => ({ turnId: id as TurnId, text: "hello", images: [] });
-const capture = (runtime: Effect.Success<ReturnType<typeof make>>) =>
-  Effect.gen(function* () {
-    const frames: Array<Record<string, unknown>> = [];
-    yield* Stream.runForEach(runtime.frames, (frame) =>
-      Effect.sync(() => {
-        frames.push(frame as Record<string, unknown>);
-      }),
-    ).pipe(Effect.forkScoped);
-    return frames;
+const capture = Effect.fn("NativeRuntimeTest.capture")(function* (
+  runtime: Effect.Success<ReturnType<typeof make>>,
+) {
+  const frames: Array<Record<string, unknown>> = [];
+  const outcomes: Array<Record<string, unknown>> = [];
+  const changed = yield* Effect.acquireRelease(Queue.unbounded<void>(), Queue.shutdown);
+  yield* Stream.runForEach(runtime.frames, (frame) =>
+    Effect.sync(() => {
+      frames.push(frame as Record<string, unknown>);
+      if (frame.type === "t3.turn.outcome") outcomes.push(frame as Record<string, unknown>);
+    }).pipe(Effect.andThen(Queue.offer(changed, undefined))),
+  ).pipe(Effect.forkScoped({ startImmediately: true }));
+  const waitFor = Effect.fn("NativeRuntimeTest.waitFor")(function* (
+    predicate: (frames: ReadonlyArray<Record<string, unknown>>) => boolean,
+  ) {
+    while (!predicate(frames)) yield* Queue.take(changed);
   });
-const awaitOutcomes = (frames: Array<Record<string, unknown>>, count: number) =>
-  Effect.gen(function* () {
-    for (let i = 0; i < 200; i++) {
-      const outcomes = frames.filter((frame) => frame.type === "t3.turn.outcome");
-      if (outcomes.length >= count) return outcomes;
-      yield* Effect.sleep("5 millis");
-    }
-    throw new Error(
-      `Expected ${count} outcomes, observed ${frames.filter((frame) => frame.type === "t3.turn.outcome").length}`,
-    );
+  const awaitOutcomes = Effect.fn("NativeRuntimeTest.awaitOutcomes")(function* (count: number) {
+    yield* waitFor(() => outcomes.length >= count);
+    return outcomes.slice();
   });
+  return { frames, waitFor, awaitOutcomes };
+});
 
 const attachedCursor = {
   v: 1 as const,
@@ -250,7 +147,7 @@ const attachFixture = Effect.fn("attachFixture")(function* (
   const launches: string[][] = [];
   const spawn: NeoPiRuntimeInput["spawn"] = (command) => {
     if (!ChildProcess.isStandardCommand(command)) return Effect.die("Expected standard command");
-    launches.push([...command.args]);
+    launches.push(commandArguments(command));
     if (command.args[0] === "sessions") return catalog.finish(null).pipe(Effect.as(catalog.handle));
     return Effect.succeed(command.args[0] === "ctl" ? pipe.handle : busy.handle);
   };
@@ -524,10 +421,10 @@ it.live("types TUI commands into the attached terminal's editor as a local turn"
     Effect.gen(function* () {
       const { runtime, pipe } = yield* attachFixture();
       yield* runtime.start;
-      const frames = yield* capture(runtime);
+      const { awaitOutcomes } = yield* capture(runtime);
       // Without command_catalog an unlisted command may be a TUI builtin.
       yield* runtime.startTurn({ ...turn("attached-tui"), text: "/personality Angel" });
-      const [outcome] = yield* awaitOutcomes(frames, 1);
+      const [outcome] = yield* awaitOutcomes(1);
       NodeAssert.equal(outcome?.state, "completed");
       NodeAssert.deepEqual(
         pipe.commands.filter((cmd) => cmd.type === "slash").map((cmd) => cmd.text),
@@ -561,16 +458,10 @@ it.live("answers correlated login confirmations through an attached runtime boun
       });
       yield* Deferred.await(prompted);
       yield* runtime.respondUi({ id: "trust-certificate", confirmed: true });
-      const forwarded = () =>
-        pipe.commands.some(
-          (cmd) =>
-            cmd.type === "extension_ui_response" &&
-            cmd.id === "trust-certificate" &&
-            cmd.confirmed === true,
-        );
-      for (let attempt = 0; attempt < 200 && !forwarded(); attempt++)
-        yield* Effect.sleep("5 millis");
-      NodeAssert.ok(forwarded(), "The login confirmation did not reach the owner");
+      const forwarded = yield* pipe.awaitCommand(
+        (cmd) => cmd.type === "extension_ui_response" && cmd.id === "trust-certificate",
+      );
+      NodeAssert.equal(forwarded.confirmed, true);
       const answered = yield* Effect.flip(
         runtime.respondUi({ id: "trust-certificate", confirmed: false }),
       );
@@ -753,47 +644,42 @@ it.live(
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const { spawn, pipe } = yield* attachFixture();
-        const threadId = ThreadId.make("attached-thread");
-        const instanceId = ProviderInstanceId.make("attached-neopi");
-        const adapter = yield* makeNeoPiAdapter({
-          settings: {
-            enabled: true,
-            binaryPath: "npi",
-            profile: "",
-            launchArgs: "",
-            customModels: [],
-          },
-          instanceId,
-          binary: "npi",
-          cwd: "/tmp",
-          t3Home: root,
-          attachmentsDir: root,
-          environment: {},
-          spawn,
-          discovery: yield* makeNeoPiDiscoveryHub(),
-          sharedSessionCapabilities: attachCapabilities,
-        });
-        yield* adapter.startSession({
-          threadId,
-          provider: ProviderDriverKind.make("neopi"),
-          providerInstanceId: instanceId,
-          cwd: "/tmp",
+        const { runtime, pipe } = yield* attachFixture();
+        const h = yield* makeNativeAdapterHarness(undefined, {
           runtimeMode: "approval-required",
-          resumeCursor: attachedCursor,
+          makeRuntime: () => Effect.succeed(runtime),
         });
-        const error = yield* Effect.flip(adapter.rollbackThread(threadId, 1));
-        NodeAssert.match(error.message, /attached.*owned by another process/);
-        const chatError = yield* Effect.flip(
-          adapter.sendTurn({
-            threadId,
-            input: "/chat raw",
-            interactionMode: "default",
-          }),
-        );
-        NodeAssert.match(chatError.message, /attached.*owned by another process/);
-        const compactError = yield* Effect.flip(adapter.compaction.start(threadId));
-        NodeAssert.match(compactError.message, /attached.*owned by another process/);
+        const seed = yield* Effect.scoped(h.open());
+        const { session, providerThread } = yield* h.open({
+          ...seed.providerThread,
+          nativeMetadata: { neopiResumeCursor: attachedCursor },
+        });
+        yield* session.readThreadSnapshot({ providerThread });
+        NodeAssert.ok(session.compactThread);
+        NodeAssert.ok(session.unloadThread);
+        const compaction = yield* session
+          .compactThread(h.turn(providerThread, "compact"))
+          .pipe(Effect.exit);
+        NodeAssert.ok(compaction._tag === "Failure");
+        NodeAssert.match(Cause.pretty(compaction.cause), /attached.*owned by another process/);
+        const rollback = yield* session
+          .rollbackThread({
+            providerThread,
+            providerThreadTurns: [],
+            target: {
+              type: "thread_start",
+              checkpointId: CheckpointId.make("attached"),
+              appRunOrdinal: 0,
+            },
+          })
+          .pipe(Effect.exit);
+        NodeAssert.ok(rollback._tag === "Failure");
+        NodeAssert.match(Cause.pretty(rollback.cause), /owned by another process/);
+        const chat = yield* session
+          .startTurn(h.turn(providerThread, "/chat raw"))
+          .pipe(Effect.exit);
+        NodeAssert.ok(chat._tag === "Failure");
+        NodeAssert.match(Cause.pretty(chat.cause), /attached.*owned by another process/);
         NodeAssert.equal(
           pipe.commands.some(
             (cmd) =>
@@ -804,7 +690,7 @@ it.live(
           ),
           false,
         );
-        yield* adapter.stopAll();
+        yield* session.unloadThread({ providerThread });
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -834,7 +720,7 @@ it.live("uses shared files only with both lease and fresh-session capabilities",
             Effect.sync(() => {
               if (!ChildProcess.isStandardCommand(command))
                 throw new Error("Expected a standard NeoPi command");
-              launches.push(command.args);
+              launches.push(commandArguments(command));
               return peer.handle;
             }),
           undefined,
@@ -997,10 +883,10 @@ it.live("holds a plan proposal until refine feedback continues a new T3 turn", (
         { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { frames, awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn({ ...turn("source"), text: "plan this" });
-      yield* awaitOutcomes(frames, 1);
+      yield* awaitOutcomes(1);
       NodeAssert.equal(
         peer.commands.some((cmd) => cmd.type === "plan_proposal_response"),
         false,
@@ -1012,7 +898,7 @@ it.live("holds a plan proposal until refine feedback continues a new T3 turn", (
         { decision: "refine", feedback: "Please simplify step two" },
         { ...turn("refine"), text: "Please simplify step two" },
       );
-      yield* awaitOutcomes(frames, 2);
+      yield* awaitOutcomes(2);
       NodeAssert.deepEqual(
         peer.commands
           .filter((cmd) => cmd.type === "plan_proposal_response")
@@ -1092,12 +978,12 @@ it.live("continues approved plan work in the implementation turn without a secon
         { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { frames, awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn(turn("plan"));
-      yield* awaitOutcomes(frames, 1);
+      yield* awaitOutcomes(1);
       yield* runtime.resolvePlanProposal({ decision: "approve" }, turn("implementation"));
-      yield* awaitOutcomes(frames, 2);
+      yield* awaitOutcomes(2);
       NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "prompt").length, 1);
       NodeAssert.ok(
         frames.some(
@@ -1145,10 +1031,10 @@ it.live("does not admit an implementation after its proposal cancels during boun
         { ...defaultReady, capabilities: ["rpc-ui", "set_mode", "plan_proposal_cancel"] },
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { waitFor, awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn(turn("plan"));
-      yield* awaitOutcomes(frames, 1);
+      yield* awaitOutcomes(1);
       admit = true;
       const admission = yield* runtime
         .resolvePlanProposal({ decision: "approve" }, turn("implementation"))
@@ -1156,13 +1042,7 @@ it.live("does not admit an implementation after its proposal cancels during boun
       yield* Deferred.await(entered);
       yield* peer.emit({ type: "plan_proposal_cancel", id: "plan", reason: "abort" });
       yield* peer.emit({ type: "agent_end", isTerminal: true });
-      for (
-        let attempt = 0;
-        attempt < 100 && !frames.some((frame) => frame.type === "t3.plan.proposal.closed");
-        attempt++
-      )
-        yield* Effect.sleep("5 millis");
-      NodeAssert.ok(frames.some((frame) => frame.type === "t3.plan.proposal.closed"));
+      yield* waitFor((frames) => frames.some((frame) => frame.type === "t3.plan.proposal.closed"));
       yield* Deferred.succeed(release, undefined);
       NodeAssert.equal((yield* Effect.flip(Fiber.join(admission))).code, "not_ready");
       NodeAssert.equal(
@@ -1213,12 +1093,15 @@ it.live("fails a provisional implementation when the peer rejects its late propo
         { ...defaultReady, capabilities: ["rpc-ui", "set_mode", "plan_proposal_cancel"] },
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn(turn("plan"));
-      yield* awaitOutcomes(frames, 1);
-      yield* runtime.resolvePlanProposal({ decision: "approve" }, turn("implementation"));
-      const outcomes = yield* awaitOutcomes(frames, 2);
+      yield* awaitOutcomes(1);
+      const rejected = yield* runtime
+        .resolvePlanProposal({ decision: "approve" }, turn("implementation"))
+        .pipe(Effect.flip);
+      NodeAssert.match(rejected.message, /proposal was cancelled/);
+      const outcomes = yield* awaitOutcomes(2);
       NodeAssert.deepEqual(
         outcomes.map((frame) => ({ turnId: frame.turnId, state: frame.state })),
         [
@@ -1399,21 +1282,17 @@ it.live("uses plan cancellation frames only on peers that advertise them", () =>
           },
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { frames, waitFor, awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         yield* runtime.startTurn(turn("plan"));
-        yield* awaitOutcomes(frames, 1);
+        yield* awaitOutcomes(1);
         yield* peer.emit({ type: "plan_proposal_cancel", id: "wrong", reason: "abort" });
         yield* peer.emit({ type: "agent_end", isTerminal: true });
         yield* peer.emit({ type: "mode_changed", mode: "default" });
         yield* peer.emit({ type: "plan_proposal_cancel", id: "proposal", reason: "abort" });
-        for (
-          let attempt = 0;
-          attempt < 100 &&
-          frames.filter((frame) => frame.type === "plan_proposal_cancel").length < 2;
-          attempt++
-        )
-          yield* Effect.sleep("5 millis");
+        yield* waitFor(
+          (frames) => frames.filter((frame) => frame.type === "plan_proposal_cancel").length === 2,
+        );
         NodeAssert.equal(
           frames.filter((frame) => frame.type === "t3.plan.proposal.closed").length,
           1,
@@ -1436,14 +1315,18 @@ it.live("uses plan cancellation frames only on peers that advertise them", () =>
 it.live("takes advertised prompt entry ids rather than inferred ancestry", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      for (const advertised of [false, true]) {
+      for (const { advertised, paged } of [
+        { advertised: false, paged: false },
+        { advertised: true, paged: false },
+        { advertised: true, paged: true },
+      ]) {
         let prompted = false;
         const peer = yield* testPeer(
           (cmd, emit) =>
             Effect.gen(function* () {
               if (cmd.type === "negotiate_protocol")
                 return yield* answer(cmd, emit, { protocolVersion: 2 });
-              if (cmd.type === "get_entries")
+              if (cmd.type === "get_entries" || cmd.type === "get_entries_page")
                 return yield* answer(
                   cmd,
                   emit,
@@ -1478,22 +1361,26 @@ it.live("takes advertised prompt entry ids rather than inferred ancestry", () =>
             }),
           {
             ...defaultReady,
-            capabilities: ["rpc-ui", ...(advertised ? ["prompt_entry_ids"] : [])],
+            capabilities: [
+              "rpc-ui",
+              ...(advertised ? ["prompt_entry_ids"] : []),
+              ...(paged ? ["session_journal"] : []),
+            ],
           },
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         yield* SubscriptionRef.update(runtime.cursor, (cursor) => ({
           ...cursor,
           historyLeafId: "imported-leaf",
         }));
         yield* runtime.startTurn(turn("prompt"));
-        yield* awaitOutcomes(frames, 1);
+        yield* awaitOutcomes(1);
         NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
           { turnId: "prompt", userEntryId: advertised ? "native-user" : "extension-user" },
         ]);
-        NodeAssert.equal((yield* SubscriptionRef.get(runtime.cursor)).historyLeafId, undefined);
+        NodeAssert.equal((yield* SubscriptionRef.get(runtime.cursor)).historyLeafId, "native-user");
         yield* runtime.stop;
       }
     }),
@@ -1634,10 +1521,10 @@ it.live("distinguishes persisted local entries from reserved and absent prompt i
           { ...defaultReady, capabilities: ["rpc-ui", "prompt_entry_ids"] },
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         yield* runtime.startTurn(turn("local"));
-        yield* awaitOutcomes(frames, 1);
+        yield* awaitOutcomes(1);
         NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
           { turnId: "local", ...scenario.boundary },
         ]);
@@ -1681,16 +1568,14 @@ it.live("opts into host tool approvals before prompting only when the peer adver
           },
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { frames, waitFor } = yield* capture(runtime);
         yield* runtime.start;
         yield* runtime.startTurn(turn("approval"));
-        if (supported)
-          for (
-            let i = 0;
-            i < 100 && !frames.some((frame) => frame.type === "tool_approval_request");
-            i++
-          )
-            yield* Effect.sleep("5 millis");
+        if (supported) {
+          yield* waitFor((frames) =>
+            frames.some((frame) => frame.type === "tool_approval_request"),
+          );
+        }
         NodeAssert.equal(handlerSelected, supported);
         NodeAssert.equal(
           frames.some((frame) => frame.type === "tool_approval_request"),
@@ -1770,10 +1655,10 @@ it.live("interrupting a pending plan proposal refuses it without approval", () =
         { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn({ ...turn("source"), text: "plan this" });
-      yield* awaitOutcomes(frames, 1);
+      yield* awaitOutcomes(1);
       yield* runtime.interrupt;
       NodeAssert.deepEqual(
         peer.commands
@@ -1827,6 +1712,69 @@ it.live("rejects auto-resumed fresh sessions and mismatched resume ids, closing 
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
+it.live("waits for the correlated prompt acknowledgment even after agent start", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const promptSeen = yield* Deferred.make<void>();
+      const releaseAck = yield* Deferred.make<void>();
+      const accepted = yield* Deferred.make<void>();
+      let received = false;
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_state")
+              return yield* answer(cmd, emit, {
+                sessionId: "s1",
+                sessionFile,
+                messageCount: received ? 1 : 0,
+              });
+            if (cmd.type === "get_entries")
+              return yield* answer(cmd, emit, {
+                entries: received
+                  ? [
+                      {
+                        id: "accepted-user",
+                        parentId: null,
+                        type: "message",
+                        message: { role: "user", content: [{ type: "text", text: "hello" }] },
+                      },
+                    ]
+                  : [],
+                leafId: received ? "accepted-user" : null,
+              });
+            if (cmd.type !== "prompt") return yield* answer(cmd, emit);
+            received = true;
+            yield* emit({ type: "agent_start" });
+            yield* Deferred.succeed(promptSeen, undefined);
+            yield* Deferred.await(releaseAck);
+            yield* answer(cmd, emit, { agentInvoked: true, userEntryId: "accepted-user" });
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "prompt_entry_ids"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      yield* runtime.start;
+      const sending = yield* runtime.startTurn(turn("accepted")).pipe(
+        Effect.tap(() => Deferred.succeed(accepted, undefined)),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(promptSeen);
+      NodeAssert.equal(yield* Deferred.isDone(accepted), false);
+      yield* Deferred.succeed(releaseAck, undefined);
+      yield* Fiber.join(sending);
+      NodeAssert.equal(yield* Deferred.isDone(accepted), true);
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+        {
+          turnId: "accepted",
+          userEntryId: "accepted-user",
+        },
+      ]);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live(
   "settles late rejection, local response, local prompt_result and terminal agent_end exactly once",
   () =>
@@ -1859,11 +1807,13 @@ it.live(
           }),
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { frames, awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         for (const [i, text] of ["reject", "data-local", "event-local", "agent"].entries()) {
-          yield* runtime.startTurn({ ...turn(`turn-${i}`), text });
-          const outcomes = yield* awaitOutcomes(frames, i + 1);
+          const sending = runtime.startTurn({ ...turn(`turn-${i}`), text });
+          if (i === 0) NodeAssert.match((yield* Effect.flip(sending)).message, /denied/);
+          else yield* sending;
+          const outcomes = yield* awaitOutcomes(i + 1);
           NodeAssert.equal(outcomes[i]?.state, i === 0 ? "failed" : "completed");
           NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
         }
@@ -1925,7 +1875,7 @@ it.live(
           }),
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         NodeAssert.equal(
           (yield* runtime.steer(turn("unused")).pipe(Effect.flip)).code,
@@ -1938,11 +1888,11 @@ it.live(
           "not_ready",
         );
         yield* peer.emit({ type: "agent_end", isTerminal: true });
-        yield* awaitOutcomes(frames, 1);
+        yield* awaitOutcomes(1);
         yield* runtime.startTurn(turn("t2"));
         yield* runtime.interrupt;
         yield* peer.emit({ type: "agent_end", isTerminal: true });
-        const outcomes = yield* awaitOutcomes(frames, 2);
+        const outcomes = yield* awaitOutcomes(2);
         NodeAssert.deepEqual(
           outcomes.map((event) => [event.turnId, event.state]),
           [
@@ -1974,7 +1924,7 @@ it.live("restarts with the verified cursor and updated approval mode", () =>
         Effect.sync(() => {
           NodeAssert.equal(cmd._tag, "StandardCommand");
           if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
-          args.push([...cmd.args]);
+          args.push(commandArguments(cmd));
           return peers[index++]!.handle;
         }),
       );
@@ -1998,7 +1948,7 @@ it.live(
             : basicHandler(cmd, emit),
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
-        const frames = yield* capture(runtime);
+        const { frames, awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         yield* runtime.startTurn(turn("exit-turn"));
         yield* peer.emit({
@@ -2008,7 +1958,7 @@ it.live(
           title: "Approve",
         });
         yield* peer.finish("SIGKILL");
-        const outcomes = yield* awaitOutcomes(frames, 1);
+        const outcomes = yield* awaitOutcomes(1);
         NodeAssert.equal(outcomes[0]?.state, "failed");
         NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
         NodeAssert.ok(
@@ -2020,101 +1970,24 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
-it.live("removes a dead adapter session after mock peer exit and resumes on the next send", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const threadId = ThreadId.make("thread-test");
-      const instanceId = ProviderInstanceId.make("neopi-exit-test");
-      const adapterHandler = (cmd: Command, emit: Emitter) =>
-        cmd.type === "get_state"
-          ? answer(cmd, emit, {
-              sessionId: "s1",
-              sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
-              messageCount: 0,
-            })
-          : cmd.type === "prompt"
-            ? answer(cmd, emit, { agentInvoked: true })
-            : basicHandler(cmd, emit);
-      const peers = [yield* testPeer(adapterHandler), yield* testPeer(adapterHandler)];
-      let launches = 0;
-      const adapter = yield* makeNeoPiAdapter({
-        settings: {
-          enabled: true,
-          binaryPath: "npi",
-          profile: "",
-          launchArgs: "",
-          customModels: [],
-        },
-        instanceId,
-        binary: "npi",
-        cwd: "/tmp",
-        t3Home: root,
-        attachmentsDir: root,
-        environment: {},
-        spawn: () => Effect.succeed(peers[launches++]!.handle),
-        discovery: yield* makeNeoPiDiscoveryHub(),
-      });
-      const events: Array<{ type: string; payload: unknown }> = [];
-      yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        Effect.sync(() => {
-          events.push(event);
-        }),
-      ).pipe(Effect.forkScoped);
-      const sessionInput = {
-        threadId,
-        provider: ProviderDriverKind.make("neopi"),
-        providerInstanceId: instanceId,
-        cwd: "/tmp",
-        runtimeMode: "approval-required" as const,
-      };
-      const first = yield* adapter.startSession(sessionInput);
-      yield* adapter.sendTurn({ threadId, input: "before exit" });
-      yield* peers[0]!.finish("SIGKILL");
-      for (
-        let attempt = 0;
-        attempt < 200 &&
-        !(
-          events.some((event) => event.type === "session.exited") &&
-          !(yield* adapter.hasSession(threadId))
-        );
-        attempt++
-      )
-        yield* Effect.sleep("5 millis");
-      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
-      NodeAssert.ok(
-        events.some(
-          (event) =>
-            event.type === "session.exited" &&
-            (event.payload as { recoverable?: boolean; exitKind?: string }).recoverable === true &&
-            (event.payload as { exitKind?: string }).exitKind === "error",
-        ),
-      );
-      const resumed = yield* adapter.startSession({
-        ...sessionInput,
-        resumeCursor: first.resumeCursor,
-      });
-      NodeAssert.equal(resumed.status, "ready");
-      yield* adapter.sendTurn({ threadId, input: "after exit" });
-      NodeAssert.equal(launches, 2);
-      yield* adapter.stopAll();
-      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
-    }),
-  ).pipe(Effect.provide(NodeServices.layer)),
-);
 
 it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGTERM", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const peer = yield* testPeer(basicHandler);
       const signals: AbortSignal[] = [];
+      const started = yield* Deferred.make<void>();
       const runtime = yield* make(() => Effect.succeed(peer.handle), undefined, {
         definitions: [{ name: "preview", description: "preview", parameters: {} }],
         handle: (_call, signal) =>
           Effect.sync(() => {
             signals.push(signal);
-          }).pipe(Effect.andThen(Effect.never)),
+          }).pipe(
+            Effect.andThen(Deferred.succeed(started, undefined)),
+            Effect.andThen(Effect.never),
+          ),
       });
-      const frames = yield* capture(runtime);
+      const { frames, waitFor } = yield* capture(runtime);
       yield* runtime.start;
       yield* peer.emit({
         type: "extension_ui_request",
@@ -2129,13 +2002,8 @@ it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGT
         toolName: "preview",
         arguments: {},
       });
-      for (
-        let i = 0;
-        i < 100 && (signals.length === 0 || !frames.some((frame) => frame.id === "select-pending"));
-        i++
-      )
-        yield* Effect.sleep("5 millis");
-      NodeAssert.equal(signals.length, 1);
+      yield* Deferred.await(started);
+      yield* waitFor((frames) => frames.some((frame) => frame.id === "select-pending"));
       yield* runtime.stop;
       NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "stopped");
       NodeAssert.ok(peer.signals.includes("SIGKILL"));
@@ -2156,8 +2024,7 @@ it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGT
             cmd.cancelled === true,
         ),
       );
-      for (let i = 0; i < 100 && !frames.some((frame) => frame.type === "t3.session.exited"); i++)
-        yield* Effect.sleep("5 millis");
+      yield* waitFor((frames) => frames.some((frame) => frame.type === "t3.session.exited"));
       NodeAssert.ok(
         frames.some(
           (frame) =>
@@ -2203,11 +2070,11 @@ it.live(
           Effect.sync(() => {
             NodeAssert.equal(cmd._tag, "StandardCommand");
             if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
-            args.push([...cmd.args]);
+            args.push(commandArguments(cmd));
             return peers[index++]!.handle;
           }),
         );
-        const frames = yield* capture(runtime);
+        const { awaitOutcomes } = yield* capture(runtime);
         yield* runtime.start;
         yield* runtime.startTurn(turn("first"));
         const deferred = yield* runtime.setRuntimeMode("full-access").pipe(Effect.flip);
@@ -2222,7 +2089,7 @@ it.live(
           },
         });
         yield* peers[0]!.emit({ type: "agent_end", isTerminal: true });
-        NodeAssert.equal((yield* awaitOutcomes(frames, 1))[0]?.state, "failed");
+        NodeAssert.equal((yield* awaitOutcomes(1))[0]?.state, "failed");
         yield* runtime.startTurn(turn("second"));
         NodeAssert.equal(args.length, 2);
         NodeAssert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
@@ -2231,7 +2098,7 @@ it.live(
           assistantMessageEvent: { type: "error", reason: "aborted", error: {} },
         });
         yield* peers[1]!.emit({ type: "agent_end", isTerminal: true });
-        NodeAssert.equal((yield* awaitOutcomes(frames, 2))[1]?.state, "interrupted");
+        NodeAssert.equal((yield* awaitOutcomes(2))[1]?.state, "interrupted");
         yield* runtime.stop;
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
@@ -2248,7 +2115,7 @@ it.live("treats recovered nonterminal errors as a successful original turn", () 
           : basicHandler(cmd, emit),
       );
       const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
+      const { awaitOutcomes } = yield* capture(runtime);
       yield* runtime.start;
       yield* runtime.startTurn(turn("retry-success"));
       yield* peer.emit({
@@ -2267,7 +2134,7 @@ it.live("treats recovered nonterminal errors as a successful original turn", () 
         isTerminal: true,
         messages: [{ role: "assistant", stopReason: "stop" }],
       });
-      const outcomes = yield* awaitOutcomes(frames, 1);
+      const outcomes = yield* awaitOutcomes(1);
       NodeAssert.equal(outcomes[0]?.state, "completed");
       NodeAssert.equal(outcomes[0]?.errorMessage, undefined);
       yield* runtime.stop;
@@ -2275,7 +2142,7 @@ it.live("treats recovered nonterminal errors as a successful original turn", () 
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("answers first-session startup UI through ProviderService before v2 negotiation", () =>
+it.live("answers first-session startup UI before v2 negotiation", () =>
   Effect.scoped(
     Effect.gen(function* () {
       let negotiateId: string | undefined;
@@ -2298,7 +2165,7 @@ it.live("answers first-session startup UI through ProviderService before v2 nego
           if (cmd.type === "get_state")
             return answer(cmd, emit, {
               sessionId: "s1",
-              sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
+              sessionFile,
               messageCount: 0,
             });
           return answer(cmd, emit);
@@ -2310,307 +2177,23 @@ it.live("answers first-session startup UI through ProviderService before v2 nego
           capabilities: ["rpc-ui"],
         },
       );
-      const threadId = ThreadId.make("thread-test");
-      const adapter = yield* makeNeoPiAdapter({
-        settings: {
-          enabled: true,
-          binaryPath: "npi",
-          profile: "",
-          launchArgs: "",
-          customModels: [],
-        },
-        instanceId: ProviderInstanceId.make("neopi"),
-        binary: "npi",
-        cwd: "/tmp",
-        t3Home: root,
-        attachmentsDir: root,
-        environment: {},
-        spawn: () => Effect.succeed(peer.handle),
-        discovery: yield* makeNeoPiDiscoveryHub(),
-      });
-      const provider = ProviderDriverKind.make("neopi");
-      const instanceId = ProviderInstanceId.make("neopi");
-      const projectId = ProjectId.make("neopi-startup-test-project");
-      const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
-      yield* Effect.addFinalizer(() => harness.dispose);
-      const createdAt = "2026-09-27T00:00:00.000Z";
-      yield* harness.engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("neopi-startup-project-create"),
-        projectId,
-        title: "NeoPi startup",
-        workspaceRoot: harness.workspaceDir,
-        defaultModelSelection: { instanceId, model: "neopi-current" },
-        createdAt,
-      });
-      yield* harness.engine.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make("neopi-startup-thread-create"),
-        threadId,
-        projectId,
-        title: "Startup UI",
-        modelSelection: { instanceId, model: "neopi-current" },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        branch: null,
-        worktreePath: harness.workspaceDir,
-        createdAt,
-      });
-      yield* Stream.runForEach(harness.providerService.streamEvents, (event) =>
-        event.type === "user-input.requested"
-          ? harness.providerService.respondToUserInput({
-              threadId,
-              requestId: ApprovalRequestId.make(event.requestId!),
-              answers: { "startup-input": "true" },
-            })
-          : Effect.void,
-      ).pipe(Effect.forkScoped);
-      const session = yield* harness.providerService
-        .startSession(threadId, {
-          threadId,
-          provider,
-          providerInstanceId: instanceId,
-          cwd: harness.workspaceDir,
-          runtimeMode: "approval-required",
-        })
-        .pipe(Effect.timeout("5 seconds"));
-      NodeAssert.ok(session.status === "ready" || session.status === "connecting");
-      for (
-        let attempt = 0;
-        attempt < 200 &&
-        !(yield* adapter.listSessions()).some(
-          (current) => current.threadId === threadId && current.status === "ready",
-        );
-        attempt++
-      )
-        yield* Effect.sleep("5 millis");
-      NodeAssert.equal(
-        (yield* adapter.listSessions()).find((current) => current.threadId === threadId)?.status,
-        "ready",
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const { waitFor } = yield* capture(runtime);
+      const starting = yield* runtime.start.pipe(Effect.forkScoped);
+      yield* waitFor((frames) =>
+        frames.some(
+          (frame) => frame.type === "extension_ui_request" && frame.id === "startup-input",
+        ),
       );
-      NodeAssert.ok(
+      yield* runtime.respondUi({ id: "startup-input", confirmed: true });
+      yield* Fiber.join(starting);
+      NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
+      NodeAssert.equal(
         peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.confirmed === true),
+        true,
       );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
-);
-
-it.live(
-  "answers first-turn startup dialogs and reports later startup failures through the command reactor",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        for (const kind of ["user-input", "approval", "session-in-use"] as const) {
-          const id = `startup-${kind}`;
-          const threadId = ThreadId.make(`startup-reactor-${kind}`);
-          const sessionFile = `${root}/neopi/sessions/default/${threadId}/session.jsonl`;
-          let startupAnswered = false;
-          let stateRequest: Command | undefined;
-          const peer = yield* testPeer((cmd, emit) => {
-            if (cmd.type === "get_state" && !startupAnswered) {
-              stateRequest = cmd;
-              return emit(
-                kind !== "approval"
-                  ? {
-                      type: "extension_ui_request",
-                      id,
-                      method: "confirm",
-                      title: "Startup check",
-                      message: "Continue startup?",
-                    }
-                  : {
-                      type: "extension_ui_request",
-                      id,
-                      method: "select",
-                      title: "Allow tool: bash\nCommand: echo ready",
-                      options: ["Approve", "Deny"],
-                    },
-              );
-            }
-            if (cmd.type === "extension_ui_response" && stateRequest) {
-              startupAnswered = true;
-              return kind === "session-in-use"
-                ? emit({
-                    type: "response",
-                    id: stateRequest.id,
-                    command: "get_state",
-                    success: false,
-                    code: "session_in_use",
-                    error: "session_in_use: session already owned by PID 42",
-                  })
-                : answer(stateRequest, emit, {
-                    sessionId: "s1",
-                    sessionFile,
-                    messageCount: 0,
-                  });
-            }
-            if (cmd.type === "get_state")
-              return answer(cmd, emit, { sessionId: "s1", sessionFile, messageCount: 0 });
-            if (cmd.type === "prompt")
-              return answer(cmd, emit, { agentInvoked: true }).pipe(
-                Effect.andThen(emit({ type: "agent_start" })),
-                Effect.andThen(emit({ type: "agent_end", isTerminal: true })),
-              );
-            return answer(cmd, emit);
-          });
-          const provider = ProviderDriverKind.make("neopi");
-          const instanceId = ProviderInstanceId.make("neopi");
-          const projectId = ProjectId.make(`startup-reactor-project-${kind}`);
-          let launches = 0;
-          const adapter = yield* makeNeoPiAdapter({
-            settings: {
-              enabled: true,
-              binaryPath: "npi",
-              profile: "",
-              launchArgs: "",
-              customModels: [],
-            },
-            instanceId,
-            binary: "npi",
-            cwd: "/tmp",
-            t3Home: root,
-            attachmentsDir: root,
-            environment: {},
-            spawn: () =>
-              Effect.sync(() => {
-                launches++;
-                return peer.handle;
-              }),
-            discovery: yield* makeNeoPiDiscoveryHub(),
-          });
-          const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
-          yield* Effect.addFinalizer(() => harness.dispose);
-          const createdAt = "2026-09-27T00:00:00.000Z";
-          yield* harness.engine.dispatch({
-            type: "project.create",
-            commandId: CommandId.make(`startup-reactor-project-create-${kind}`),
-            projectId,
-            title: "NeoPi startup",
-            workspaceRoot: harness.workspaceDir,
-            defaultModelSelection: { instanceId, model: "neopi-current" },
-            createdAt,
-          });
-          yield* harness.engine.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(`startup-reactor-thread-create-${kind}`),
-            threadId,
-            projectId,
-            title: "Startup UI",
-            modelSelection: { instanceId, model: "neopi-current" },
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            runtimeMode: "approval-required",
-            branch: null,
-            worktreePath: harness.workspaceDir,
-            createdAt,
-          });
-          const opened = yield* Deferred.make<string>();
-          yield* Stream.runForEach(harness.providerService.streamEvents, (event) =>
-            event.requestId === id &&
-            event.type === (kind === "approval" ? "request.opened" : "user-input.requested")
-              ? Deferred.succeed(opened, event.requestId).pipe(Effect.asVoid)
-              : Effect.void,
-          ).pipe(Effect.forkScoped);
-          yield* harness.engine.dispatch({
-            type: "thread.turn.start",
-            commandId: CommandId.make(`startup-reactor-turn-${kind}`),
-            threadId,
-            message: {
-              messageId: MessageId.make(`startup-reactor-message-${kind}`),
-              role: "user",
-              text: "Run after startup",
-              attachments: [],
-            },
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            runtimeMode: "approval-required",
-            createdAt,
-          });
-          NodeAssert.equal(yield* Deferred.await(opened).pipe(Effect.timeout("5 seconds")), id);
-          yield* harness.engine.dispatch(
-            kind !== "approval"
-              ? {
-                  type: "thread.user-input.respond",
-                  commandId: CommandId.make(`startup-reactor-response-${kind}`),
-                  threadId,
-                  requestId: ApprovalRequestId.make(id),
-                  answers: { [id]: "true" },
-                  createdAt,
-                }
-              : {
-                  type: "thread.approval.respond",
-                  commandId: CommandId.make(`startup-reactor-response-${kind}`),
-                  threadId,
-                  requestId: ApprovalRequestId.make(id),
-                  decision: "accept",
-                  createdAt,
-                },
-          );
-          for (
-            let attempt = 0;
-            attempt < 200 &&
-            !peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.id === id);
-            attempt++
-          )
-            yield* Effect.sleep("5 millis");
-          NodeAssert.ok(
-            peer.commands.some(
-              (cmd) =>
-                cmd.type === "extension_ui_response" &&
-                cmd.id === id &&
-                (kind === "approval" ? cmd.value === "Approve" : cmd.confirmed === true),
-            ),
-            `The ${kind} answer did not reach the startup peer`,
-          );
-          if (kind === "session-in-use") {
-            const failed = yield* harness.waitForThread(
-              threadId,
-              (thread) =>
-                thread.activities.some(
-                  (activity) => activity.kind === "provider.turn.start.failed",
-                ),
-              5_000,
-            );
-            const failure = failed.activities.find(
-              (activity) => activity.kind === "provider.turn.start.failed",
-            );
-            NodeAssert.match(
-              String((failure?.payload as { detail?: string } | undefined)?.detail),
-              /session_in_use/,
-            );
-            NodeAssert.equal(launches, 1, "Startup failure must not trigger session recovery");
-            NodeAssert.equal(
-              peer.commands.some((cmd) => cmd.type === "prompt"),
-              false,
-            );
-            continue;
-          }
-          for (
-            let attempt = 0;
-            attempt < 200 && !peer.commands.some((cmd) => cmd.type === "prompt");
-            attempt++
-          )
-            yield* Effect.sleep("5 millis");
-          NodeAssert.ok(peer.commands.some((cmd) => cmd.type === "prompt"));
-          const completed = yield* harness.waitForThread(
-            threadId,
-            (thread) =>
-              thread.session?.status === "ready" &&
-              thread.activities.some(
-                (activity) =>
-                  activity.kind ===
-                  (kind === "user-input" ? "user-input.resolved" : "approval.resolved"),
-              ),
-          );
-          NodeAssert.equal(
-            completed.activities.some(
-              (activity) =>
-                activity.kind === "provider.user-input.respond.failed" ||
-                activity.kind === "provider.approval.respond.failed",
-            ),
-            false,
-          );
-        }
-      }),
-    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("installs host tools without credential frames and suppresses cancelled results", () =>
@@ -2618,6 +2201,8 @@ it.live("installs host tools without credential frames and suppresses cancelled 
     Effect.gen(function* () {
       const peer = yield* testPeer(basicHandler);
       const signals: AbortSignal[] = [];
+      const started = yield* Deferred.make<void>();
+      const cancelled = yield* Deferred.make<void>();
       const runtime = yield* make(() => Effect.succeed(peer.handle), undefined, {
         definitions: [
           {
@@ -2630,7 +2215,11 @@ it.live("installs host tools without credential frames and suppresses cancelled 
         handle: (_call, signal) =>
           Effect.sync(() => {
             signals.push(signal);
-          }).pipe(Effect.andThen(Effect.never)),
+          }).pipe(
+            Effect.andThen(Deferred.succeed(started, undefined)),
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(cancelled, undefined)),
+          ),
       });
       yield* runtime.start;
       NodeAssert.deepEqual(
@@ -2652,16 +2241,14 @@ it.live("installs host tools without credential frames and suppresses cancelled 
         toolName: "list_thread_pull_requests",
         arguments: {},
       });
-      for (let count = 0; count < 100 && signals.length === 0; count++)
-        yield* Effect.sleep("5 millis");
+      yield* Deferred.await(started);
       NodeAssert.equal(signals.length, 1);
       yield* peer.emit({
         type: "host_tool_cancel",
         id: "cancel-frame",
         targetId: "host-cancelled",
       });
-      for (let count = 0; count < 100 && signals[0]?.aborted !== true; count++)
-        yield* Effect.sleep("5 millis");
+      yield* Deferred.await(cancelled);
       NodeAssert.equal(signals[0]?.aborted, true);
       NodeAssert.equal(
         peer.commands.some((cmd) => cmd.type === "host_tool_result" && cmd.id === "host-cancelled"),
@@ -2685,127 +2272,13 @@ it.live("answers unexpected host calls with an explicit error when no bridge is 
         toolName: "unknown_host_tool",
         arguments: {},
       });
-      for (
-        let count = 0;
-        count < 100 && !peer.commands.some((cmd) => cmd.type === "host_tool_result");
-        count++
-      )
-        yield* Effect.sleep("5 millis");
-      const result = peer.commands.find((cmd) => cmd.type === "host_tool_result");
+      const result = yield* peer.awaitCommand((cmd) => cmd.type === "host_tool_result");
       NodeAssert.equal(result?.id, "unsupported-call");
       NodeAssert.equal(result?.isError, true);
       NodeAssert.match(encodeCommand(result), /Unsupported host tool/);
       yield* runtime.stop;
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
-);
-
-it.live(
-  "routes capability-gated chat changes to RPC and exposes mode through adapter activities",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        let mode: "off" | "chat" | "erp" | "raw" = "off";
-        const peer = yield* testPeer(
-          (cmd, emit) => {
-            if (cmd.type === "get_entries") return answer(cmd, emit, { entries: [], leafId: null });
-            if (cmd.type === "get_messages_page") return answer(cmd, emit, { messages: [] });
-            if (cmd.type === "negotiate_protocol") return answer(cmd, emit, { protocolVersion: 2 });
-            if (cmd.type === "get_state")
-              return answer(cmd, emit, {
-                sessionId: "s1",
-                sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
-                messageCount: 0,
-                chatMode: mode,
-              });
-            if (cmd.type === "set_chat_mode") {
-              if (
-                cmd.mode === "off" ||
-                cmd.mode === "chat" ||
-                cmd.mode === "erp" ||
-                cmd.mode === "raw"
-              )
-                mode = cmd.mode;
-              return answer(cmd, emit, { mode }).pipe(
-                Effect.andThen(emit({ type: "chat_mode_changed", mode })),
-              );
-            }
-            return answer(cmd, emit);
-          },
-          {
-            type: "ready",
-            protocolVersion: 1,
-            supportedProtocolVersions: [2],
-            capabilities: ["rpc-ui", "set_chat_mode"],
-          },
-        );
-        const threadId = ThreadId.make("thread-test");
-        const adapter = yield* makeNeoPiAdapter({
-          settings: {
-            enabled: true,
-            binaryPath: "npi",
-            profile: "",
-            launchArgs: "",
-            customModels: [],
-          },
-          instanceId: ProviderInstanceId.make("neopi-chat-test"),
-          binary: "npi",
-          cwd: "/tmp",
-          t3Home: root,
-          attachmentsDir: root,
-          environment: {},
-          spawn: () => Effect.succeed(peer.handle),
-          discovery: yield* makeNeoPiDiscoveryHub(),
-        });
-        const warnings: unknown[] = [];
-        yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          Effect.sync(() => {
-            if (event.type === "runtime.warning") warnings.push(event.payload.detail);
-          }),
-        ).pipe(Effect.forkScoped);
-        yield* adapter.startSession({
-          threadId,
-          provider: ProviderDriverKind.make("neopi"),
-          providerInstanceId: ProviderInstanceId.make("neopi-chat-test"),
-          cwd: "/tmp",
-          runtimeMode: "approval-required",
-        });
-        yield* adapter.sendTurn({ threadId, input: "/chat erp" });
-        NodeAssert.equal(mode, "erp");
-        yield* adapter.sendTurn({ threadId, input: "/chat" });
-        NodeAssert.equal(mode, "off");
-        yield* adapter.sendTurn({ threadId, input: "/chat" });
-        NodeAssert.equal(mode, "erp");
-        NodeAssert.deepEqual(
-          peer.commands.filter((cmd) => cmd.type === "set_chat_mode").map((cmd) => cmd.mode),
-          ["erp", "off", "erp"],
-        );
-        NodeAssert.equal(
-          peer.commands.some((cmd) => cmd.type === "prompt"),
-          false,
-        );
-        const cursorBefore = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
-        NodeAssert.deepEqual(
-          cursorBefore.turnBoundaries.map((boundary) =>
-            "kind" in boundary ? boundary.kind : boundary.userEntryId,
-          ),
-          ["local", "local", "local"],
-        );
-        yield* adapter.rollbackThread(threadId, 1);
-        const cursorAfter = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
-        NodeAssert.equal(cursorAfter.turnBoundaries.length, 2);
-        NodeAssert.equal(
-          peer.commands.some((cmd) => cmd.type === "branch"),
-          false,
-        );
-        for (let count = 0; count < 100 && warnings.length < 2; count++)
-          yield* Effect.sleep("5 millis");
-        NodeAssert.ok(
-          warnings.some((detail) => JSON.stringify(detail).includes('\"mode\":\"erp\"')),
-        );
-        yield* adapter.stopAll();
-      }),
-    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("reports disconnection during configuration reads instead of stale success", () =>
@@ -2868,38 +2341,25 @@ it.live("follows idle terminal model and effort changes without importing its tu
         roles: () => ({ roles: [configurationRole] }),
       });
       const { runtime, pipe, launches } = fixture;
-      const instanceId = ProviderInstanceId.make("observed-neopi");
-      const adapter = yield* makeNeoPiAdapter({
-        settings: {
-          enabled: true,
-          binaryPath: "npi",
-          profile: "",
-          launchArgs: "",
-          customModels: [],
-        },
-        instanceId,
-        binary: "npi",
-        cwd: "/tmp",
-        t3Home: root,
-        attachmentsDir: root,
-        environment: {},
-        spawn: fixture.spawn,
-        discovery: yield* makeNeoPiDiscoveryHub(),
+      const h = yield* makeNativeAdapterHarness(undefined, {
+        runtimeMode: "approval-required",
         makeRuntime: () => Effect.succeed(runtime),
       });
-      yield* adapter.startSession({
-        threadId: runtime.threadId,
-        provider: ProviderDriverKind.make("neopi"),
-        providerInstanceId: instanceId,
-        cwd: "/tmp",
-        runtimeMode: "approval-required",
-        resumeCursor: attachedCursor,
+      const seed = yield* Effect.scoped(h.open());
+      const { session, providerThread } = yield* h.open({
+        ...seed.providerThread,
+        nativeMetadata: { neopiResumeCursor: attachedCursor },
       });
+      yield* session.readThreadSnapshot({ providerThread });
       const cursorBefore = yield* SubscriptionRef.get(runtime.cursor);
-      const frames = yield* capture(runtime);
+      const { frames } = yield* capture(runtime);
       const commandCount = pipe.commands.length;
       const launchCount = launches.length;
-      const observation = yield* adapter.observeConfiguration(runtime.threadId, attachedCursor);
+      NodeAssert.ok(providerThread.appThreadId);
+      const observation = yield* h.adapter.observeConfiguration(
+        providerThread.appThreadId,
+        attachedCursor,
+      );
       const output = yield* Queue.unbounded<Effect.Success<typeof observation.read>>();
       const watching = yield* Stream.concat(
         Stream.fromEffect(observation.read),
@@ -2950,9 +2410,16 @@ it.live("follows idle terminal model and effort changes without importing its tu
         ),
         false,
       );
-      NodeAssert.deepEqual(
-        pipe.commands.slice(commandCount).map((cmd) => cmd.type),
-        Array.from({ length: 6 }, () => ["get_state", "get_roles", "get_state"]).flat(),
+      NodeAssert.ok(
+        pipe.commands
+          .slice(commandCount)
+          .every((cmd) => cmd.type === "get_state" || cmd.type === "get_roles"),
+      );
+      NodeAssert.equal(
+        h.observed.some(
+          (event) => event.type === "provider_turn.updated" || event.type === "message.updated",
+        ),
+        false,
       );
       yield* pipe.finish(null);
       NodeAssert.equal((yield* Queue.take(output)).status, "unavailable");

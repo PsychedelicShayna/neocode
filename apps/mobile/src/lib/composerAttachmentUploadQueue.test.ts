@@ -254,7 +254,7 @@ describe("draft upload scope and offline submission", () => {
       const threadId = ThreadId.make("thread:1");
       const prefix = questionAttachmentDraftPrefix(environment, threadId);
       const key = questionAttachmentDraftKey(environment, threadId, requestId, "question:1");
-      expect(composerDraftEnvironmentId(key, [])).toBe(environment);
+      expect(composerDraftEnvironmentId(key, [environment], [])).toBe(environment);
       expect(key.startsWith(prefix)).toBe(true);
       for (const suffix of ["-extra", ":extra", "/extra", "%extra"]) {
         const otherKey = questionAttachmentDraftKey(
@@ -264,7 +264,7 @@ describe("draft upload scope and offline submission", () => {
           "question:1",
         );
         expect(otherKey.startsWith(prefix)).toBe(false);
-        expect(composerDraftEnvironmentId(otherKey, [])).toBe(environment);
+        expect(composerDraftEnvironmentId(otherKey, [environment], [])).toBe(environment);
       }
     }
   });
@@ -277,7 +277,7 @@ describe("draft upload scope and offline submission", () => {
           sessionFile: "/sessions/a:path with spaces.jsonl",
         },
       };
-      expect(composerDraftEnvironmentId(workspaceKey(target), [])).toBe(environment);
+      expect(composerDraftEnvironmentId(workspaceKey(target), [], [])).toBe(environment);
       expect(
         composerDraftEnvironmentId(
           workspaceKey({
@@ -285,21 +285,36 @@ describe("draft upload scope and offline submission", () => {
             ref: { ...target.ref, providerInstanceId: ProviderInstanceId.make("other") },
           }),
           [],
+          [],
         ),
       ).toBe(environment);
     }
-    expect(composerDraftEnvironmentId("environment-1:native:{broken}", [])).toBeNull();
+    expect(composerDraftEnvironmentId("environment-1:native:{broken}", [], [])).toBeNull();
   });
   it("resolves thread, new-task, and queued-task drafts without crossing environments", () => {
-    expect(composerDraftEnvironmentId("environment-1:thread", [])).toBe(environmentId);
-    expect(composerDraftEnvironmentId("new-task:environment-1:project", [])).toBe(environmentId);
+    expect(composerDraftEnvironmentId("environment-1:thread", [environmentId], [])).toBe(
+      environmentId,
+    );
+    expect(composerDraftEnvironmentId("new-task:environment-1:project", [], [])).toBe(
+      environmentId,
+    );
     expect(
-      composerDraftEnvironmentId("pending-task:message", [{ messageId: "message", environmentId }]),
+      composerDraftEnvironmentId(
+        "pending-task:message",
+        [],
+        [{ messageId: "message", environmentId }],
+      ),
     ).toBe(environmentId);
-    expect(composerDraftEnvironmentId("pending-task:missing", [])).toBeNull();
+    expect(composerDraftEnvironmentId("pending-task:missing", [], [])).toBeNull();
     const colonEnvironment = EnvironmentId.make("a:vcs-status:b");
-    expect(composerDraftEnvironmentId(`${colonEnvironment}:thread`, [])).toBe(colonEnvironment);
-    expect(composerDraftEnvironmentId(`new-task:${colonEnvironment}:project`, [])).toBe(
+    expect(
+      composerDraftEnvironmentId(
+        `${colonEnvironment}:thread`,
+        [EnvironmentId.make("a"), colonEnvironment],
+        [],
+      ),
+    ).toBe(colonEnvironment);
+    expect(composerDraftEnvironmentId(`new-task:${colonEnvironment}:project`, [], [])).toBe(
       colonEnvironment,
     );
   });
@@ -312,12 +327,11 @@ describe("draft upload scope and offline submission", () => {
         createdAt: "2026-09-05T00:00:00.000Z",
       },
     };
-    expect(composerDraftEnvironmentId("new-task:abc123-def456", [], stamped)).toBe(environmentId);
-    // An id-keyed draft that lost its stamp belongs to nobody: uploads must
-    // not start and sign-out must not sweep it into some other environment.
-    expect(composerDraftEnvironmentId("new-task:abc123-def456", [])).toBeNull();
-    // The stamp wins over a legacy-looking key when both are present.
-    expect(composerDraftEnvironmentId("new-task:environment-2:project", [], stamped)).toBe(
+    expect(composerDraftEnvironmentId("new-task:abc123-def456", [], [], stamped)).toBe(
+      environmentId,
+    );
+    expect(composerDraftEnvironmentId("new-task:abc123-def456", [], [])).toBeNull();
+    expect(composerDraftEnvironmentId("new-task:environment-2:project", [], [], stamped)).toBe(
       environmentId,
     );
   });
@@ -330,13 +344,11 @@ describe("draft upload scope and offline submission", () => {
       connected: true,
       serverConfig: {
         environment: {
-          capabilities: { attachmentUploads: true, fileAttachments: { maxUploadBytes: 1024 } },
+          capabilities: { fileAttachments: { maxUploadBytes: 1024 } },
         },
       },
       states: {},
     };
-    // Not started yet and mid-transfer both let the send through as a queued
-    // message; the outbox drain finishes (or redoes) the upload.
     expect(composerAttachmentUploadBlockReason(input)).toBeNull();
     expect(composerAttachmentsStillUploading(input)).toBe(true);
     expect(
@@ -364,7 +376,6 @@ describe("draft upload scope and offline submission", () => {
     expect(
       composerAttachmentsStillUploading({ ...input, states: { [key]: { status: "ready" } } }),
     ).toBe(false);
-    // Attachments the environment cannot accept never count as uploading.
     expect(composerAttachmentsStillUploading({ ...input, serverConfig: null })).toBe(false);
   });
 });

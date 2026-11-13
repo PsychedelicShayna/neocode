@@ -1,4 +1,5 @@
 import type {
+  NeoPiNativeSessionsGetBranchCommitsInput,
   NeoPiNativeSessionsGetDiffFileContentsInput,
   NeoPiNativeSessionsGetDiffPreviewInput,
 } from "@t3tools/contracts";
@@ -11,6 +12,17 @@ import { NeoPiNativeSessions } from "./NeoPiNativeSessions.ts";
 export const makeNeoPiNativeReview = Effect.gen(function* () {
   const sessions = yield* NeoPiNativeSessions;
   const review = yield* ReviewService;
+
+  const getBranchCommits = Effect.fn("NeoPiNativeReview.getBranchCommits")(function* (
+    input: NeoPiNativeSessionsGetBranchCommitsInput,
+  ) {
+    const { ref, ...selectors } = input;
+    const workspace = yield* sessions.resolveWorkspace(ref);
+    return yield* review.getBranchCommits(
+      { ...selectors, cwd: workspace.cwd },
+      { workspaceRoot: workspace.cwd },
+    );
+  });
 
   const getDiffPreview = Effect.fn("NeoPiNativeReview.getDiffPreview")(function* (
     input: NeoPiNativeSessionsGetDiffPreviewInput,
@@ -34,5 +46,5 @@ export const makeNeoPiNativeReview = Effect.gen(function* () {
     );
   });
 
-  return { getDiffPreview, getDiffFileContents };
+  return { getBranchCommits, getDiffPreview, getDiffFileContents };
 });

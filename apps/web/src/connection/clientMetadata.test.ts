@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  browserClientOs,
-  browserDeviceType,
-  browserFamily,
-  clientPresentationMetadata,
-} from "./clientMetadata";
+import { clientPresentationMetadata } from "./clientMetadata";
 
 const desktopChrome = {
   userAgent:
@@ -62,13 +57,16 @@ describe("client telemetry metadata", () => {
       maxTouchPoints: 5,
     };
 
-    expect(browserDeviceType(iphone)).toBe("mobile");
-    expect(browserClientOs(iphone)).toBe("iOS");
-    expect(browserFamily(iphone.userAgent)).toBe("Safari");
-    expect(browserDeviceType(androidTablet)).toBe("tablet");
-    expect(browserClientOs(androidTablet)).toBe("Android");
-    expect(browserDeviceType(ipadosDesktopUa)).toBe("tablet");
-    expect(browserClientOs(ipadosDesktopUa)).toBe("iOS");
+    const metadata = (identity: typeof desktopChrome) =>
+      clientPresentationMetadata({
+        appVersion: "1.2.3",
+        hosted: false,
+        identity,
+        desktopBridge: undefined,
+      });
+    expect(metadata(iphone)).toMatchObject({ deviceType: "mobile", os: "iOS", browser: "Safari" });
+    expect(metadata(androidTablet)).toMatchObject({ deviceType: "tablet", os: "Android" });
+    expect(metadata(ipadosDesktopUa)).toMatchObject({ deviceType: "tablet", os: "iOS" });
   });
 
   it("uses Electron's client platform for desktop", () => {

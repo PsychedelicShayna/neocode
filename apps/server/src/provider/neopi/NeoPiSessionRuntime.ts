@@ -1,6 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off -- compare session identities with Node path resolution.
 import * as NodePath from "node:path";
-import type { ModelSelection, RuntimeMode, ThreadId, TurnId } from "@t3tools/contracts";
+import type {
+  ModelSelection,
+  NeoPiResumeCursor,
+  RuntimeMode,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import { NeoPiNavigateTreeResult } from "@t3tools/contracts";
 import {
   make as makeClient,
   type NeoPiRpcClient,
@@ -23,7 +30,7 @@ import * as Queue from "effect/Queue";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
-import { ChildProcess } from "effect/unstable/process";
+import { ChildProcess } from "effect/process";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -36,10 +43,9 @@ import {
 import { NEOPI_CAPABILITIES, neopiCompatibility } from "./NeoPiCompatibility.ts";
 import { neoPiRoleFromModelSlug } from "./NeoPiModelCatalog.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
-import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
+import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
 import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import type {
-  NeoPiResumeCursor,
   NeoPiRuntimeFrame,
   NeoPiRuntimeState,
   NeoPiSessionRuntimeShape,
@@ -95,10 +101,11 @@ export interface NeoPiRuntimeInput {
   readonly closeExitWaitMs?: number;
 }
 
+const isRpcError = Schema.is(NeoPiRpcError);
+
 const rpcError = (cause: unknown): NeoPiRuntimeError =>
   new NeoPiRuntimeError({
-    code:
-      cause instanceof NeoPiRpcError && cause.code === "session_in_use" ? "session_in_use" : "rpc",
+    code: isRpcError(cause) && cause.code === "session_in_use" ? "session_in_use" : "rpc",
     message: cause instanceof Error ? cause.message : String(cause),
     cause,
   });
@@ -112,6 +119,8 @@ const unknownCommand = (error: NeoPiRuntimeError) => /unknown command/i.test(err
 /** The longest a runtime close waits for a child to exit, or for its scope to release it. */
 const DEFAULT_CLOSE_EXIT_WAIT_MS = 5_000;
 const activeUiMethods = new Set(["select", "confirm", "input", "editor"]);
+const isNeoPiRuntimeError = Schema.is(NeoPiRuntimeError);
+const decodeNavigateTreeResult = Schema.decodeUnknownEffect(NeoPiNavigateTreeResult);
 const decodeOwnerCatalog = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -133,8 +142,10 @@ type ActiveTurn = {
   readonly boundaryDone: Deferred.Deferred<void>;
   boundaryStarted: boolean;
   readonly continuation?: boolean;
+  readonly continuationAccepted?: Deferred.Deferred<void, NeoPiRuntimeError>;
   promptId?: string;
-  readonly promptReady?: Deferred.Deferred<PromptHandle>;
+  readonly promptReady?: Deferred.Deferred<PromptHandle, NeoPiRuntimeError>;
+  readonly promptAdmission?: Deferred.Deferred<void>;
   agentInvoked: boolean;
   interrupted: boolean;
   error?: { reason: string; message?: string };
@@ -157,6 +168,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const capabilities = new Set<string>();
   const uiPending = new Set<string>();
   const hostPending = new Map<string, Scope.Closeable>();
+  const childOwners = new Map<string, TurnId>();
   let client: NeoPiRpcClient | undefined;
   let earlyUi: Pick<NeoPiRpcTransport, "respondUi"> | undefined;
   let lifetime: Scope.Closeable | undefined;
@@ -229,8 +241,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     "logout",
   ]);
   const modelsAuthUi = new Set<string>();
-  const request: NeoPiRpcClient["request"] = (cmd) =>
-    Effect.gen(function* () {
+  const request: NeoPiRpcClient["request"] = Effect.fn("NeoPiSessionRuntime.request")(
+    function* (cmd) {
       if (!attachedCommands.has(cmd.type) && !(cmd.type === "abort" && active))
         yield* requireOwner(cmd.type);
       if (!client)
@@ -240,7 +252,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           command: cmd.type,
         });
       return yield* client.request(cmd);
-    });
+    },
+  );
   const getState = () =>
     request({ type: "get_state" }).pipe(
       Effect.map((data) => record(data) as SessionState),
@@ -272,47 +285,16 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     }
     hostPending.clear();
   });
-  const captureBoundary = (turn: ActiveTurn) =>
-    Effect.gen(function* () {
-      if (capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) {
-        if (!turn.promptReady) return;
-        const outcome = yield* Deferred.await((yield* Deferred.await(turn.promptReady)).outcome);
-        if (outcome.kind === "rejected") return;
-        if (outcome.kind === "agent") turn.agentInvoked = true;
-        let boundary: NeoPiResumeCursor["turnBoundaries"][number] | undefined;
-        if (outcome.userEntryId) {
-          const result = record(
-            yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
-          );
-          const entries = Array.isArray(result.entries) ? result.entries.map(record) : [];
-          const byId = new Map(
-            entries
-              .filter((entry) => typeof entry.id === "string")
-              .map((entry) => [entry.id, entry]),
-          );
-          let id = typeof result.leafId === "string" ? result.leafId : null;
-          const seen = new Set<string>();
-          while (id && !seen.has(id)) {
-            if (id === outcome.userEntryId) {
-              boundary = { turnId: turn.id, userEntryId: id };
-              break;
-            }
-            seen.add(id);
-            const entry = byId.get(id);
-            id = typeof entry?.parentId === "string" ? entry.parentId : null;
-          }
-        }
-        if (!boundary && outcome.kind === "local") boundary = { turnId: turn.id, kind: "local" };
-        if (boundary) {
-          const previous = yield* SubscriptionRef.get(cursor);
-          yield* SubscriptionRef.set(cursor, {
-            ...previous,
-            turnBoundaries: [...previous.turnBoundaries, boundary],
-          });
-        }
-        return;
-      }
-      for (let attempt = 0; attempt < 3; attempt++) {
+  const captureBoundary = Effect.fn("NeoPiSessionRuntime.captureBoundary")(function* (
+    turn: ActiveTurn,
+  ) {
+    if (capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) {
+      if (!turn.promptReady) return;
+      const outcome = yield* Deferred.await((yield* Deferred.await(turn.promptReady)).outcome);
+      if (outcome.kind === "rejected") return;
+      if (outcome.kind === "agent") turn.agentInvoked = true;
+      let boundary: NeoPiResumeCursor["turnBoundaries"][number] | undefined;
+      if (outcome.userEntryId) {
         const result = record(
           yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
         );
@@ -320,297 +302,407 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         const byId = new Map(
           entries.filter((entry) => typeof entry.id === "string").map((entry) => [entry.id, entry]),
         );
-        const descendants: Record<string, unknown>[] = [];
         let id = typeof result.leafId === "string" ? result.leafId : null;
         const seen = new Set<string>();
-        while (id !== turn.baselineLeaf && id !== null && !seen.has(id)) {
+        while (id && !seen.has(id)) {
+          if (id === outcome.userEntryId) {
+            boundary = { turnId: turn.id, userEntryId: id };
+            break;
+          }
           seen.add(id);
           const entry = byId.get(id);
-          if (!entry) break;
-          descendants.push(entry);
-          id = typeof entry.parentId === "string" ? entry.parentId : null;
+          id = typeof entry?.parentId === "string" ? entry.parentId : null;
         }
-        // Prompt text changes under templates and mentions; follow the active
-        // ancestry from the pre-admission leaf to the first new user entry.
-        const user = (id === turn.baselineLeaf ? descendants.reverse() : []).find(
-          (entry) => entry.type === "message" && record(entry.message).role === "user",
-        );
-        if (user && typeof user.id === "string") {
-          const previous = yield* SubscriptionRef.get(cursor);
-          yield* SubscriptionRef.set(cursor, {
-            ...previous,
-            turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, userEntryId: user.id }],
-          });
-          return;
-        }
-        if (attempt < 2) yield* Effect.sleep("50 millis");
       }
-      yield* emit({
-        type: "notice",
-        level: "warning",
-        message: "NeoPi did not expose this turn's user entry; rollback is unavailable for it",
-        turnId: turn.id,
-      });
+      if (!boundary && outcome.kind === "local") boundary = { turnId: turn.id, kind: "local" };
+      if (boundary) {
+        const previous = yield* SubscriptionRef.get(cursor);
+        yield* SubscriptionRef.set(cursor, {
+          ...previous,
+          turnBoundaries: [...previous.turnBoundaries, boundary],
+        });
+      }
+      return;
+    }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = record(
+        yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
+      );
+      const entries = Array.isArray(result.entries) ? result.entries.map(record) : [];
+      const byId = new Map(
+        entries.filter((entry) => typeof entry.id === "string").map((entry) => [entry.id, entry]),
+      );
+      const descendants: Record<string, unknown>[] = [];
+      let id = typeof result.leafId === "string" ? result.leafId : null;
+      const seen = new Set<string>();
+      while (id !== turn.baselineLeaf && id !== null && !seen.has(id)) {
+        seen.add(id);
+        const entry = byId.get(id);
+        if (!entry) break;
+        descendants.push(entry);
+        id = typeof entry.parentId === "string" ? entry.parentId : null;
+      }
+      // Prompt text changes under templates and mentions; follow the active
+      // ancestry from the pre-admission leaf to the first new user entry.
+      const user = (id === turn.baselineLeaf ? descendants.reverse() : []).find(
+        (entry) => entry.type === "message" && record(entry.message).role === "user",
+      );
+      if (user && typeof user.id === "string") {
+        const previous = yield* SubscriptionRef.get(cursor);
+        yield* SubscriptionRef.set(cursor, {
+          ...previous,
+          turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, userEntryId: user.id }],
+        });
+        return;
+      }
+      if (attempt < 2) yield* Effect.sleep("50 millis");
+    }
+    yield* emit({
+      type: "notice",
+      level: "warning",
+      message: "NeoPi did not expose this turn's user entry; rollback is unavailable for it",
+      turnId: turn.id,
     });
+  });
   const rememberBoundary = (turn: ActiveTurn) =>
-    captureBoundary(turn).pipe(
-      Effect.catch((error) =>
-        emit({
-          type: "notice",
-          level: "warning",
-          message: `NeoPi boundary capture failed: ${error.message}`,
-          turnId: turn.id,
-        }),
-      ),
-      Effect.ensuring(
-        Effect.gen(function* () {
-          const previous = yield* SubscriptionRef.get(cursor);
-          if (!previous.turnBoundaries.some((boundary) => boundary.turnId === turn.id))
-            yield* SubscriptionRef.set(cursor, {
-              ...previous,
-              turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, kind: "unknown" }],
-            });
-          yield* Deferred.succeed(turn.boundaryDone, undefined).pipe(Effect.ignore);
-        }),
-      ),
+    Effect.suspend(() => {
+      if (turn.boundaryStarted) return Deferred.await(turn.boundaryDone);
+      turn.boundaryStarted = true;
+      return captureBoundary(turn).pipe(
+        Effect.catch((error) =>
+          emit({
+            type: "notice",
+            level: "warning",
+            message: `NeoPi boundary capture failed: ${error.message}`,
+            turnId: turn.id,
+          }),
+        ),
+        Effect.ensuring(
+          Effect.gen(function* () {
+            const previous = yield* SubscriptionRef.get(cursor);
+            if (!previous.turnBoundaries.some((boundary) => boundary.turnId === turn.id))
+              yield* SubscriptionRef.set(cursor, {
+                ...previous,
+                turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, kind: "unknown" }],
+              });
+            yield* Deferred.succeed(turn.boundaryDone, undefined).pipe(Effect.ignore);
+          }),
+        ),
+      );
+    });
+  const rememberHistoryLeaf = Effect.fn("NeoPiSessionRuntime.rememberHistoryLeaf")(function* () {
+    const result = record(
+      yield* request(
+        capabilities.has(NEOPI_CAPABILITIES.sessionJournal)
+          ? { type: "get_entries_page", direction: "backward", limit: 1 }
+          : { type: "get_entries" },
+      ).pipe(Effect.mapError(rpcError)),
     );
-  const settle = (
+    const leafId = result.leafId;
+    if (leafId !== null && typeof leafId !== "string")
+      return yield* new NeoPiRuntimeError({
+        code: "rpc",
+        message: "NeoPi did not return its native history leaf.",
+      });
+    yield* SubscriptionRef.update(cursor, ({ historyLeafId: _, ...previous }) => ({
+      ...previous,
+      ...(leafId === null ? {} : { historyLeafId: leafId }),
+    }));
+  });
+  const acceptContinuation = Effect.fn("NeoPiSessionRuntime.acceptContinuation")(function* (
+    turn: ActiveTurn,
+  ) {
+    if (!turn.continuationAccepted || (yield* Deferred.isDone(turn.continuationAccepted))) return;
+    yield* emit({ type: "t3.prompt.accepted", turnId: turn.id });
+    yield* Deferred.succeed(turn.continuationAccepted, undefined);
+  });
+  const settle = Effect.fn("NeoPiSessionRuntime.settle")(function* (
     turn: ActiveTurn,
     outcome: "completed" | "failed" | "interrupted",
     errorMessage?: string,
-  ) =>
-    Effect.gen(function* () {
-      if (active !== turn) return;
-      active = undefined;
-      if (
-        (turn.agentInvoked || capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) &&
-        !turn.continuation &&
-        client &&
-        (yield* SubscriptionRef.get(state)) !== "failed"
-      ) {
-        if (turn.boundaryStarted) yield* Deferred.await(turn.boundaryDone);
-        else yield* rememberBoundary(turn);
-      }
-      if (
-        !(turn.continuation && outcome !== "completed") &&
-        !(yield* SubscriptionRef.get(cursor)).turnBoundaries.some(
-          (boundary) => boundary.turnId === turn.id,
-        )
-      ) {
-        const previous = yield* SubscriptionRef.get(cursor);
-        yield* SubscriptionRef.set(cursor, {
-          ...previous,
-          turnBoundaries: [
-            ...previous.turnBoundaries,
-            {
-              turnId: turn.id,
-              kind: !turn.agentInvoked && outcome === "completed" ? "local" : "unknown",
-            },
-          ],
-        });
-      }
-      if ((yield* SubscriptionRef.get(state)) === "running") yield* setState("ready");
-      yield* emit({
-        type: "t3.turn.outcome",
-        state: outcome,
-        ...(errorMessage ? { errorMessage } : {}),
-        turnId: turn.id,
+  ) {
+    if (active !== turn) return;
+    if (turn.continuationAccepted) {
+      if (outcome === "completed") yield* acceptContinuation(turn);
+      else
+        yield* Deferred.fail(
+          turn.continuationAccepted,
+          new NeoPiRuntimeError({
+            code: "rpc",
+            message: errorMessage ?? `Native plan continuation ${outcome}`,
+          }),
+        );
+    }
+    active = undefined;
+    if (turn.promptAdmission) yield* Deferred.await(turn.promptAdmission);
+    if (
+      (turn.agentInvoked || capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) &&
+      !turn.continuation &&
+      client &&
+      (yield* SubscriptionRef.get(state)) !== "failed"
+    ) {
+      yield* rememberBoundary(turn);
+    }
+    if (client && (yield* SubscriptionRef.get(state)) !== "failed") {
+      yield* rememberHistoryLeaf().pipe(
+        Effect.catch((error) =>
+          emit({
+            type: "notice",
+            level: "warning",
+            message: error.message,
+            turnId: turn.id,
+          }),
+        ),
+      );
+    }
+    if (
+      !(turn.continuation && outcome !== "completed") &&
+      !(yield* SubscriptionRef.get(cursor)).turnBoundaries.some(
+        (boundary) => boundary.turnId === turn.id,
+      )
+    ) {
+      const previous = yield* SubscriptionRef.get(cursor);
+      yield* SubscriptionRef.set(cursor, {
+        ...previous,
+        turnBoundaries: [
+          ...previous.turnBoundaries,
+          {
+            turnId: turn.id,
+            kind: !turn.agentInvoked && outcome === "completed" ? "local" : "unknown",
+          },
+        ],
       });
-      if ((yield* SubscriptionRef.get(state)) === "ready")
-        yield* publishState().pipe(Effect.ignore);
+    }
+    yield* Deferred.succeed(turn.boundaryDone, undefined);
+    if ((yield* SubscriptionRef.get(state)) === "running") yield* setState("ready");
+    yield* emit({
+      type: "t3.turn.outcome",
+      state: outcome,
+      ...(errorMessage ? { errorMessage } : {}),
+      turnId: turn.id,
     });
-  const observePrompt = (turn: ActiveTurn, handle: PromptHandle) =>
-    Effect.gen(function* () {
+    if ((yield* SubscriptionRef.get(state)) === "ready") yield* publishState().pipe(Effect.ignore);
+  });
+  const observePrompt = Effect.fn("NeoPiSessionRuntime.observePrompt")(
+    function* (turn: ActiveTurn, handle: PromptHandle) {
       const outcome = yield* Deferred.await(handle.outcome);
-      if (active !== turn || outcome.kind !== "agent") return;
-      turn.agentInvoked = true;
-      if (!capabilities.has(NEOPI_CAPABILITIES.promptEntryIds) && !turn.boundaryStarted) {
-        turn.boundaryStarted = true;
-        yield* rememberBoundary(turn).pipe(Effect.forkIn(lifetime!));
+      if (outcome.kind === "rejected") return;
+      if (outcome.kind === "agent") turn.agentInvoked = true;
+      yield* emit({ type: "t3.prompt.accepted", turnId: turn.id });
+    },
+    (effect, turn) =>
+      effect.pipe(
+        Effect.ensuring(
+          turn.promptAdmission ? Deferred.succeed(turn.promptAdmission, undefined) : Effect.void,
+        ),
+      ),
+  );
+  const rejectProposal = Effect.fn("NeoPiSessionRuntime.rejectProposal")(function* (
+    proposal: NonNullable<typeof pendingProposal>,
+    message: string,
+  ) {
+    if (pendingProposal === proposal) {
+      pendingProposal = undefined;
+      if (!proposal.closed) yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+    }
+    const turn = active;
+    if (turn?.continuation) {
+      const previous = yield* SubscriptionRef.get(cursor);
+      yield* SubscriptionRef.set(cursor, {
+        ...previous,
+        turnBoundaries: previous.turnBoundaries.filter((boundary) => boundary.turnId !== turn.id),
+      });
+      yield* settle(turn, "failed", message);
+    }
+    yield* Deferred.fail(proposal.done, new NeoPiRuntimeError({ code: "not_ready", message })).pipe(
+      Effect.ignore,
+    );
+  });
+  // Native stream frames must not allocate a tracing span per chunk.
+  const handleEvent = Effect.fnUntraced(function* (frame: NeoPiRuntimeFrame) {
+    if (frame.type === "message_update") {
+      const now = yield* Clock.currentTimeMillis;
+      if (now - lastTelemetryAt >= 1000) {
+        lastTelemetryAt = now;
+        yield* invalidateConfiguration;
       }
-    });
-  const rejectProposal = (proposal: NonNullable<typeof pendingProposal>, message: string) =>
-    Effect.gen(function* () {
-      if (pendingProposal === proposal) {
+    }
+    if (
+      frame.type === "model_changed" ||
+      frame.type === "thinking_level_changed" ||
+      frame.type === "approval_mode_changed" ||
+      frame.type === "models_configuration_changed" ||
+      frame.type === "themes_configuration_changed" ||
+      frame.type === "message_end" ||
+      frame.type === "agent_start" ||
+      frame.type === "agent_end" ||
+      frame.type === "auto_compaction_end" ||
+      frame.type === "advisor_cost_changed" ||
+      frame.type === "journal_state" ||
+      frame.type === "journal_entry"
+    )
+      yield* invalidateConfiguration;
+    // Native observers retain process-local message IDs independently of SQL
+    // turns. Only message_persisted can associate one with a durable entry.
+    const nativeFrame: { readonly type: string } = frame;
+    yield* nativeEvents.publish(nativeFrame);
+    if (
+      frame.type === "journal_state" ||
+      frame.type === "journal_entry" ||
+      frame.type === "message_persisted"
+    )
+      return;
+    if (
+      frame.type === "subagent_lifecycle" ||
+      frame.type === "subagent_progress" ||
+      frame.type === "subagent_event"
+    ) {
+      const data = record(frame);
+      const payload = data.payload === undefined ? data : record(data.payload);
+      const id = typeof payload.id === "string" ? payload.id : record(payload.progress).id;
+      if (typeof id !== "string") return;
+      if (active && (payload.status === "started" || !childOwners.has(id)))
+        childOwners.set(id, active.id);
+      const owner = childOwners.get(id);
+      if (owner) yield* emit({ ...frame, turnId: owner });
+      return;
+    }
+    // External terminal work must not create or settle NeoCode SQL turns.
+    if (attached && !active) return;
+    // A proposal settles the graphical turn before the native run ends.
+    // Its terminal event must still release withdrawal and expiry waiters.
+    if (
+      !active &&
+      (frame.type.startsWith("message_") ||
+        frame.type === "agent_start" ||
+        (frame.type === "agent_end" && !pendingProposal) ||
+        frame.type === "turn_start" ||
+        frame.type === "turn_end")
+    )
+      return;
+    const turn = active;
+    yield* emit({ ...frame, ...(turn ? { turnId: turn.id } : {}) });
+    const rejected = pendingProposal;
+    if (
+      frame.type === "t3.plan.proposal.rejected" &&
+      rejected !== undefined &&
+      rejected.id === frame.id
+    ) {
+      yield* rejectProposal(
+        rejected,
+        typeof frame.error === "string" ? frame.error : "NeoPi rejected the plan proposal",
+      );
+      return;
+    }
+    if (
+      (frame.type === "model_changed" || frame.type === "config_warnings_changed") &&
+      !record(frame).model
+    ) {
+      if (lifetime) yield* publishState().pipe(Effect.ignore, Effect.forkIn(lifetime));
+    }
+    if (
+      frame.type === "plan_proposal_request" &&
+      typeof frame.id === "string" &&
+      frame.id &&
+      capabilities.has(NEOPI_CAPABILITIES.setMode) &&
+      turn
+    ) {
+      pendingProposal = {
+        id: frame.id,
+        done: yield* Deferred.make<void, NeoPiRuntimeError>(),
+        resolving: false,
+      };
+      yield* settle(turn, "completed");
+      return;
+    }
+    if (pendingProposal) {
+      const proposal = pendingProposal;
+      const terminal = frame.type === "agent_end" && frame.isTerminal !== false;
+      const cancelled = capabilities.has(NEOPI_CAPABILITIES.planProposalCancel)
+        ? frame.type === "plan_proposal_cancel" && frame.id === proposal.id
+        : (terminal && !proposal.resolving) ||
+          (frame.type === "mode_changed" && frame.mode !== "plan" && !proposal.resolving);
+      if (cancelled && !proposal.closed) {
+        proposal.closed = true;
+        yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+      }
+      if (cancelled && proposal.resolving && !proposal.withdrawing && turn?.continuation) {
+        yield* rejectProposal(proposal, "NeoPi cancelled the proposed plan");
+        return;
+      }
+      if (
+        (terminal &&
+          (proposal.resolving || !capabilities.has(NEOPI_CAPABILITIES.planProposalCancel))) ||
+        (cancelled && !proposal.withdrawing)
+      ) {
         pendingProposal = undefined;
         if (!proposal.closed) yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+        yield* Deferred.succeed(proposal.done, undefined).pipe(Effect.ignore);
       }
-      const turn = active;
-      if (turn?.continuation) {
-        const previous = yield* SubscriptionRef.get(cursor);
-        yield* SubscriptionRef.set(cursor, {
-          ...previous,
-          turnBoundaries: previous.turnBoundaries.filter((boundary) => boundary.turnId !== turn.id),
-        });
-        yield* settle(turn, "failed", message);
-      }
-      yield* Deferred.fail(
-        proposal.done,
-        new NeoPiRuntimeError({ code: "not_ready", message }),
-      ).pipe(Effect.ignore);
-    });
-  const handleEvent = (frame: NeoPiRuntimeFrame) =>
-    Effect.gen(function* () {
-      if (frame.type === "message_update") {
-        const now = yield* Clock.currentTimeMillis;
-        if (now - lastTelemetryAt >= 1000) {
-          lastTelemetryAt = now;
-          yield* invalidateConfiguration;
-        }
-      }
-      if (
-        frame.type === "model_changed" ||
-        frame.type === "thinking_level_changed" ||
-        frame.type === "approval_mode_changed" ||
-        frame.type === "models_configuration_changed" ||
-        frame.type === "themes_configuration_changed" ||
-        frame.type === "message_end" ||
-        frame.type === "agent_start" ||
-        frame.type === "agent_end" ||
-        frame.type === "auto_compaction_end" ||
-        frame.type === "advisor_cost_changed" ||
-        frame.type === "journal_state" ||
-        frame.type === "journal_entry"
-      )
-        yield* invalidateConfiguration;
-      // Native observers retain process-local message IDs independently of SQL
-      // turns. Only message_persisted can associate one with a durable entry.
-      const nativeFrame: { readonly type: string } = frame;
-      yield* nativeEvents.publish(nativeFrame);
-      if (
-        frame.type === "journal_state" ||
-        frame.type === "journal_entry" ||
-        frame.type === "message_persisted"
-      )
-        return;
-      // External terminal work must not create or settle NeoCode SQL turns.
-      if (attached && !active) return;
-      // A proposal settles the graphical turn before the native run ends.
-      // Its terminal event must still release withdrawal and expiry waiters.
-      if (
-        !active &&
-        (frame.type.startsWith("message_") ||
-          frame.type === "agent_start" ||
-          (frame.type === "agent_end" && !pendingProposal) ||
-          frame.type === "turn_start" ||
-          frame.type === "turn_end")
-      )
-        return;
-      const turn = active;
-      yield* emit({ ...frame, ...(turn ? { turnId: turn.id } : {}) });
-      const rejected = pendingProposal;
-      if (
-        frame.type === "t3.plan.proposal.rejected" &&
-        rejected !== undefined &&
-        rejected.id === frame.id
-      ) {
-        yield* rejectProposal(
-          rejected,
-          typeof frame.error === "string" ? frame.error : "NeoPi rejected the plan proposal",
-        );
-        return;
-      }
-      if (
-        (frame.type === "model_changed" || frame.type === "config_warnings_changed") &&
-        !record(frame).model
-      ) {
-        if (lifetime) yield* publishState().pipe(Effect.ignore, Effect.forkIn(lifetime));
-      }
-      if (
-        frame.type === "plan_proposal_request" &&
-        typeof frame.id === "string" &&
-        frame.id &&
-        capabilities.has(NEOPI_CAPABILITIES.setMode) &&
-        turn
-      ) {
-        pendingProposal = {
-          id: frame.id,
-          done: yield* Deferred.make<void, NeoPiRuntimeError>(),
-          resolving: false,
-        };
-        yield* settle(turn, "completed");
-        return;
-      }
-      if (pendingProposal) {
-        const proposal = pendingProposal;
-        const terminal = frame.type === "agent_end" && frame.isTerminal !== false;
-        const cancelled = capabilities.has(NEOPI_CAPABILITIES.planProposalCancel)
-          ? frame.type === "plan_proposal_cancel" && frame.id === proposal.id
-          : (terminal && !proposal.resolving) ||
-            (frame.type === "mode_changed" && frame.mode !== "plan" && !proposal.resolving);
-        if (cancelled && !proposal.closed) {
-          proposal.closed = true;
-          yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
-        }
-        if (cancelled && proposal.resolving && !proposal.withdrawing && turn?.continuation) {
-          yield* rejectProposal(proposal, "NeoPi cancelled the proposed plan");
-          return;
-        }
-        if (
-          (terminal &&
-            (proposal.resolving || !capabilities.has(NEOPI_CAPABILITIES.planProposalCancel))) ||
-          (cancelled && !proposal.withdrawing)
-        ) {
-          pendingProposal = undefined;
-          if (!proposal.closed) yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
-          yield* Deferred.succeed(proposal.done, undefined).pipe(Effect.ignore);
-        }
-      }
-      if (!turn) return;
-      if (
-        (frame.type === "t3.prompt.local" ||
-          (frame.type === "prompt_result" && frame.agentInvoked === false)) &&
-        (!turn.promptId || frame.id === turn.promptId)
-      ) {
-        yield* settle(turn, "completed");
-        return;
-      }
-      if (frame.type === "t3.prompt.failed" && (!turn.promptId || frame.id === turn.promptId)) {
-        yield* settle(
-          turn,
-          "failed",
-          typeof frame.error === "string" ? frame.error : "prompt failed",
-        );
-        return;
-      }
-      if (frame.type === "agent_start") {
-        turn.agentInvoked = true;
-        delete turn.error;
-      }
-      if (frame.type === "message_start" && record(frame.message).role === "assistant")
-        delete turn.error;
-      if (frame.type === "message_update") {
-        const event = record(frame.assistantMessageEvent);
-        if (event.type === "error" && (event.reason === "aborted" || event.reason === "error")) {
-          turn.error = {
-            reason: event.reason,
-            ...(typeof record(event.error).errorMessage === "string"
-              ? { message: String(record(event.error).errorMessage) }
-              : {}),
-          };
-        }
-      }
-      if (frame.type !== "agent_end" || frame.isTerminal === false) return;
-      const last = Array.isArray(frame.messages)
-        ? frame.messages
-            .map(record)
-            .filter((message) => message.role === "assistant")
-            .at(-1)
-        : undefined;
-      const reason = last?.stopReason ?? turn.error?.reason;
-      const message =
-        turn.error?.message ??
-        (typeof last?.errorMessage === "string" ? last.errorMessage : undefined);
+    }
+    if (!turn) return;
+    if (
+      turn.continuationAccepted &&
+      (frame.type === "agent_start" ||
+        frame.type === "tool_execution_start" ||
+        ((frame.type === "message_start" || frame.type === "message_end") &&
+          record(frame.message).role === "assistant"))
+    )
+      yield* acceptContinuation(turn);
+    if (
+      (frame.type === "t3.prompt.local" ||
+        (frame.type === "prompt_result" && frame.agentInvoked === false)) &&
+      (!turn.promptId || frame.id === turn.promptId)
+    ) {
+      yield* settle(turn, "completed");
+      return;
+    }
+    if (frame.type === "t3.prompt.failed" && (!turn.promptId || frame.id === turn.promptId)) {
       yield* settle(
         turn,
-        reason === "aborted" || (turn.interrupted && reason !== "error")
-          ? "interrupted"
-          : reason === "error"
-            ? "failed"
-            : "completed",
-        message,
+        "failed",
+        typeof frame.error === "string" ? frame.error : "prompt failed",
       );
-    });
+      return;
+    }
+    if (frame.type === "agent_start") {
+      turn.agentInvoked = true;
+      delete turn.error;
+    }
+    if (frame.type === "message_start" && record(frame.message).role === "assistant")
+      delete turn.error;
+    if (frame.type === "message_update") {
+      const event = record(frame.assistantMessageEvent);
+      if (event.type === "error" && (event.reason === "aborted" || event.reason === "error")) {
+        turn.error = {
+          reason: event.reason,
+          ...(typeof record(event.error).errorMessage === "string"
+            ? { message: String(record(event.error).errorMessage) }
+            : {}),
+        };
+      }
+    }
+    if (frame.type !== "agent_end" || frame.isTerminal === false) return;
+    const last = Array.isArray(frame.messages)
+      ? frame.messages
+          .map(record)
+          .filter((message) => message.role === "assistant")
+          .at(-1)
+      : undefined;
+    const reason = last?.stopReason ?? turn.error?.reason;
+    const message =
+      turn.error?.message ??
+      (typeof last?.errorMessage === "string" ? last.errorMessage : undefined);
+    yield* settle(
+      turn,
+      reason === "aborted" || (turn.interrupted && reason !== "error")
+        ? "interrupted"
+        : reason === "error"
+          ? "failed"
+          : "completed",
+      message,
+    );
+  });
   const pumpHost = (peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">) =>
     Stream.runForEach(peer.hostToolCalls, (call) =>
       Effect.gen(function* () {
@@ -632,11 +724,14 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
             .pipe(Effect.ignore);
         } else {
           const requestScope = yield* Scope.make();
+          const cancelled = yield* Deferred.make<never>();
+          yield* Scope.addFinalizer(requestScope, Deferred.interrupt(cancelled));
           const signal = yield* Effect.abortSignal.pipe(
             Effect.provideService(Scope.Scope, requestScope),
           );
           hostPending.set(call.id, requestScope);
           yield* input.hostBridge.handle(call, signal).pipe(
+            Effect.raceFirst(Deferred.await(cancelled)),
             Effect.catchCause((cause) =>
               Effect.succeed({
                 content: [{ type: "text" as const, text: String(cause) }],
@@ -665,7 +760,16 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       }),
     );
   const closePeer = Effect.gen(function* () {
+    if (active?.continuationAccepted)
+      yield* Deferred.fail(
+        active.continuationAccepted,
+        new NeoPiRuntimeError({
+          code: "closed",
+          message: "NeoPi closed before accepting the plan continuation",
+        }),
+      );
     generation++;
+    childOwners.clear();
     yield* invalidateConfiguration;
     if (pendingProposal) {
       const proposal = pendingProposal;
@@ -749,8 +853,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           ...(input.requestTimeoutMs === undefined
             ? {}
             : { requestTimeoutMs: input.requestTimeoutMs }),
-          onTransportReady: (transport) =>
-            Effect.gen(function* () {
+          onTransportReady: Effect.fn("NeoPiSessionRuntime.onTransportReady")(
+            function* (transport) {
               earlyUi = transport;
               yield* transport.transportReady.pipe(
                 Effect.flatMap((ready) => {
@@ -800,7 +904,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
                 Effect.forkScoped,
                 Effect.provideService(Scope.Scope, scope),
               );
-            }),
+            },
+          ),
         }).pipe(Effect.provideService(Scope.Scope, scope));
       const peer = yield* connect(launch.args).pipe(
         Effect.catchIf(
@@ -848,7 +953,10 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
                       });
                     const code = yield* process.exitCode;
                     if (code !== 0) return undefined;
-                    const catalog = yield* Effect.try(() => decodeOwnerCatalog(text));
+                    const catalog = yield* Effect.try({
+                      try: () => decodeOwnerCatalog(text),
+                      catch: rpcError,
+                    });
                     return catalog.sessions.find(
                       (row) => NodePath.resolve(row.path) === NodePath.resolve(resume!.sessionFile),
                     );
@@ -974,7 +1082,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       yield* setState("ready");
     });
     yield* begin.pipe(
-      Effect.mapError((error) => (error instanceof NeoPiRuntimeError ? error : rpcError(error))),
+      Effect.mapError((error) => (isNeoPiRuntimeError(error) ? error : rpcError(error))),
       Effect.catch((error) =>
         Effect.gen(function* () {
           yield* setState("failed");
@@ -984,267 +1092,283 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       ),
     );
   });
-  const applyModelSelection = (selection: ModelSelection) =>
-    Effect.gen(function* () {
-      yield* requireOwner("change model or thinking settings").pipe(Effect.mapError(rpcError));
-      const role = capabilities.has(NEOPI_CAPABILITIES.getRoles)
-        ? neoPiRoleFromModelSlug(selection.model)
-        : undefined;
-      if (role) yield* request({ type: "set_role", role }).pipe(Effect.mapError(rpcError));
-      else {
-        const slash = selection.model.indexOf("/");
-        if (slash > 0)
-          yield* request({
-            type: "set_model",
-            provider: selection.model.slice(0, slash),
-            modelId: selection.model.slice(slash + 1),
-          }).pipe(Effect.mapError(rpcError));
-      }
-      for (const option of selection.options ?? []) {
-        if (option.id === "reasoningEffort" && typeof option.value === "string")
-          yield* request({ type: "set_thinking_level", level: option.value }).pipe(
+  const applyModelSelection = Effect.fn("NeoPiSessionRuntime.applyModelSelection")(function* (
+    selection: ModelSelection,
+  ) {
+    yield* requireOwner("change model or thinking settings").pipe(Effect.mapError(rpcError));
+    const role = capabilities.has(NEOPI_CAPABILITIES.getRoles)
+      ? neoPiRoleFromModelSlug(selection.model)
+      : undefined;
+    if (role) yield* request({ type: "set_role", role }).pipe(Effect.mapError(rpcError));
+    else {
+      const slash = selection.model.indexOf("/");
+      if (slash > 0)
+        yield* request({
+          type: "set_model",
+          provider: selection.model.slice(0, slash),
+          modelId: selection.model.slice(slash + 1),
+        }).pipe(Effect.mapError(rpcError));
+    }
+    for (const option of selection.options ?? []) {
+      if (option.id === "reasoningEffort" && typeof option.value === "string")
+        yield* request({ type: "set_thinking_level", level: option.value }).pipe(
+          Effect.mapError(rpcError),
+        );
+      if (option.id === "fastMode" && typeof option.value === "boolean") {
+        const data = record(
+          yield* request({ type: "set_fast_mode", enabled: option.value }).pipe(
             Effect.mapError(rpcError),
-          );
-        if (option.id === "fastMode" && typeof option.value === "boolean") {
-          const data = record(
-            yield* request({ type: "set_fast_mode", enabled: option.value }).pipe(
-              Effect.mapError(rpcError),
-            ),
-          );
-          yield* emit({ type: "t3.fast_mode", enabled: data.enabled, active: data.active });
-          if (data.enabled && !data.active)
-            yield* emit({
-              type: "notice",
-              level: "warning",
-              message: "NeoPi fast mode is enabled but not active for the current model",
-            });
-        }
+          ),
+        );
+        yield* emit({ type: "t3.fast_mode", enabled: data.enabled, active: data.active });
+        if (data.enabled && !data.active)
+          yield* emit({
+            type: "notice",
+            level: "warning",
+            message: "NeoPi fast mode is enabled but not active for the current model",
+          });
       }
-    });
-  const restart = (_reason: "runtime-mode-change") =>
-    Effect.gen(function* () {
-      yield* requireOwner("restart").pipe(Effect.mapError(rpcError));
-      if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi can restart only between turns",
-        });
-      yield* closePeer;
-      yield* setState("stopped");
-      yield* start;
-      pendingMode = false;
-    });
+    }
+  });
+  const restart = Effect.fn("NeoPiSessionRuntime.restart")(function* (
+    _reason: "runtime-mode-change",
+  ) {
+    yield* requireOwner("restart").pipe(Effect.mapError(rpcError));
+    if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi can restart only between turns",
+      });
+    yield* closePeer;
+    yield* setState("stopped");
+    yield* start;
+    pendingMode = false;
+  });
   const prepareForTurn = Effect.gen(function* () {
     if (pendingMode && (yield* SubscriptionRef.get(state)) === "ready")
       yield* restart("runtime-mode-change");
   });
-  const startTurn = (turn: NeoPiTurnInput) =>
-    Effect.gen(function* () {
-      yield* prepareForTurn;
-      if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi is not ready for a turn",
-        });
-      if (!attached && turn.modelSelection) yield* applyModelSelection(turn.modelSelection);
-      const peer = yield* current();
-      // An attached prompt runs only headless commands; the terminal's TUI dispatches
-      // the rest when the text is typed into its editor.
-      let typedInTerminal = false;
-      if (attached && turn.images.length === 0 && neoPiSlashCommandName(turn.text)) {
-        const listed = yield* peer
-          .request({ type: "get_available_commands" })
-          .pipe(Effect.mapError(rpcError));
-        typedInTerminal =
-          neoPiTerminalTextRoute(
-            turn.text,
-            neoPiAvailableCommands(record(listed).commands),
-            capabilities.has(NEOPI_CAPABILITIES.commandCatalog),
-          ) === "tui";
-      }
-      const baseline = record(
-        yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
-      );
-      const entry: ActiveTurn = {
-        id: turn.turnId,
-        baselineLeaf: typeof baseline.leafId === "string" ? baseline.leafId : null,
-        boundaryDone: yield* Deferred.make<void>(),
-        promptReady: yield* Deferred.make<PromptHandle>(),
-        boundaryStarted: false,
-        agentInvoked: false,
-        interrupted: false,
-      };
-      active = entry;
-      // The import/handoff watermark predates this GUI turn. Invalidate it;
-      // handoff records a new exact leaf only after the writer has stopped.
-      yield* SubscriptionRef.update(cursor, (previous) => {
-        const next = { ...previous };
-        delete next.historyLeafId;
-        return next;
+  const startTurn = Effect.fn("NeoPiSessionRuntime.startTurn")(function* (turn: NeoPiTurnInput) {
+    yield* prepareForTurn;
+    if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi is not ready for a turn",
       });
-      yield* setState("running");
-      if (typedInTerminal) {
-        // The pane answers once the editor took the text; the command's work is the terminal's.
-        const outcome = yield* Deferred.make<PromptOutcome>();
-        yield* Deferred.succeed(entry.promptReady!, { id: `tui-${turn.turnId}`, outcome });
-        yield* peer.request({ type: "slash", text: turn.text }).pipe(
-          Effect.matchEffect({
-            onFailure: (error) =>
-              Deferred.succeed(outcome, {
-                kind: "rejected",
-                error: error.message,
-                ...(error.code !== undefined ? { code: error.code } : {}),
-              }).pipe(Effect.andThen(settle(entry, "failed", error.message))),
-            onSuccess: () =>
-              Deferred.succeed(outcome, { kind: "local", agentInvoked: false }).pipe(
-                Effect.andThen(settle(entry, "completed")),
-              ),
-          }),
-          Effect.forkIn(lifetime!),
-        );
-        return { turnId: turn.turnId };
-      }
-      const handle = yield* peer
-        .prompt({
-          type: "prompt",
-          message: turn.text,
-          ...(turn.images.length ? { images: turn.images } : {}),
-        })
-        .pipe(
-          Effect.mapError(rpcError),
-          Effect.tapError(() =>
-            Effect.gen(function* () {
-              active = undefined;
-              yield* setState("ready");
-            }),
-          ),
-        );
-      entry.promptId = handle.id;
+    if (!attached && turn.modelSelection) yield* applyModelSelection(turn.modelSelection);
+    const peer = yield* current();
+    // An attached prompt runs only headless commands; the terminal's TUI dispatches
+    // the rest when the text is typed into its editor.
+    let typedInTerminal = false;
+    if (attached && turn.images.length === 0 && neoPiSlashCommandName(turn.text)) {
+      const listed = yield* peer
+        .request({ type: "get_available_commands" })
+        .pipe(Effect.mapError(rpcError));
+      typedInTerminal =
+        neoPiTerminalTextRoute(
+          turn.text,
+          neoPiAvailableCommands(record(listed).commands),
+          capabilities.has(NEOPI_CAPABILITIES.commandCatalog),
+        ) === "tui";
+    }
+    const baseline = record(
+      yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
+    );
+    const entry: ActiveTurn = {
+      id: turn.turnId,
+      baselineLeaf: typeof baseline.leafId === "string" ? baseline.leafId : null,
+      boundaryDone: yield* Deferred.make<void>(),
+      promptReady: yield* Deferred.make<PromptHandle, NeoPiRuntimeError>(),
+      promptAdmission: yield* Deferred.make<void>(),
+      boundaryStarted: false,
+      agentInvoked: false,
+      interrupted: false,
+    };
+    active = entry;
+    // The import/handoff watermark predates this GUI turn. Invalidate it;
+    // handoff records a new exact leaf only after the writer has stopped.
+    yield* SubscriptionRef.update(cursor, (previous) => {
+      const next = { ...previous };
+      delete next.historyLeafId;
+      return next;
+    });
+    yield* setState("running");
+    if (typedInTerminal) {
+      // The pane answers once the editor took the text; the command's work is the terminal's.
+      const outcome = yield* Deferred.make<PromptOutcome>();
+      const handle = { id: `tui-${turn.turnId}`, outcome };
       yield* Deferred.succeed(entry.promptReady!, handle);
       yield* observePrompt(entry, handle).pipe(Effect.forkIn(lifetime!));
+      yield* peer.request({ type: "slash", text: turn.text }).pipe(
+        Effect.matchEffect({
+          onFailure: (error) =>
+            Deferred.succeed(outcome, {
+              kind: "rejected",
+              error: error.message,
+              ...(error.code !== undefined ? { code: error.code } : {}),
+            }).pipe(Effect.andThen(settle(entry, "failed", error.message))),
+          onSuccess: () =>
+            Deferred.succeed(outcome, { kind: "local", agentInvoked: false }).pipe(
+              Effect.andThen(settle(entry, "completed")),
+            ),
+        }),
+        Effect.forkIn(lifetime!),
+      );
+      const accepted = yield* Deferred.await(outcome);
+      yield* Deferred.await(entry.promptAdmission!);
+      if (accepted.kind === "rejected")
+        return yield* new NeoPiRuntimeError({ code: "rpc", message: accepted.error });
       return { turnId: turn.turnId };
-    });
-  const steer = (turn: NeoPiTurnInput) =>
-    Effect.gen(function* () {
-      if ((yield* SubscriptionRef.get(state)) !== "running" || !active || compacting)
-        return yield* new NeoPiRuntimeError({
-          code: "not_running",
-          message: "NeoPi has no running turn to steer",
-        });
-      yield* request({
-        type: "steer",
+    }
+    const handle = yield* peer
+      .prompt({
+        type: "prompt",
         message: turn.text,
         ...(turn.images.length ? { images: turn.images } : {}),
-      }).pipe(Effect.mapError(rpcError));
-    });
-  const resolvePlanProposal: NeoPiSessionRuntimeShape["resolvePlanProposal"] = (
-    response,
-    continuation,
-  ) =>
-    Effect.gen(function* () {
-      const proposal = pendingProposal;
-      yield* requireOwner("respond to a plan proposal").pipe(Effect.mapError(rpcError));
-      if (!proposal || proposal.resolving)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi has no pending plan proposal for this action",
-        });
-      if (response.decision === "withdraw") {
-        proposal.resolving = true;
-        proposal.withdrawing = true;
-        yield* request({ type: "set_mode", mode: "default" }).pipe(
-          Effect.mapError(rpcError),
-          Effect.tapError(() =>
-            Effect.sync(() => {
-              proposal.resolving = false;
-              proposal.withdrawing = false;
-            }),
-          ),
-        );
-        yield* Deferred.await(proposal.done);
-        return;
-      }
-      const beforeRefinement = continuation
-        ? record(yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError))).leafId
-        : undefined;
-      if (pendingProposal !== proposal || proposal.resolving)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi cancelled this plan before its response could be sent",
-        });
-      if (continuation) {
-        if (typeof beforeRefinement !== "string")
-          return yield* new NeoPiRuntimeError({
-            code: "identity_mismatch",
-            message: "NeoPi cannot locate the plan refinement's native history boundary",
-          });
-        proposal.resolving = true;
-        const entry: ActiveTurn = {
-          id: continuation.turnId,
-          baselineLeaf: null,
-          boundaryDone: yield* Deferred.make<void>(),
-          boundaryStarted: false,
-          continuation: true,
-          agentInvoked: true,
-          interrupted: false,
-        };
-        const previous = yield* SubscriptionRef.get(cursor);
-        const next = {
-          ...previous,
-          turnBoundaries: [
-            ...previous.turnBoundaries,
-            {
-              turnId: continuation.turnId,
-              kind: "continuation" as const,
-              afterEntryId: beforeRefinement,
-            },
-          ],
-        };
-        delete next.historyLeafId;
-        yield* SubscriptionRef.set(cursor, next);
-        active = entry;
-        yield* setState("running");
-        if (pendingProposal !== proposal) {
-          yield* rejectProposal(proposal, "NeoPi cancelled this plan before admission");
-          return yield* new NeoPiRuntimeError({
-            code: "not_ready",
-            message: "NeoPi cancelled this plan before admission",
-          });
-        }
-      } else proposal.resolving = true;
-      const peer = yield* current();
-      if (pendingProposal !== proposal)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi cancelled this plan before its response could be sent",
-        });
-      const frame: PlanProposalResponseFrame = {
-        type: "plan_proposal_response",
-        id: proposal.id,
-        decision: response.decision,
-        ...(response.feedback ? { feedback: response.feedback } : {}),
-      };
-      yield* peer.writeFrame(frame).pipe(
+      })
+      .pipe(
         Effect.mapError(rpcError),
-        Effect.tapError(() =>
+        Effect.tapError((error) =>
           Effect.gen(function* () {
-            proposal.resolving = false;
-            if (continuation && active?.id === continuation.turnId) {
-              active = undefined;
-              const previous = yield* SubscriptionRef.get(cursor);
-              yield* SubscriptionRef.set(cursor, {
-                ...previous,
-                turnBoundaries: previous.turnBoundaries.filter(
-                  (boundary) => boundary.turnId !== continuation.turnId,
-                ),
-              });
-              yield* setState("ready");
-            }
+            active = undefined;
+            yield* setState("ready");
+            yield* Deferred.fail(entry.promptReady!, error);
+            yield* Deferred.succeed(entry.promptAdmission!, undefined);
           }),
         ),
       );
-      if (!continuation) yield* Deferred.await(proposal.done);
-    });
+    entry.promptId = handle.id;
+    yield* Deferred.succeed(entry.promptReady!, handle);
+    yield* observePrompt(entry, handle).pipe(Effect.forkIn(lifetime!));
+    const outcome = yield* Deferred.await(handle.outcome);
+    yield* Deferred.await(entry.promptAdmission!);
+    if (outcome.kind === "rejected")
+      return yield* new NeoPiRuntimeError({ code: "rpc", message: outcome.error });
+    if (outcome.kind === "agent") yield* rememberBoundary(entry);
+    else yield* Deferred.await(entry.boundaryDone);
+    return { turnId: turn.turnId };
+  });
+  const steer = Effect.fn("NeoPiSessionRuntime.steer")(function* (turn: NeoPiTurnInput) {
+    if ((yield* SubscriptionRef.get(state)) !== "running" || !active || compacting)
+      return yield* new NeoPiRuntimeError({
+        code: "not_running",
+        message: "NeoPi has no running turn to steer",
+      });
+    yield* request({
+      type: "steer",
+      message: turn.text,
+      ...(turn.images.length ? { images: turn.images } : {}),
+    }).pipe(Effect.mapError(rpcError));
+  });
+  const resolvePlanProposal: NeoPiSessionRuntimeShape["resolvePlanProposal"] = Effect.fn(
+    "NeoPiSessionRuntime.resolvePlanProposal",
+  )(function* (response, continuation) {
+    const proposal = pendingProposal;
+    yield* requireOwner("respond to a plan proposal").pipe(Effect.mapError(rpcError));
+    if (!proposal || proposal.resolving)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi has no pending plan proposal for this action",
+      });
+    if (response.decision === "withdraw") {
+      proposal.resolving = true;
+      proposal.withdrawing = true;
+      yield* request({ type: "set_mode", mode: "default" }).pipe(
+        Effect.mapError(rpcError),
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            proposal.resolving = false;
+            proposal.withdrawing = false;
+          }),
+        ),
+      );
+      yield* Deferred.await(proposal.done);
+      return;
+    }
+    const beforeRefinement = continuation
+      ? record(yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError))).leafId
+      : undefined;
+    if (pendingProposal !== proposal || proposal.resolving)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi cancelled this plan before its response could be sent",
+      });
+    const acceptance = continuation ? yield* Deferred.make<void, NeoPiRuntimeError>() : undefined;
+    if (continuation) {
+      if (typeof beforeRefinement !== "string")
+        return yield* new NeoPiRuntimeError({
+          code: "identity_mismatch",
+          message: "NeoPi cannot locate the plan refinement's native history boundary",
+        });
+      proposal.resolving = true;
+      const entry: ActiveTurn = {
+        id: continuation.turnId,
+        baselineLeaf: null,
+        boundaryDone: yield* Deferred.make<void>(),
+        boundaryStarted: false,
+        continuation: true,
+        ...(acceptance ? { continuationAccepted: acceptance } : {}),
+        agentInvoked: true,
+        interrupted: false,
+      };
+      const previous = yield* SubscriptionRef.get(cursor);
+      const next = {
+        ...previous,
+        turnBoundaries: [
+          ...previous.turnBoundaries,
+          {
+            turnId: continuation.turnId,
+            kind: "continuation" as const,
+            afterEntryId: beforeRefinement,
+          },
+        ],
+      };
+      delete next.historyLeafId;
+      yield* SubscriptionRef.set(cursor, next);
+      active = entry;
+      yield* setState("running");
+      if (pendingProposal !== proposal) {
+        yield* rejectProposal(proposal, "NeoPi cancelled this plan before admission");
+        return yield* new NeoPiRuntimeError({
+          code: "not_ready",
+          message: "NeoPi cancelled this plan before admission",
+        });
+      }
+    } else proposal.resolving = true;
+    const peer = yield* current();
+    if (pendingProposal !== proposal)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi cancelled this plan before its response could be sent",
+      });
+    const frame: PlanProposalResponseFrame = {
+      type: "plan_proposal_response",
+      id: proposal.id,
+      decision: response.decision,
+      ...(response.feedback ? { feedback: response.feedback } : {}),
+    };
+    yield* peer.writeFrame(frame).pipe(
+      Effect.mapError(rpcError),
+      Effect.tapError(() =>
+        Effect.gen(function* () {
+          proposal.resolving = false;
+          if (continuation && active?.id === continuation.turnId) {
+            active = undefined;
+            const previous = yield* SubscriptionRef.get(cursor);
+            yield* SubscriptionRef.set(cursor, {
+              ...previous,
+              turnBoundaries: previous.turnBoundaries.filter(
+                (boundary) => boundary.turnId !== continuation.turnId,
+              ),
+            });
+            yield* setState("ready");
+          }
+        }),
+      ),
+    );
+    if (!continuation) yield* Deferred.await(proposal.done);
+    if (acceptance) yield* Deferred.await(acceptance);
+  });
   const interrupt = Effect.gen(function* () {
     if (attached && !active)
       return yield* new NeoPiRuntimeError({
@@ -1279,37 +1403,36 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       ),
     );
   });
-  const compact = (customInstructions?: string) =>
-    Effect.gen(function* () {
-      yield* requireOwner("compact").pipe(Effect.mapError(rpcError));
-      if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
-        return yield* new NeoPiRuntimeError({
-          code: "not_ready",
-          message: "NeoPi can compact only between turns",
-        });
-      compacting = true;
-      const result = yield* request({
-        type: "compact",
-        ...(customInstructions ? { customInstructions } : {}),
-      }).pipe(
-        Effect.mapError(rpcError),
-        Effect.ensuring(
-          Effect.sync(() => {
-            compacting = false;
-          }),
-        ),
-      );
-      const before = record(result).tokensBefore;
-      const after = yield* getState();
-      yield* emit({
-        type: "t3.compaction",
-        ...(typeof before === "number" ? { beforeTokens: before } : {}),
-        ...(typeof after.contextUsage?.tokens === "number"
-          ? { afterTokens: after.contextUsage.tokens }
-          : {}),
+  const compact = Effect.fn("NeoPiSessionRuntime.compact")(function* (customInstructions?: string) {
+    yield* requireOwner("compact").pipe(Effect.mapError(rpcError));
+    if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
+      return yield* new NeoPiRuntimeError({
+        code: "not_ready",
+        message: "NeoPi can compact only between turns",
       });
-      yield* emit({ type: "t3.state", state: after });
+    compacting = true;
+    const result = yield* request({
+      type: "compact",
+      ...(customInstructions ? { customInstructions } : {}),
+    }).pipe(
+      Effect.mapError(rpcError),
+      Effect.ensuring(
+        Effect.sync(() => {
+          compacting = false;
+        }),
+      ),
+    );
+    const before = record(result).tokensBefore;
+    const after = yield* getState();
+    yield* emit({
+      type: "t3.compaction",
+      ...(typeof before === "number" ? { beforeTokens: before } : {}),
+      ...(typeof after.contextUsage?.tokens === "number"
+        ? { afterTokens: after.contextUsage.tokens }
+        : {}),
     });
+    yield* emit({ type: "t3.state", state: after });
+  });
   const stop = Effect.gen(function* () {
     const previous = yield* SubscriptionRef.get(state);
     if (previous === "stopped") return;
@@ -1345,21 +1468,22 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     yield* invalidateConfiguration;
     yield* emit({ type: "t3.state", state: fresh });
   });
-  const setRuntimeMode = (next: RuntimeMode) =>
-    Effect.gen(function* () {
-      yield* requireOwner("change runtime mode").pipe(Effect.mapError(rpcError));
-      if (mode === next) return;
-      mode = next;
-      const status = yield* SubscriptionRef.get(state);
-      if (status === "ready") yield* restart("runtime-mode-change");
-      else if (status === "running") {
-        pendingMode = true;
-        return yield* new NeoPiRuntimeError({
-          code: "runtime_mode_deferred",
-          message: "NeoPi runtime mode takes effect after the current turn",
-        });
-      }
-    });
+  const setRuntimeMode = Effect.fn("NeoPiSessionRuntime.setRuntimeMode")(function* (
+    next: RuntimeMode,
+  ) {
+    yield* requireOwner("change runtime mode").pipe(Effect.mapError(rpcError));
+    if (mode === next) return;
+    mode = next;
+    const status = yield* SubscriptionRef.get(state);
+    if (status === "ready") yield* restart("runtime-mode-change");
+    else if (status === "running") {
+      pendingMode = true;
+      return yield* new NeoPiRuntimeError({
+        code: "runtime_mode_deferred",
+        message: "NeoPi runtime mode takes effect after the current turn",
+      });
+    }
+  });
   return {
     threadId: input.threadId,
     state,
@@ -1369,31 +1493,68 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     },
     subscribeConfigurationChanges: PubSub.subscribe(configurationChanges),
     observeNative: nativeEvents.subscribe,
-    nativeRequest: (command) =>
-      Effect.gen(function* () {
+    nativeRequest: Effect.fn("NeoPiSessionRuntime.nativeRequest")(function* (command) {
+      if (
+        ![
+          "get_state",
+          "get_entries_page",
+          "snapshot_session_journal",
+          "navigate_tree",
+          "resume_tree",
+          "abort",
+        ].includes(command.type)
+      )
+        return yield* new NeoPiRpcError({
+          code: "unsupported",
+          command: command.type,
+          message: "Not a native conversation command.",
+        });
+      if (!client)
+        return yield* new NeoPiRpcError({
+          code: "closed",
+          command: command.type,
+          message: "NeoPi session is not connected",
+        });
+      const peer = client;
+      const epoch = generation;
+      const result = yield* peer.request(command);
+      if (client !== peer || generation !== epoch)
+        return yield* new NeoPiRpcError({
+          code: "closed",
+          command: command.type,
+          message: "The native connection changed during the request.",
+        });
+      if (command.type === "navigate_tree") {
+        const navigation = yield* decodeNavigateTreeResult(result).pipe(
+          Effect.mapError(
+            (cause) =>
+              new NeoPiRpcError({
+                code: "protocol",
+                command: command.type,
+                message: `NeoPi returned an invalid navigation receipt: ${cause.message}`,
+              }),
+          ),
+        );
+        const previous = yield* SubscriptionRef.get(cursor);
         if (
-          ![
-            "get_state",
-            "get_entries_page",
-            "snapshot_session_journal",
-            "navigate_tree",
-            "resume_tree",
-            "abort",
-          ].includes(command.type)
+          navigation.sessionId !== previous.sessionId ||
+          (navigation.sessionFile !== undefined &&
+            NodePath.resolve(navigation.sessionFile) !== NodePath.resolve(previous.sessionFile))
         )
           return yield* new NeoPiRpcError({
-            code: "unsupported",
+            code: "protocol",
             command: command.type,
-            message: "Not a native conversation command.",
+            message: "The native navigation receipt belongs to a different session.",
           });
-        if (!client)
-          return yield* new NeoPiRpcError({
-            code: "closed",
-            command: command.type,
-            message: "NeoPi session is not connected",
-          });
-        return yield* client.request(command);
-      }),
+        const { historyLeafId: _, ...withoutLeaf } = previous;
+        yield* SubscriptionRef.set(cursor, {
+          ...withoutLeaf,
+          ...(navigation.leafId === null ? {} : { historyLeafId: navigation.leafId }),
+        });
+        yield* invalidateConfiguration;
+      }
+      return result;
+    }),
     invalidateConfiguration,
     prepareForTurn,
     capabilities,
@@ -1423,18 +1584,17 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     setRuntimeMode,
     onSessionIdentityMayHaveChanged,
     applyModelSelection,
-    respondUi: (response) =>
-      Effect.gen(function* () {
-        if (!modelsAuthUi.has(response.id)) yield* requireOwner("respond to owner UI");
-        const channel = client ?? earlyUi;
-        if (!channel)
-          return yield* new NeoPiRpcError({
-            code: "closed",
-            message: "NeoPi session is not connected",
-          });
-        yield* channel.respondUi(response);
-        uiPending.delete(response.id);
-        modelsAuthUi.delete(response.id);
-      }),
+    respondUi: Effect.fn("NeoPiSessionRuntime.respondUi")(function* (response) {
+      if (!modelsAuthUi.has(response.id)) yield* requireOwner("respond to owner UI");
+      const channel = client ?? earlyUi;
+      if (!channel)
+        return yield* new NeoPiRpcError({
+          code: "closed",
+          message: "NeoPi session is not connected",
+        });
+      yield* channel.respondUi(response);
+      uiPending.delete(response.id);
+      modelsAuthUi.delete(response.id);
+    }),
   } satisfies NeoPiSessionRuntimeShape;
 });

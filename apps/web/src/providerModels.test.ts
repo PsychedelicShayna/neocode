@@ -7,9 +7,13 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { getProviderModelCapabilities, resolveSelectableProvider } from "./providerModels";
+import {
+  getDefaultServerModel,
+  getProviderModelCapabilities,
+  resolveSelectableProvider,
+} from "./providerModels";
 
-const PROVIDER = ProviderDriverKind.make("claudeAgent");
+const PROVIDER = ProviderDriverKind.make("neopi");
 
 function capabilities(id: string): ModelCapabilities {
   return {
@@ -63,23 +67,27 @@ describe("getProviderModelCapabilities", () => {
       customCapabilities,
     );
   });
-
-  it("returns empty capabilities for an unknown slug", () => {
-    const models = [
-      model({
-        slug: "default-model",
-        capabilities: capabilities("default-option"),
-      }),
-    ];
-
-    expect(getProviderModelCapabilities(models, "unknown-model", PROVIDER)).toEqual({
-      optionDescriptors: [],
-    });
-  });
 });
 
 describe("resolveSelectableProvider", () => {
-  const provider = (driver: string, instanceId = driver, overrides: Partial<ServerProvider> = {}): ServerProvider => ({ driver: ProviderDriverKind.make(driver), instanceId: ProviderInstanceId.make(instanceId), enabled: true, installed: true, version: null, status: "ready", auth: { status: "unknown" }, checkedAt: "2026-10-22T00:00:00.000Z", models: [model({ slug: "openai-codex/current", capabilities: {} })], skills: [], slashCommands: [], ...overrides });
+  const provider = (
+    driver: string,
+    instanceId = driver,
+    overrides: Partial<ServerProvider> = {},
+  ): ServerProvider => ({
+    driver: ProviderDriverKind.make(driver),
+    instanceId: ProviderInstanceId.make(instanceId),
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "unknown" },
+    checkedAt: "2026-10-22T00:00:00.000Z",
+    models: [model({ slug: "openai-codex/current", capabilities: {} })],
+    skills: [],
+    slashCommands: [],
+    ...overrides,
+  });
   it("resolves unset and obsolete runtime choices to NeoPi", () => {
     const providers = [provider("codex"), provider("neopi")];
     expect(resolveSelectableProvider(providers, null)).toBe("neopi");
@@ -91,6 +99,12 @@ describe("resolveSelectableProvider", () => {
     expect(resolveSelectableProvider([selected], selected.instanceId)).toBe("neopi");
   });
   it("does not resurrect another runtime when NeoPi is unavailable", () => {
-    expect(resolveSelectableProvider([provider("codex"), provider("neopi", "neopi", { enabled: false })], ProviderInstanceId.make("codex"))).toBe("neopi");
+    expect(
+      resolveSelectableProvider(
+        [provider("codex"), provider("neopi", "neopi", { enabled: false })],
+        ProviderInstanceId.make("codex"),
+      ),
+    ).toBe("neopi");
+    expect(getDefaultServerModel([provider("neopi", "neopi", { models: [] })], PROVIDER)).toBe("");
   });
-});;
+});

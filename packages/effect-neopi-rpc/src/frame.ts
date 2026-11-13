@@ -2,17 +2,11 @@ import * as Schema from "effect/Schema";
 
 import { isRecord } from "./schema.ts";
 
-/**
- * Physical stdout frame cap advertised by NeoPi/OMP protocol v1.
- * Inbound commands are never chunked; this is the peer's physical ceiling.
- */
-export const MAX_RPC_FRAME_BYTES = 1024 * 1024;
-
 /** Default logical-frame ceiling when `ready.maxReassembledFrameBytes` is absent. */
 export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 
 /** Decoded payload cap of one `rpc_chunk`, matching NeoPi `rpc-frame.ts`. */
-export const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
+const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
 export interface RpcChunkFrame {
   readonly type: "rpc_chunk";
@@ -33,6 +27,7 @@ interface PendingRpcChunks {
 }
 
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const decodeJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 
 /**
  * A 3-chunk sequence cannot both satisfy NeoPi's 1 MiB `byteLength` floor and
@@ -127,7 +122,7 @@ export class RpcFrameDecoder {
     }
     let frame: unknown;
     try {
-      frame = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(decoded);
+      frame = decodeJson(decoded);
     } catch {
       throw new Error("reassembled rpc frame is not JSON");
     }

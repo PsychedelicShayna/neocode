@@ -1,19 +1,13 @@
-import {
-  EventId,
-  RuntimeItemId,
-  type ProviderRuntimeEvent,
-  type TurnTokenUsage,
-} from "@t3tools/contracts";
+import { MessageId, type OrchestrationV2TurnItem, type TurnTokenUsage } from "@t3tools/contracts";
+import type { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
+import * as DateTime from "effect/DateTime";
 
-import { scopedItemId, type MapCtx } from "./MapCtx.ts";
+import { nativeItemBase, scopedItemId, type CoreMapCtx } from "./MapCtx.ts";
 
-/**
- * Frames the runtime injects around native RPC events. Native `agent_end`
- * never settles a turn; N3 injects `t3.turn.outcome` after it decides the
- * terminal state. `t3.state` is the post-settle / post-compaction
- * `get_state` snapshot. `t3.compaction` covers a manual compact that did
- * not also surface `auto_compaction_end`.
- */
+type CoreResult = { readonly events: ProviderAdapterV2Event[]; readonly state: CoreState };
+
+// Only the runtime's t3.turn.outcome settles a turn; native agent_end cannot.
+// t3.state carries post-settlement/compaction snapshots; t3.compaction covers manual compaction.
 const T3_TURN_OUTCOME_TYPE = "t3.turn.outcome";
 const T3_STATE_TYPE = "t3.state";
 const T3_COMPACTION_TYPE = "t3.compaction";
@@ -48,7 +42,7 @@ interface OpenContentItem {
   readonly contentIndex: number;
   readonly itemType: "assistant_message" | "reasoning";
   readonly text: string;
-  readonly started: boolean;
+  readonly startedAt: string;
   readonly pendingComplete: boolean;
   readonly failed: boolean;
 }
@@ -68,6 +62,7 @@ interface UsageTotals {
 
 interface CompactionTracker {
   readonly itemId: string;
+  readonly startedAt: string;
   readonly open: boolean;
   readonly settled: boolean;
   readonly beforeTokens: number | undefined;
@@ -117,64 +112,182 @@ export function coreTurnTokenUsage(state: CoreState): TurnTokenUsage {
   return tokenUsageFrom(state);
 }
 
-export function mapCoreFrame(
-  ctx: MapCtx,
-  frame: unknown,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+export function mapCoreFrame(ctx: CoreMapCtx, frame: unknown, state: CoreState): CoreResult {
   const record = asRecord(frame);
-  if (!record || typeof record.type !== "string") {
-    return { events: [], state };
-  }
+  if (!record || typeof record.type !== "string") return { events: [], state };
   switch (record.type) {
+    case "t3.prompt.accepted":
+      return {
+        events:
+          ctx.agentId === undefined && ctx.providerTurn && !ctx.providerTurn.inputAccepted
+            ? [
+                {
+                  type: "provider_turn.updated",
+                  driver: ctx.provider,
+                  threadId: ctx.threadId,
+                  providerTurn: { ...ctx.providerTurn, inputAccepted: true },
+                },
+              ]
+            : [],
+        state,
+      };
     case "agent_start":
       return mapAgentStart(ctx, record, state);
-    case "message_start":
-      return mapMessageStart(record, state);
+    case "message_start": {
+      const message = asRecord(record.message);
+      return {
+        events: [],
+        state:
+          message?.role === "assistant"
+            ? openAssistant(state, message)
+            : { ...state, openMessageOrdinal: undefined },
+      };
+    }
     case "message_update":
       return mapMessageUpdate(ctx, record, state);
-    case "message_end":
-      return mapMessageEnd(ctx, record, state);
-    case "agent_end":
-      return mapAgentEnd(ctx, record, state);
+    case "message_end": {
+      const message = asRecord(record.message);
+      if (message?.role !== "assistant") {
+        return { events: [], state: { ...state, openMessageOrdinal: undefined } };
+      }
+      let next = state.openMessageOrdinal === undefined ? openAssistant(state, message) : state;
+      next = noteUsage(next, next.openMessageOrdinal, message, true);
+      next = rememberSignature(next, next.openMessageOrdinal, signatureOf(message));
+      return closeOpenContent(ctx, next, next.openMessageOrdinal, false);
+    }
+    case "agent_end": {
+      const messages = Array.isArray(record.messages)
+        ? record.messages.filter(isAssistantMessage)
+        : [];
+      return closeOpenContent(
+        ctx,
+        pairAgentEndMessages(state, messages),
+        state.openMessageOrdinal,
+        false,
+      );
+    }
     case "turn_end": {
-      const closed = closeOpenContent(ctx, record, state, state.openMessageOrdinal, false);
+      const closed = closeOpenContent(ctx, state, state.openMessageOrdinal, false);
       return {
         events: closed.events,
         state: { ...closed.state, openMessageOrdinal: state.openMessageOrdinal },
       };
     }
-    case "command_output":
-      return mapCommandOutput(ctx, record, state);
+    case "command_output": {
+      const textValue = typeof record.text === "string" ? record.text : "";
+      if (!textValue) return { events: [], state };
+      const seq = state.commandSeq + 1;
+      return {
+        events: contentEvents(
+          ctx,
+          {
+            itemId: `neopi:command:${seq}`,
+            ordinal: state.nextMessageOrdinal,
+            contentIndex: 0,
+            itemType: "assistant_message",
+            text: textValue,
+            startedAt: ctx.now(),
+            pendingComplete: true,
+            failed: false,
+          },
+          "completed",
+        ),
+        state: { ...state, commandSeq: seq },
+      };
+    }
     case "subagent_lifecycle":
     case "subagent_progress":
     case "subagent_event":
       return { events: [], state: { ...state, hasSubagents: true } };
-    case "notice":
-      return mapNotice(ctx, record, state);
-    case "auto_retry_start":
-      return mapAutoRetryStart(ctx, record, state);
+    case "notice": {
+      const message = text(record.message);
+      return {
+        events: message ? [noticeEvent(ctx, message, noticeDetail(record))] : [],
+        state,
+      };
+    }
+    case "auto_retry_start": {
+      const attempt = nonNeg(record.attempt);
+      const maxAttempts = nonNeg(record.maxAttempts);
+      const message =
+        text(record.errorMessage) ??
+        `NeoPi is retrying${attempt !== undefined ? ` (attempt ${attempt}${maxAttempts !== undefined ? `/${maxAttempts}` : ""})` : ""}`;
+      return {
+        events: [
+          noticeEvent(ctx, message, {
+            ...(attempt !== undefined ? { attempt } : {}),
+            ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+            ...(nonNeg(record.delayMs) !== undefined ? { delayMs: nonNeg(record.delayMs) } : {}),
+            ...(record.errorId !== undefined ? { errorId: record.errorId } : {}),
+          }),
+        ],
+        state,
+      };
+    }
     case "auto_retry_end":
-      return mapAutoRetryEnd(ctx, record, state);
-    case "retry_fallback_applied":
-      return mapRetryFallback(ctx, record, state);
-    case "config_update":
-      return mapConfigUpdate(ctx, record, state);
-    case "thinking_level_changed":
-      return mapThinkingLevel(ctx, record, state);
+      return {
+        events:
+          record.success === false
+            ? [
+                noticeEvent(
+                  ctx,
+                  text(record.finalError) ?? "NeoPi retry failed",
+                  nonNeg(record.attempt) !== undefined ? { attempt: nonNeg(record.attempt) } : {},
+                ),
+              ]
+            : [],
+        state,
+      };
+    case "retry_fallback_applied": {
+      const fromModel = text(record.from);
+      const toModel = text(record.to);
+      if (!fromModel || !toModel) return { events: [], state };
+      const reason =
+        text(record.reason) ??
+        (text(record.role) ? `Retry fallback (${text(record.role)})` : "Retry fallback");
+      const refreshed = metadataRefresh(ctx, state, toModel, state.thinkingLevel, false);
+      return {
+        events: [noticeEvent(ctx, reason, { fromModel, toModel }), ...refreshed.events],
+        state: refreshed.state,
+      };
+    }
+    case "config_update": {
+      const hasModel = Object.prototype.hasOwnProperty.call(record, "model");
+      const hasThinking = Object.prototype.hasOwnProperty.call(record, "thinkingLevel");
+      const thinkingLevel = hasThinking ? text(record.thinkingLevel) : state.thinkingLevel;
+      return metadataRefresh(
+        ctx,
+        state,
+        hasModel ? (modelSlug(record.model) ?? text(record.model)) : state.model,
+        thinkingLevel,
+        hasThinking && thinkingLevel === undefined,
+      );
+    }
+    case "thinking_level_changed": {
+      const level = text(record.thinkingLevel) ?? text(record.resolved) ?? text(record.configured);
+      return metadataRefresh(ctx, state, state.model, level, level === undefined);
+    }
+    case "extension_error":
+      return {
+        events: [
+          noticeEvent(ctx, errorText(record.error), {
+            ...(text(record.extensionPath) ? { extensionPath: text(record.extensionPath) } : {}),
+            ...(text(record.event) ? { event: text(record.event) } : {}),
+          }),
+        ],
+        state,
+      };
     case "auto_compaction_start":
       return mapCompactionStart(ctx, record, state);
     case "auto_compaction_end":
-      return mapCompactionEnd(ctx, record, state);
-    case "extension_error":
-      return mapExtensionError(ctx, record, state);
+    case T3_COMPACTION_TYPE:
+      return settleCompaction(ctx, record, state);
     case T3_TURN_OUTCOME_TYPE:
       return mapTurnOutcome(ctx, record, state);
     case T3_STATE_TYPE:
       return mapSessionState(ctx, record, state);
-    case T3_COMPACTION_TYPE:
-      return mapInjectedCompaction(ctx, record, state);
     case "t3.session.exited": {
+      const recoverable = record.recoverable === true;
       const stderr =
         typeof record.stderrTail === "string" ? record.stderrTail.trim().slice(-512) : "";
       const processStatus = [
@@ -183,14 +296,18 @@ export function mapCoreFrame(
       ].join(", ");
       return {
         events: [
-          emit(ctx, frame, "session.exited", {
-            reason:
-              record.recoverable === true
+          {
+            type: "provider_session.updated",
+            driver: ctx.provider,
+            providerSession: {
+              ...ctx.providerSession,
+              status: recoverable ? "error" : "stopped",
+              lastError: recoverable
                 ? `NeoPi process exited (${processStatus})${stderr ? `: ${stderr}` : ""}`
-                : "NeoPi session stopped",
-            recoverable: record.recoverable === true,
-            exitKind: record.recoverable === true ? "error" : "graceful",
-          }),
+                : null,
+              updatedAt: DateTime.makeUnsafe(ctx.now()),
+            },
+          },
         ],
         state,
       };
@@ -201,10 +318,10 @@ export function mapCoreFrame(
 }
 
 function mapAgentStart(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   const model = modelSlug(frame.model) ?? text(frame.model) ?? state.model;
   const effort = text(frame.effort) ?? text(frame.thinkingLevel) ?? state.thinkingLevel;
   if (state.turnStarted) {
@@ -221,40 +338,34 @@ function mapAgentStart(
     usage: EMPTY_USAGE,
     hasSubagents: false,
   };
-  if (ctx.agentId !== undefined) {
-    return { events: [], state: next };
-  }
   return {
-    events: [
-      emit(ctx, frame, "turn.started", {
-        ...(model ? { model } : {}),
-        ...(effort ? { effort } : {}),
-      }),
-    ],
+    events:
+      ctx.agentId === undefined && ctx.providerTurn
+        ? [
+            {
+              type: "provider_turn.updated",
+              driver: ctx.provider,
+              threadId: ctx.threadId,
+              providerTurn: {
+                ...ctx.providerTurn,
+                status: "running",
+                startedAt: ctx.providerTurn.startedAt ?? DateTime.makeUnsafe(ctx.now()),
+                ...(model ? { model } : {}),
+              },
+            },
+          ]
+        : [],
     state: next,
   };
 }
 
-function mapMessageStart(
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const message = asRecord(frame.message);
-  if (message?.role !== "assistant") {
-    return { events: [], state: { ...state, openMessageOrdinal: undefined } };
-  }
-  return { events: [], state: openAssistant(state, message) };
-}
-
 function mapMessageUpdate(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   const assistantEvent = asRecord(frame.assistantMessageEvent);
-  if (!assistantEvent || typeof assistantEvent.type !== "string") {
-    return { events: [], state };
-  }
+  if (!assistantEvent || typeof assistantEvent.type !== "string") return { events: [], state };
   const message =
     asRecord(frame.message) ?? asRecord(assistantEvent.partial) ?? asRecord(assistantEvent.message);
   let next =
@@ -263,530 +374,366 @@ function mapMessageUpdate(
       : state;
   const kind = contentKind(assistantEvent.type);
   if (!kind || next.openMessageOrdinal === undefined) {
-    if (assistantEvent.type === "error" || assistantEvent.type === "done") {
-      const final = asRecord(assistantEvent.message) ?? asRecord(assistantEvent.error);
-      if (final?.role === "assistant") {
-        next = noteUsage(next, next.openMessageOrdinal, final, true);
-        next = rememberSignature(next, next.openMessageOrdinal, signatureOf(final));
-      }
-      const closed = closeOpenContent(
-        ctx,
-        frame,
-        next,
-        next.openMessageOrdinal,
-        assistantEvent.type === "error",
-      );
-      return {
-        events: closed.events,
-        state: { ...closed.state, openMessageOrdinal: next.openMessageOrdinal },
-      };
+    if (assistantEvent.type !== "error" && assistantEvent.type !== "done") {
+      return { events: [], state: next };
     }
-    return { events: [], state: next };
-  }
-  const contentIndex = contentIndexOf(assistantEvent);
-  const itemType = kind === "thinking" ? "reasoning" : "assistant_message";
-  const streamKind = kind === "thinking" ? "reasoning_text" : "assistant_text";
-  const itemId = contentItemId(next.openMessageOrdinal, kind, contentIndex);
-  let item = next.openItems[itemId];
-  const events: ProviderRuntimeEvent[] = [];
-  if (
-    assistantEvent.type === "text_start" ||
-    assistantEvent.type === "thinking_start" ||
-    assistantEvent.type.endsWith("_delta")
-  ) {
-    if (!item) {
-      item = {
-        itemId,
-        ordinal: next.openMessageOrdinal,
-        contentIndex,
-        itemType,
-        text: "",
-        started: false,
-        pendingComplete: false,
-        failed: false,
-      };
+    const final = asRecord(assistantEvent.message) ?? asRecord(assistantEvent.error);
+    if (final?.role === "assistant") {
+      next = noteUsage(next, next.openMessageOrdinal, final, true);
+      next = rememberSignature(next, next.openMessageOrdinal, signatureOf(final));
     }
-    if (!item.started) {
-      events.push(
-        emit(
-          ctx,
-          frame,
-          "item.started",
-          {
-            itemType,
-            status: "inProgress",
-            title: itemType === "reasoning" ? "Thinking" : "Assistant",
-          },
-          itemId,
-        ),
-      );
-      item = { ...item, started: true };
-    }
-  }
-  if (assistantEvent.type.endsWith("_delta")) {
-    const delta = typeof assistantEvent.delta === "string" ? assistantEvent.delta : "";
-    if (item && delta.length > 0) {
-      events.push(emit(ctx, frame, "content.delta", { streamKind, delta, contentIndex }, itemId));
-      item = { ...item, text: item.text + delta };
-    }
-  }
-  if (assistantEvent.type === "text_end" || assistantEvent.type === "thinking_end") {
-    const finalText =
-      typeof assistantEvent.content === "string" ? assistantEvent.content : (item?.text ?? "");
-    if (!item) {
-      item = {
-        itemId,
-        ordinal: next.openMessageOrdinal,
-        contentIndex,
-        itemType,
-        text: finalText,
-        started: false,
-        pendingComplete: false,
-        failed: false,
-      };
-    } else {
-      item = { ...item, text: finalText || item.text };
-    }
-    item = { ...item, pendingComplete: true };
-  }
-  next = putItem(next, item);
-  const flushed = flushReadyItems(ctx, frame, next, next.openMessageOrdinal, false);
-  return { events: [...events, ...flushed.events], state: flushed.state };
-}
-
-function mapMessageEnd(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const message = asRecord(frame.message);
-  if (message?.role !== "assistant") {
-    return { events: [], state: { ...state, openMessageOrdinal: undefined } };
-  }
-  let next = state.openMessageOrdinal === undefined ? openAssistant(state, message) : state;
-  next = noteUsage(next, next.openMessageOrdinal, message, true);
-  next = rememberSignature(next, next.openMessageOrdinal, signatureOf(message));
-  return closeOpenContent(ctx, frame, next, next.openMessageOrdinal, false);
-}
-
-function mapAgentEnd(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const messages = Array.isArray(frame.messages) ? frame.messages.filter(isAssistantMessage) : [];
-  let next = pairAgentEndMessages(state, messages);
-  const closed = closeOpenContent(ctx, frame, next, next.openMessageOrdinal, false);
-  next = closed.state;
-  return { events: closed.events, state: { ...next, openMessageOrdinal: undefined } };
-}
-
-function mapCommandOutput(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const textValue = typeof frame.text === "string" ? frame.text : "";
-  if (textValue.length === 0) {
-    return { events: [], state };
-  }
-  const seq = state.commandSeq + 1;
-  const itemId = `neopi:command:${seq}`;
-  const events = [
-    emit(
+    const closed = closeOpenContent(
       ctx,
-      frame,
-      "item.started",
-      { itemType: "assistant_message", status: "inProgress", title: "Assistant" },
-      itemId,
-    ),
-    emit(ctx, frame, "content.delta", { streamKind: "assistant_text", delta: textValue }, itemId),
-    emit(
-      ctx,
-      frame,
-      "item.completed",
-      { itemType: "assistant_message", status: "completed", title: "Assistant", detail: textValue },
-      itemId,
-    ),
-  ];
-  return { events, state: { ...state, commandSeq: seq } };
-}
-
-function mapNotice(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const message = text(frame.message);
-  if (!message) return { events: [], state };
-  const detail = noticeDetail(frame);
-  if (frame.level === "error") {
+      next,
+      next.openMessageOrdinal,
+      assistantEvent.type === "error",
+    );
     return {
-      events: [
-        emit(ctx, frame, "runtime.error", {
-          message,
-          class: "provider_error",
-          ...(detail ? { detail } : {}),
-        }),
-      ],
-      state,
+      events: closed.events,
+      state: { ...closed.state, openMessageOrdinal: next.openMessageOrdinal },
     };
   }
-  return {
-    events: [emit(ctx, frame, "runtime.warning", { message, ...(detail ? { detail } : {}) })],
-    state,
+  const contentIndex = contentIndexOf(assistantEvent);
+  const itemId = contentItemId(next.openMessageOrdinal, kind, contentIndex);
+  let item = next.openItems[itemId];
+  const isStart = assistantEvent.type === "text_start" || assistantEvent.type === "thinking_start";
+  const isDelta = assistantEvent.type.endsWith("_delta");
+  const isEnd = assistantEvent.type === "text_end" || assistantEvent.type === "thinking_end";
+  if (!isStart && !isDelta && !isEnd) return { events: [], state: next };
+  item ??= {
+    itemId,
+    ordinal: next.openMessageOrdinal,
+    contentIndex,
+    itemType: kind === "thinking" ? "reasoning" : "assistant_message",
+    text: "",
+    startedAt: ctx.now(),
+    pendingComplete: false,
+    failed: false,
   };
-}
-
-function mapAutoRetryStart(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const attempt = nonNeg(frame.attempt);
-  const maxAttempts = nonNeg(frame.maxAttempts);
-  const message =
-    text(frame.errorMessage) ??
-    `NeoPi is retrying${attempt !== undefined ? ` (attempt ${attempt}${maxAttempts !== undefined ? `/${maxAttempts}` : ""})` : ""}`;
-  return {
-    events: [
-      emit(ctx, frame, "runtime.warning", {
-        message,
-        detail: {
-          ...(attempt !== undefined ? { attempt } : {}),
-          ...(maxAttempts !== undefined ? { maxAttempts } : {}),
-          ...(nonNeg(frame.delayMs) !== undefined ? { delayMs: nonNeg(frame.delayMs) } : {}),
-          ...(frame.errorId !== undefined ? { errorId: frame.errorId } : {}),
-        },
-      }),
-    ],
-    state,
-  };
-}
-
-function mapAutoRetryEnd(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  if (frame.success !== false) return { events: [], state };
-  const message = text(frame.finalError) ?? "NeoPi retry failed";
+  if (isDelta && typeof assistantEvent.delta === "string") {
+    item = { ...item, text: item.text + assistantEvent.delta };
+  }
+  if (isEnd) {
+    item = {
+      ...item,
+      text: typeof assistantEvent.content === "string" ? assistantEvent.content : item.text,
+      pendingComplete: true,
+    };
+  }
+  next = putItem(next, item);
+  const flushed = flushReadyItems(ctx, next, next.openMessageOrdinal, false);
   return {
     events: [
-      emit(ctx, frame, "runtime.warning", {
-        message,
-        detail: {
-          ...(nonNeg(frame.attempt) !== undefined ? { attempt: nonNeg(frame.attempt) } : {}),
-        },
-      }),
+      ...(!item.pendingComplete || flushed.state.openItems[itemId]
+        ? contentEvents(ctx, item, "running")
+        : []),
+      ...flushed.events,
     ],
-    state,
+    state: flushed.state,
   };
-}
-
-function mapRetryFallback(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const fromModel = text(frame.from);
-  const toModel = text(frame.to);
-  if (!fromModel || !toModel) return { events: [], state };
-  const role = text(frame.role);
-  const reason = text(frame.reason) ?? (role ? `Retry fallback (${role})` : "Retry fallback");
-  return {
-    events: [emit(ctx, frame, "model.rerouted", { fromModel, toModel, reason })],
-    state: { ...state, model: toModel },
-  };
-}
-
-function mapConfigUpdate(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const hasModel = Object.prototype.hasOwnProperty.call(frame, "model");
-  const hasThinking = Object.prototype.hasOwnProperty.call(frame, "thinkingLevel");
-  const model = hasModel ? (modelSlug(frame.model) ?? text(frame.model)) : state.model;
-  const thinkingLevel = hasThinking ? text(frame.thinkingLevel) : state.thinkingLevel;
-  return metadataRefresh(
-    ctx,
-    frame,
-    state,
-    model,
-    thinkingLevel,
-    hasThinking && thinkingLevel === undefined,
-  );
-}
-
-function mapThinkingLevel(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const thinkingLevel = text(frame.thinkingLevel) ?? text(frame.resolved) ?? text(frame.configured);
-  return metadataRefresh(
-    ctx,
-    frame,
-    state,
-    state.model,
-    thinkingLevel,
-    thinkingLevel === undefined,
-  );
-}
-
-function mapExtensionError(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  return {
-    events: [
-      emit(ctx, frame, "runtime.warning", {
-        message: errorText(frame.error),
-        detail: {
-          ...(text(frame.extensionPath) ? { extensionPath: text(frame.extensionPath) } : {}),
-          ...(text(frame.event) ? { event: text(frame.event) } : {}),
-        },
-      }),
-    ],
-    state,
-  };
-}
-
-function mapCompactionStart(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  if (state.compaction?.open) return { events: [], state };
-  const itemId = `neopi:compaction:${state.commandSeq + 1}`;
-  const detail = text(frame.reason) ?? text(frame.action);
-  return {
-    events: [
-      emit(
-        ctx,
-        frame,
-        "item.started",
-        {
-          itemType: "context_compaction",
-          status: "inProgress",
-          title: "Context compaction",
-          ...(detail ? { detail } : {}),
-        },
-        itemId,
-      ),
-    ],
-    state: {
-      ...state,
-      commandSeq: state.commandSeq + 1,
-      compaction: {
-        itemId,
-        open: true,
-        settled: false,
-        beforeTokens: undefined,
-        afterTokens: undefined,
-      },
-    },
-  };
-}
-
-function mapCompactionEnd(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const result = asRecord(frame.result);
-  return settleCompaction(ctx, frame, state, {
-    beforeTokens: nonNeg(result?.tokensBefore),
-    afterTokens: nonNeg(result?.tokensAfter),
-    skipped: frame.skipped === true,
-    aborted: frame.aborted === true,
-    errorMessage: text(frame.errorMessage),
-    summary: text(result?.summary) ?? text(result?.shortSummary),
-  });
-}
-
-function mapInjectedCompaction(
-  ctx: MapCtx,
-  frame: Record<string, unknown>,
-  state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const result = asRecord(frame.result);
-  return settleCompaction(ctx, frame, state, {
-    beforeTokens:
-      nonNeg(frame.beforeTokens) ?? nonNeg(frame.tokensBefore) ?? nonNeg(result?.tokensBefore),
-    afterTokens:
-      nonNeg(frame.afterTokens) ?? nonNeg(frame.tokensAfter) ?? nonNeg(result?.tokensAfter),
-    skipped: frame.skipped === true,
-    aborted: frame.aborted === true,
-    errorMessage: text(frame.errorMessage),
-    summary: text(frame.summary) ?? text(result?.summary),
-  });
 }
 
 function mapTurnOutcome(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   if (!isTurnState(frame.state)) return { events: [], state };
-  const closed = closeOpenContent(ctx, frame, state, undefined, frame.state === "failed");
-  if (ctx.agentId !== undefined) {
+  const closed = closeOpenContent(ctx, state, undefined, frame.state === "failed");
+  const turn = ctx.providerTurn;
+  if (
+    ctx.agentId !== undefined ||
+    !turn ||
+    ctx.runOrdinal === null ||
+    (turn.status !== "pending" && turn.status !== "running")
+  ) {
     return { events: closed.events, state: resetTurn(closed.state) };
   }
-  const errorMessage = text(frame.errorMessage);
-  const tokenUsage = tokenUsageFrom(closed.state);
-  const events: ProviderRuntimeEvent[] = [
+  const events: ProviderAdapterV2Event[] = [
     ...closed.events,
-    emit(ctx, frame, "turn.completed", {
-      state: frame.state,
-      ...(errorMessage ? { errorMessage } : {}),
-      tokenUsage,
-      ...(closed.state.usage.sawCost ? { totalCostUsd: closed.state.usage.totalCostUsd } : {}),
-    }),
+    {
+      type: "provider_turn.updated",
+      driver: ctx.provider,
+      threadId: ctx.threadId,
+      providerTurn: {
+        ...turn,
+        status: frame.state,
+        completedAt: DateTime.makeUnsafe(ctx.now()),
+        turnTokenUsage: tokenUsageFrom(closed.state),
+        ...(closed.state.model ? { model: closed.state.model } : {}),
+      },
+    },
   ];
+  if (frame.state === "failed") {
+    events.push({
+      type: "turn.terminal",
+      driver: ctx.provider,
+      providerThreadId: ctx.providerThreadId,
+      providerTurnId: turn.id,
+      runOrdinal: ctx.runOrdinal,
+      status: "failed",
+      failureItemOrdinal: ctx.itemOrdinal(scopedItemId(ctx, "terminal-failure")),
+      failure: {
+        class: "provider_error",
+        message: (text(frame.errorMessage) ?? "NeoPi turn failed").slice(0, 4096),
+        code: null,
+        retryable: null,
+      },
+      threadDisposition: "reusable",
+    });
+  } else {
+    events.push({
+      type: "turn.terminal",
+      driver: ctx.provider,
+      providerThreadId: ctx.providerThreadId,
+      providerTurnId: turn.id,
+      runOrdinal: ctx.runOrdinal,
+      status: frame.state,
+      failure: null,
+      threadDisposition: "reusable",
+    });
+  }
   return { events, state: resetTurn(closed.state) };
 }
 
 function mapSessionState(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   const session = asRecord(frame.state) ?? frame;
   const model = modelSlug(session.model) ?? text(session.model) ?? state.model;
-  const thinkingLevel = Object.prototype.hasOwnProperty.call(session, "thinkingLevel")
-    ? text(session.thinkingLevel)
-    : state.thinkingLevel;
-  const next: CoreState = { ...state, model, thinkingLevel };
+  const hasThinking = Object.prototype.hasOwnProperty.call(session, "thinkingLevel");
+  const level = hasThinking ? text(session.thinkingLevel) : state.thinkingLevel;
+  const refreshed = metadataRefresh(ctx, state, model, level, hasThinking && level === undefined);
   const context = asRecord(session.contextUsage);
   const usedTokens = nonNeg(context?.tokens);
-  if (usedTokens === undefined) return { events: [], state: next };
+  if (usedTokens === undefined) return refreshed;
   const maxTokens = positive(context?.contextWindow);
+  const previous = refreshed.events.find((event) => event.type === "provider_thread.updated");
   return {
     events: [
-      emit(ctx, frame, "thread.token-usage.updated", {
-        usage: {
-          usedTokens,
-          ...(maxTokens !== undefined ? { maxTokens } : {}),
+      {
+        type: "provider_thread.updated",
+        driver: ctx.provider,
+        providerThread: {
+          ...(previous?.providerThread ?? ctx.providerThread),
+          contextUsage: {
+            usedTokens,
+            ...(maxTokens !== undefined ? { maxTokens } : {}),
+          },
+          updatedAt: DateTime.makeUnsafe(ctx.now()),
         },
-      }),
+      },
+    ],
+    state: refreshed.state,
+  };
+}
+
+function metadataRefresh(
+  ctx: CoreMapCtx,
+  state: CoreState,
+  model: string | undefined,
+  thinkingLevel: string | undefined,
+  clearThinking: boolean,
+): CoreResult {
+  const next = { ...state, model, thinkingLevel: clearThinking ? undefined : thinkingLevel };
+  const previous = ctx.providerThread.nativeMetadata?.modelSelection;
+  const selectedModel = model ?? previous?.model;
+  if (!selectedModel || (!model && !thinkingLevel && !clearThinking))
+    return { events: [], state: next };
+  const options = (previous?.options ?? []).filter(
+    (option) => option.id !== "reasoningEffort" || (!clearThinking && thinkingLevel === undefined),
+  );
+  if (thinkingLevel !== undefined) options.push({ id: "reasoningEffort", value: thinkingLevel });
+  return {
+    events: [
+      {
+        type: "provider_thread.updated",
+        driver: ctx.provider,
+        providerThread: {
+          ...ctx.providerThread,
+          nativeMetadata: {
+            ...ctx.providerThread.nativeMetadata,
+            modelSelection: { instanceId: ctx.providerInstanceId, model: selectedModel, options },
+            updatedAt: ctx.now(),
+          },
+          updatedAt: DateTime.makeUnsafe(ctx.now()),
+        },
+      },
     ],
     state: next,
   };
 }
 
-function metadataRefresh(
-  ctx: MapCtx,
+function mapCompactionStart(
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-  model: string | undefined,
-  thinkingLevel: string | undefined,
-  clearThinking: boolean,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const next: CoreState = {
-    ...state,
-    model,
-    thinkingLevel: clearThinking ? undefined : thinkingLevel,
+): CoreResult {
+  if (state.compaction?.open) return { events: [], state };
+  const compaction: CompactionTracker = {
+    itemId: `neopi:compaction:${state.commandSeq + 1}`,
+    startedAt: ctx.now(),
+    open: true,
+    settled: false,
+    beforeTokens: undefined,
+    afterTokens: undefined,
   };
-  const metadata: Record<string, unknown> = {};
-  if (model) metadata.model = model;
-  if (thinkingLevel) metadata.thinkingLevel = thinkingLevel;
-  else if (clearThinking) metadata.thinkingLevel = null;
-  if (Object.keys(metadata).length === 0) return { events: [], state: next };
   return {
-    events: [emit(ctx, frame, "thread.metadata.updated", { metadata })],
-    state: next,
+    events: [compactionEvent(ctx, compaction, "running", text(frame.reason) ?? text(frame.action))],
+    state: { ...state, commandSeq: state.commandSeq + 1, compaction },
   };
 }
 
 function settleCompaction(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: CoreState,
-  input: {
-    readonly beforeTokens: number | undefined;
-    readonly afterTokens: number | undefined;
-    readonly skipped: boolean;
-    readonly aborted: boolean;
-    readonly errorMessage: string | undefined;
-    readonly summary: string | undefined;
-  },
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
-  const failed = input.aborted || input.errorMessage !== undefined;
-  const itemId = state.compaction?.itemId ?? `neopi:compaction:${state.commandSeq + 1}`;
-  const beforeTokens = input.beforeTokens ?? state.compaction?.beforeTokens;
-  const afterTokens = input.afterTokens ?? state.compaction?.afterTokens;
-  const events: ProviderRuntimeEvent[] = [];
-  if (!state.compaction?.open && !state.compaction) {
-    events.push(
-      emit(
-        ctx,
-        frame,
-        "item.started",
-        { itemType: "context_compaction", status: "inProgress", title: "Context compaction" },
-        itemId,
-      ),
-    );
-  }
-  const status = input.skipped ? "declined" : failed ? "failed" : "completed";
-  const alreadyClosed = state.compaction?.settled === true && state.compaction.open === false;
-  if (!alreadyClosed) {
-    events.push(
-      emit(
-        ctx,
-        frame,
-        "item.completed",
-        {
-          itemType: "context_compaction",
-          status,
-          title: "Context compaction",
-          ...(input.summary
-            ? { detail: input.summary }
-            : input.errorMessage
-              ? { detail: input.errorMessage }
-              : {}),
-        },
-        itemId,
-      ),
-    );
-  }
-  const shouldAnnounce =
-    !input.skipped && !failed && !sameCompaction(state.compaction, beforeTokens, afterTokens);
-  if (shouldAnnounce) {
-    events.push(
-      emit(ctx, frame, "thread.state.changed", {
-        state: "compacted",
-        ...(beforeTokens !== undefined ? { beforeTokens } : {}),
-        ...(afterTokens !== undefined ? { afterTokens } : {}),
-        ...(input.summary ? { detail: input.summary } : {}),
-      }),
-    );
-  }
+): CoreResult {
+  const result = asRecord(frame.result);
+  const beforeTokens =
+    nonNeg(frame.beforeTokens) ??
+    nonNeg(frame.tokensBefore) ??
+    nonNeg(result?.tokensBefore) ??
+    state.compaction?.beforeTokens;
+  const afterTokens =
+    nonNeg(frame.afterTokens) ??
+    nonNeg(frame.tokensAfter) ??
+    nonNeg(result?.tokensAfter) ??
+    state.compaction?.afterTokens;
+  const skipped = frame.skipped === true;
+  const errorMessage = text(frame.errorMessage);
+  const failed = frame.aborted === true || errorMessage !== undefined;
+  const summary =
+    text(frame.summary) ??
+    text(result?.summary) ??
+    text(result?.shortSummary) ??
+    errorMessage ??
+    (skipped ? "Compaction skipped" : undefined);
+  const compaction: CompactionTracker = {
+    itemId: state.compaction?.itemId ?? `neopi:compaction:${state.commandSeq + 1}`,
+    startedAt: state.compaction?.startedAt ?? ctx.now(),
+    open: false,
+    settled: true,
+    beforeTokens,
+    afterTokens,
+  };
+  const alreadyClosed = state.compaction?.settled === true && !state.compaction.open;
+  const changedCounts = !sameCompaction(state.compaction, beforeTokens, afterTokens);
   return {
-    events,
+    events:
+      !alreadyClosed || changedCounts
+        ? [
+            compactionEvent(
+              ctx,
+              compaction,
+              skipped ? "cancelled" : failed ? "failed" : "completed",
+              summary,
+            ),
+          ]
+        : [],
     state: {
       ...state,
       commandSeq: state.compaction ? state.commandSeq : state.commandSeq + 1,
-      compaction: {
-        itemId,
-        open: false,
-        settled: true,
-        beforeTokens,
-        afterTokens,
-      },
+      compaction,
     },
   };
 }
 
+function compactionEvent(
+  ctx: CoreMapCtx,
+  item: CompactionTracker,
+  status: OrchestrationV2TurnItem["status"],
+  summary?: string,
+): ProviderAdapterV2Event {
+  return {
+    type: "turn_item.updated",
+    driver: ctx.provider,
+    turnItem: {
+      ...nativeItemBase(ctx, item.itemId, status, "Context compaction", item.startedAt),
+      type: "compaction",
+      driver: ctx.provider,
+      ...(summary ? { summary } : {}),
+      ...(item.beforeTokens !== undefined ? { beforeTokenCount: item.beforeTokens } : {}),
+      ...(item.afterTokens !== undefined ? { afterTokenCount: item.afterTokens } : {}),
+    },
+  };
+}
+
+function noticeEvent(
+  ctx: CoreMapCtx,
+  message: string,
+  providerMetadata?: Record<string, unknown>,
+): ProviderAdapterV2Event {
+  return {
+    type: "turn_item.updated",
+    driver: ctx.provider,
+    turnItem: {
+      ...nativeItemBase(ctx, `notice:${ctx.newEventId()}`, "completed", null),
+      type: "system_notice",
+      message,
+      ...(providerMetadata ? { providerMetadata } : {}),
+    },
+  };
+}
+
+function contentEvents(
+  ctx: CoreMapCtx,
+  item: OpenContentItem,
+  status: OrchestrationV2TurnItem["status"],
+): ProviderAdapterV2Event[] {
+  const base = nativeItemBase(
+    ctx,
+    item.itemId,
+    status,
+    item.itemType === "reasoning" ? "Thinking" : "Assistant",
+    item.startedAt,
+  );
+  const streaming = status === "running";
+  if (item.itemType === "reasoning") {
+    return [
+      {
+        type: "turn_item.updated",
+        driver: ctx.provider,
+        turnItem: { ...base, type: "reasoning", text: item.text, streaming },
+      },
+    ];
+  }
+  const messageId = MessageId.make(scopedItemId(ctx, item.itemId));
+  return [
+    {
+      type: "message.updated",
+      driver: ctx.provider,
+      message: {
+        id: messageId,
+        threadId: ctx.threadId,
+        runId: ctx.runId,
+        nodeId: ctx.nodeId,
+        role: "assistant",
+        text: item.text,
+        attachments: [],
+        streaming,
+        createdAt: DateTime.makeUnsafe(item.startedAt),
+        updatedAt: DateTime.makeUnsafe(ctx.now()),
+        createdBy: "agent",
+        creationSource: "provider",
+      },
+    },
+    {
+      type: "turn_item.updated",
+      driver: ctx.provider,
+      turnItem: { ...base, type: "assistant_message", messageId, text: item.text, streaming },
+    },
+  ];
+}
+
 function closeOpenContent(
-  ctx: MapCtx,
-  frame: unknown,
+  ctx: CoreMapCtx,
   state: CoreState,
   ordinal: number | undefined,
   failed: boolean,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   const openItems = Object.values(state.openItems).map((item) =>
     ordinal !== undefined && item.ordinal !== ordinal
       ? item
@@ -794,7 +741,7 @@ function closeOpenContent(
   );
   let next = state;
   for (const item of openItems) next = putItem(next, item);
-  const flushed = flushReadyItems(ctx, frame, next, ordinal, true);
+  const flushed = flushReadyItems(ctx, next, ordinal, true);
   return {
     events: flushed.events,
     state: { ...flushed.state, openMessageOrdinal: undefined },
@@ -802,12 +749,11 @@ function closeOpenContent(
 }
 
 function flushReadyItems(
-  ctx: MapCtx,
-  frame: unknown,
+  ctx: CoreMapCtx,
   state: CoreState,
   ordinal: number | undefined,
   force: boolean,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
+): CoreResult {
   const items = Object.values(state.openItems).filter(
     (item) => ordinal === undefined || item.ordinal === ordinal,
   );
@@ -824,39 +770,14 @@ function flushReadyItems(
           ? -1
           : 1,
     );
-  const events: ProviderRuntimeEvent[] = [];
-  let next = state;
+  const events: ProviderAdapterV2Event[] = [];
+  if (ready.length === 0) return { events, state };
+  const openItems = { ...state.openItems };
   for (const item of ready) {
-    if (!item.started) {
-      events.push(
-        emit(
-          ctx,
-          frame,
-          "item.started",
-          {
-            itemType: item.itemType,
-            status: "inProgress",
-            title: item.itemType === "reasoning" ? "Thinking" : "Assistant",
-          },
-          item.itemId,
-        ),
-      );
-    }
-    const status = item.failed ? "failed" : "completed";
-    const payload = {
-      itemType: item.itemType,
-      status,
-      title: item.itemType === "reasoning" ? "Thinking" : "Assistant",
-      ...(item.text.trim().length > 0 ? { detail: item.text } : {}),
-    } as const;
-    if (item.text.trim().length > 0) {
-      events.push(emit(ctx, frame, "item.updated", payload, item.itemId));
-    }
-    events.push(emit(ctx, frame, "item.completed", payload, item.itemId));
-    const { [item.itemId]: _removed, ...rest } = next.openItems;
-    next = { ...next, openItems: rest };
+    events.push(...contentEvents(ctx, item, item.failed ? "failed" : "completed"));
+    delete openItems[item.itemId];
   }
-  return { events, state: next };
+  return { events, state: { ...state, openItems } };
 }
 
 function openAssistant(state: CoreState, message: Record<string, unknown> | undefined): CoreState {
@@ -876,8 +797,7 @@ function ensureOpenAssistant(
   state: CoreState,
   message: Record<string, unknown> | undefined,
 ): CoreState {
-  if (state.openMessageOrdinal !== undefined) return state;
-  return openAssistant(state, message);
+  return state.openMessageOrdinal !== undefined ? state : openAssistant(state, message);
 }
 
 function noteUsage(
@@ -1160,36 +1080,6 @@ function sameCompaction(
 ): boolean {
   if (!tracker?.settled) return false;
   return tracker.beforeTokens === beforeTokens && tracker.afterTokens === afterTokens;
-}
-
-function emit<T extends ProviderRuntimeEvent["type"]>(
-  ctx: MapCtx,
-  frame: unknown,
-  type: T,
-  payload: Extract<ProviderRuntimeEvent, { type: T }>["payload"],
-  itemId?: string,
-): Extract<ProviderRuntimeEvent, { type: T }> {
-  const agent =
-    ctx.agentId !== undefined &&
-    (type === "item.started" || type === "item.updated" || type === "item.completed")
-      ? {
-          ...(payload && typeof payload === "object" ? payload : {}),
-          agentId: ctx.agentId,
-          ...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
-        }
-      : payload;
-  return {
-    type,
-    eventId: EventId.make(ctx.newEventId()),
-    provider: ctx.provider,
-    providerInstanceId: ctx.providerInstanceId,
-    threadId: ctx.threadId,
-    createdAt: ctx.now(),
-    ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    ...(itemId ? { itemId: RuntimeItemId.make(scopedItemId(ctx, itemId)) } : {}),
-    payload: agent,
-    raw: { source: "neopi.rpc", payload: frame },
-  } as Extract<ProviderRuntimeEvent, { type: T }>;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

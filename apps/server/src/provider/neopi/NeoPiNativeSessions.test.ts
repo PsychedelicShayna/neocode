@@ -231,9 +231,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                       message: "Invalid model selector glob",
                     });
                   default:
-                    return yield* Effect.fail(
-                      new NeoPiRpcError({ message: `Unknown native command: ${command.type}` }),
-                    );
+                    return yield* new NeoPiRpcError({
+                      message: `Unknown native command: ${command.type}`,
+                    });
                 }
               }),
             respondUi: (response) =>

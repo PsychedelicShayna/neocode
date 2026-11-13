@@ -21,8 +21,8 @@ export function nativeEffortLabel(level: string): string {
   return EFFORT_LABELS[level] ?? level;
 }
 
-export const NATIVE_EFFORT_OPTION_ID = "effort";
-export const NATIVE_FAST_MODE_OPTION_ID = "fastMode";
+const NATIVE_EFFORT_OPTION_ID = "effort";
+const NATIVE_FAST_MODE_OPTION_ID = "fastMode";
 
 export type NativeTraitsCommand =
   | { readonly type: "set_thinking_level"; readonly level: string }

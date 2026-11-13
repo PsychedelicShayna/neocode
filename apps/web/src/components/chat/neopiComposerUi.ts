@@ -1,4 +1,4 @@
-import type { OrchestrationThreadActivity } from "@t3tools/contracts";
+import type { OrchestrationV2ProjectedTurnItem } from "@t3tools/contracts";
 
 export interface NeoPiComposerUi {
   readonly chatMode: "off" | "chat" | "erp" | "raw" | null;
@@ -12,19 +12,18 @@ const record = (value: unknown): Record<string, unknown> | null =>
     ? (value as Record<string, unknown>)
     : null;
 
-/** Persisted runtime activities survive reconnects; the newest key update wins. */
+/** Persisted provider notices survive reconnects; the newest key update wins. */
 export function projectNeoPiComposerUi(
-  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
 ): NeoPiComposerUi {
   const status = new Map<string, string>();
   const widgets = new Map<string, string>();
   let chatMode: NeoPiComposerUi["chatMode"] = null;
   let nativePlanMode: NeoPiComposerUi["nativePlanMode"] = null;
   let editor: NeoPiComposerUi["editor"] = null;
-  for (const activity of activities) {
-    if (activity.kind !== "runtime.warning") continue;
-    const detail = record(record(activity.payload)?.detail);
-    const ui = record(detail?.neopiUi);
+  for (const { item } of items) {
+    if (item.type !== "system_notice") continue;
+    const ui = record(item.providerMetadata?.neopiUi);
     if (!ui) continue;
     if (
       ui.kind === "chat-mode" &&
@@ -34,7 +33,7 @@ export function projectNeoPiComposerUi(
     if (ui.kind === "plan-mode" && (ui.mode === "default" || ui.mode === "plan"))
       nativePlanMode = ui.mode;
     if (ui.kind === "editor" && typeof ui.text === "string")
-      editor = { eventId: activity.id, text: ui.text };
+      editor = { eventId: item.id, text: ui.text };
     if ((ui.kind === "status" || ui.kind === "widget") && typeof ui.key === "string") {
       const value =
         ui.kind === "status"
@@ -72,8 +71,8 @@ function consumeNeoPiEditorAction(
 const composerProviderCapabilities = {
   neopi: {
     ownsSlashCommands: true,
-    project: (activities: ReadonlyArray<OrchestrationThreadActivity>) => {
-      const ui = projectNeoPiComposerUi(activities);
+    project: (items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>) => {
+      const ui = projectNeoPiComposerUi(items);
       return {
         editor: ui.editor,
         displayState: [

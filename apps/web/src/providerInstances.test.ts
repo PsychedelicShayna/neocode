@@ -1,7 +1,13 @@
-import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   applyProviderInstanceSettings,
+  brandProviderInstanceEntries,
   deriveProviderEntriesByEnvironment,
   deriveProviderInstanceEntries,
   getDefaultProviderInstanceModel,
@@ -10,6 +16,7 @@ import {
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   sortProviderInstanceEntries,
+  shouldShowInstanceBadge,
 } from "./providerInstances";
 
 function provider(input: {
@@ -21,10 +28,14 @@ function provider(input: {
   accentColor?: string;
   status?: ServerProvider["status"];
   models?: ServerProvider["models"];
+  supportsTextGeneration?: boolean;
 }): ServerProvider {
   return {
     instanceId: ProviderInstanceId.make(input.instanceId),
     driver: input.provider,
+    ...(input.supportsTextGeneration === undefined
+      ? {}
+      : { supportsTextGeneration: input.supportsTextGeneration }),
     ...(input.displayName ? { displayName: input.displayName } : {}),
     ...(input.accentColor ? { accentColor: input.accentColor } : {}),
     enabled: input.enabled ?? true,
@@ -104,30 +115,19 @@ describe("applyProviderInstanceSettings", () => {
     const entries = deriveProviderInstanceEntries([
       provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
     ]);
-    const [entry] = applyProviderInstanceSettings(entries, {
-      providerInstances: {
-        [ProviderInstanceId.make("codex")]: {
-          driver: ProviderDriverKind.make("codex"),
-          enabled: false,
+    const [entry] = applyProviderInstanceSettings(
+      entries,
+      {
+        providerInstances: {
+          [ProviderInstanceId.make("codex")]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: false,
+          },
         },
+        projectSettingsOverrides: {},
       },
-      providers: {} as never,
-    });
-
-    expect(entry?.enabled).toBe(false);
-  });
-
-  it("treats a removed custom instance snapshot as disabled", () => {
-    const entries = deriveProviderInstanceEntries([
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claude_work",
-      }),
-    ]);
-    const [entry] = applyProviderInstanceSettings(entries, {
-      providerInstances: {},
-      providers: {} as never,
-    });
+      null,
+    );
 
     expect(entry?.enabled).toBe(false);
   });
@@ -141,15 +141,20 @@ describe("applyProviderInstanceSettings", () => {
           instanceId,
         }),
       ]);
-      const [entry] = applyProviderInstanceSettings(entries, {
-        providerInstances: {},
-        providers: {} as never,
-      });
+      const [entry] = applyProviderInstanceSettings(
+        entries,
+        {
+          providerInstances: {},
+          projectSettingsOverrides: {},
+        },
+        null,
+      );
 
       expect(entry?.enabled).toBe(false);
     },
   );
 
+  // regression: #8337 provider ids matching Object.prototype keys resolved to prototype members
   it("uses settings for a configured custom instance named constructor", () => {
     const instanceId = ProviderInstanceId.make("constructor");
     const entries = deriveProviderInstanceEntries([
@@ -158,67 +163,75 @@ describe("applyProviderInstanceSettings", () => {
         instanceId,
       }),
     ]);
-    const [entry] = applyProviderInstanceSettings(entries, {
-      providerInstances: {
-        [instanceId]: {
-          driver: ProviderDriverKind.make("claudeAgent"),
-          enabled: false,
+    const [entry] = applyProviderInstanceSettings(
+      entries,
+      {
+        providerInstances: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            enabled: false,
+          },
         },
+        projectSettingsOverrides: {},
       },
-      providers: {} as never,
-    });
+      null,
+    );
 
     expect(entry?.enabled).toBe(false);
   });
 
-  it("treats a removed default instance for a fork driver as disabled", () => {
-    const driver = ProviderDriverKind.make("constructor");
+  it("uses the driver default for an unconfigured built-in default instance", () => {
     const entries = deriveProviderInstanceEntries([
-      provider({
-        provider: driver,
-        instanceId: "constructor",
-      }),
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi", enabled: false }),
+      provider({ provider: ProviderDriverKind.make("grok"), instanceId: "grok", enabled: true }),
     ]);
-    const [entry] = applyProviderInstanceSettings(entries, {
-      providerInstances: {},
-      providers: {} as never,
-    });
+    const [native, grok] = applyProviderInstanceSettings(
+      entries,
+      {
+        providerInstances: {},
+        projectSettingsOverrides: {},
+      },
+      null,
+    );
 
-    expect(entry?.isDefault).toBe(true);
-    expect(entry?.enabled).toBe(false);
-  });
-
-  it("uses legacy settings for a built-in default instance", () => {
-    const entries = deriveProviderInstanceEntries([
-      provider({
-        provider: ProviderDriverKind.make("codex"),
-        instanceId: "codex",
-      }),
-    ]);
-    const [entry] = applyProviderInstanceSettings(entries, {
-      providerInstances: {},
-      providers: { codex: { enabled: false } } as never,
-    });
-
-    expect(entry?.enabled).toBe(false);
-  });
-});
-
-describe("deriveProviderInstanceEntries", () => {
-  it("uses explicit instance id and driver kind from the snapshot", () => {
-    const snapshot = provider({
-      provider: ProviderDriverKind.make("codex"),
-      instanceId: "codex_personal",
-    });
-    const [entry] = deriveProviderInstanceEntries([snapshot]);
-
-    expect(entry?.instanceId).toBe("codex_personal");
-    expect(entry?.driverKind).toBe("codex");
-    expect(entry?.isDefault).toBe(false);
+    expect(native?.enabled).toBe(true);
+    expect(grok?.enabled).toBe(false);
   });
 });
 
 describe("deriveProviderEntriesByEnvironment", () => {
+  it("resolves registry branding from each environment's settings", () => {
+    const instanceId = "custom-acp";
+    const snapshot = provider({ provider: ProviderDriverKind.make("acpRegistry"), instanceId });
+    const byEnvironment = deriveProviderEntriesByEnvironment(
+      ["devin", "other-agent"].map(
+        (agentId) =>
+          [
+            agentId,
+            [snapshot],
+            {
+              providerInstances: {
+                [instanceId]: {
+                  driver: ProviderDriverKind.make("acpRegistry"),
+                  enabled: true,
+                  config: { agentId, registryIconUrl: `https://example.com/${agentId}.svg` },
+                },
+              },
+              projectSettingsOverrides: {},
+            },
+          ] as const,
+      ),
+    );
+    expect(byEnvironment.get("devin")?.get(instanceId)?.acpRegistryAgentId).toBe("devin");
+    expect(byEnvironment.get("devin")?.get(instanceId)?.acpRegistryIconUrl).toBe(
+      "https://example.com/devin.svg",
+    );
+    expect(byEnvironment.get("other-agent")?.get(instanceId)?.acpRegistryAgentId).toBe(
+      "other-agent",
+    );
+  });
+
+  // regression: #7292 sidebar provider icons resolved from the wrong environment
   it("keeps same-id default instances distinct per environment", () => {
     const byEnvironment = deriveProviderEntriesByEnvironment([
       [
@@ -251,16 +264,57 @@ describe("deriveProviderEntriesByEnvironment", () => {
     expect(byEnvironment.get("remote")?.get("claude")?.accentColor).toBe("#445566");
   });
 
-  it("never falls back to another environment's instances", () => {
+  it("keeps an instance a project turns on as a sibling for the instance badge", () => {
+    const codex = ProviderDriverKind.make("codex");
     const byEnvironment = deriveProviderEntriesByEnvironment([
-      ["local", [provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" })]],
-      ["empty", []],
+      [
+        "local",
+        [
+          provider({ provider: codex, instanceId: "codex" }),
+          provider({ provider: codex, instanceId: "codex_work" }),
+        ],
+        {
+          providerInstances: {
+            [ProviderInstanceId.make("codex_work")]: { driver: codex, enabled: false },
+          },
+          projectSettingsOverrides: {
+            [ProjectId.make("project-work")]: {
+              providerInstances: { [ProviderInstanceId.make("codex_work")]: { enabled: true } },
+            },
+          },
+        },
+      ],
     ]);
+    const entries = byEnvironment.get("local");
+    const personal = entries?.get("codex");
 
-    expect(byEnvironment.get("empty")?.get("codex")).toBeUndefined();
-    // Every environment gets its own bucket, so an absent lookup is a real
-    // "this environment has no such instance", not a missing key.
-    expect(byEnvironment.get("empty")?.size).toBe(0);
+    expect(personal && shouldShowInstanceBadge(personal, entries?.values() ?? [])).toBe(true);
+  });
+});
+
+describe("brandProviderInstanceEntries", () => {
+  it("keeps an instance a project turns on as a sibling for the instance badge", () => {
+    const codex = ProviderDriverKind.make("codex");
+    const settings = {
+      providerInstances: {
+        [ProviderInstanceId.make("codex_work")]: { driver: codex, enabled: false },
+      },
+      projectSettingsOverrides: {
+        [ProjectId.make("project-work")]: {
+          providerInstances: { [ProviderInstanceId.make("codex_work")]: { enabled: true } },
+        },
+      },
+    };
+    const entries = brandProviderInstanceEntries(
+      deriveProviderInstanceEntries([
+        provider({ provider: codex, instanceId: "codex" }),
+        provider({ provider: codex, instanceId: "codex_work" }),
+      ]),
+      settings,
+    );
+    const personal = entries.find((entry) => entry.instanceId === "codex");
+
+    expect(personal && shouldShowInstanceBadge(personal, entries)).toBe(true);
   });
 });
 
@@ -291,34 +345,81 @@ describe("sortProviderInstanceEntries", () => {
 });
 
 describe("resolveSelectableProviderInstance", () => {
-  const native = (instanceId = "neopi", overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {}) => provider({ provider: ProviderDriverKind.make("neopi"), instanceId, models: [model("openai-codex/current")], ...overrides });
+  const native = (
+    instanceId = "neopi",
+    overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {},
+  ) =>
+    provider({
+      provider: ProviderDriverKind.make("neopi"),
+      instanceId,
+      models: [model("openai-codex/current")],
+      ...overrides,
+    });
 
   it("keeps an explicit native instance and its probe error", () => {
     const requested = ProviderInstanceId.make("personal");
-    expect(resolveSelectableProviderInstance([native(), native(requested, { status: "error" })], requested)).toBe(requested);
+    expect(
+      resolveSelectableProviderInstance(
+        [native(), native(requested, { status: "error" })],
+        requested,
+      ),
+    ).toBe(requested);
   });
   it("prefers the native default before custom configurations", () => {
     expect(resolveSelectableProviderInstance([native("work"), native()], undefined)).toBe("neopi");
   });
-  it.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"])("never selects the removed %s runtime", (driver) => {
-    const legacy = provider({ provider: ProviderDriverKind.make(driver), instanceId: driver, models: [model("saved")] });
-    expect(resolveSelectableProviderInstance([legacy], legacy.instanceId)).toBeUndefined();
-    expect(resolveSelectableProviderInstance([legacy, native()], legacy.instanceId)).toBe("neopi");
-  });
-  it.each([{ enabled: false }, { availability: "unavailable" as const }, { status: "error" as const }, { models: [] }])("uses another ready native configuration when the default cannot start: %j", (state) => {
-    expect(resolveSelectableProviderInstance([native("neopi", state), native("work")], undefined)).toBe("work");
+  it.each(["codex", "claudeAgent", "cursor", "grok", "opencode", "antigravity"])(
+    "never selects the removed %s runtime",
+    (driver) => {
+      const legacy = provider({
+        provider: ProviderDriverKind.make(driver),
+        instanceId: driver,
+        models: [model("saved")],
+      });
+      expect(resolveSelectableProviderInstance([legacy], legacy.instanceId)).toBeUndefined();
+      expect(resolveSelectableProviderInstance([legacy, native()], legacy.instanceId)).toBe(
+        "neopi",
+      );
+    },
+  );
+  it.each([
+    { enabled: false },
+    { availability: "unavailable" as const },
+    { status: "error" as const },
+    { models: [] },
+  ])("uses another ready native configuration when the default cannot start: %j", (state) => {
+    expect(
+      resolveSelectableProviderInstance([native("neopi", state), native("work")], undefined),
+    ).toBe("work");
   });
   it("prefers a ready native instance over a pending probe", () => {
-    expect(resolveSelectableProviderInstance([native("neopi", { status: "warning" }), native("work")], undefined)).toBe("work");
+    expect(
+      resolveSelectableProviderInstance(
+        [native("neopi", { status: "warning" }), native("work")],
+        undefined,
+      ),
+    ).toBe("work");
   });
   it("can select an unprobed native configuration without inventing an errored one", () => {
-    expect(resolveSelectableProviderInstance([native("neopi", { status: "error" }), native("work", { status: "warning" })], undefined)).toBe("work");
-    expect(resolveSelectableProviderInstance([native("neopi", { status: "error" })], undefined)).toBeUndefined();
+    expect(
+      resolveSelectableProviderInstance(
+        [native("neopi", { status: "error" }), native("work", { status: "warning" })],
+        undefined,
+      ),
+    ).toBe("work");
+    expect(
+      resolveSelectableProviderInstance([native("neopi", { status: "error" })], undefined),
+    ).toBeUndefined();
   });
   it("returns no fresh choice when every native configuration is disabled or unavailable", () => {
-    expect(resolveSelectableProviderInstance([native("neopi", { enabled: false }), native("work", { availability: "unavailable" })], ProviderInstanceId.make("removed"))).toBeUndefined();
+    expect(
+      resolveSelectableProviderInstance(
+        [native("neopi", { enabled: false }), native("work", { availability: "unavailable" })],
+        ProviderInstanceId.make("removed"),
+      ),
+    ).toBeUndefined();
   });
-});;
+});
 
 describe("getDefaultProviderInstanceModel", () => {
   it("uses the instance's own models, not the default instance of the kind", () => {
@@ -340,17 +441,13 @@ describe("getDefaultProviderInstanceModel", () => {
     ).toBe("claude-opus-4-8");
   });
 
-  it("falls back to the driver default when the instance reports no models", () => {
+  it("does not invent a native model when the instance reports no catalog", () => {
     const providers = [
-      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+      provider({ provider: ProviderDriverKind.make("neopi"), instanceId: "neopi" }),
     ];
-
-    const resolved = getDefaultProviderInstanceModel(
-      providers,
-      ProviderInstanceId.make("claudeAgent"),
-    );
-    expect(typeof resolved).toBe("string");
-    expect(resolved?.length).toBeGreaterThan(0);
+    expect(
+      getDefaultProviderInstanceModel(providers, ProviderInstanceId.make("neopi")),
+    ).toBeUndefined();
   });
 
   it("honors the instance's declared default before model-list order", () => {
@@ -366,41 +463,143 @@ describe("getDefaultProviderInstanceModel", () => {
       "claude-opus-4-8",
     );
   });
-
-  it("returns undefined for an unknown instance", () => {
-    expect(
-      getDefaultProviderInstanceModel([], ProviderInstanceId.make("removed_instance")),
-    ).toBeUndefined();
-  });
 });
 
 describe("resolveDefaultProviderModelSelection", () => {
-  const native = (instanceId = "neopi", overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {}) => provider({ provider: ProviderDriverKind.make("neopi"), instanceId, models: [model("openai-codex/current", false, true)], ...overrides });
+  const native = (
+    instanceId = "neopi",
+    overrides: Pick<Partial<ServerProvider>, "enabled" | "availability" | "status" | "models"> = {},
+  ) =>
+    provider({
+      provider: ProviderDriverKind.make("neopi"),
+      instanceId,
+      models: [model("openai-codex/current", false, true)],
+      ...overrides,
+    });
   it("uses another native configuration when the default catalog is empty", () => {
-    expect(resolveDefaultProviderModelSelection([native("neopi", { models: [] }), native("work")], null)).toEqual({ instanceId: "work", model: "openai-codex/current" });
+    expect(
+      resolveDefaultProviderModelSelection([native("neopi", { models: [] }), native("work")], null),
+    ).toEqual({ instanceId: "work", model: "openai-codex/current" });
   });
   it("keeps an explicit native selection including saved inference options", () => {
-    const stored = { instanceId: ProviderInstanceId.make("work"), model: "anthropic/saved", options: [{ id: "thinking", value: "high" }] };
+    const stored = {
+      instanceId: ProviderInstanceId.make("work"),
+      model: "anthropic/saved",
+      options: [{ id: "thinking", value: "high" }],
+    };
     expect(resolveDefaultProviderModelSelection([native(), native("work")], stored)).toBe(stored);
   });
   it("replaces an obsolete runtime default without rewriting the stored object", () => {
-    const stored = { instanceId: ProviderInstanceId.make("codex"), model: "saved", options: [{ id: "reasoningEffort", value: "high" }] };
-    const legacy = provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex", models: [model("saved")] });
-    expect(resolveDefaultProviderModelSelection([legacy, native()], stored)).toEqual({ instanceId: "neopi", model: "openai-codex/current" });
+    const stored = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "saved",
+      options: [{ id: "reasoningEffort", value: "high" }],
+    };
+    const legacy = provider({
+      provider: ProviderDriverKind.make("codex"),
+      instanceId: "codex",
+      models: [model("saved")],
+    });
+    expect(resolveDefaultProviderModelSelection([legacy, native()], stored)).toEqual({
+      instanceId: "neopi",
+      model: "openai-codex/current",
+    });
     expect(stored.instanceId).toBe("codex");
     expect(stored.model).toBe("saved");
   });
   it("resets a missing native instance to the fallback instance's own model", () => {
-    expect(resolveDefaultProviderModelSelection([native()], { instanceId: ProviderInstanceId.make("removed"), model: "anthropic/stale" })).toEqual({ instanceId: "neopi", model: "openai-codex/current" });
+    expect(
+      resolveDefaultProviderModelSelection([native()], {
+        instanceId: ProviderInstanceId.make("removed"),
+        model: "anthropic/stale",
+      }),
+    ).toEqual({ instanceId: "neopi", model: "openai-codex/current" });
   });
-  it.each([{ enabled: false }, { availability: "unavailable" as const }])("replaces an unavailable native default with a ready native configuration: %j", (state) => {
-    expect(resolveDefaultProviderModelSelection([native("neopi", state), native("work")], { instanceId: ProviderInstanceId.make("neopi"), model: "saved" })).toEqual({ instanceId: "work", model: "openai-codex/current" });
-  });
+  it.each([{ enabled: false }, { availability: "unavailable" as const }])(
+    "replaces an unavailable native default with a ready native configuration: %j",
+    (state) => {
+      expect(
+        resolveDefaultProviderModelSelection([native("neopi", state), native("work")], {
+          instanceId: ProviderInstanceId.make("neopi"),
+          model: "saved",
+        }),
+      ).toEqual({ instanceId: "work", model: "openai-codex/current" });
+    },
+  );
   it("returns no selection for empty or unsupported catalogs", () => {
     expect(resolveDefaultProviderModelSelection([], null)).toBeNull();
-    for (const state of [{ enabled: false }, { availability: "unavailable" as const }, { status: "error" as const }, { models: [] }]) {
+    for (const state of [
+      { enabled: false },
+      { availability: "unavailable" as const },
+      { status: "error" as const },
+      { models: [] },
+    ]) {
       expect(resolveDefaultProviderModelSelection([native("neopi", state)], null)).toBeNull();
     }
-    expect(resolveDefaultProviderModelSelection([provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent", models: [model("saved")] })], null)).toBeNull();
+    expect(
+      resolveDefaultProviderModelSelection(
+        [
+          provider({
+            provider: ProviderDriverKind.make("claudeAgent"),
+            instanceId: "claudeAgent",
+            models: [model("saved")],
+          }),
+        ],
+        null,
+      ),
+    ).toBeNull();
   });
-});;
+});
+
+describe("provider icon metadata", () => {
+  it("clears stale registry branding when an instance switches to a local command", () => {
+    const instanceId = ProviderInstanceId.make("custom-acp");
+    const driver = ProviderDriverKind.make("acpRegistry");
+    const iconUrl = "https://cdn.agentclientprotocol.com/registry/icons/swe-agent.svg";
+    const snapshots = deriveProviderInstanceEntries([
+      { ...provider({ provider: driver, instanceId }), iconUrl },
+    ]);
+    const registryConfig = { agentId: "swe-agent", registryIconUrl: iconUrl };
+    const brandedEntries = applyProviderInstanceSettings(
+      snapshots,
+      {
+        providerInstances: { [instanceId]: { driver, enabled: true, config: registryConfig } },
+        projectSettingsOverrides: {},
+      },
+      null,
+    );
+    expect(brandedEntries[0]?.acpRegistryAgentId).toBe("swe-agent");
+    expect(brandedEntries[0]?.acpRegistryIconUrl).toBe(iconUrl);
+
+    const [localEntry] = applyProviderInstanceSettings(
+      brandedEntries,
+      {
+        providerInstances: {
+          [instanceId]: {
+            driver,
+            enabled: false,
+            config: { ...registryConfig, source: "local", commandPath: "dsh" },
+          },
+        },
+        projectSettingsOverrides: {},
+      },
+      null,
+    );
+    expect(localEntry?.acpRegistryAgentId).toBeUndefined();
+    expect(localEntry?.acpRegistryIconUrl).toBeUndefined();
+    expect(localEntry?.enabled).toBe(false);
+    expect(localEntry?.snapshot).toBe(snapshots[0]?.snapshot);
+
+    const [restoredEntry] = applyProviderInstanceSettings(
+      localEntry ? [localEntry] : [],
+      {
+        providerInstances: { [instanceId]: { driver, enabled: true, config: registryConfig } },
+        projectSettingsOverrides: {},
+      },
+      null,
+    );
+    expect(restoredEntry?.acpRegistryAgentId).toBe("swe-agent");
+    expect(restoredEntry?.acpRegistryIconUrl).toBe(iconUrl);
+    expect(restoredEntry?.enabled).toBe(true);
+  });
+});

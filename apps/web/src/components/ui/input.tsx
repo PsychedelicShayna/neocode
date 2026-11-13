@@ -1,5 +1,3 @@
-"use client";
-
 import { Input as InputPrimitive } from "@base-ui/react/input";
 import type * as React from "react";
 
@@ -7,7 +5,6 @@ import { cn } from "~/lib/utils";
 
 type InputProps = Omit<InputPrimitive.Props & React.RefAttributes<HTMLInputElement>, "size"> & {
   size?: "sm" | "compact" | "default" | "lg" | number;
-  /** Monospace with tabular digits, for paths, commands, colors and numbers. */
   font?: "default" | "mono";
   unstyled?: boolean;
   nativeInput?: boolean;
@@ -28,7 +25,6 @@ function Input({
     size === "lg" && "h-9.5 leading-9.5 sm:h-8.5 sm:leading-8.5",
     props.type === "search" &&
       "[&::-webkit-search-cancel-button]:appearance-none [&::-webkit-search-decoration]:appearance-none [&::-webkit-search-results-button]:appearance-none [&::-webkit-search-results-decoration]:appearance-none",
-    // Number fields are typed into; browser spin buttons crowd narrow fields and step by 1.
     props.type === "number" &&
       "[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none",
     props.type === "file" &&
@@ -65,7 +61,7 @@ function Input({
       className={
         cn(
           !unstyled &&
-            "relative inline-flex w-full rounded-lg border border-input bg-card text-base text-foreground ring-ring/24 transition-[border-color,box-shadow] has-focus-visible:has-aria-invalid:border-destructive/64 has-focus-visible:has-aria-invalid:ring-destructive/16 has-aria-invalid:border-destructive/36 has-focus-visible:border-ring has-autofill:bg-foreground/4 has-disabled:opacity-64 has-focus-visible:ring-[3px] sm:text-sm dark:has-autofill:bg-foreground/8 dark:has-aria-invalid:ring-destructive/24",
+            "relative inline-flex w-full rounded-lg border border-input bg-card text-base text-foreground ring-ring/24 transition-[border-color,box-shadow] has-focus-visible:has-aria-invalid:border-destructive/64 has-focus-visible:has-aria-invalid:ring-destructive/16 has-aria-invalid:border-destructive/36 has-focus-visible:border-ring has-autofill:bg-foreground/4 has-disabled:opacity-64 has-focus-visible:ring-[3px] has-focus-visible:ring-inset sm:text-sm dark:has-autofill:bg-foreground/8 dark:has-aria-invalid:ring-destructive/24",
           !unstyled && size === "compact" && "rounded-md",
           font === "mono" && "font-mono tabular-nums",
           className,

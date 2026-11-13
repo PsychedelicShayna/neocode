@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { ProcessEventQueue } from "./ProcessEventQueue.ts";
-import type { PtyProcess } from "./PtyAdapter.ts";
+import type { PtyProcess } from "@t3tools/shared/PtyAdapter";
 
 function processHandle(): PtyProcess {
   return {

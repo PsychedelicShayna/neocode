@@ -8,7 +8,7 @@ export interface TranscriptCacheLimits {
   readonly ttlMs: number;
 }
 
-export const DEFAULT_TRANSCRIPT_CACHE_LIMITS: TranscriptCacheLimits = {
+const DEFAULT_TRANSCRIPT_CACHE_LIMITS: TranscriptCacheLimits = {
   maxEntries: 16,
   maxBytes: 4 * 1024 * 1024,
   ttlMs: 10 * 60_000,

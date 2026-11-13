@@ -1,30 +1,367 @@
-import * as NodeServices from "@effect/platform-node/NodeServices";
+import { assert, it } from "@effect/vitest";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
-  DEFAULT_MODEL,
   DEFAULT_SERVER_SETTINGS,
   ProjectId,
-  ProviderDriverKind,
-  type OrchestrationCommand,
   ProviderInstanceId,
-  ThreadId,
+  ProviderDriverKind,
+  CommandId,
+  EnvironmentId,
+  type ServerLifecycleStreamEvent,
 } from "@t3tools/contracts";
-import { assert, it } from "@effect/vitest";
-import * as Crypto from "effect/Crypto";
+import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
+import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
+import { HttpServer } from "effect/http";
+import * as NetAddress from "effect/net/NetAddress";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
-import * as Option from "effect/Option";
-import * as Layer from "effect/Layer";
-import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
-import * as Stream from "effect/Stream";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+
+import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 
 import * as ServerConfig from "./config.ts";
-import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
-import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
+import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import * as Keybindings from "./keybindings.ts";
+import * as EffectWorker from "./orchestration-v2/EffectWorker.ts";
+import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
+import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
+import * as ProviderRuntimeRecovery from "./orchestration-v2/ProviderRuntimeRecoveryService.ts";
+import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
+import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
+import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
+import * as ExternalLauncher from "./process/externalLauncher.ts";
+import * as ProjectService from "./project/ProjectService.ts";
+import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
+import { ServerActivation } from "./serverActivation.ts";
+import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
-import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
+
+it.effect.each([
+  "disabled-native",
+  "disabled-default",
+  "launch-failure",
+  "project-failure",
+  "saved-native-default",
+  "saved-native-project",
+  "retired-preference",
+  "native-work-fallback",
+] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("bootstrap-project");
+      const instanceId = ProviderInstanceId.make(
+        scenario === "disabled-default"
+          ? "custom"
+          : scenario.startsWith("saved-native-") || scenario === "native-work-fallback"
+            ? "native-work"
+            : "neopi",
+      );
+      const legacySelection = {
+        instanceId: ProviderInstanceId.make("saved-codex"),
+        model: "saved-model",
+      };
+      const savedSelection = { instanceId, model: "anthropic/saved" };
+      let launchAttempts = 0;
+      const events: ServerLifecycleStreamEvent[] = [];
+      const recovery = {
+        terminalizedRuns: 0,
+        stoppedSessions: 0,
+        closedRequests: 0,
+        retiredEffects: 0,
+        requeuedEffects: 0,
+      };
+      const imports = { importedThreadCount: 0, importedMessageCount: 0 };
+      const dependencies = Layer.mergeAll(
+        NodeCrypto.layer,
+        Path.layer,
+        Layer.mock(ServerConfig.ServerConfig)({
+          ...(yield* ServerConfig.deriveServerPaths("/bootstrap-project", undefined).pipe(
+            Effect.provide(Path.layer),
+          )),
+          baseDir: "/bootstrap-project",
+          logLevel: "Error",
+          traceMinLevel: "Info",
+          traceTimingEnabled: false,
+          traceBatchWindowMs: 200,
+          traceMaxBytes: 1024,
+          traceMaxFiles: 1,
+          otlpTracesUrl: undefined,
+          otlpMetricsUrl: undefined,
+          otlpLogsUrl: undefined,
+          otlpTracesExport: DEFAULT_SIGNAL_EXPORT,
+          otlpMetricsExport: DEFAULT_SIGNAL_EXPORT,
+          otlpLogsExport: DEFAULT_SIGNAL_EXPORT,
+          otelEnvironment: OtelEnvironment.none,
+          staticDir: undefined,
+          devAllowedOrigins: [],
+          desktopBootstrapToken: undefined,
+          logWebSocketEvents: false,
+          tailscaleServeEnabled: false,
+          tailscaleServePort: 443,
+          mode: "web",
+          cwd: "/bootstrap-project",
+          host: "localhost",
+          port: 3773,
+          devUrl: undefined,
+          noBrowser: true,
+          startupPresentation: "browser",
+          autoBootstrapProjectFromCwd: true,
+        }),
+        Layer.mock(Keybindings.Keybindings)({ start: Effect.void }),
+        Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+          pendingThreadCount: Effect.succeed(0),
+          reconcileShells: Effect.succeed(imports),
+          importPendingTranscripts: Effect.succeed(imports),
+        }),
+        Layer.mock(ProviderRuntimeRecovery.ProviderRuntimeRecoveryService)({
+          recover: Effect.succeed(recovery),
+          prepareForShutdown: Effect.void,
+          reconcile: () => Effect.succeed(recovery),
+        }),
+        Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
+        Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
+        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: Effect.never }),
+        Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({
+          publish: (event) =>
+            Effect.sync(() => {
+              const published = { ...event, sequence: events.length + 1 };
+              events.push(published);
+              return published;
+            }),
+        }),
+        Layer.mock(ServerSettings.ServerSettingsService)({
+          start: Effect.void,
+          getSettings: Effect.succeed({
+            ...DEFAULT_SERVER_SETTINGS,
+            defaultModelSelection:
+              scenario === "retired-preference"
+                ? legacySelection
+                : scenario === "native-work-fallback"
+                  ? { instanceId: ProviderInstanceId.make("neopi"), model: "saved-disabled" }
+                  : scenario === "disabled-default" || scenario.startsWith("saved-native-")
+                    ? savedSelection
+                    : null,
+            defaultRuntimeMode: "approval-required",
+            projectSettingsOverrides:
+              scenario === "saved-native-project" || scenario === "retired-preference"
+                ? {
+                    [projectId]: {
+                      defaultModelSelection:
+                        scenario === "saved-native-project"
+                          ? { ...savedSelection, model: "anthropic/project" }
+                          : legacySelection,
+                      defaultRuntimeMode: "auto-accept-edits",
+                    },
+                  }
+                : {},
+            providerInstances: {
+              neopi: { driver: ProviderDriverKind.make("neopi"), enabled: false, config: {} },
+              ...(scenario === "retired-preference"
+                ? {
+                    [legacySelection.instanceId]: {
+                      driver: ProviderDriverKind.make("codex"),
+                      enabled: true,
+                      config: {},
+                    },
+                  }
+                : {}),
+              [instanceId]: {
+                driver: ProviderDriverKind.make("neopi"),
+                enabled: scenario !== "disabled-native" && scenario !== "disabled-default",
+                config: {},
+              },
+            },
+          }),
+        }),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({
+          getDescriptor: Effect.succeed({
+            environmentId: EnvironmentId.make("bootstrap-environment"),
+            label: "Test environment",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "0.0.0-test",
+            capabilities: { repositoryIdentity: true },
+          }),
+        }),
+        Layer.mock(ProjectStore.ProjectStoreV2)({}),
+        Layer.mock(ProjectService.ProjectService)({
+          bootstrap: () =>
+            scenario === "project-failure"
+              ? Effect.die("project bootstrap failed")
+              : Effect.succeed({
+                  created: true,
+                  project: {
+                    id: projectId,
+                    title: "Project",
+                    workspaceRoot: "/bootstrap-project",
+                    repositoryIdentity: null,
+                    faviconPath: null,
+                    scripts: [],
+                    createdAt: "2026-01-01T00:00:00Z",
+                    updatedAt: "2026-01-01T00:00:00Z",
+                    deletedAt: null,
+                    defaultModelSelection:
+                      scenario === "disabled-default"
+                        ? { instanceId, model: "custom-model" }
+                        : null,
+                  },
+                }),
+        }),
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          countThreads: () => Effect.succeed(0),
+          listActiveShellIndex: () => Effect.succeed([]),
+        }),
+        Layer.mock(ThreadLaunch.ThreadLaunchService)({
+          launch: (input) => {
+            launchAttempts += 1;
+            assert.equal(input.modelSelection.instanceId, instanceId);
+            if (scenario.startsWith("saved-native-")) {
+              assert.equal(
+                input.modelSelection.model,
+                scenario === "saved-native-project" ? "anthropic/project" : savedSelection.model,
+              );
+            }
+            assert.equal(
+              input.runtimeMode,
+              scenario === "saved-native-project" || scenario === "retired-preference"
+                ? "auto-accept-edits"
+                : "approval-required",
+            );
+            return Effect.fail(
+              new ThreadLaunch.ThreadLaunchError({
+                operation: "create-thread",
+                commandId: CommandId.make("bootstrap-command"),
+                projectId,
+                cause: "test launch failure",
+              }),
+            );
+          },
+        }),
+        Layer.mock(ServiceLauncherClient.ServiceLauncherClient)({
+          managed: false,
+          prepareTrial: Effect.undefined,
+        }),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        Layer.mock(AnalyticsService.AnalyticsService)({}),
+        // No provider logins or Connect link, so startup records no owners.
+        FileSystem.layerNoop({}),
+        Layer.mock(ServerSecretStore.ServerSecretStore)({ get: () => Effect.succeedNone }),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(HttpServer.HttpServer)({
+          address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 3773),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+        yield* startup.markHttpListening;
+        const ready = yield* Effect.exit(startup.awaitCommandReady);
+        assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
+        assert.equal(
+          launchAttempts,
+          scenario === "disabled-native" ||
+            scenario === "disabled-default" ||
+            scenario === "project-failure"
+            ? 0
+            : 1,
+        );
+        assert.deepStrictEqual(legacySelection, {
+          instanceId: "saved-codex",
+          model: "saved-model",
+        });
+        const welcome = events.find((event) => event.type === "welcome");
+        if (scenario === "project-failure") {
+          assert.isUndefined(welcome);
+        } else {
+          assert.isDefined(welcome);
+          if (welcome?.type === "welcome") {
+            assert.equal(welcome.payload.bootstrapProjectId, projectId);
+            assert.isUndefined(welcome.payload.bootstrapThreadId);
+          }
+        }
+      }).pipe(
+        Effect.provide(ServerRuntimeStartup.layerWithOptions().pipe(Layer.provide(dependencies))),
+        Effect.provideService(ServerActivation, Effect.never),
+      );
+    }),
+  ),
+);
+
+it.effect("interrupts the effect worker when awareness relay startup fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const workerInterrupted = yield* Ref.make(false);
+      const workerStarted = yield* Deferred.make<void>();
+      const workerFiberRef = yield* Ref.make<Fiber.Fiber<void, never> | null>(null);
+
+      const exit = yield* ServerRuntimeStartup.startEffectWorkerWithRelay({
+        runWorker: Deferred.succeed(workerStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Ref.set(workerInterrupted, true)),
+        ),
+        startRelay: Deferred.await(workerStarted).pipe(
+          Effect.andThen(Effect.die("awareness relay startup failed")),
+        ),
+        workerFiberRef,
+      }).pipe(Effect.exit);
+
+      assert.isTrue(Exit.isFailure(exit));
+      assert.isTrue(yield* Ref.get(workerInterrupted));
+      assert.isNull(yield* Ref.get(workerFiberRef));
+    }),
+  ),
+);
+
+it.effect("queues commands until startup signals readiness", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const gate = yield* ServerRuntimeStartup.makeCommandGate;
+      const count = yield* Ref.make(0);
+      const queued = yield* gate
+        .enqueueCommand(Ref.updateAndGet(count, (value) => value + 1))
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+
+      assert.equal(yield* Ref.get(count), 0);
+      yield* gate.signalCommandReady;
+      assert.equal(yield* Fiber.join(queued), 1);
+    }),
+  ),
+);
+
+it.effect("enqueueCommand fails queued work when readiness fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      const failure = yield* Deferred.make<void, never>();
+
+      const queuedCommandFiber = yield* commandGate
+        .enqueueCommand(Deferred.await(failure).pipe(Effect.as("should-not-run")))
+        .pipe(Effect.forkScoped);
+
+      const startupError = new ServerRuntimeStartup.ServerRuntimeStartupError({
+        mode: "web",
+        host: "127.0.0.1",
+        port: 3773,
+        cause: new Error("test startup failure"),
+      });
+      yield* commandGate.failCommandReady(startupError);
+
+      const error = yield* Effect.flip(Fiber.join(queuedCommandFiber));
+      assert.strictEqual(error, startupError);
+    }),
+  ),
+);
 
 it.effect("automatic pull only updates enabled, behind, clean default-branch checkouts", () =>
   Effect.gen(function* () {
@@ -88,549 +425,5 @@ it.effect("automatic pull only updates enabled, behind, clean default-branch che
       { ...overrides({ "/opted-out": false }), defaultAutoPull: true },
     ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git));
     assert.deepStrictEqual(pulled, ["/inherited"]);
-  }),
-);
-
-it.effect("enqueueCommand waits for readiness and then drains queued work", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const executionCount = yield* Ref.make(0);
-      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
-
-      const queuedCommandFiber = yield* commandGate
-        .enqueueCommand(Ref.updateAndGet(executionCount, (count) => count + 1))
-        .pipe(Effect.forkScoped);
-
-      yield* Effect.yieldNow;
-      assert.equal(yield* Ref.get(executionCount), 0);
-
-      yield* commandGate.signalCommandReady;
-
-      const result = yield* Fiber.join(queuedCommandFiber);
-      assert.equal(result, 1);
-      assert.equal(yield* Ref.get(executionCount), 1);
-    }),
-  ),
-);
-
-it.effect("enqueueCommand fails queued work when readiness fails", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
-      const failure = yield* Deferred.make<void, never>();
-
-      const queuedCommandFiber = yield* commandGate
-        .enqueueCommand(Deferred.await(failure).pipe(Effect.as("should-not-run")))
-        .pipe(Effect.forkScoped);
-
-      yield* commandGate.failCommandReady(
-        new ServerRuntimeStartup.ServerRuntimeStartupError({
-          mode: "web",
-          host: "127.0.0.1",
-          port: 3773,
-          cause: new Error("test startup failure"),
-        }),
-      );
-
-      const error = yield* Effect.flip(Fiber.join(queuedCommandFiber));
-      assert.equal(error.message, "Server runtime startup failed before command readiness.");
-    }),
-  ),
-);
-
-it.effect("resolveWelcomeBase derives cwd and project name from server config", () =>
-  Effect.gen(function* () {
-    const welcome = yield* ServerRuntimeStartup.resolveWelcomeBase.pipe(
-      Effect.provideService(ServerConfig.ServerConfig, {
-        cwd: "/tmp/startup-project",
-      } as never),
-    );
-
-    assert.deepStrictEqual(welcome, {
-      cwd: "/tmp/startup-project",
-      projectName: "startup-project",
-    });
-  }),
-);
-
-it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and thread ids", () => {
-  const bootstrapProjectId = ProjectId.make("project-startup-bootstrap");
-  const bootstrapThreadId = ThreadId.make("thread-startup-bootstrap");
-
-  return Effect.gen(function* () {
-    const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
-    const targets = yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
-      Effect.provide(ServerSettings.layerTest()),
-      Effect.provideService(ServerConfig.ServerConfig, {
-        cwd: "/tmp/startup-project",
-        autoBootstrapProjectFromCwd: true,
-      } as never),
-      Effect.provideService(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
-        getUserInputActivity: () => Effect.die("unused"),
-        listActivitiesByKind: () => Effect.succeed([]),
-        getCommandReadModel: () => Effect.die("unused"),
-        getSnapshot: () => Effect.die("unused"),
-        getShellSnapshot: () => Effect.die("unused"),
-        getDeletedWorktreeThreads: () => Effect.die("unused"),
-        listThreadsWithPullRequests: () => Effect.die("unused"),
-        getArchivedShellSnapshot: () => Effect.die("unused"),
-        getSnapshotSequence: () => Effect.die("unused"),
-        getCounts: () => Effect.die("unused"),
-        getEventReplayStats: () => Effect.die("unused"),
-        getActiveProjectByWorkspaceRoot: () =>
-          Effect.succeedSome({
-            id: bootstrapProjectId,
-            title: "Startup Project",
-            workspaceRoot: "/tmp/startup-project",
-            defaultModelSelection: {
-              instanceId: ProviderInstanceId.make("codex"),
-              model: DEFAULT_MODEL,
-            },
-            scripts: [],
-            createdAt: "2026-01-01T00:00:00.000Z",
-            updatedAt: "2026-01-01T00:00:00.000Z",
-            deletedAt: null,
-          }),
-        getProjectShells: () => Effect.die("unused"),
-        getProjectShellById: () => Effect.die("unused"),
-        getFirstActiveThreadIdByProjectId: () => Effect.succeedSome(bootstrapThreadId),
-        getImportedAgentSessionSources: () => Effect.die("unused"),
-        getThreadCheckpointContext: () => Effect.succeedNone,
-        getFullThreadDiffContext: () => Effect.succeedNone,
-        getThreadRuntimeContext: () => Effect.die("unused"),
-        getTurnStartMessage: () => Effect.die("unused"),
-        getThreadShellById: () => Effect.die("unused"),
-        getThreadDetailById: () => Effect.die("unused"),
-        getThreadDetailSnapshot: () => Effect.die("unused"),
-        searchThreads: () => Effect.succeed({ matches: [] }),
-      }),
-      Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
-        readEvents: () => Stream.empty,
-        readThreadEvents: () => Stream.empty,
-        getThreadReplayStats: () => Effect.die("unused thread replay stats"),
-        dispatch: (command) =>
-          Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
-            Effect.as({ sequence: 1 }),
-          ),
-        streamDomainEvents: Stream.empty,
-        subscribeDomainEvents: Effect.succeed(Stream.empty),
-        latestSequence: Effect.succeed(0),
-      } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-      Effect.provide(NodeServices.layer),
-    );
-
-    assert.deepStrictEqual(targets, {
-      bootstrapProjectId,
-      bootstrapThreadId,
-      bootstrapProjectCreated: false,
-      bootstrapThreadCreated: false,
-    });
-    assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
-  });
-});
-
-it.effect.each([
-  {
-    existing: false,
-    machineModel: null,
-    projectModel: null,
-    machineMode: "full-access",
-    projectMode: null,
-  },
-  {
-    existing: false,
-    machineModel: "anthropic/current",
-    projectModel: null,
-    machineMode: "approval-required",
-    projectMode: null,
-  },
-  {
-    existing: true,
-    machineModel: "anthropic/current",
-    projectModel: null,
-    machineMode: "auto",
-    projectMode: null,
-  },
-  {
-    existing: true,
-    machineModel: "anthropic/current",
-    projectModel: "openai-codex/current",
-    machineMode: "full-access",
-    projectMode: "auto-accept-edits",
-  },
-] as const)("auto-bootstrap model and permissions precedence: %j", (options) =>
-  Effect.gen(function* () {
-    const { existing, machineModel, projectModel, machineMode, projectMode } = options;
-    const machineSelection = machineModel
-      ? { instanceId: ProviderInstanceId.make("neopi"), model: machineModel }
-      : null;
-    const projectSelection = projectModel
-      ? { instanceId: ProviderInstanceId.make("neopi"), model: projectModel }
-      : null;
-    const dispatchCalls = yield* Ref.make<
-      ReadonlyArray<{
-        readonly type: string;
-        readonly defaultModelSelection?: unknown;
-        readonly modelSelection?: unknown;
-        readonly runtimeMode?: unknown;
-      }>
-    >([]);
-    const targets = yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
-      Effect.provide(
-        ServerSettings.layerTest({
-          defaultModelSelection: machineSelection,
-          defaultRuntimeMode: machineMode,
-          projectSettingsOverrides:
-            existing && projectSelection
-              ? {
-                  [ProjectId.make("existing-project")]: {
-                    defaultModelSelection: projectSelection,
-                    ...(projectMode ? { defaultRuntimeMode: projectMode } : {}),
-                  },
-                }
-              : {},
-        }),
-      ),
-      Effect.provideService(ServerConfig.ServerConfig, {
-        cwd: "/tmp/startup-project",
-        autoBootstrapProjectFromCwd: true,
-      } as never),
-      Effect.provideService(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
-        getUserInputActivity: () => Effect.die("unused"),
-        listActivitiesByKind: () => Effect.succeed([]),
-        getCommandReadModel: () => Effect.die("unused"),
-        getSnapshot: () => Effect.die("unused"),
-        getShellSnapshot: () => Effect.die("unused"),
-        getDeletedWorktreeThreads: () => Effect.die("unused"),
-        listThreadsWithPullRequests: () => Effect.die("unused"),
-        getArchivedShellSnapshot: () => Effect.die("unused"),
-        getSnapshotSequence: () => Effect.die("unused"),
-        getCounts: () => Effect.die("unused"),
-        getEventReplayStats: () => Effect.die("unused"),
-        getActiveProjectByWorkspaceRoot: () =>
-          Effect.succeed(
-            existing
-              ? Option.some({
-                  id: ProjectId.make("existing-project"),
-                  title: "Startup Project",
-                  workspaceRoot: "/tmp/startup-project",
-                  defaultModelSelection: null,
-                  scripts: [],
-                  createdAt: "2026-01-01T00:00:00.000Z",
-                  updatedAt: "2026-01-01T00:00:00.000Z",
-                  deletedAt: null,
-                })
-              : Option.none(),
-          ),
-        getProjectShells: () => Effect.die("unused"),
-        getProjectShellById: () => Effect.die("unused"),
-        getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
-        getImportedAgentSessionSources: () => Effect.die("unused"),
-        getThreadCheckpointContext: () => Effect.succeedNone,
-        getFullThreadDiffContext: () => Effect.succeedNone,
-        getThreadRuntimeContext: () => Effect.die("unused"),
-        getTurnStartMessage: () => Effect.die("unused"),
-        getThreadShellById: () => Effect.die("unused"),
-        getThreadDetailById: () => Effect.die("unused"),
-        getThreadDetailSnapshot: () => Effect.die("unused"),
-        searchThreads: () => Effect.succeed({ matches: [] }),
-      }),
-      Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
-        readEvents: () => Stream.empty,
-        readThreadEvents: () => Stream.empty,
-        getThreadReplayStats: () => Effect.die("unused thread replay stats"),
-        dispatch: (command) =>
-          Ref.update(dispatchCalls, (calls) => [...calls, command]).pipe(
-            Effect.as({ sequence: 1 }),
-          ),
-        streamDomainEvents: Stream.empty,
-        subscribeDomainEvents: Effect.succeed(Stream.empty),
-        latestSequence: Effect.succeed(0),
-      } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-      Effect.provide(NodeServices.layer),
-    );
-
-    assert.equal(typeof targets.bootstrapProjectId, "string");
-    assert.equal(typeof targets.bootstrapThreadId, "string");
-    assert.equal(targets.bootstrapProjectCreated, !existing);
-    assert.equal(targets.bootstrapThreadCreated, true);
-    const commands = yield* Ref.get(dispatchCalls);
-    assert.deepStrictEqual(
-      commands.map((command) => command.type),
-      existing ? ["thread.create"] : ["project.create", "thread.create"],
-    );
-    if (!existing) assert.equal("defaultModelSelection" in commands[0]!, false);
-    assert.equal(commands.at(-1)?.runtimeMode, projectMode ?? machineMode);
-    assert.deepStrictEqual(
-      commands.at(-1)?.modelSelection,
-      projectSelection ??
-        machineSelection ?? {
-          instanceId: ProviderInstanceId.make("neopi"),
-          model: DEFAULT_MODEL,
-        },
-    );
-  }),
-);
-
-it.effect.each([
-  {
-    existing: false,
-    nativeGlobal: false,
-    defaultEnabled: true,
-    workEnabled: false,
-    expected: "neopi",
-  },
-  {
-    existing: true,
-    nativeGlobal: true,
-    defaultEnabled: true,
-    workEnabled: false,
-    expected: "neopi",
-  },
-  {
-    existing: false,
-    nativeGlobal: false,
-    defaultEnabled: false,
-    workEnabled: true,
-    expected: "native-work",
-  },
-  {
-    existing: false,
-    nativeGlobal: false,
-    defaultEnabled: false,
-    workEnabled: false,
-    expected: null,
-  },
-] as const)(
-  "bootstrap ignores obsolete runtime preferences without rewriting them: %j",
-  (scenario) =>
-    Effect.gen(function* () {
-      const projectId = ProjectId.make("bootstrap-legacy-preference");
-      const legacy = { instanceId: ProviderInstanceId.make("saved-codex"), model: "saved-model" };
-      const native = { instanceId: ProviderInstanceId.make("neopi"), model: "anthropic/current" };
-      const commands: OrchestrationCommand[] = [];
-      const project = {
-        id: projectId,
-        title: "Startup",
-        workspaceRoot: "/startup-project",
-        defaultModelSelection: legacy,
-        scripts: [],
-        createdAt: "2026-01-01T00:00:00.000Z",
-        updatedAt: "2026-01-01T00:00:00.000Z",
-        deletedAt: null,
-      };
-      yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            ServerSettings.layerTest({
-              defaultModelSelection: scenario.nativeGlobal ? native : legacy,
-              providerInstances: {
-                [ProviderInstanceId.make("neopi")]: {
-                  driver: ProviderDriverKind.make("neopi"),
-                  enabled: scenario.defaultEnabled,
-                  config: { profile: "personal" },
-                },
-                [ProviderInstanceId.make("native-work")]: {
-                  driver: ProviderDriverKind.make("neopi"),
-                  enabled: scenario.workEnabled,
-                  config: { profile: "work" },
-                },
-                [legacy.instanceId]: {
-                  driver: ProviderDriverKind.make("codex"),
-                  enabled: true,
-                  config: {},
-                },
-              },
-              projectSettingsOverrides: { [projectId]: { defaultModelSelection: legacy } },
-            }),
-            Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
-              getActiveProjectByWorkspaceRoot: () =>
-                Effect.succeed(scenario.existing ? Option.some(project) : Option.none()),
-              getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
-            }),
-            Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
-              dispatch: (command) =>
-                Effect.sync(() => {
-                  commands.push(command);
-                  return { sequence: commands.length };
-                }),
-            }),
-          ),
-        ),
-        Effect.provideService(ServerConfig.ServerConfig, {
-          cwd: "/startup-project",
-          autoBootstrapProjectFromCwd: true,
-        } as never),
-        Effect.provide(NodeServices.layer),
-      );
-      const created = commands.find((command) => command.type === "thread.create");
-      if (scenario.expected === null) {
-        assert.isUndefined(created);
-      } else {
-        assert.equal(created?.type, "thread.create");
-        if (created?.type === "thread.create") {
-          assert.deepStrictEqual(created.modelSelection, {
-            instanceId: ProviderInstanceId.make(scenario.expected),
-            model: scenario.nativeGlobal ? native.model : DEFAULT_MODEL,
-          });
-        }
-      }
-      assert.deepStrictEqual(project.defaultModelSelection, legacy);
-      assert.deepStrictEqual(legacy, { instanceId: "saved-codex", model: "saved-model" });
-    }),
-);
-
-it.effect(
-  "resolveAutoBootstrapWelcomeTargets preserves a project created before thread failure",
-  () =>
-    Effect.gen(function* () {
-      const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
-      const targets = yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
-        Effect.provide(ServerSettings.layerTest()),
-        Effect.provideService(ServerConfig.ServerConfig, {
-          cwd: "/tmp/startup-project",
-          autoBootstrapProjectFromCwd: true,
-        } as never),
-        Effect.provideService(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
-          getUserInputActivity: () => Effect.die("unused"),
-          listActivitiesByKind: () => Effect.succeed([]),
-          getCommandReadModel: () => Effect.die("unused"),
-          getSnapshot: () => Effect.die("unused"),
-          getShellSnapshot: () => Effect.die("unused"),
-          getDeletedWorktreeThreads: () => Effect.die("unused"),
-          listThreadsWithPullRequests: () => Effect.die("unused"),
-          getArchivedShellSnapshot: () => Effect.die("unused"),
-          getSnapshotSequence: () => Effect.die("unused"),
-          getCounts: () => Effect.die("unused"),
-          getEventReplayStats: () => Effect.die("unused"),
-          getActiveProjectByWorkspaceRoot: () => Effect.succeedNone,
-          getProjectShells: () => Effect.die("unused"),
-          getProjectShellById: () => Effect.die("unused"),
-          getFirstActiveThreadIdByProjectId: () => Effect.die("thread lookup failed"),
-          getImportedAgentSessionSources: () => Effect.die("unused"),
-          getThreadCheckpointContext: () => Effect.succeedNone,
-          getFullThreadDiffContext: () => Effect.succeedNone,
-          getThreadRuntimeContext: () => Effect.die("unused"),
-          getTurnStartMessage: () => Effect.die("unused"),
-          getThreadShellById: () => Effect.die("unused"),
-          getThreadDetailById: () => Effect.die("unused"),
-          getThreadDetailSnapshot: () => Effect.die("unused"),
-          searchThreads: () => Effect.succeed({ matches: [] }),
-        }),
-        Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
-          readEvents: () => Stream.empty,
-          readThreadEvents: () => Stream.empty,
-          getThreadReplayStats: () => Effect.die("unused thread replay stats"),
-          dispatch: (command) =>
-            Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
-              Effect.as({ sequence: 1 }),
-            ),
-          streamDomainEvents: Stream.empty,
-          subscribeDomainEvents: Effect.succeed(Stream.empty),
-          latestSequence: Effect.succeed(0),
-        } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-        Effect.provide(NodeServices.layer),
-      );
-
-      assert.equal(typeof targets.bootstrapProjectId, "string");
-      assert.equal(targets.bootstrapProjectCreated, true);
-      assert.equal(targets.bootstrapThreadId, undefined);
-      assert.equal(targets.bootstrapThreadCreated, undefined);
-      assert.deepStrictEqual(yield* Ref.get(dispatchCalls), ["project.create"]);
-    }),
-);
-
-it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation failures", () =>
-  Effect.gen(function* () {
-    const crypto = yield* Crypto.Crypto;
-    const uuidError = PlatformError.systemError({
-      _tag: "Unknown",
-      module: "Crypto",
-      method: "randomUUIDv4",
-      description: "UUID generation unavailable",
-    });
-    const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
-
-    const error = yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
-      Effect.provide(ServerSettings.layerTest()),
-      Effect.provideService(ServerConfig.ServerConfig, {
-        cwd: "/tmp/startup-project",
-        autoBootstrapProjectFromCwd: true,
-      } as never),
-      Effect.provideService(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
-        getUserInputActivity: () => Effect.die("unused"),
-        listActivitiesByKind: () => Effect.succeed([]),
-        getCommandReadModel: () => Effect.die("unused"),
-        getSnapshot: () => Effect.die("unused"),
-        getShellSnapshot: () => Effect.die("unused"),
-        getDeletedWorktreeThreads: () => Effect.die("unused"),
-        listThreadsWithPullRequests: () => Effect.die("unused"),
-        getArchivedShellSnapshot: () => Effect.die("unused"),
-        getSnapshotSequence: () => Effect.die("unused"),
-        getCounts: () => Effect.die("unused"),
-        getEventReplayStats: () => Effect.die("unused"),
-        getActiveProjectByWorkspaceRoot: () => Effect.succeedNone,
-        getProjectShells: () => Effect.die("unused"),
-        getProjectShellById: () => Effect.die("unused"),
-        getFirstActiveThreadIdByProjectId: () => Effect.succeedNone,
-        getImportedAgentSessionSources: () => Effect.die("unused"),
-        getThreadCheckpointContext: () => Effect.succeedNone,
-        getFullThreadDiffContext: () => Effect.succeedNone,
-        getThreadRuntimeContext: () => Effect.die("unused"),
-        getTurnStartMessage: () => Effect.die("unused"),
-        getThreadShellById: () => Effect.die("unused"),
-        getThreadDetailById: () => Effect.die("unused"),
-        getThreadDetailSnapshot: () => Effect.die("unused"),
-        searchThreads: () => Effect.succeed({ matches: [] }),
-      }),
-      Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
-        readEvents: () => Stream.empty,
-        readThreadEvents: () => Stream.empty,
-        getThreadReplayStats: () => Effect.die("unused thread replay stats"),
-        dispatch: (command) =>
-          Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
-            Effect.as({ sequence: 1 }),
-          ),
-        streamDomainEvents: Stream.empty,
-        subscribeDomainEvents: Effect.succeed(Stream.empty),
-        latestSequence: Effect.succeed(0),
-      } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
-      Effect.provideService(Crypto.Crypto, {
-        ...crypto,
-        randomUUIDv4: Effect.fail(uuidError),
-      }),
-      Effect.flip,
-    );
-
-    assert.strictEqual(error, uuidError);
-    assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
-  }).pipe(Effect.provide(NodeServices.layer)),
-);
-
-it.effect("completeAutoBootstrapWelcome settles failures without bootstrap targets", () =>
-  Effect.gen(function* () {
-    const completion = yield* ServerRuntimeStartup.completeAutoBootstrapWelcome(
-      Effect.fail("bootstrap failed"),
-    );
-
-    assert.deepStrictEqual(completion, { bootstrapStatus: "complete" });
-  }),
-);
-
-it.effect("completeAutoBootstrapWelcome settles unexpected defects", () =>
-  Effect.gen(function* () {
-    const completion = yield* ServerRuntimeStartup.completeAutoBootstrapWelcome(
-      Effect.die("bootstrap defect"),
-    );
-
-    assert.deepStrictEqual(completion, { bootstrapStatus: "complete" });
-  }),
-);
-
-it.effect("completeAutoBootstrapWelcome settles an empty bootstrap result", () =>
-  Effect.gen(function* () {
-    const completion = yield* ServerRuntimeStartup.completeAutoBootstrapWelcome(Effect.succeed({}));
-
-    assert.deepStrictEqual(completion, { bootstrapStatus: "complete" });
   }),
 );

@@ -5,11 +5,11 @@ import type {
   NeoPiModelsTarget,
   NeoPiThemesConfiguration,
 } from "@t3tools/contracts";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { useMemo } from "react";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useEnvironments } from "./environments";
-import { useProjects } from "./entities";
+import { useProjects, useServerConfigs } from "./entities";
 import { mobilePreferencesAtom } from "./preferences";
 
 const state = createNeoPiThemesState(connectionAtomRuntime);
@@ -30,10 +30,11 @@ export function useMobileNeoPiThemeCatalog() {
   const enabled = stored?.nativeThemeCatalogEnabled === true;
   const { environments } = useEnvironments();
   const projects = useProjects();
+  const configs = useServerConfigs();
   const choices = useMemo(
     () =>
       environments.flatMap((environment) =>
-        (environment.serverConfig?.providers ?? [])
+        (configs.get(environment.environmentId)?.providers ?? [])
           .filter((provider) => provider.driver === "neopi" && provider.enabled)
           .flatMap((provider) => {
             const make = (project: (typeof projects)[number] | null): MobileNeoPiThemeTarget => ({
@@ -57,7 +58,7 @@ export function useMobileNeoPiThemeCatalog() {
             ];
           }),
       ),
-    [environments, projects],
+    [environments, projects, configs],
   );
   const target = stored?.nativeThemeTarget
     ? (choices.find((choice) => choice.key === stored.nativeThemeTarget) ?? null)

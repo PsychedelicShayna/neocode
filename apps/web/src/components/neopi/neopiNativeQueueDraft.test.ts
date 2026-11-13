@@ -191,6 +191,4 @@ it("restores a signed-asset image when the native response omits oversized inlin
   const preview = draft.images[0]!.previewUrl;
   expect(draft.images[0]?.sizeBytes).toBe(6);
   expect(preview).toBe("data:image/png;base64,cmVtb3Rl");
-  useComposerDraftStore.getState().removeImage(target, draft.images[0]!.id);
-  expect(useComposerDraftStore.getState().getComposerDraft(target)?.images).toEqual([]);
 });

@@ -1,9 +1,10 @@
 import type { EnvironmentId } from "@t3tools/contracts";
+import type { PreparedConnection } from "@t3tools/client-runtime/connection";
 
 import { folderDropTarget } from "../chat/folderDrop";
 
 /** Advertised in NeoPi's `ready` frame, and in a control connection's hello, when it serves `dictation_*`. */
-export const NATIVE_DICTATION_CAPABILITY = "dictation";
+const NATIVE_DICTATION_CAPABILITY = "dictation";
 
 export type NativeDictationAvailability =
   /** Not the desktop app: the composer has no microphone control at all. */
@@ -12,18 +13,14 @@ export type NativeDictationAvailability =
   /** Shown disabled; `reason` says what is wrong and what fixes it. */
   | { readonly kind: "disabled"; readonly reason: string };
 
-/**
- * NeoPi records the microphone of the machine that runs it. That is the user's own
- * only when this is the desktop app talking to its own backend. An owned session
- * and a terminal-attached one serve dictation alike, each when its own connection
- * advertises the `dictation` capability. On the desktop the control is always
- * present: when dictation cannot work, `reason` is what the user needs to hear.
- */
+// NeoPi records its host's microphone, so dictation is local-desktop only.
+// Owned and terminal sessions each need their own connection's dictation capability.
 export function nativeDictationAvailability(input: {
   readonly isDesktop: boolean;
   readonly localEnvironmentDisabled: boolean;
   readonly environmentId: EnvironmentId;
   readonly primaryEnvironmentId: EnvironmentId | null;
+  readonly connection: Pick<PreparedConnection, "target" | "httpBaseUrl"> | null;
   readonly attachment: "owned" | "terminal" | undefined;
   /** The session connection's capabilities; null until the session has opened. */
   readonly capabilities: readonly string[] | null;
@@ -33,7 +30,7 @@ export function nativeDictationAvailability(input: {
 }): NativeDictationAvailability {
   if (!input.isDesktop) return { kind: "hidden" };
   const disabled = (reason: string): NativeDictationAvailability => ({ kind: "disabled", reason });
-  if (folderDropTarget(input) === "remote")
+  if (folderDropTarget({ ...input, isDesktopRenderer: input.isDesktop }) === "remote")
     return disabled(
       "Dictation records on the computer running NeoPi, so it only works in NeoCode on that computer. This session runs on another one.",
     );

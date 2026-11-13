@@ -296,10 +296,7 @@ describe("native conversation authority", () => {
 
   it.effect("does not start stopped sessions or forward foreign navigation", () =>
     Effect.gen(function* () {
-      const stopped = yield* makeNeoPiNativeConversationWith(
-        () => Effect.succeed(undefined),
-        resolveFile,
-      );
+      const stopped = yield* makeNeoPiNativeConversationWith(() => Effect.undefined, resolveFile);
       assert.equal(
         (yield* stopped.navigate({ threadId, ...expected, targetId: "e1" })).status,
         "unavailable",
@@ -330,6 +327,9 @@ describe("native conversation authority", () => {
     Effect.gen(function* () {
       let started = false;
       const calls: Array<Record<string, unknown>> = [];
+      const starting = yield* Deferred.make<void>();
+      const releaseStart = yield* Deferred.make<void>();
+      let starts = 0;
       const owner = makeOwner(Stream.empty, (command) =>
         Effect.sync(() => {
           calls.push(command);
@@ -340,7 +340,10 @@ describe("native conversation authority", () => {
         () => Effect.succeed(started ? { owner, expected: identity } : undefined),
         resolveFile,
         () =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
+            starts++;
+            yield* Deferred.succeed(starting, undefined);
+            yield* Deferred.await(releaseStart);
             started = true;
           }),
         () =>
@@ -358,11 +361,25 @@ describe("native conversation authority", () => {
         "unavailable",
       );
       assert.equal(started, false);
-      assert.equal(
-        (yield* service.navigate({ threadId, ...expected, targetId: "e1", startIfStopped: true }))
-          .status,
-        "available",
-      );
+      const navigation = yield* service
+        .navigate({
+          threadId,
+          ...expected,
+          targetId: "e1",
+          startIfStopped: true,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(starting);
+      const duplicate = yield* service.navigate({
+        threadId,
+        ...expected,
+        targetId: "e1",
+        startIfStopped: true,
+      });
+      assert.equal(duplicate.status === "error" && duplicate.code, "session_busy");
+      assert.equal(starts, 1);
+      yield* Deferred.succeed(releaseStart, undefined);
+      assert.equal((yield* Fiber.join(navigation)).status, "available");
       assert.equal(started, true);
       assert.equal(calls[0]?.type, "navigate_tree");
       assert.equal("startIfStopped" in calls[0]!, false);
@@ -370,7 +387,7 @@ describe("native conversation authority", () => {
         calls.some((command) => command.type === "prompt"),
         false,
       );
-    }),
+    }).pipe(Effect.scoped),
   );
 
   it.effect(

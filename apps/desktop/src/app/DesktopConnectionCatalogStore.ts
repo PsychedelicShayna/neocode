@@ -17,9 +17,9 @@ import {
 } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
-import * as Encoding from "effect/Encoding";
+import * as Base64 from "effect/encoding/Base64";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -211,7 +211,7 @@ function decodeSecretBytes(
   catalogPath: string,
   encoded: string,
 ): Effect.Effect<Uint8Array, DesktopConnectionCatalogStoreDecodeError> {
-  return Effect.fromResult(Encoding.decodeBase64(encoded)).pipe(
+  return Effect.fromResult(Base64.decode(encoded)).pipe(
     Effect.mapError(
       (cause) =>
         new DesktopConnectionCatalogStoreDecodeError({
@@ -416,21 +416,22 @@ const migrateSavedEnvironmentRecords = Effect.fn(
   };
 });
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   const savedEnvironments = yield* DesktopSavedEnvironments.DesktopSavedEnvironments;
   const catalogPath = path.join(environment.stateDir, "connection-catalog.json");
   const recoveryPath = path.join(environment.stateDir, "connection-catalog-recovery.json");
   const lock = yield* Semaphore.make(1);
 
   const readRecovery = fileSystem.readFileString(recoveryPath).pipe(
-    Effect.catch((error) =>
-      error.reason._tag === "NotFound" ? Effect.succeed(null) : Effect.fail(error),
+    Effect.catchIf(
+      (error) => error.reason._tag === "NotFound",
+      () => Effect.succeed(null),
     ),
     Effect.flatMap((raw) => (raw === null ? Effect.succeed(null) : decodeRecoveryRecord(raw))),
     Effect.mapError(
@@ -450,13 +451,12 @@ export const make = Effect.gen(function* () {
       if (previous !== null) {
         const candidate = path.join(environment.stateDir, previous.preservedName);
         const active = yield* fileSystem.readFile(catalogPath);
-        const saved = yield* fileSystem
-          .readFile(candidate)
-          .pipe(
-            Effect.catch((error) =>
-              error.reason._tag === "NotFound" ? Effect.succeed(null) : Effect.fail(error),
-            ),
-          );
+        const saved = yield* fileSystem.readFile(candidate).pipe(
+          Effect.catchIf(
+            (error) => error.reason._tag === "NotFound",
+            () => Effect.succeed(null),
+          ),
+        );
         if (
           saved !== null &&
           active.length === saved.length &&
@@ -469,15 +469,16 @@ export const make = Effect.gen(function* () {
         // link is exclusive: a collision never overwrites an earlier preserved file.
         // The active catalog is replaced by rename, never edited through this link.
         while (preservedPath === null) {
-          const suffix = (yield* crypto.randomUUIDv4).replace(/-/g, "");
+          const suffix = (yield* random.uuidV4()).replace(/-/g, "");
           const candidate = path.join(
             environment.stateDir,
             `connection-catalog.${suffix}.unreadable.json`,
           );
           const linked = yield* fileSystem.link(catalogPath, candidate).pipe(
             Effect.as(true),
-            Effect.catch((error) =>
-              error.reason._tag === "AlreadyExists" ? Effect.succeed(false) : Effect.fail(error),
+            Effect.catchIf(
+              (error) => error.reason._tag === "AlreadyExists",
+              () => Effect.succeed(false),
             ),
           );
           if (linked) {
@@ -491,7 +492,7 @@ export const make = Effect.gen(function* () {
         reason,
         preservedName: path.basename(preservedPath),
       });
-      const temporaryPath = `${recoveryPath}.${yield* crypto.randomUUIDv4}.tmp`;
+      const temporaryPath = `${recoveryPath}.${yield* random.uuidV4()}.tmp`;
       yield* Effect.gen(function* () {
         yield* Effect.scoped(
           Effect.gen(function* () {
@@ -513,10 +514,9 @@ export const make = Effect.gen(function* () {
           yield* preserved.sync;
           const directory = yield* fileSystem.open(environment.stateDir, { flag: "r" });
           yield* directory.sync.pipe(
-            Effect.catch((error) =>
-              environment.platform === "win32" && isEpermCause(error.reason.cause)
-                ? Effect.void
-                : Effect.fail(error),
+            Effect.catchIf(
+              (error) => environment.platform === "win32" && isEpermCause(error.reason.cause),
+              () => Effect.void,
             ),
           );
         }),
@@ -529,9 +529,7 @@ export const make = Effect.gen(function* () {
           ? fileSystem.remove(createdPath, { force: true }).pipe(Effect.ignore)
           : Effect.void,
       ),
-      Effect.catch(() =>
-        Effect.succeed({ ...status, status: "blocked", preservedPath: null } as const),
-      ),
+      Effect.orElseSucceed(() => ({ ...status, status: "blocked", preservedPath: null }) as const),
       Effect.uninterruptible,
     );
   });
@@ -549,7 +547,7 @@ export const make = Effect.gen(function* () {
   const writeCatalog = Effect.fn("desktop.connectionCatalogStore.writeCatalog")(function* (
     catalog: string,
   ) {
-    const encryptedCatalog = Encoding.encodeBase64(
+    const encryptedCatalog = Base64.encode(
       yield* safeStorage.encryptString(catalog).pipe(
         Effect.mapError(
           (cause) =>
@@ -561,16 +559,7 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const suffix = (yield* crypto.randomUUIDv4.pipe(
-      Effect.mapError(
-        (cause) =>
-          new DesktopConnectionCatalogStoreWriteError({
-            operation: "create-temporary-file-name",
-            path: catalogPath,
-            cause,
-          }),
-      ),
-    )).replace(/-/g, "");
+    const suffix = (yield* random.uuidV4()).replace(/-/g, "");
     yield* writeDocument({
       fileSystem,
       path,
@@ -646,11 +635,12 @@ export const make = Effect.gen(function* () {
     }
     return yield* safeStorage.decryptString(encrypted).pipe(
       Effect.map((catalog): DesktopConnectionCatalogRead => ({ catalog, recovery })),
-      Effect.catchTag("ElectronSafeStorageDecryptError", () =>
-        preserve("decrypt-failed", record).pipe(
-          Effect.map((recovery): DesktopConnectionCatalogRead => ({ catalog: null, recovery })),
-        ),
-      ),
+      Effect.catchTags({
+        ElectronSafeStorageDecryptError: () =>
+          preserve("decrypt-failed", record).pipe(
+            Effect.map((recovery): DesktopConnectionCatalogRead => ({ catalog: null, recovery })),
+          ),
+      }),
     );
   });
 

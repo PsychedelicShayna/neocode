@@ -1,11 +1,17 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { ComposerContextId, EnvironmentId } from "@t3tools/contracts";
-import { formatComposerContextReference } from "@t3tools/shared/composerContextReferences";
+import { ComposerContextId, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  formatComposerContextReference,
+  threadContextRecord,
+} from "@t3tools/shared/composerContextReferences";
 import {
   persistComposerDraftSnapshot,
   type ComposerThreadDraftState,
 } from "../../composerDraftStore";
-import { terminalContextReference } from "../../lib/composerContextRecords";
+import {
+  environmentContextRecord,
+  terminalContextReference,
+} from "../../lib/composerContextRecords";
 import {
   captureNativeComposerFocus,
   remainingNativeDraft,
@@ -51,6 +57,8 @@ const draft = (changes: Partial<ComposerThreadDraftState> = {}): ComposerThreadD
   terminalContexts: [],
   previewAnnotations: [],
   reviewComments: [],
+  threadContexts: [],
+  environmentContexts: [],
   modelSelectionByProvider: {},
   activeProvider: null,
   runtimeMode: null,
@@ -72,6 +80,11 @@ const reference = formatComposerContextReference({
   ...terminalReference,
   contextId: ComposerContextId.make(terminalReference.contextId),
 });
+const linkedEnvironment = environmentContextRecord(EnvironmentId.make("linked-computer"), "Lab");
+const linkedThread = threadContextRecord(
+  { environmentId: linkedEnvironment.environmentId, threadId: ThreadId.make("linked-thread") },
+  "Reference work",
+);
 const imageFile = new File(["image"], "capture.png", { type: "image/png" });
 const image = {
   type: "image" as const,
@@ -97,6 +110,8 @@ describe("accepted native composer snapshots", () => {
     const submitted = draft({
       files: [attachment],
       terminalContexts: [selection],
+      threadContexts: [linkedThread],
+      environmentContexts: [linkedEnvironment],
       prompt: `Explain ${reference}`,
     });
     const uploadedFile = {
@@ -115,6 +130,8 @@ describe("accepted native composer snapshots", () => {
     expect(remaining.prompt).toBe("\nNext question");
     expect(remaining.files).toEqual([]);
     expect(remaining.terminalContexts).toEqual([]);
+    expect(remaining.threadContexts).toEqual([]);
+    expect(remaining.environmentContexts).toEqual([]);
     expect(remaining.images).toEqual([image]);
     expect(remaining.nonPersistedImageIds).toEqual([image.id]);
   });
@@ -137,6 +154,18 @@ describe("accepted native composer snapshots", () => {
       terminalContexts: [{ ...selection, text: "revised selection" }],
     };
     expect(remainingNativeDraft(current, submitted)).toEqual(current);
+    const threadDraft = draft({ threadContexts: [linkedThread] });
+    const revisedThread = {
+      ...threadDraft,
+      threadContexts: [{ ...linkedThread, title: "Updated reference" }],
+    };
+    expect(remainingNativeDraft(revisedThread, threadDraft)).toBe(revisedThread);
+    const environmentDraft = draft({ environmentContexts: [linkedEnvironment] });
+    const revisedEnvironment = {
+      ...environmentDraft,
+      environmentContexts: [{ ...linkedEnvironment, label: "Renamed lab" }],
+    };
+    expect(remainingNativeDraft(revisedEnvironment, environmentDraft)).toBe(revisedEnvironment);
   });
 
   it("retains an accepted context explicitly referenced again in newly appended text", () => {
@@ -148,16 +177,29 @@ describe("accepted native composer snapshots", () => {
   });
 
   it("consumes unchanged records after persistence changes their object identity and property order", () => {
-    const submitted = draft({ terminalContexts: [selection], prompt: `Explain ${reference}` });
+    const submitted = draft({
+      terminalContexts: [selection],
+      threadContexts: [linkedThread],
+      environmentContexts: [linkedEnvironment],
+      prompt: `Explain ${reference}`,
+    });
     const persisted = JSON.parse(JSON.stringify(persistComposerDraftSnapshot(submitted)));
     const restoredSelection = persisted.terminalContexts[0];
     const current = draft({
       prompt: `${submitted.prompt}\nNext question`,
       terminalContexts: [{ ...restoredSelection }],
+      threadContexts: persisted.threadContexts.map((record: typeof linkedThread) => ({
+        ...record,
+      })),
+      environmentContexts: persisted.environmentContexts.map(
+        (record: typeof linkedEnvironment) => ({ ...record }),
+      ),
     });
     const remaining = remainingNativePersistedDraft(current, persisted);
     expect(remaining.prompt).toBe("\nNext question");
     expect(remaining.terminalContexts).toEqual([]);
+    expect(remaining.threadContexts).toEqual([]);
+    expect(remaining.environmentContexts).toEqual([]);
   });
 
   it("keeps a same-ID terminal record revision when a different window accepts its old version", () => {

@@ -10,7 +10,7 @@ import * as Schema from "effect/Schema";
 import * as PubSub from "effect/PubSub";
 import * as Semaphore from "effect/Semaphore";
 import { ServerConfig } from "../../config.ts";
-import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
+import { ProviderInstanceRegistry } from "../ProviderInstanceRegistry.ts";
 import {
   neoPiSessionCatalogSource,
   type NeoPiSessionCatalogSource,
@@ -43,9 +43,10 @@ const decodeReady = Schema.decodeUnknownSync(
     }),
   ),
 );
+const isRuntimeError = Schema.is(NeoPiRuntimeError);
 
 const statsError = (cause: unknown) =>
-  cause instanceof NeoPiRuntimeError
+  isRuntimeError(cause)
     ? cause
     : new NeoPiRuntimeError({
         code: "startup",

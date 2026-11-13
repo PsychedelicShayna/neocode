@@ -36,7 +36,8 @@ function setupClient() {
   vi.stubGlobal("document", { documentElement: root });
   vi.stubGlobal("getComputedStyle", undefined);
   vi.stubGlobal("requestAnimationFrame", () => 1);
-  vi.doMock("react", () => ({
+  vi.doMock("react", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("react")>()),
     useCallback: <A>(callback: A) => callback,
     useEffect: () => undefined,
     useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),

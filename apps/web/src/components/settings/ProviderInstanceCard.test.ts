@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { ServerProviderModel } from "@t3tools/contracts";
+import { SecretProviderId, type ServerProviderModel } from "@t3tools/contracts";
 
-import { deriveProviderModelsForDisplay } from "./ProviderInstanceCard";
+import {
+  deriveProviderModelsForDisplay,
+  nextProviderEnvironmentWithFieldSecret,
+  nextProviderEnvironmentWithFieldValue,
+} from "./ProviderInstanceCard";
 
 describe("deriveProviderModelsForDisplay", () => {
   it("uses current config custom models instead of stale live custom rows", () => {
@@ -51,7 +55,6 @@ describe("deriveProviderModelsForDisplay", () => {
       { slug: "bare", name: "bare", isCustom: true, capabilities: liveCapabilities },
       { slug: "named", name: "named", isCustom: true, capabilities: liveCapabilities },
     ];
-
     const display = deriveProviderModelsForDisplay({
       liveModels,
       customModels: [
@@ -59,8 +62,6 @@ describe("deriveProviderModelsForDisplay", () => {
         { slug: "named", name: "My Model", capabilities: customCapabilities },
       ],
     });
-
-    // A bare entry keeps the driver default the server filled in.
     expect(display[0]).toEqual({
       slug: "bare",
       name: "bare",
@@ -73,5 +74,68 @@ describe("deriveProviderModelsForDisplay", () => {
       isCustom: true,
       capabilities: customCapabilities,
     });
+  });
+});
+
+describe("provider environment helpers", () => {
+  const apiKeyField = {
+    name: "OPENAI_API_KEY",
+    label: "OpenAI API key",
+    sensitive: true,
+  };
+
+  it("writes dedicated provider secrets as sensitive environment variables", () => {
+    expect(
+      nextProviderEnvironmentWithFieldValue(
+        [{ name: "EXTRA_FLAG", value: "1", sensitive: false }],
+        apiKeyField,
+        "  api-key  ",
+      ),
+    ).toEqual([
+      { name: "EXTRA_FLAG", value: "1", sensitive: false },
+      { name: "OPENAI_API_KEY", value: "api-key", sensitive: true },
+    ]);
+  });
+
+  it("replaces redacted provider secrets without preserving redaction markers", () => {
+    expect(
+      nextProviderEnvironmentWithFieldValue(
+        [
+          {
+            name: "OPENAI_API_KEY",
+            value: "",
+            sensitive: true,
+            valueRedacted: true,
+          },
+        ],
+        apiKeyField,
+        "new-key",
+      ),
+    ).toEqual([{ name: "OPENAI_API_KEY", value: "new-key", sensitive: true }]);
+  });
+
+  it("points a stored provider secret at a secret provider and drops the stored value", () => {
+    const secret = {
+      provider: SecretProviderId.make("personal"),
+      reference: "op://Private/Inference/credential",
+    };
+    const stored = [{ name: "OPENAI_API_KEY", value: "", sensitive: true, valueRedacted: true }];
+    const referenced = nextProviderEnvironmentWithFieldSecret(stored, apiKeyField, secret);
+
+    expect(referenced).toEqual([{ name: "OPENAI_API_KEY", value: secret, sensitive: true }]);
+    expect(nextProviderEnvironmentWithFieldSecret(referenced, apiKeyField, undefined)).toEqual([]);
+  });
+
+  it("applies the secure field default when replacing an existing non-sensitive value", () => {
+    expect(
+      nextProviderEnvironmentWithFieldValue(
+        [{ name: "OPENAI_API_KEY", value: "old-key", sensitive: false }],
+        {
+          name: "OPENAI_API_KEY",
+          label: "OpenAI API key",
+        },
+        "new-key",
+      ),
+    ).toEqual([{ name: "OPENAI_API_KEY", value: "new-key", sensitive: true }]);
   });
 });

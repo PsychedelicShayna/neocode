@@ -5,7 +5,7 @@ import {
   ServerConfig,
   ServerConfigStreamEvent,
 } from "@t3tools/contracts";
-import { buildServerProvider } from "../providerSnapshot.ts";
+import { buildServerProvider } from "@t3tools/provider-core/server/snapshotProbe";
 import { expect, it } from "vite-plus/test";
 import {
   neoPiRoleFromModelSlug,
@@ -519,7 +519,7 @@ it("keeps models with unknown facts connected through config snapshots and statu
     },
     settings: {},
   });
-  const events: ReadonlyArray<typeof ServerConfigStreamEvent.Type> = [
+  const events: ReadonlyArray<ServerConfigStreamEvent> = [
     { version: 1, type: "snapshot", config: { ...config, providers: [provider] } },
     { version: 1, type: "providerStatuses", payload: { providers: [provider] } },
   ];

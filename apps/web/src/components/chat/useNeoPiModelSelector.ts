@@ -1,6 +1,6 @@
 import type { NeoPiModelSelectorResult, ProviderInstanceId } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import { neopiModels } from "../neopi/modelsPageState";
@@ -20,6 +20,7 @@ export function useNeoPiModelSelector(
   typedQuery: string,
 ) {
   const [settledQuery, setSettledQuery] = useState(typedQuery);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Debounce native ranking requests while clearing the search immediately.
   useEffect(() => {
     const timer = setTimeout(() => setSettledQuery(typedQuery), NATIVE_QUERY_DEBOUNCE_MS);
     return () => clearTimeout(timer);
@@ -31,7 +32,7 @@ export function useNeoPiModelSelector(
   const threadInstanceId = connectedThread?.providerInstanceId;
   const sessionFile = connectedSession?.sessionFile;
   const sessionInstanceId = connectedSession?.providerInstanceId;
-  const request = useMemo(() => {
+  const request = (() => {
     const targetContext: NativeSelectorContext = {
       environmentId,
       ...(projectId ? { projectId } : {}),
@@ -50,33 +51,16 @@ export function useNeoPiModelSelector(
       requests,
       query,
     };
-  }, [
-    environmentId,
-    projectId,
-    threadId,
-    threadInstanceId,
-    sessionFile,
-    sessionInstanceId,
-    entries,
-    query,
-  ]);
+  })();
   const [snapshot, setSnapshot] = useState<{
     key: string;
     results: ReadonlyMap<ProviderInstanceId, NeoPiModelSelectorResult>;
     errors: ReadonlyArray<string>;
     pending: boolean;
   } | null>(null);
-  useEffect(() => {
+  const readRequest = useEffectEvent((key: string, readCommand: typeof read) => {
+    if (!request.environmentId || request.requests.length === 0) return;
     let current = true;
-    if (!request.environmentId) {
-      setSnapshot({
-        key: request.key,
-        results: EMPTY_RESULTS,
-        errors: ["Connect an environment to query native models."],
-        pending: false,
-      });
-      return;
-    }
     const environmentId = request.environmentId;
     const results = new Map<ProviderInstanceId, NeoPiModelSelectorResult>();
     const errors = new Map<ProviderInstanceId, string>();
@@ -84,7 +68,7 @@ export function useNeoPiModelSelector(
     const publish = () => {
       if (!current) return;
       setSnapshot({
-        key: request.key,
+        key,
         results: new Map(
           request.requests.flatMap(({ target }) => {
             const value = results.get(target.providerInstanceId);
@@ -102,7 +86,10 @@ export function useNeoPiModelSelector(
     for (const { target, displayName } of request.requests) {
       void (async () => {
         try {
-          const result = await read({ environmentId, input: { target, query: request.query } });
+          const result = await readCommand({
+            environmentId,
+            input: { target, query: request.query },
+          });
           if (result._tag === "Failure") throw squashAtomCommandFailure(result);
           if (result.value.error !== null)
             errors.set(target.providerInstanceId, `${displayName}: ${result.value.error}`);
@@ -120,13 +107,19 @@ export function useNeoPiModelSelector(
     return () => {
       current = false;
     };
-  }, [request, read]);
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Own one native query per semantic scope and search key, not per render's arrays.
+  useEffect(() => readRequest(request.key, read), [request.key, read]);
   const current = snapshot?.key === request.key && query === typedQuery ? snapshot : null;
+  const noEnvironment = !request.environmentId;
+  const emptyScope = request.requests.length === 0;
   return {
     results: current?.results ?? EMPTY_RESULTS,
-    errors: current?.errors ?? [],
-    pending: current?.pending ?? true,
-    hasResponse: current !== null,
+    errors: noEnvironment
+      ? ["Connect an environment to query native models."]
+      : (current?.errors ?? []),
+    pending: noEnvironment || emptyScope ? false : (current?.pending ?? true),
+    hasResponse: noEnvironment || emptyScope || current !== null,
     scopeKey: request.scopeKey,
   };
 }

@@ -1,21 +1,35 @@
+import type { ModelPreferences } from "@t3tools/contracts/settings";
 import {
+  DEFAULT_MODEL_BY_PROVIDER,
+  DEFAULT_TEXT_GENERATION_MODEL,
+  DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
+  globalIdleCompaction,
+  type IdleCompactionMode,
   isProviderAvailable,
+  isUnconfiguredDefaultInstanceEnabled,
+  resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
+  resolveTextGenerationSelectionEnabled,
+  textGeneratorForSelection,
+  isProviderTextGenerationCapable,
   type ModelSelection,
   type ProjectId,
   type ProjectScopedServerSettingKey,
   type ProjectSettingsOverrides,
   type ProjectSettingsOverridesPatch,
-  type ProviderDriverKind,
+  ProviderDriverKind,
+  ProviderInstanceId,
   type ServerProvider,
   ServerSettings,
   type ServerSettingsPatch,
+  withIdleCompaction,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import { deepMerge } from "./Struct.ts";
 import { fromLenientJson } from "./schemaJson.ts";
-import { createModelSelection } from "./model.ts";
+import { createModelSelection, readCustomModelEntries } from "./model.ts";
 import {
   getBackgroundActivityBaseProfile,
   normalizeBackgroundActivitySettings,
@@ -23,94 +37,150 @@ import {
   resolveBackgroundActivitySettings,
 } from "./backgroundActivitySettings.ts";
 
-const ServerSettingsJson = fromLenientJson(ServerSettings);
-const decodeServerSettingsJson = Schema.decodeUnknownOption(ServerSettingsJson);
-
-/** @deprecated Read `resolveProjectSettings(...).settings.enableAgentBrowserAccess`. */
-export function resolveProjectAgentBrowserAccess(
-  settings: Pick<
-    ServerSettings,
-    "enableAgentBrowserAccess" | "projectAgentBrowserAccessOverrides" | "projectSettingsOverrides"
-  >,
-  projectId: ProjectId,
-): boolean {
-  return (
-    settings.projectSettingsOverrides[projectId]?.enableAgentBrowserAccess ??
-    settings.projectAgentBrowserAccessOverrides[projectId] ??
-    settings.enableAgentBrowserAccess
-  );
-}
-
-/** @deprecated Read `resolveProjectSettings(...).settings.defaultAutoPull`. */
-export function resolveProjectAutoPull(
-  settings: Pick<
-    ServerSettings,
-    "defaultAutoPull" | "projectAutoPullOverrides" | "projectSettingsOverrides"
-  >,
-  projectId: ProjectId,
-  legacyAutoPull: boolean | undefined,
-): boolean {
-  // Existing opt-ins stay enabled until explicitly overridden or reset.
-  return (
-    settings.projectSettingsOverrides[projectId]?.defaultAutoPull ??
-    settings.projectAutoPullOverrides[projectId] ??
-    (legacyAutoPull === true || settings.defaultAutoPull)
-  );
-}
-
-type LegacyProviderSettings = ServerSettings["providers"][keyof ServerSettings["providers"]];
-
-const getLegacyProviderSettings = (
-  settings: ServerSettings,
-  provider: ProviderDriverKind,
-): LegacyProviderSettings | undefined =>
-  (settings.providers as Record<string, LegacyProviderSettings | undefined>)[provider];
+// Only observability: a value the server migrates on load elsewhere in the file must not drop it.
+const ServerObservabilitySettingsJson = fromLenientJson(
+  Schema.Struct({ observability: ServerSettings.fields.observability }),
+);
+const decodeServerObservabilitySettingsJson = Schema.decodeUnknownOption(
+  ServerObservabilitySettingsJson,
+);
 
 export function isModelSelectionProviderEnabled(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
+  const generator = textGeneratorForSelection(settings, selection.instanceId);
+  if (generator !== undefined) return generator.enabled;
   const instanceConfig = settings.providerInstances[selection.instanceId];
   if (instanceConfig !== undefined) {
     return instanceConfig.driver === "neopi" && resolveProviderInstanceEnabled(instanceConfig);
   }
 
-  return selection.instanceId === "neopi" && settings.providers.neopi.enabled === true;
+  return isUnconfiguredDefaultInstanceEnabled(selection.instanceId);
 }
 
 /** Stored runtime identity wins over a draft model choice, so old history cannot be reinterpreted. */
 export function getThreadRuntimeReadOnlyReason(input: {
   readonly modelSelection: ModelSelection;
   readonly session?: { readonly providerName?: string | null } | null;
+  readonly historyOrigin?: "native" | "v1_import" | undefined;
+  readonly legacyRuntimeDriver?: string | null | undefined;
   readonly settings?: Pick<ServerSettings, "providerInstances"> | undefined;
   readonly providers?: ReadonlyArray<Pick<ServerProvider, "instanceId" | "driver">>;
 }): string | null {
   const instanceId = input.modelSelection.instanceId;
   const driver =
-    input.session?.providerName ??
-    input.settings?.providerInstances[instanceId]?.driver ??
-    input.providers?.find((provider) => provider.instanceId === instanceId)?.driver ??
-    (instanceId === "neopi" ? "neopi" : undefined);
+    input.historyOrigin === "v1_import"
+      ? input.legacyRuntimeDriver
+      : (input.session?.providerName ??
+        input.settings?.providerInstances[instanceId]?.driver ??
+        input.providers?.find((provider) => provider.instanceId === instanceId)?.driver ??
+        (instanceId === "neopi" ? "neopi" : undefined));
   if (driver === "neopi") return null;
   return driver
     ? `This saved thread uses ${driver}. NeoCode only runs NeoPi, so its history is read-only.`
     : "This saved thread's runtime is unavailable. Its history is read-only.";
 }
 
+/** Only project-scoped callers may include configured instances when falling back; machine-level callers leave it unset. */
+export function fallbackTextGenerationModelSelection(
+  providerInstances: ServerSettings["providerInstances"],
+  isEnabled: (instanceId: ProviderInstanceId, driver: ProviderDriverKind) => boolean,
+  options?: {
+    readonly includeConfiguredInstances?: boolean;
+    readonly defaultModelSelection?: ModelSelection | null;
+  },
+): ModelSelection | null {
+  const driver = ProviderDriverKind.make("neopi");
+  const defaultId = ProviderInstanceId.make("neopi");
+  const candidates: Array<ProviderInstanceId> = [];
+  const defaultConfig = providerInstances[defaultId];
+  if (defaultConfig?.driver === driver) {
+    candidates.push(defaultId);
+  }
+  if (options?.includeConfiguredInstances === true) {
+    for (const [instanceId, instance] of Object.entries(providerInstances)) {
+      if (instance.driver === driver && instanceId !== defaultId) {
+        candidates.push(ProviderInstanceId.make(instanceId));
+      }
+    }
+  }
+  if (defaultConfig === undefined) candidates.push(defaultId);
+  const instanceId = candidates.find((candidate) => isEnabled(candidate, driver));
+  if (instanceId === undefined) return null;
+  const threadDefault = options?.defaultModelSelection;
+  const config = providerInstances[instanceId]?.config as { customModels?: unknown } | undefined;
+  if (
+    threadDefault?.instanceId === instanceId &&
+    readCustomModelEntries(config?.customModels).some((entry) => entry.slug === threadDefault.model)
+  ) {
+    return threadDefault;
+  }
+  return { instanceId, model: defaultTextGenerationModel(driver) };
+}
+
+export function defaultTextGenerationModel(driver: ProviderDriverKind): string {
+  return (
+    DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[driver] ??
+    DEFAULT_MODEL_BY_PROVIDER[driver] ??
+    DEFAULT_TEXT_GENERATION_MODEL
+  );
+}
+
+/** A text generator, or a provider whose snapshot can generate text; no snapshots trusts settings. */
+function isTextGenerationTargetUsable(
+  settings: ServerSettings,
+  providers: ReadonlyArray<ServerProvider> | undefined,
+  instanceId: ProviderInstanceId,
+): boolean {
+  if (providers === undefined || textGeneratorForSelection(settings, instanceId) !== undefined) {
+    return true;
+  }
+  const provider = providers.find((candidate) => candidate.instanceId === instanceId);
+  return (
+    provider?.enabled === true &&
+    isProviderAvailable(provider) &&
+    isProviderTextGenerationCapable(provider)
+  );
+}
+
 export function resolveSourceControlWriterModelSelection(
+  settings: ServerSettings,
+  providers: ReadonlyArray<ServerProvider> | undefined,
+  projectId: ProjectId | null,
+): ModelSelection {
+  const selection = settings.sourceControlWriterModelSelection;
+  return selection &&
+    resolveTextGenerationSelectionEnabled(settings, projectId, selection.instanceId) &&
+    isTextGenerationTargetUsable(settings, providers, selection.instanceId)
+    ? selection
+    : settings.textGenerationModelSelection;
+}
+
+export function resolveReviewGuideModelSelection(
+  settings: ServerSettings,
+  providers: ReadonlyArray<ServerProvider> | undefined,
+  projectId: ProjectId | null,
+): ModelSelection {
+  const selection = settings.reviewGuideModelSelection;
+  // Text generators cannot investigate a checkout, so they never write review guides.
+  return selection &&
+    textGeneratorForSelection(settings, selection.instanceId) === undefined &&
+    resolveProjectProviderInstanceEnabled(settings, projectId, selection.instanceId) &&
+    isTextGenerationTargetUsable(settings, providers, selection.instanceId)
+    ? selection
+    : resolveSourceControlWriterModelSelection(settings, providers, projectId);
+}
+
+/** Transcript cleanup follows the text generation model unless its own usable model is set. */
+export function resolveSpeechPostProcessingModelSelection(
   settings: ServerSettings,
   providers?: ReadonlyArray<ServerProvider>,
 ): ModelSelection {
-  const selection = settings.sourceControlWriterModelSelection;
-  if (!selection || !isModelSelectionProviderEnabled(settings, selection)) {
-    return settings.textGenerationModelSelection;
-  }
-  if (providers === undefined) {
-    return selection;
-  }
-
-  const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
-  return provider?.enabled === true && isProviderAvailable(provider)
+  const selection = settings.speechPostProcessingModelSelection;
+  return selection &&
+    isModelSelectionProviderEnabled(settings, selection) &&
+    isTextGenerationTargetUsable(settings, providers, selection.instanceId)
     ? selection
     : settings.textGenerationModelSelection;
 }
@@ -145,7 +215,7 @@ function extractPersistedServerObservabilitySettings(input: {
 export function parsePersistedServerObservabilitySettings(
   raw: string,
 ): PersistedServerObservabilitySettings {
-  const decoded = decodeServerSettingsJson(raw);
+  const decoded = decodeServerObservabilitySettingsJson(raw);
   if (Option.isSome(decoded)) {
     return extractPersistedServerObservabilitySettings(decoded.value);
   }
@@ -176,7 +246,6 @@ function mergeModelSelectionOptionsById(input: {
   return [...merged.entries()].map(([id, value]) => ({ id, value }));
 }
 
-/** Upsert each patched entry; `null` removes it. Entries the patch omits are untouched. */
 function mergeSettingsEntries<Value>(
   current: Readonly<Record<string, Value>>,
   patch: Readonly<Record<string, Value | null>>,
@@ -192,11 +261,15 @@ function mergeSettingsEntries<Value>(
   return Object.fromEntries(next);
 }
 
-/**
- * Derived views of `projectSettingsOverrides` for clients that still read
- * the legacy per-key maps. Recomputed on every patch and load so they
- * cannot drift from the generic record.
- */
+// Secret persistence keys tokens by trimmed, lowercased host, so merge on the same key.
+const byHost = (tokens: unknown) =>
+  Object.fromEntries(
+    Object.entries(Predicate.isObject(tokens) ? tokens : {}).map(([host, token]) => [
+      host.trim().toLowerCase(),
+      token,
+    ]),
+  );
+
 export function deriveLegacyProjectOverrides(
   settings: Pick<ServerSettings, "projectSettingsOverrides">,
 ): Pick<
@@ -220,13 +293,15 @@ export function deriveLegacyProjectOverrides(
   return { projectAgentBrowserAccessOverrides, projectAutoPullOverrides, projectScriptOverrides };
 }
 
-/**
- * Rewrite a patch that still uses the legacy per-key project maps into
- * entries of `projectSettingsOverrides`, so older clients keep editing the
- * values the server actually reads. `null` in a legacy map clears that one
- * override.
- */
-function translateLegacyProjectOverridePatch(patch: ServerSettingsPatch): ServerSettingsPatch {
+type CanonicalServerSettingsPatch = Omit<
+  ServerSettingsPatch,
+  keyof ReturnType<typeof deriveLegacyProjectOverrides>
+>;
+
+/** Convert legacy per-key edits to atomic mutations without resending a stale project entry. */
+function translateLegacyProjectOverridePatch(
+  patch: ServerSettingsPatch,
+): CanonicalServerSettingsPatch {
   const {
     projectAgentBrowserAccessOverrides,
     projectAutoPullOverrides,
@@ -238,7 +313,7 @@ function translateLegacyProjectOverridePatch(patch: ServerSettingsPatch): Server
     projectAutoPullOverrides === undefined &&
     projectScriptOverrides === undefined
   ) {
-    return patch;
+    return rest;
   }
   const entries = new Map<string, ProjectSettingsOverridesPatch | null>(
     Object.entries(rest.projectSettingsOverrides ?? {}),
@@ -267,15 +342,36 @@ function translateLegacyProjectOverridePatch(patch: ServerSettingsPatch): Server
   return {
     ...rest,
     projectSettingsOverrides: Object.fromEntries(entries),
-  } as ServerSettingsPatch;
+  };
+}
+
+/**
+ * A client from before `idleCompaction` patches the old boolean switch. Turning
+ * it off keeps "Never" rather than reverting to the default.
+ */
+function patchedIdleCompaction(
+  current: ServerSettings,
+  patch: ServerSettingsPatch,
+): IdleCompactionMode {
+  if (patch.idleCompaction !== undefined) return patch.idleCompaction;
+  const legacy = patch.compactIdleThreads;
+  if (legacy === undefined) return globalIdleCompaction(current);
+  if (typeof legacy === "string") return legacy;
+  if (legacy) return "beforeCacheExpires";
+  return globalIdleCompaction(current) === "off" ? "off" : "onReturn";
 }
 
 function applySettingsValuesPatch(
   current: ServerSettings,
-  patch: ServerSettingsPatch,
+  patch: Omit<CanonicalServerSettingsPatch, "projectSettingsOverrides">,
 ): ServerSettings {
   const selectionPatch = patch.textGenerationModelSelection;
   const {
+    migrateModelPreferences,
+    setModelFavorites,
+    setModelsHidden,
+    setProviderModelOrder,
+    providerModelPreferences,
     automaticGitFetchInterval,
     providerHealthRefreshInterval,
     backgroundActivityProfile,
@@ -283,7 +379,11 @@ function applySettingsValuesPatch(
     worktreeCleanup: worktreeCleanupPatch,
     // Merged per entry below; its `null` removals must not reach deepMerge.
     usageLimitSources: usageLimitSourcesPatch,
+    textGenerators: textGeneratorsPatch,
+    secretProviders: secretProvidersPatch,
+    sourceControlHosts: sourceControlHostsPatch,
     usagePriceOverrides: usagePriceOverridesPatch,
+    usageModelAliases: usageModelAliasesPatch,
     ...patchForMerge
   } = patch;
   const currentBackgroundActivity = normalizeServerBackgroundActivitySettings(current);
@@ -321,9 +421,63 @@ function applySettingsValuesPatch(
             },
           }
         : undefined;
+  const initialFavorites =
+    patch.favorites ?? current.favorites ?? migrateModelPreferences?.favorites ?? null;
+  const favorites =
+    setModelFavorites?.reduce(
+      (current, change) => {
+        const exists = current.some(
+          (favorite) => favorite.provider === change.provider && favorite.model === change.model,
+        );
+        if (change.favorite) {
+          if (!exists) current.push({ provider: change.provider, model: change.model });
+          return current;
+        }
+        return current.filter(
+          (favorite) => favorite.provider !== change.provider || favorite.model !== change.model,
+        );
+      },
+      [...(initialFavorites ?? [])],
+    ) ?? initialFavorites;
+  const initialModelPreferences =
+    providerModelPreferences ??
+    current.providerModelPreferences ??
+    migrateModelPreferences?.providerModelPreferences ??
+    null;
+  let nextModelPreferences = initialModelPreferences;
+  if (setModelsHidden?.length) {
+    const updated = { ...initialModelPreferences };
+    for (const change of setModelsHidden) {
+      const preferences = (Object.hasOwn(updated, change.provider)
+        ? updated[change.provider]
+        : undefined) ?? {
+        hiddenModels: [],
+        modelOrder: [],
+      };
+      const hiddenModels = preferences.hiddenModels.filter((model) => model !== change.model);
+      if (change.hidden) hiddenModels.push(change.model);
+      updated[change.provider] = { ...preferences, hiddenModels };
+    }
+    nextModelPreferences = updated;
+  }
+  if (setProviderModelOrder) {
+    const preferences = nextModelPreferences?.[setProviderModelOrder.provider] ?? {
+      hiddenModels: [],
+      modelOrder: [],
+    };
+    nextModelPreferences = {
+      ...nextModelPreferences,
+      [setProviderModelOrder.provider]: {
+        ...preferences,
+        modelOrder: [...setProviderModelOrder.modelOrder],
+      },
+    };
+  }
   const next = deepMerge(current, patchForMerge);
   const nextWithReplacementsBase = {
     ...next,
+    favorites,
+    providerModelPreferences: nextModelPreferences,
     ...(worktreeCleanupPatch === undefined
       ? {}
       : {
@@ -332,7 +486,9 @@ function applySettingsValuesPatch(
               ? {
                   mode: "custom" as const,
                   rules: {
+                    worktreeKeepWhen: next.storageCleanup.worktreeKeepWhen,
                     worktreeAfterDays: next.storageCleanup.worktreeAfterDays,
+                    worktreeSettledAfterDays: next.storageCleanup.worktreeSettledAfterDays,
                     worktreeOnMerge: next.storageCleanup.worktreeOnMerge,
                     worktreeOnDelete: next.storageCleanup.worktreeOnDelete,
                     worktreeUnchanged: next.storageCleanup.worktreeUnchanged,
@@ -360,8 +516,58 @@ function applySettingsValuesPatch(
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
       : {}),
+    ...(patch.worktreesDirectory !== undefined &&
+    patch.worktreesDirectory !== current.worktreesDirectory
+      ? {
+          previousWorktreesDirectories: [
+            ...current.previousWorktreesDirectories.filter(
+              (directory) => directory !== patch.worktreesDirectory,
+            ),
+            ...(current.worktreesDirectory !== "" &&
+            !current.previousWorktreesDirectories.includes(current.worktreesDirectory)
+              ? [current.worktreesDirectory]
+              : []),
+          ],
+        }
+      : {}),
+    // Per host, a patched field replaces the saved one: deepMerge would keep a cleared account pin.
+    ...(sourceControlHostsPatch !== undefined
+      ? {
+          sourceControlHosts: {
+            ...current.sourceControlHosts,
+            ...Object.fromEntries(
+              Object.entries(sourceControlHostsPatch).map(([kind, fields]) => {
+                const saved = current.sourceControlHosts[kind];
+                return [
+                  kind,
+                  {
+                    ...saved,
+                    ...fields,
+                    // Older clients send the whole token map; a host missing from it keeps its saved
+                    // token. An empty map still clears them all.
+                    ...(Predicate.isObject(fields.tokens) && Object.keys(fields.tokens).length > 0
+                      ? {
+                          tokens: {
+                            ...byHost(saved?.tokens),
+                            ...byHost(fields.tokens),
+                          },
+                        }
+                      : {}),
+                  },
+                ];
+              }),
+            ),
+          },
+        }
+      : {}),
     ...(patch.defaultModelSelection !== undefined
       ? { defaultModelSelection: patch.defaultModelSelection }
+      : {}),
+    ...(patch.fallbackModelSelection !== undefined
+      ? { fallbackModelSelection: patch.fallbackModelSelection }
+      : {}),
+    ...(patch.speechPostProcessingModelSelection !== undefined
+      ? { speechPostProcessingModelSelection: patch.speechPostProcessingModelSelection }
       : {}),
     ...(patch.defaultProjectScripts !== undefined
       ? { defaultProjectScripts: patch.defaultProjectScripts }
@@ -375,6 +581,12 @@ function applySettingsValuesPatch(
           ),
         }
       : {}),
+    ...(textGeneratorsPatch !== undefined
+      ? { textGenerators: mergeSettingsEntries(current.textGenerators, textGeneratorsPatch) }
+      : {}),
+    ...(secretProvidersPatch !== undefined
+      ? { secretProviders: mergeSettingsEntries(current.secretProviders, secretProvidersPatch) }
+      : {}),
     ...(usagePriceOverridesPatch !== undefined
       ? {
           usagePriceOverrides: mergeSettingsEntries(
@@ -383,8 +595,19 @@ function applySettingsValuesPatch(
           ),
         }
       : {}),
+    ...(usageModelAliasesPatch !== undefined
+      ? {
+          usageModelAliases: mergeSettingsEntries(
+            current.usageModelAliases,
+            usageModelAliasesPatch,
+          ),
+        }
+      : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
+      : {}),
+    ...(patch.reviewGuideModelSelection !== undefined
+      ? { reviewGuideModelSelection: patch.reviewGuideModelSelection }
       : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
@@ -396,7 +619,7 @@ function applySettingsValuesPatch(
     normalizedBackgroundActivity,
   );
   const nextWithReplacements = {
-    ...nextWithReplacementsBase,
+    ...withIdleCompaction(nextWithReplacementsBase, patchedIdleCompaction(current, patch)),
     backgroundActivity: normalizedBackgroundActivity,
     automaticGitFetchInterval: resolvedBackgroundActivity.automaticGitFetchInterval,
     providerHealthRefreshInterval: resolvedBackgroundActivity.providerHealthRefreshInterval,
@@ -442,10 +665,17 @@ export function applyServerSettingsPatch(
     const currentEntry = overrides.get(projectId) ?? {};
     const entry: Record<string, unknown> = { ...currentEntry };
     if (update.set !== undefined) {
-      // Complete partial object-valued settings from the authoritative project
-      // value, not the client's potentially stale settings snapshot.
-      const values = applySettingsValuesPatch({ ...next, ...currentEntry }, update.set);
-      for (const key of Object.keys(update.set) as ProjectScopedServerSettingKey[]) {
+      const { providerInstances, ...valuePatch } = update.set;
+      const definedValuePatch: Omit<CanonicalServerSettingsPatch, "projectSettingsOverrides"> =
+        Object.fromEntries(Object.entries(valuePatch).filter(([, value]) => value !== undefined));
+      const { providerInstances: _projectInstances, ...currentValues } = currentEntry;
+      const currentSettings: Record<string, unknown> = { ...next };
+      for (const [key, value] of Object.entries(currentValues)) {
+        if (value !== undefined) currentSettings[key] = value;
+      }
+      const values = applySettingsValuesPatch(currentSettings as ServerSettings, definedValuePatch);
+      if (providerInstances !== undefined) entry.providerInstances = providerInstances;
+      for (const key of Object.keys(definedValuePatch) as ProjectScopedServerSettingKey[]) {
         entry[key] = values[key];
       }
     }
@@ -456,4 +686,39 @@ export function applyServerSettingsPatch(
 
   const result = { ...next, projectSettingsOverrides: Object.fromEntries(overrides) };
   return { ...result, ...deriveLegacyProjectOverrides(result) };
+}
+
+export function resolveModelPreferences(
+  settings: Pick<ServerSettings, "favorites" | "providerModelPreferences">,
+  legacy: Partial<ModelPreferences> = {},
+): ModelPreferences {
+  return {
+    favorites: settings.favorites ?? legacy.favorites ?? [],
+    providerModelPreferences:
+      settings.providerModelPreferences ?? legacy.providerModelPreferences ?? {},
+  };
+}
+
+/** Empty legacy values do not claim ownership before another client can migrate its saved list. */
+export function modelPreferencesMigrationPatch(
+  settings: Pick<ServerSettings, "favorites" | "providerModelPreferences">,
+  legacy: Partial<ModelPreferences>,
+): ServerSettingsPatch | null {
+  const favorites =
+    settings.favorites === null && (legacy.favorites?.length ?? 0) > 0
+      ? legacy.favorites
+      : undefined;
+  const providerModelPreferences =
+    settings.providerModelPreferences === null &&
+    Object.keys(legacy.providerModelPreferences ?? {}).length > 0
+      ? legacy.providerModelPreferences
+      : undefined;
+  return favorites === undefined && providerModelPreferences === undefined
+    ? null
+    : {
+        migrateModelPreferences: {
+          ...(favorites === undefined ? {} : { favorites }),
+          ...(providerModelPreferences === undefined ? {} : { providerModelPreferences }),
+        },
+      };
 }

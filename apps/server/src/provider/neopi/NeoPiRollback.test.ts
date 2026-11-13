@@ -1,8 +1,15 @@
 import * as NodeAssert from "node:assert/strict";
 import { assert, it } from "@effect/vitest";
 import { TurnId } from "@t3tools/contracts";
-import { groupNeoPiHistory, rollbackNeoPiConversation } from "./NeoPiRollback.ts";
-import type { NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
+import * as Schema from "effect/Schema";
+import {
+  groupNeoPiHistory,
+  NeoPiRollbackIntegrityError,
+  rollbackNeoPiConversation,
+} from "./NeoPiRollback.ts";
+import type { NeoPiResumeCursor } from "@t3tools/contracts";
+
+const isNeoPiRollbackIntegrityError = Schema.is(NeoPiRollbackIntegrityError);
 
 const user = (id: string, parentId: string | null, text: string) => ({
   id,
@@ -39,47 +46,48 @@ const cursor: NeoPiResumeCursor = {
   })),
 };
 
-for (const numTurns of [1, 3])
-  it(`branches the captured user entry when rewinding ${numTurns} turns`, async () => {
-    const sent: string[] = [];
-    const target = numTurns === 1 ? "third" : "first";
-    let branched = false;
-    const result = await rollbackNeoPiConversation({
-      cursor,
-      numTurns,
-      request: async ({ type, entryId }) => {
-        sent.push(`${type}:${entryId ?? ""}`);
-        if (type === "get_entries") return { entries, leafId: "a5" };
-        if (type === "get_messages_page")
-          return {
-            messages: (branched
-              ? entries.slice(
-                  0,
-                  entries.findIndex((entry) => entry.id === target),
-                )
-              : entries
-            ).map((entry) => entry.message),
-          };
-        if (type === "branch") {
-          branched = true;
-          return { cancelled: false, text: "removed" };
-        }
-        return { sessionId: `new-${numTurns}`, sessionFile: `/tmp/new-${numTurns}.jsonl` };
-      },
-    });
-    assert.deepEqual(sent, [
-      "get_entries:",
-      "get_messages_page:",
-      `branch:${target}`,
-      "get_state:",
-      "get_messages_page:",
-    ]);
-    assert.equal(result.sessionFile, `/tmp/new-${numTurns}.jsonl`);
-    assert.equal(result.sessionId, `new-${numTurns}`);
-    assert.equal(result.turnBoundaries.length, 3 - numTurns);
-    // The persisted cursor passed to the next runtime points at the new file, not the original.
-    assert.notEqual(result.sessionFile, cursor.sessionFile);
+it.each([1, 3])("branches the captured user entry when rewinding %s turns", async (numTurns) => {
+  let branchedEntry: string | undefined;
+  const target = numTurns === 1 ? "third" : "first";
+  let branched = false;
+  const result = await rollbackNeoPiConversation({
+    cursor,
+    numTurns,
+    request: async ({ type, entryId }) => {
+      if (type === "get_entries") {
+        const retained = branched
+          ? entries.slice(
+              0,
+              entries.findIndex((entry) => entry.id === target),
+            )
+          : entries;
+        return { entries: retained, leafId: retained.at(-1)?.id ?? null };
+      }
+      if (type === "get_messages_page")
+        return {
+          messages: (branched
+            ? entries.slice(
+                0,
+                entries.findIndex((entry) => entry.id === target),
+              )
+            : entries
+          ).map((entry) => entry.message),
+        };
+      if (type === "branch") {
+        branchedEntry = entryId;
+        branched = true;
+        return { cancelled: false, text: "removed" };
+      }
+      return { sessionId: `new-${numTurns}`, sessionFile: `/tmp/new-${numTurns}.jsonl` };
+    },
   });
+  assert.equal(branchedEntry, target);
+  assert.equal(result.historyLeafId, numTurns === 1 ? "a4" : null);
+  assert.equal(result.sessionFile, `/tmp/new-${numTurns}.jsonl`);
+  assert.equal(result.sessionId, `new-${numTurns}`);
+  assert.equal(result.turnBoundaries.length, 3 - numTurns);
+  assert.notEqual(result.sessionFile, cursor.sessionFile);
+});
 
 it("keeps a proposal refinement tied to its original native rollback boundary", async () => {
   const refined: NeoPiResumeCursor = {
@@ -204,7 +212,7 @@ it("branches a user-invoked skill entry and verifies it by advertised entry id",
   assert.equal(result.sessionId, "skill-branch");
 });
 
-it("marks every failure after a confirmed branch as requiring restoration", async () => {
+it("distinguishes unverified branch identity from a later history read failure", async () => {
   for (const state of ["throw", "invalid"]) {
     await NodeAssert.rejects(
       rollbackNeoPiConversation({
@@ -222,6 +230,35 @@ it("marks every failure after a confirmed branch as requiring restoration", asyn
       /rollback integrity error/,
     );
   }
+  let branched = false;
+  let saved: NeoPiResumeCursor | undefined;
+  const failure = new Error("history became unavailable after branching");
+  await NodeAssert.rejects(
+    rollbackNeoPiConversation({
+      cursor: { ...cursor, historyLeafId: "a5" },
+      numTurns: 1,
+      onBranched: async (next) => {
+        saved = next;
+      },
+      request: async ({ type }) => {
+        if (type === "get_entries") return { entries, leafId: "a5" };
+        if (type === "get_messages_page") {
+          if (branched) throw failure;
+          return { messages: entries.map((entry) => entry.message) };
+        }
+        if (type === "branch") {
+          branched = true;
+          return { cancelled: false };
+        }
+        return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
+      },
+    }),
+    (error) => error === failure && !isNeoPiRollbackIntegrityError(error),
+  );
+  assert.equal(saved?.sessionId, "new");
+  assert.equal(saved?.sessionFile, "/tmp/new.jsonl");
+  assert.equal(saved?.historyLeafId, undefined);
+  assert.deepEqual(saved?.turnBoundaries, cursor.turnBoundaries.slice(0, -1));
 });
 
 it("does not branch a missing ancestry entry, a hidden entry, or a cancelled request", async () => {

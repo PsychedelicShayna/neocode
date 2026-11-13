@@ -5,11 +5,12 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import {
   clampPercent,
   makeUnavailableUsageLimits,
   makeUsageLimits,
-} from "../provider/providerUsageLimits.ts";
+} from "@t3tools/provider-core/server/usageLimits";
 
 // Inference account quotas remain available through the usage hub without loading CLI runtimes.
 interface CodexRateLimitWindow {
@@ -25,6 +26,10 @@ export interface CodexRateLimitSnapshot {
   readonly rateLimitReachedType?: string | null;
   readonly primary?: CodexRateLimitWindow | null;
   readonly secondary?: CodexRateLimitWindow | null;
+  readonly individualLimit?: {
+    readonly remainingPercent: number;
+    readonly resetsAt: number;
+  } | null;
 }
 
 /** Structural view of the read response's `rateLimitResetCredits`. */
@@ -88,10 +93,21 @@ function codexRateLimitsToWindows(
       ...(resetsAt ? { resetsAt } : {}),
     });
   }
+  const individualLimit = snapshot.individualLimit;
+  if (individualLimit && Number.isFinite(individualLimit.remainingPercent)) {
+    const resetsAt = isoFromEpochSeconds(individualLimit.resetsAt);
+    windows.push({
+      id: "individual",
+      kind: "monthly",
+      label: "Monthly credit limit",
+      usedPercent: clampPercent(100 - individualLimit.remainingPercent),
+      ...(resetsAt ? { resetsAt } : {}),
+    });
+  }
   return windows;
 }
 
-export function codexResetCreditsToContract(
+function codexResetCreditsToContract(
   summary: CodexResetCreditsSummary | null | undefined,
 ): ServerProviderResetCredits | undefined {
   if (!summary) return undefined;
@@ -138,12 +154,14 @@ export function codexPlanLabel(planType: string | null | undefined): string | un
     case "plus":
       return "ChatGPT Plus Subscription";
     case "pro":
-      return "ChatGPT Pro 20x Subscription";
+      return "ChatGPT Pro 200 Subscription";
     case "prolite":
-      return "ChatGPT Pro 5x Subscription";
-    case "team":
-      return "ChatGPT Team Subscription";
+      return "ChatGPT Pro 100 Subscription";
+    case "promax":
+      return "ChatGPT Pro 500 Subscription";
     case "self_serve_business_prolite":
+      return "ChatGPT Business Premium Subscription";
+    case "team":
     case "self_serve_business_usage_based":
     case "business":
       return "ChatGPT Business Subscription";
@@ -163,12 +181,6 @@ export function codexPlanLabel(planType: string | null | undefined): string | un
   }
 }
 
-/**
- * The account-wide windows, keyed by the SDK's `rateLimitType`. Model-scoped
- * weeklies are additive on top of these: the CLI reports them under
- * `rate_limits.model_scoped[]` on `get_usage` and streams the overage-included
- * model bucket (Fable today) as `seven_day_overage_included`.
- */
 const WINDOWS: Readonly<
   Record<string, Pick<ServerProviderUsageWindow, "kind" | "label" | "windowDurationMins">>
 > = {
@@ -199,10 +211,6 @@ function scopedWindow(
   };
 }
 
-/**
- * `model_scoped` shipped in the CLI after the SDK typings we pin, so it is
- * read structurally until the `.d.ts` catches up.
- */
 interface ModelScopedWindow {
   readonly display_name: string;
   readonly utilization: number | null;
@@ -240,27 +248,83 @@ function makeWindow(
   };
 }
 
+interface ClaudeUsageRateLimits {
+  readonly five_hour?: {
+    readonly utilization?: number | null;
+    readonly resets_at?: string | null;
+  } | null;
+  readonly seven_day?: {
+    readonly utilization?: number | null;
+    readonly resets_at?: string | null;
+  } | null;
+  readonly model_scoped?: ReadonlyArray<ModelScopedWindow>;
+  readonly spend?: unknown;
+  readonly extra_usage?: {
+    readonly is_enabled?: boolean;
+    readonly used_credits?: number | null;
+    readonly monthly_limit?: number | null;
+    readonly utilization?: number | null;
+  } | null;
+}
+
+const SpendMoney = Schema.Struct({
+  amount_minor: Schema.Natural,
+  currency: Schema.NonEmptyString,
+  exponent: Schema.Natural,
+});
+const decodeSpendBudget = Schema.decodeUnknownOption(
+  Schema.Struct({ enabled: Schema.Boolean, used: SpendMoney, limit: SpendMoney }),
+);
+
+function percentFromAmounts(used: number | null | undefined, limit: number | null | undefined) {
+  if (
+    typeof used !== "number" ||
+    typeof limit !== "number" ||
+    !Number.isFinite(used) ||
+    !Number.isFinite(limit) ||
+    used < 0 ||
+    limit <= 0
+  ) {
+    return undefined;
+  }
+  const percent = (used / limit) * 100;
+  return Number.isFinite(percent) ? clampPercent(percent) : undefined;
+}
+
+function readSpendPercent(rateLimits: ClaudeUsageRateLimits) {
+  const spend = Option.getOrUndefined(decodeSpendBudget(rateLimits.spend));
+  // Minor-unit ratios require matching currency and scale; spend.percent is rounded.
+  if (
+    spend?.enabled &&
+    spend.used.currency.trim().length > 0 &&
+    spend.used.currency.trim() === spend.limit.currency.trim() &&
+    spend.used.exponent === spend.limit.exponent
+  ) {
+    const percent = percentFromAmounts(spend.used.amount_minor, spend.limit.amount_minor);
+    if (percent !== undefined) return percent;
+  }
+  const extra = rateLimits.extra_usage;
+  if (extra?.is_enabled !== true) return undefined;
+  const percent = percentFromAmounts(extra.used_credits, extra.monthly_limit) ?? extra.utilization;
+  return typeof percent === "number" && Number.isFinite(percent) && percent >= 0
+    ? clampPercent(percent)
+    : undefined;
+}
+
 export function claudeUsageResponseToLimits(input: {
   readonly response: {
     readonly rate_limits_available: boolean;
-    readonly rate_limits?: {
-      readonly five_hour?: {
-        readonly utilization?: number | null;
-        readonly resets_at?: string | null;
-      } | null;
-      readonly seven_day?: {
-        readonly utilization?: number | null;
-        readonly resets_at?: string | null;
-      } | null;
-      readonly model_scoped?: ReadonlyArray<ModelScopedWindow>;
-    } | null;
+    readonly rate_limits?: ClaudeUsageRateLimits | null;
   };
   readonly checkedAt: string;
 }): { readonly limits: ServerProviderUsageLimits; readonly names: ClaudeScopedLimitNames } {
   const { response, checkedAt } = input;
   if (!response.rate_limits_available || !response.rate_limits) {
     return {
-      limits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }),
+      limits: makeUnavailableUsageLimits({
+        checkedAt,
+        reason: response.rate_limits_available ? "probeFailed" : "unsupported",
+      }),
       names: { overageIncluded: undefined },
     };
   }
@@ -270,17 +334,22 @@ export function claudeUsageResponseToLimits(input: {
     if (!window || typeof window.utilization !== "number") continue;
     windows.push(makeWindow(id, window.utilization, isoFromString(window.resets_at)));
   }
-  // The CLI filters `model_scoped` to the overage-included allowlist, which
-  // today holds one model; the first entry is the one the event refers to.
   let overageIncluded: string | undefined;
   for (const entry of readModelScoped(response.rate_limits)) {
     if (typeof entry.utilization !== "number") continue;
     windows.push(
       scopedWindow(entry.display_name, entry.utilization, isoFromString(entry.resets_at)),
     );
-    // Only a bucket that drew a row may receive events; naming one that was
-    // skipped would let a mid-turn event open a row the probe never showed.
     overageIncluded ??= entry.display_name;
+  }
+  const spendPercent = readSpendPercent(response.rate_limits);
+  if (spendPercent !== undefined) {
+    windows.push({
+      id: "monthly_spend",
+      kind: "monthly",
+      label: "Monthly spend",
+      usedPercent: spendPercent,
+    });
   }
   return {
     limits: makeUsageLimits({ checkedAt, windows }),

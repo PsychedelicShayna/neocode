@@ -1,0 +1,19 @@
+import type { WorkspaceRef } from "@t3tools/client-runtime/environment";
+
+import { browserMiniPlayerSource, usePreviewMiniPlayerStore } from "~/previewMiniPlayerStore";
+import { whenPreviewTabKnown } from "~/previewStateStore";
+import { useRightPanelStore } from "~/rightPanelStore";
+
+export function showPreviewPopup(
+  threadRef: WorkspaceRef,
+  popupTabId: string,
+  from: "panel" | "floating",
+): void {
+  whenPreviewTabKnown(threadRef, popupTabId, () => {
+    if (from === "floating") {
+      usePreviewMiniPlayerStore.getState().open(threadRef, browserMiniPlayerSource(popupTabId));
+    } else {
+      useRightPanelStore.getState().openBrowser(threadRef, popupTabId);
+    }
+  });
+}

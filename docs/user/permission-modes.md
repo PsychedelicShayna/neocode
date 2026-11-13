@@ -5,19 +5,23 @@ policy and choose permissions for the **Next owned turn**. Selecting a preferenc
 does not change the running native policy. NeoCode asks the native runtime to
 apply it before sending your next turn.
 
-Set the default for new threads in **Settings → General → New threads → Permissions**.
+Set the default for new threads in **Settings → Threads → New threads → Permissions**.
 Projects can override the environment default. New threads use this setting rather than the
 mode of the thread you were viewing. The initial default is **Full access**; existing threads
 and modes you choose in a draft keep their permissions.
 
-| Mode                  | Behavior                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------- |
-| **Supervised**        | Requests approval for commands and file changes.                                      |
-| **Auto-accept edits** | Approves file edits automatically; other actions can still require approval.          |
-| **Full access**       | Allows commands and edits without approval prompts.                                   |
+| Mode                  | Behavior                                                                     |
+| --------------------- | ---------------------------------------------------------------------------- |
+| **Supervised**        | Requests approval for commands and file changes.                             |
+| **Auto-accept edits** | Approves file edits automatically; other actions can still require approval. |
+| **Full access**       | Allows commands and edits without approval prompts.                          |
+
+An administrator can cap the modes available on a machine with a
+[managed policy](./managed-policy.md#permission-modes); modes above the cap show who manages them.
 
 Approve or reject requests in the conversation to let the agent continue. Permission modes do
-not prevent the agent from asking questions about the task.
+not prevent the agent from asking questions about the task. Subagent approval requests appear in
+the parent conversation with the subagent's name, so you can respond without switching threads.
 
 ## Native ownership
 

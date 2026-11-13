@@ -1,8 +1,8 @@
 import { useState, type ReactNode } from "react";
 import { Modal, ScrollView, TextInput, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 
 export function NativeChoice<T extends string>({
   label,
@@ -26,7 +26,7 @@ export function NativeChoice<T extends string>({
         showsHorizontalScrollIndicator={false}
       >
         {options.map((option) => (
-          <MaterialButton
+          <Button
             key={option.value}
             label={option.label}
             tone={option.value === value ? "primary" : "secondary"}
@@ -94,7 +94,7 @@ export function NativeJson({
   const [open, setOpen] = useState(false);
   return (
     <View className="gap-2">
-      <MaterialButton
+      <Button
         label={open ? `Hide ${label}` : label}
         tone="text"
         onPress={() => setOpen((value) => !value)}
@@ -131,7 +131,7 @@ export function NativeModal({
           >
             {title}
           </Text>
-          <MaterialButton label="Close" tone="text" onPress={onClose} />
+          <Button label="Close" tone="text" onPress={onClose} />
         </View>
         {children}
       </View>

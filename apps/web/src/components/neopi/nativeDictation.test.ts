@@ -10,6 +10,7 @@ const base = {
   localEnvironmentDisabled: false,
   environmentId: local,
   primaryEnvironmentId: local,
+  connection: null,
   attachment: "owned" as const,
   capabilities: ["dictation"] as readonly string[] | null,
   connected: true,

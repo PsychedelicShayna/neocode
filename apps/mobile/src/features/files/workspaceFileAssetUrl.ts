@@ -20,19 +20,13 @@ export function useWorkspaceFileAssetUrlState(props: {
   readonly relativePath: string | null;
   readonly threadId: ThreadId | null;
   readonly nativeRef?: NeoPiNativeSessionRef | undefined;
-  /** A draft's workspace root, used only when there is no thread to resolve one from. */
   readonly draftCwd?: string | null;
 }) {
-  const absolutePath = useMemo(
-    () =>
-      props.cwd !== null && props.relativePath !== null
-        ? resolveWorkspaceFilePath(props.cwd, props.relativePath)
-        : null,
-    [props.cwd, props.relativePath],
-  );
+  const absolutePath =
+    props.cwd !== null && props.relativePath !== null
+      ? resolveWorkspaceFilePath(props.cwd, props.relativePath)
+      : null;
 
-  // Video and audio stream from an exact-file URL, and so does anything outside
-  // the workspace, where no workspace-scoped URL can exist.
   const relativePath = props.relativePath;
   const draftCwd = props.draftCwd ?? null;
   const resource = useMemo<AssetResource | null>(() => {
@@ -61,7 +55,6 @@ export function useWorkspaceFileAssetUrlState(props: {
         path: absolutePath,
       };
     }
-    // A project draft has no thread, so it names its workspace root explicitly.
     if (draftCwd === null) return null;
     return { _tag: "draft-workspace-file", cwd: draftCwd, path: relativePath };
   }, [absolutePath, relativePath, props.threadId, props.nativeRef, draftCwd]);

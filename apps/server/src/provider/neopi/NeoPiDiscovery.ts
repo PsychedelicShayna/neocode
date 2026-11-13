@@ -26,13 +26,12 @@ export const makeNeoPiDiscoveryHub = Effect.fn("NeoPiDiscoveryHub.make")(functio
     PubSub.shutdown,
   );
   return {
-    publish: (snapshot) =>
-      Effect.gen(function* () {
-        const previous = byCwd.get(snapshot.cwd);
-        if (previous && priority[previous.source] > priority[snapshot.source]) return;
-        byCwd.set(snapshot.cwd, snapshot);
-        yield* PubSub.publish(changes, snapshot);
-      }),
+    publish: Effect.fn("NeoPiDiscoveryHub.publish")(function* (snapshot) {
+      const previous = byCwd.get(snapshot.cwd);
+      if (previous && priority[previous.source] > priority[snapshot.source]) return;
+      byCwd.set(snapshot.cwd, snapshot);
+      yield* PubSub.publish(changes, snapshot);
+    }),
     latest: (cwd) =>
       Effect.sync(
         () => byCwd.get(cwd) ?? { cwd, commands: [], skills: [], source: "not-loaded", at: "" },

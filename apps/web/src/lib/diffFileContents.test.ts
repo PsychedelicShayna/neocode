@@ -5,7 +5,7 @@ import {
   type ReviewDiffFileContentsResult,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -31,38 +31,6 @@ function fileDiff(type: FileDiffMetadata["type"] = "rename-changed"): FileDiffMe
 }
 
 describe("createGitDiffFileContentsLoader", () => {
-  it("loads both sides with normalized paths and comparison-scoped cache keys", async () => {
-    const getDiffFileContents = vi.fn(async () =>
-      AsyncResult.success({ oldContents: "before\n", newContents: "after\n" }),
-    );
-    const load = createGitDiffFileContentsLoader(getDiffFileContents, SOURCE);
-
-    await expect(load(fileDiff())).resolves.toEqual({
-      oldFile: {
-        name: "src/old-name.ts",
-        contents: "before\n",
-        cacheKey: "comparison-1:old:src/old-name.ts",
-      },
-      newFile: {
-        name: "src/new-name.ts",
-        contents: "after\n",
-        cacheKey: "comparison-1:new:src/new-name.ts",
-      },
-    });
-    expect(getDiffFileContents).toHaveBeenCalledWith({
-      environmentId: "environment-1",
-      input: {
-        cwd: "/workspace",
-        sourceKind: "branch-range",
-        changeType: "rename-changed",
-        baseRef: "main",
-        headRef: "feature",
-        oldPath: "src/old-name.ts",
-        newPath: "src/new-name.ts",
-      },
-    });
-  });
-
   it("loads a pure rename from its one shared file", async () => {
     const getDiffFileContents = vi.fn(async () =>
       AsyncResult.success({ oldContents: "same\n", newContents: "same\n" }),

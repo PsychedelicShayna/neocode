@@ -77,7 +77,6 @@ export function composerDictationBannerItems(
     items.push({
       id: "composer-dictation",
       variant: "info",
-      priority: "activity",
       icon: <MicIcon />,
       title: dictationStatusLabel(dictation.phase, shortcut),
       ...(dictation.preview ? { description: dictation.preview } : {}),
@@ -86,7 +85,6 @@ export function composerDictationBannerItems(
     items.push({
       id: "composer-dictation-notice",
       variant: "error",
-      priority: "urgent",
       icon: <MicOffIcon />,
       title: dictation.notice,
       dismissLabel: "Dismiss",

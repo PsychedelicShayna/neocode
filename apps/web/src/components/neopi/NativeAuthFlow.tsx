@@ -1,7 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, NeoPiModelsAuthState } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { useEffect, useId, useRef, useState } from "react";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { formatEnvironmentQueryError } from "../../state/query";
@@ -34,35 +34,21 @@ export function NativeAuthFlow({
   const state = useAtomValue(neopiModels.authChanges({ environmentId, input: { flowId } }));
   const respond = useAtomCommand(neopiModels.respondAuth, { reportFailure: false });
   const cancel = useAtomCommand(neopiModels.cancelAuth, { reportFailure: false });
-  const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const finished = useRef(false);
   const mounted = useRef(false);
-  const pendingRequest = useRef<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const confirmationRef = useRef<HTMLDivElement>(null);
-  const confirmationId = useId();
   const result = AsyncResult.isSuccess(state) ? state.value : null;
   const prompt = result?.prompt ?? null;
-  const promptId = useRef(prompt?.id);
-  promptId.current = prompt?.id;
   const isNeoProxy = providerId === "neoproxy";
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Ignore native cancellation replies after this flow unmounts.
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
     };
   }, []);
-  useEffect(() => {
-    setValue("");
-    setError(null);
-    setSubmitting(false);
-    pendingRequest.current = null;
-    if (prompt?.kind === "confirm") confirmationRef.current?.focus();
-    else if (prompt?.kind === "input") inputRef.current?.focus();
-  }, [prompt?.id, prompt?.kind]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Report the native authentication flow's terminal status once.
   useEffect(() => {
     if (finished.current) return;
     if (AsyncResult.isFailure(state)) {
@@ -73,20 +59,9 @@ export function NativeAuthFlow({
       finish(result.status, result.message);
     }
   }, [state, result, finish]);
-  const send = (requestId: string, answer: { value: string } | { confirmed: boolean }) => {
-    if (pendingRequest.current !== null || cancelling || result?.status !== "running") return;
-    pendingRequest.current = requestId;
-    setSubmitting(true);
-    setError(null);
-    void respond({ environmentId, input: { flowId, requestId, ...answer } }).then((response) => {
-      if (!mounted.current || promptId.current !== requestId) return;
-      if (response._tag === "Failure") {
-        const cause = squashAtomCommandFailure(response);
-        setError(cause instanceof Error ? cause.message : String(cause));
-        pendingRequest.current = null;
-        setSubmitting(false);
-      } else setValue("");
-    });
+  const send = async (requestId: string, answer: { value: string } | { confirmed: boolean }) => {
+    const response = await respond({ environmentId, input: { flowId, requestId, ...answer } });
+    if (response._tag === "Failure") throw squashAtomCommandFailure(response);
   };
   const url = result?.url && /^https?:\/\//i.test(result.url) ? result.url : null;
   const control = (
@@ -144,12 +119,92 @@ export function NativeAuthFlow({
       {result?.instructions ? (
         <p className="whitespace-pre-wrap text-xs text-muted-foreground">{result.instructions}</p>
       ) : null}
-      {prompt?.kind === "input" ? (
+      {prompt ? (
+        <NativeAuthPrompt
+          key={JSON.stringify([prompt.id, prompt.kind])}
+          prompt={prompt}
+          isNeoProxy={isNeoProxy}
+          disabled={cancelling || result?.status !== "running"}
+          send={send}
+        />
+      ) : null}
+    </div>
+  );
+  return variant === "card" ? (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-medium">{title}</h3>
+        {control}
+      </div>
+      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+      {status}
+      {body}
+    </div>
+  ) : (
+    <SettingsRow title={title} description={description} status={status} control={control}>
+      {body}
+    </SettingsRow>
+  );
+}
+
+function NativeAuthPrompt({
+  prompt,
+  isNeoProxy,
+  disabled,
+  send,
+}: {
+  prompt: NonNullable<NeoPiModelsAuthState["prompt"]>;
+  isNeoProxy: boolean;
+  disabled: boolean;
+  send: (requestId: string, answer: { value: string } | { confirmed: boolean }) => Promise<void>;
+}) {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const mounted = useRef(false);
+  const pending = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const confirmationRef = useRef<HTMLDivElement>(null);
+  const confirmationId = useId();
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Focus this native prompt and reject replies after its keyed lifetime ends.
+  useEffect(() => {
+    mounted.current = true;
+    if (prompt.kind === "confirm") confirmationRef.current?.focus();
+    else inputRef.current?.focus();
+    return () => {
+      mounted.current = false;
+    };
+  }, [prompt.kind]);
+  const answer = (response: { value: string } | { confirmed: boolean }) => {
+    if (pending.current || disabled) return;
+    pending.current = true;
+    setSubmitting(true);
+    setError(null);
+    void send(prompt.id, response).then(
+      () => {
+        if (mounted.current) setValue("");
+      },
+      (cause) => {
+        if (!mounted.current) return;
+        setError(cause instanceof Error ? cause.message : String(cause));
+        pending.current = false;
+        setSubmitting(false);
+      },
+    );
+  };
+  return (
+    <>
+      {error ? (
+        <p role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
+      ) : null}
+      {prompt.kind === "input" ? (
         <form
           className="space-y-3"
           onSubmit={(event) => {
             event.preventDefault();
-            if (value.trim()) send(prompt.id, { value });
+            if (value.trim()) answer({ value });
           }}
         >
           <label className="block space-y-1.5 text-sm">
@@ -164,15 +219,15 @@ export function NativeAuthFlow({
               type={prompt.secret ? "password" : "text"}
               value={value}
               placeholder={prompt.placeholder ?? undefined}
-              disabled={submitting || cancelling}
+              disabled={submitting || disabled}
               onChange={(event) => setValue(event.target.value)}
             />
           </label>
-          <Button type="submit" size="sm" disabled={!value.trim() || submitting || cancelling}>
+          <Button type="submit" size="sm" disabled={!value.trim() || submitting || disabled}>
             Continue
           </Button>
         </form>
-      ) : prompt?.kind === "confirm" ? (
+      ) : (
         <Alert
           role="group"
           aria-labelledby={`${confirmationId}-title`}
@@ -200,38 +255,23 @@ export function NativeAuthFlow({
                 type="button"
                 size="sm"
                 variant="outline"
-                disabled={submitting || cancelling}
-                onClick={() => send(prompt.id, { confirmed: false })}
+                disabled={submitting || disabled}
+                onClick={() => answer({ confirmed: false })}
               >
                 {isNeoProxy ? "Don't trust" : "Decline"}
               </Button>
               <Button
                 type="button"
                 size="sm"
-                disabled={submitting || cancelling}
-                onClick={() => send(prompt.id, { confirmed: true })}
+                disabled={submitting || disabled}
+                onClick={() => answer({ confirmed: true })}
               >
                 {isNeoProxy ? "Trust this server" : "Confirm"}
               </Button>
             </div>
           </AlertDescription>
         </Alert>
-      ) : null}
-    </div>
-  );
-  return variant === "card" ? (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-medium">{title}</h3>
-        {control}
-      </div>
-      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
-      {status}
-      {body}
-    </div>
-  ) : (
-    <SettingsRow title={title} description={description} status={status} control={control}>
-      {body}
-    </SettingsRow>
+      )}
+    </>
   );
 }

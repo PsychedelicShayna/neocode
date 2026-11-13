@@ -3,17 +3,20 @@ import {
   type EnvironmentId,
   type NeoPiModelsConfiguration,
   type NeoPiModelsTarget,
+  type NeoPiModelsAccountsInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import type { Atom } from "effect/unstable/reactivity";
+import type { Atom } from "effect/reactivity";
 import { EnvironmentSupervisor } from "./connection/supervisor.ts";
 import type { EnvironmentRegistry } from "./connection/registry.ts";
+import { requestGuarded } from "./rpc/client.ts";
 import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcSubscriptionAtomFamily,
+  createEnvironmentQueryAtomFamily,
 } from "./state/runtime.ts";
 
 /** A missing native catalog limit is unknown, not a zero-token capability. */
@@ -105,6 +108,13 @@ export function makeNeoPiModelsClientState<R, ER>(
     accounts: createEnvironmentRpcCommand(runtime, {
       label: "neopi-models:accounts",
       tag: WS_METHODS.neopiModelsAccounts,
+    }),
+    accountsQuery: createEnvironmentQueryAtomFamily(runtime, {
+      label: "neopi-models:accounts-query",
+      staleTimeMs: 0,
+      idleTtlMs: 0,
+      execute: (input: typeof NeoPiModelsAccountsInput.Type) =>
+        requestGuarded(WS_METHODS.neopiModelsAccounts, input),
     }),
     startAuth: createEnvironmentRpcCommand(runtime, {
       label: "neopi-models:auth-start",

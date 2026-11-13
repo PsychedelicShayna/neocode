@@ -12,7 +12,17 @@
         "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "developmentClient": true,
-      "distribution": "internal"
+      "distribution": "internal",
+      "ios": {
+        "image": "macos-tahoe-26.6-xcode-27.1"
+      }
+    },
+    "development-simulator": {
+      "extends": "development",
+      "ios": {
+        "simulator": true,
+        "image": "macos-tahoe-26.6-xcode-27.1"
+      }
     },
     "preview": {
       "corepack": true,
@@ -21,20 +31,34 @@
         "NODE_OPTIONS": "--max-old-space-size=4096"
       },
       "distribution": "internal",
-      "android": { "buildType": "apk" }
+      "android": { "buildType": "apk" },
+      "ios": {
+        "image": "macos-tahoe-26.6-xcode-27.1"
+      }
     },
     "preview:dev": {
       "extends": "preview",
       "developmentClient": true
     },
+    "testflight": {
+      "extends": "production",
+      "distribution": "store",
+      "env": {
+        "T3CODE_MOBILE_VERSION": "3.0.0"
+      }
+    },
     "production": {
       "corepack": true,
       "env": {
         "APP_VARIANT": "production",
-        "NODE_OPTIONS": "--max-old-space-size=4096"
+        "NODE_OPTIONS": "--max-old-space-size=4096",
+        "SOURCEMAP_FILE": "/tmp/t3code-ios-main.jsbundle.map"
       },
       "distribution": "internal",
-      "android": { "buildType": "apk" }
+      "android": { "buildType": "apk" },
+      "ios": {
+        "image": "macos-tahoe-26.6-xcode-27.1"
+      }
     }
   }
 }

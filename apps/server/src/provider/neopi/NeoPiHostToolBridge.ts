@@ -6,21 +6,20 @@ import type {
   NeoPiRpcTransport,
 } from "effect-neopi-rpc/client";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import { Tool } from "effect/unstable/ai";
-import { invokeRegisteredMcpTool, McpInProcessToolError } from "../../mcp/McpHttpServer.ts";
-import type { McpCapability, McpInvocationScope } from "../../mcp/McpInvocationContext.ts";
+import { McpServer } from "effect/ai";
 import {
-  issueActiveNativeMcpCredential,
-  resolveActiveMcpCredential,
-  revokeActiveMcpProviderSession,
-} from "../../mcp/McpSessionRegistry.ts";
-import { DeviceToolkit } from "../../mcp/toolkits/device/tools.ts";
-import { PreviewToolkit } from "../../mcp/toolkits/preview/tools.ts";
-import { PullRequestsToolkit } from "../../mcp/toolkits/pullRequests/tools.ts";
+  invokeRegisteredMcpTool,
+  McpInProcessToolError,
+  McpHostTool,
+} from "../../mcp/McpInProcessTool.ts";
+import type { McpCapability, McpInvocationScope } from "../../mcp/McpInvocationContext.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 
 export interface NeoPiHostToolBridge {
   readonly definitions: ReadonlyArray<{
@@ -35,14 +34,6 @@ export interface NeoPiHostToolBridge {
   ) => Effect.Effect<AgentToolResultWire>;
 }
 
-const definitionsFor = (tools: Record<string, Tool.Any>) =>
-  Object.values(tools).map((tool) => ({
-    name: tool.name,
-    description: Tool.getDescription(tool) ?? tool.name,
-    parameters: Tool.getJsonSchema(tool),
-    loadMode: "discoverable" as const,
-  }));
-
 const failed = (message: string): AgentToolResultWire => ({
   content: [{ type: "text", text: message }],
   isError: true,
@@ -55,14 +46,24 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
   readonly credential: string;
   readonly context: McpInvocationScope;
 }) {
+  const registry = yield* McpSessionRegistry.McpSessionRegistry;
+  const server = yield* McpServer.McpServer;
+  const mcpContext = Context.pick(
+    McpSessionRegistry.McpSessionRegistry,
+    McpServer.McpServer,
+    Scope.Scope,
+  )(
+    yield* Effect.context<
+      McpSessionRegistry.McpSessionRegistry | McpServer.McpServer | Scope.Scope
+    >(),
+  );
   const granted = new Set(
     [...input.capabilities].filter((capability) => input.context.capabilities.has(capability)),
   );
-  const definitions = [
-    ...(granted.has("preview") ? definitionsFor(PreviewToolkit.tools) : []),
-    ...(granted.has("device") ? definitionsFor(DeviceToolkit.tools) : []),
-    ...(granted.has("pull-requests") ? definitionsFor(PullRequestsToolkit.tools) : []),
-  ];
+  const definitions = server.tools.flatMap(({ annotations }) => {
+    const hostTool = Context.getOrUndefined(annotations, McpHostTool);
+    return hostTool && granted.has(hostTool.capability) ? [hostTool.definition] : [];
+  });
   const names = new Set(definitions.map((definition) => definition.name));
   const handle: NeoPiHostToolBridge["handle"] = (call, signal) => {
     if (signal.aborted) return Effect.succeed(failed("Host tool cancelled"));
@@ -70,14 +71,18 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
       return Effect.succeed(failed(`Unsupported host tool: ${call.toolName}`));
     }
     return Effect.gen(function* () {
-      const scope = yield* resolveActiveMcpCredential(input.credential);
+      const scope = yield* registry.resolve(input.credential.replace(/^Bearer\s+/, ""));
+      const caller = scope?.kind === "native" ? scope : scope?.thread;
+      const expected = input.context.kind === "native" ? input.context : input.context.thread;
       if (
         !scope ||
-        scope.threadId !== input.threadId ||
+        !caller ||
+        !expected ||
+        caller.threadId !== input.threadId ||
         scope.environmentId !== input.context.environmentId ||
         scope.kind !== input.context.kind ||
-        scope.providerSessionId !== input.context.providerSessionId ||
-        scope.providerInstanceId !== input.context.providerInstanceId ||
+        caller.providerSessionId !== expected.providerSessionId ||
+        caller.providerInstanceId !== expected.providerInstanceId ||
         scope.revoked?.aborted ||
         (scope.kind === "native" &&
           (input.context.kind !== "native" ||
@@ -92,7 +97,7 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
         input.credential,
         call.toolName,
         call.arguments,
-      );
+      ).pipe(Effect.provideContext(mcpContext));
       const content: Array<AgentToolResultWire["content"][number]> = [];
       for (const block of result.content) {
         if (block.type === "text") {
@@ -140,11 +145,16 @@ export const makeNeoPiNativeHostToolPump = Effect.fn("NeoPiHostToolBridge.native
   peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">,
   validate: (ref: NeoPiNativeSessionRef) => Effect.Effect<void, NeoPiNativeSessionsError>,
 ) {
+  const registry = yield* McpSessionRegistry.McpSessionRegistry;
+  const mcpContext = Context.pick(
+    McpSessionRegistry.McpSessionRegistry,
+    McpServer.McpServer,
+  )(yield* Effect.context<McpSessionRegistry.McpSessionRegistry | McpServer.McpServer>());
   const lifetime = yield* Effect.scope;
   const workScope = yield* Scope.fork(lifetime);
   const mutation = yield* Semaphore.make(1);
   let closed = false;
-  const pending = new Map<string, AbortController>();
+  const pending = new Map<string, Deferred.Deferred<never>>();
   let binding:
     | {
         readonly ref: NeoPiNativeSessionRef;
@@ -157,8 +167,8 @@ export const makeNeoPiNativeHostToolPump = Effect.fn("NeoPiHostToolBridge.native
     binding = undefined;
     const requests = Array.from(pending);
     pending.clear();
-    for (const [, controller] of requests) controller.abort();
-    if (previous) yield* revokeActiveMcpProviderSession(previous.providerSessionId);
+    for (const [, cancelled] of requests) yield* Deferred.interrupt(cancelled);
+    if (previous) yield* registry.revokeProviderSession(previous.providerSessionId);
     for (const [id] of requests)
       yield* peer
         .hostToolResult(id, failed("access revoked"), true)
@@ -175,17 +185,13 @@ export const makeNeoPiNativeHostToolPump = Effect.fn("NeoPiHostToolBridge.native
           message: "Native host-tool connection is closed",
         });
       yield* revoke;
-      const credential = yield* issueActiveNativeMcpCredential({ sessionRef: ref, capabilities });
-      if (!credential)
-        return yield* new McpInProcessToolError({
-          message: "Native host-tool credential registry is unavailable",
-        });
+      const credential = yield* registry.issueNative({ sessionRef: ref, capabilities });
       const bridge = yield* makeNeoPiHostToolBridge({
         threadId: nativeWorkspaceResourceId(ref),
         capabilities,
         credential: credential.authorizationHeader,
         context: credential.scope,
-      });
+      }).pipe(Effect.provideContext(Context.add(mcpContext, Scope.Scope, workScope)));
       binding = { ref: { ...ref }, bridge, providerSessionId: credential.scope.providerSessionId };
       return bridge.definitions;
     },
@@ -195,35 +201,40 @@ export const makeNeoPiNativeHostToolPump = Effect.fn("NeoPiHostToolBridge.native
   yield* Stream.runForEach(peer.hostToolCalls, (call) =>
     Effect.gen(function* () {
       if (call.type === "host_tool_cancel") {
-        pending.get(call.targetId)?.abort();
+        const cancelled = pending.get(call.targetId);
         pending.delete(call.targetId);
+        if (cancelled) yield* Deferred.interrupt(cancelled);
         return;
       }
       const current = binding;
-      const controller = new AbortController();
-      // A duplicate native request id must not leave its previous execution running.
-      pending.get(call.id)?.abort();
-      pending.set(call.id, controller);
+      const cancelled = yield* Deferred.make<never>();
+      const previous = pending.get(call.id);
+      pending.delete(call.id);
+      if (previous) yield* Deferred.interrupt(previous);
+      pending.set(call.id, cancelled);
       yield* Effect.gen(function* () {
+        const signal = yield* Effect.abortSignal;
         if (!current) return failed("Native host tools are not bound to a canonical session");
         const valid = yield* validate(current.ref).pipe(Effect.result);
         if (valid._tag === "Failure") {
-          yield* revokeActiveMcpProviderSession(current.providerSessionId);
+          yield* registry.revokeProviderSession(current.providerSessionId);
           return failed(
             valid.failure instanceof Error ? valid.failure.message : String(valid.failure),
           );
         }
-        if (binding !== current || controller.signal.aborted) return failed("access revoked");
-        return yield* current.bridge.handle(call, controller.signal);
+        if (binding !== current || signal.aborted) return failed("access revoked");
+        return yield* current.bridge.handle(call, signal);
       }).pipe(
+        Effect.scoped,
+        Effect.raceFirst(Deferred.await(cancelled)),
         Effect.flatMap((result) =>
-          pending.get(call.id) === controller && !controller.signal.aborted
+          pending.get(call.id) === cancelled
             ? peer.hostToolResult(call.id, result, result.isError)
             : Effect.void,
         ),
         Effect.ensuring(
           Effect.sync(() => {
-            if (pending.get(call.id) === controller) pending.delete(call.id);
+            if (pending.get(call.id) === cancelled) pending.delete(call.id);
           }),
         ),
         Effect.catch((cause) => Effect.logWarning("Native host-tool response failed", { cause })),

@@ -1,20 +1,6 @@
-export type MobileAppVariant = "development" | "preview" | "production";
+import { MOBILE_APP_IDENTITIES } from "../../../../packages/shared/src/mobileDistribution.ts";
 
-/** Separate packages and schemes leave upstream installs and their private data untouched. */
-export const MOBILE_APP_IDENTITIES = {
-  development: {
-    applicationId: "io.github.psychedelicshayna.neocode.dev",
-    scheme: "neocode-dev",
-  },
-  preview: {
-    applicationId: "io.github.psychedelicshayna.neocode.preview",
-    scheme: "neocode-preview",
-  },
-  production: {
-    applicationId: "io.github.psychedelicshayna.neocode",
-    scheme: "neocode",
-  },
-} as const;
+export type MobileAppVariant = "development" | "preview" | "production";
 
 export const MOBILE_LINK_PREFIXES = Object.values(MOBILE_APP_IDENTITIES).map(
   ({ scheme }) => `${scheme}://`,

@@ -115,7 +115,7 @@ picker instead of falling back to a different search.
 
 ### Connect to NeoProxy
 
-Choose **Connect to NeoProxy** in **Settings → Providers**, or during first-run
+Choose **Connect to NeoProxy** in **Settings → NeoCore**, or during first-run
 NeoPi setup. Select the computer and NeoPi runtime you intend to use, then enter
 the server address and your member key from your administrator. You do not need
 an upstream-provider account or a project folder.
@@ -147,6 +147,21 @@ directory to start the server and open the web app. Use `./t3 serve` or
 `PATH` if you want to use `t3` from another folder. Run `t3 --help` for the full
 reference.
 
+| Task                                  | Command                                                                 |
+| ------------------------------------- | ----------------------------------------------------------------------- |
+| Start the server and open the web app | `t3`                                                                    |
+| Start without a browser               | `t3 serve`                                                              |
+| Use it from other devices             | `t3 up` ([details](./remote-access.md))                                 |
+| Keep it running in the background     | `t3 service install` ([platform limits](./background-service.md))       |
+| Update to the newest fork release     | `t3 update`                                                             |
+| Reclaim database space                | `t3 doctor` ([details](./background-service.md#reclaim-database-space)) |
+| Remove an installed command           | `t3 uninstall`                                                          |
+
+To start in a new working directory, use an explicit path such as `t3 ./my-project`.
+A bare directory name is accepted only if it already exists. If `t3` reports a
+running server, connect to that server, stop it before starting a replacement, or
+use a different `--base-dir` for an independent server.
+
 The upstream `t3.codes` install scripts, `npx t3`, Winget, Homebrew and AUR
 packages fetch upstream T3 Code, not NeoCode. Do not use them to install or
 update this fork.
@@ -167,9 +182,20 @@ complete app entrypoint and forwards callback URLs unchanged. Development builds
 use the separate `t3code-dev:` scheme. To return callbacks to the packaged app,
 close the source app and launch the packaged app again.
 
+### The `t3` command
+
+The desktop app includes the `t3` command-line tool. A new install sets it up
+on first launch; after an update, or any time, choose **Install** next to
+**t3 command** in **Settings → About**. On macOS and Linux it adds a `t3` link
+in `~/.local/bin` (or `~/bin`); on Windows it adds the app's command folder to
+your `PATH`. Open a new terminal afterwards. If the folder is not on your
+`PATH`, **Add to PATH** on the Welcome page or in **Settings → About** adds one
+line to your shell's startup file. **Remove** takes it off, and the app does not
+add it again. If you already have another `t3`, it stays as it is.
+
 ### Windows Subsystem for Linux
 
-Choose a WSL distro in **Settings → Connections** to run sessions and projects
+Choose a WSL distro in **Settings → Sharing & access** to run sessions and projects
 there. Install NeoPi inside that distro. NeoCode installs its server runtime
 there automatically; the first launch after an app update can take longer.
 
@@ -440,3 +466,4 @@ Upgrade the NeoPi executable separately; Roles manages provider sign-in through 
 - [Remote access](./remote-access.md): connect from another device.
 - [Running in the background](./background-service.md): keep a Linux or macOS host available.
 - [Updating NeoCode](./updating.md): update the app and connected servers.
+- [Managed policy](./managed-policy.md): configure NeoCode for everyone on a machine.

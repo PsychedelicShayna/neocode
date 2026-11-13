@@ -8,10 +8,12 @@ import {
 } from "@t3tools/contracts";
 import {
   DEFAULT_RESOLVED_KEYBINDINGS,
+  parseKeybindingShortcut,
   parseKeybindingWhenExpression,
+  US_SHIFTED_TO_UNSHIFTED_KEYS,
 } from "@t3tools/shared/keybindings";
 
-import { shortcutKeyFromEvent } from "../../keybindings";
+import { shortcutConflictKey, shortcutKeyFromEvent } from "../../keybindings";
 import { isMacPlatform } from "../../lib/utils";
 
 export type KeybindingSource = "Default" | "Custom" | "Project";
@@ -34,6 +36,7 @@ export type KeybindingCommandOption = KeybindingCommand;
 const CORE_WHEN_VARIABLES = [
   "terminalFocus",
   "terminalOpen",
+  "previewOpen",
   "isWeb",
   "isDesktop",
   "true",
@@ -155,13 +158,18 @@ function conflictsWithWhen(leftWhen: string, rightWhen: string): boolean {
 export function keybindingConflictLabels(
   rows: ReadonlyArray<KeybindingRow>,
   input: { readonly rowId: string; readonly key: string; readonly when: string },
+  platform = navigator.platform,
 ): ReadonlyArray<string> {
   if (input.key.trim().length === 0) return [];
+  const shortcut = parseKeybindingShortcut(input.key);
+  if (!shortcut) return [];
+  // Compare resolved chords so mod+k and ctrl+k collide where mod is Ctrl.
+  const conflictKey = shortcutConflictKey(shortcut, platform);
   const conflicts: Array<string> = [];
   for (const candidate of rows) {
     if (
       candidate.id !== input.rowId &&
-      candidate.key === input.key &&
+      shortcutConflictKey(candidate.binding.shortcut, platform) === conflictKey &&
       conflictsWithWhen(candidate.when, input.when)
     ) {
       conflicts.push(commandLabel(candidate.command));
@@ -170,17 +178,63 @@ export function keybindingConflictLabels(
   return [...new Set(conflicts)].toSorted();
 }
 
+export interface KeybindingGroup {
+  readonly id: string;
+  readonly title: string;
+  readonly rows: ReadonlyArray<KeybindingRow>;
+}
+
+const KEYBINDING_GROUPS = [
+  {
+    id: "navigation",
+    title: "Navigation",
+    prefixes: ["sidebar", "rightPanel", "commandPalette", "filePicker", "projectSearch", "editor"],
+  },
+  { id: "threads", title: "Threads", prefixes: ["thread", "chat", "pullRequest"] },
+  { id: "composer", title: "Composer", prefixes: ["composer", "modelPicker"] },
+  { id: "terminal", title: "Terminal", prefixes: ["terminal"] },
+  { id: "preview", title: "Preview & diff", prefixes: ["preview", "diff"] },
+  { id: "appearance", title: "Appearance", prefixes: ["theme", "appearance", "themeEditor"] },
+  { id: "scripts", title: "Project scripts", prefixes: ["script"] },
+] as const;
+const OTHER_KEYBINDING_GROUP = { id: "other", title: "Other" } as const;
+
+function keybindingGroupFor(command: KeybindingCommand): { id: string; title: string } {
+  const prefix = String(command).split(".")[0] ?? "";
+  return (
+    KEYBINDING_GROUPS.find((group) => (group.prefixes as ReadonlyArray<string>).includes(prefix)) ??
+    OTHER_KEYBINDING_GROUP
+  );
+}
+
+export function groupKeybindingRows(
+  rows: ReadonlyArray<KeybindingRow>,
+): ReadonlyArray<KeybindingGroup> {
+  const rowsByGroup = new Map<string, Array<KeybindingRow>>();
+  for (const row of rows) {
+    const group = keybindingGroupFor(row.command);
+    const bucket = rowsByGroup.get(group.id);
+    if (bucket) bucket.push(row);
+    else rowsByGroup.set(group.id, [row]);
+  }
+  return [...KEYBINDING_GROUPS, OTHER_KEYBINDING_GROUP].flatMap((group) => {
+    const groupRows = rowsByGroup.get(group.id);
+    return groupRows ? [{ id: group.id, title: group.title, rows: groupRows }] : [];
+  });
+}
+
 export function buildKeybindingRows(
   keybindings: ResolvedKeybindingsConfig,
-  query: string,
+  platform = navigator.platform,
 ): ReadonlyArray<KeybindingRow> {
-  const normalizedQuery = query.trim().toLowerCase();
-  const rows = keybindings.map((binding, index) => {
+  const rowsById = new Map<string, KeybindingRow>();
+  for (const binding of keybindings) {
     const defaultBinding = defaultBindingForBinding(binding);
     const key = shortcutToKeybindingInput(binding.shortcut);
     const when = whenAstToExpression(binding.whenAst);
-    return {
-      id: `${keybindingRowId(binding.command, key, when)}\u0000${index}`,
+    const id = keybindingRowId(binding.command, key, when);
+    rowsById.set(id, {
+      id,
       command: binding.command,
       key,
       when,
@@ -189,15 +243,20 @@ export function buildKeybindingRows(
       defaultWhen: whenAstToExpression(defaultBinding?.whenAst),
       binding,
       conflicts: [],
-    } satisfies KeybindingRow;
-  });
+    });
+  }
+  const rows = [...rowsById.values()];
 
   const rowsWithConflicts = rows.map((row) => {
-    const conflicts = keybindingConflictLabels(rows, {
-      rowId: row.id,
-      key: row.key,
-      when: row.when,
-    });
+    const conflicts = keybindingConflictLabels(
+      rows,
+      {
+        rowId: row.id,
+        key: row.key,
+        when: row.when,
+      },
+      platform,
+    );
     return conflicts.length > 0
       ? Object.assign({}, row, { conflicts: [...new Set(conflicts)].toSorted() })
       : row;
@@ -209,11 +268,16 @@ export function buildKeybindingRows(
     return left.key.localeCompare(right.key);
   });
 
-  if (normalizedQuery.length === 0) {
-    return rowsWithConflicts;
-  }
+  return rowsWithConflicts;
+}
 
-  return rowsWithConflicts.filter((row) => {
+export function filterKeybindingRows(
+  rows: ReadonlyArray<KeybindingRow>,
+  query: string,
+): ReadonlyArray<KeybindingRow> {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.length === 0) return rows;
+  return rows.filter((row) => {
     return (
       row.command.toLowerCase().includes(normalizedQuery) ||
       commandLabel(row.command).toLowerCase().includes(normalizedQuery) ||
@@ -283,7 +347,17 @@ export function buildKeybindingCommandOptions(
 }
 
 export function commandLabel(command: KeybindingCommand): string {
+  if (command === "workspace.focusNext") return "Focus Next Workspace Area";
+  if (command === "workspace.focusPrevious") return "Focus Previous Workspace Area";
+  if (command === "composer.sendAlternate") return "Composer: Opposite Queue or Steer Action";
+  if (command === "composer.sendBackground") return "Composer: Start in Background";
+  if (command === "composer.sendAndNewThread") return "Composer: Send and Start New Thread";
+  if (command === "composer.dictation") return "Composer: Start or Finish Dictation";
+  if (command === "thread.steerQueuedMessage") return "Queue: Send First Queued Message";
+  if (command === "thread.editQueuedMessage") return "Queue: Edit Last Queued Message";
   if (command === "thread.copyReference") return "Pull Request: Copy Link or Thread ID";
+  if (command === "view.reopenClosed") return "Reopen Closed Tab";
+  if (command === "preview.focusUrl") return "Preview: Focus URL";
   const raw = String(command);
   if (raw.startsWith("script.") && raw.endsWith(".run")) {
     return `Run Script: ${titleCaseCommandSegment(raw.slice("script.".length, -".run".length))}`;
@@ -299,6 +373,18 @@ function titleCaseCommandSegment(segment: string): string {
     }
   }
   return words.join(" ");
+}
+
+function recordedLayoutShortcutKey(
+  event: Pick<KeyboardEvent, "key" | "code" | "shiftKey" | "altKey">,
+): string {
+  const physicalKey = shortcutKeyFromEvent(event);
+  const layoutKey = event.key.toLowerCase();
+  if (event.altKey || layoutKey.length !== 1) return physicalKey;
+  // Normalize only US shifted glyphs at their US position. Other layouts can
+  // produce the same glyph without Shift or at a different position.
+  const unshiftedKey = event.shiftKey ? US_SHIFTED_TO_UNSHIFTED_KEYS.get(layoutKey) : undefined;
+  return unshiftedKey === physicalKey ? physicalKey : layoutKey;
 }
 
 function normalizeShortcutKeyToken(key: string): string | null {
@@ -334,8 +420,13 @@ function normalizeShortcutKeyToken(key: string): string | null {
 export function keybindingFromKeyboardEvent(
   event: Pick<KeyboardEvent, "key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
   platform: string,
+  options?: {
+    readonly layoutCharacter?: boolean;
+  },
 ): string | null {
-  const keyToken = normalizeShortcutKeyToken(shortcutKeyFromEvent(event));
+  const keyToken = normalizeShortcutKeyToken(
+    options?.layoutCharacter ? recordedLayoutShortcutKey(event) : shortcutKeyFromEvent(event),
+  );
   if (!keyToken) return null;
 
   const parts: string[] = [];
@@ -348,9 +439,6 @@ export function keybindingFromKeyboardEvent(
   }
   if (event.altKey) parts.push("alt");
   if (event.shiftKey) parts.push("shift");
-  if (parts.length === 0) {
-    return null;
-  }
   parts.push(keyToken);
   return parts.join("+");
 }

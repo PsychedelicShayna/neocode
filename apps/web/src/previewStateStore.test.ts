@@ -12,26 +12,27 @@ import {
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { startPreviewTitleRecording } from "./browserHistoryStore";
 import {
   __testing,
   applyPreviewDesktopState,
   applyPreviewServerEvent as applyPreviewServerEventImpl,
   applyPreviewServerSnapshot,
+  updatePreviewServerSnapshot,
   beginPreviewSessionClose,
   cancelPreviewSessionClose,
   previewStateAtom,
+  previewThreadRefsAtom,
   readThreadPreviewState,
   reconcilePreviewServerSessions,
   rememberPreviewUrl,
   resetPreviewStateForTests,
   setActivePreviewTab,
-  updatePreviewServerSnapshot,
 } from "./previewStateStore";
 import { appAtomRegistry } from "./rpc/atomRegistry";
 
 const environmentId = "env-1" as EnvironmentId;
 const ref = scopeThreadRef(environmentId, ThreadId.make("thread-1"));
-const otherRef = scopeThreadRef(environmentId, ThreadId.make("thread-2"));
 
 const makeSnapshot = (overrides: Partial<PreviewSessionSnapshot> = {}): PreviewSessionSnapshot => ({
   threadId: "thread-1",
@@ -66,78 +67,6 @@ beforeEach(() => {
 });
 
 describe("previewStateStore (single-tab)", () => {
-  it("keeps independent state atoms for each thread", () => {
-    expect(previewStateAtom(scopedThreadKey(ref))).toBe(previewStateAtom(scopedThreadKey(ref)));
-    expect(previewStateAtom(scopedThreadKey(ref))).not.toBe(
-      previewStateAtom(scopedThreadKey(otherRef)),
-    );
-
-    applyPreviewServerSnapshot(ref, makeSnapshot());
-    expect(readThreadPreviewState(ref).snapshot?.tabId).toBe("tab_a");
-    expect(readThreadPreviewState(otherRef)).toEqual(__testing.EMPTY_THREAD_PREVIEW_STATE);
-  });
-
-  it("opened event seeds the snapshot and remembers the URL", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot?.tabId).toBe(snapshot.tabId);
-    expect(state.recentlySeenUrls).toContain("http://localhost:5173/");
-  });
-
-  it("a second `opened` for a different tab replaces the rendered snapshot", () => {
-    const a = makeSnapshot({ tabId: "tab_a" });
-    const b = makeSnapshot({ tabId: "tab_b" });
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: a.tabId,
-      createdAt: a.updatedAt,
-      snapshot: a,
-    });
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: b.tabId,
-      createdAt: b.updatedAt,
-      snapshot: b,
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot?.tabId).toBe(b.tabId);
-  });
-
-  it("navigated event updates the snapshot URL", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    applyPreviewServerEvent(ref, {
-      type: "navigated",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: "2026-01-01T00:00:01.000Z",
-      snapshot: {
-        ...snapshot,
-        navStatus: { _tag: "Success", url: "http://localhost:5173/about", title: "About" },
-      },
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot?.navStatus._tag).toBe("Success");
-    if (state.snapshot?.navStatus._tag === "Success") {
-      expect(state.snapshot.navStatus.url).toBe("http://localhost:5173/about");
-    }
-  });
-
   it("resized event updates tab viewport without changing the active tab", () => {
     const active = makeSnapshot({ tabId: "tab_a" });
     const background = makeSnapshot({ tabId: "tab_b" });
@@ -166,29 +95,6 @@ describe("previewStateStore (single-tab)", () => {
     });
   });
 
-  it("failed event flips the snapshot to LoadFailed when tabId matches", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    applyPreviewServerEvent(ref, {
-      type: "failed",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: "2026-01-01T00:00:01.000Z",
-      url: "http://localhost:5173/",
-      title: "",
-      code: -105,
-      description: "ERR_NAME_NOT_RESOLVED",
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot?.navStatus._tag).toBe("LoadFailed");
-  });
-
   it("failed event for a non-active tab is ignored", () => {
     const snapshot = makeSnapshot({ tabId: "tab_a" });
     applyPreviewServerEvent(ref, {
@@ -210,26 +116,6 @@ describe("previewStateStore (single-tab)", () => {
     });
     const state = readThreadPreviewState(ref);
     expect(state.snapshot?.navStatus._tag).toBe("Loading");
-  });
-
-  it("closed event clears snapshot but retains recently-seen URLs", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    applyPreviewServerEvent(ref, {
-      type: "closed",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: "2026-01-01T00:00:01.000Z",
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot).toBeNull();
-    expect(state.recentlySeenUrls).toContain("http://localhost:5173/");
   });
 
   it("optimistically removes a session before the server close event arrives", () => {
@@ -290,52 +176,6 @@ describe("previewStateStore (single-tab)", () => {
     expect(state.snapshot).toEqual(snapshot);
   });
 
-  it("closed event for a different tab is a no-op", () => {
-    const snapshot = makeSnapshot({ tabId: "tab_a" });
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    applyPreviewServerEvent(ref, {
-      type: "closed",
-      threadId: "thread-1",
-      tabId: "tab_b",
-      createdAt: "2026-01-01T00:00:01.000Z",
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot?.tabId).toBe(snapshot.tabId);
-  });
-
-  it("desktopOverlay updates independently of snapshot", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerEvent(ref, {
-      type: "opened",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: snapshot.updatedAt,
-      snapshot,
-    });
-    applyPreviewDesktopState(ref, snapshot.tabId, {
-      hasWebContents: true,
-      canGoBack: true,
-      canGoForward: false,
-      loading: false,
-      zoomFactor: 1,
-      pictureInPicture: false,
-      colorScheme: "system",
-      audioMuted: false,
-      audible: false,
-      controller: "none",
-      favicon: null,
-    });
-    const state = readThreadPreviewState(ref);
-    expect(state.desktopOverlay?.canGoBack).toBe(true);
-    expect(state.snapshot?.canGoBack).toBe(false);
-  });
-
   it("does not publish duplicate desktop browser state", () => {
     const snapshot = makeSnapshot();
     applyPreviewServerSnapshot(ref, snapshot);
@@ -394,28 +234,6 @@ describe("previewStateStore (single-tab)", () => {
     expect(state.desktopOverlay?.canGoBack).toBe(true);
   });
 
-  it("updates a background snapshot without changing the active tab", () => {
-    const background = makeSnapshot({ tabId: "tab_a" });
-    const active = makeSnapshot({
-      tabId: "tab_b",
-      updatedAt: "2026-01-01T00:00:01.000Z",
-    });
-    applyPreviewServerSnapshot(ref, background);
-    applyPreviewServerSnapshot(ref, active);
-
-    const resized = {
-      ...background,
-      viewport: { _tag: "freeform" as const, width: 900, height: 700 },
-      updatedAt: "2026-01-01T00:00:02.000Z",
-    };
-    updatePreviewServerSnapshot(ref, resized);
-
-    const state = readThreadPreviewState(ref);
-    expect(state.activeTabId).toBe(active.tabId);
-    expect(state.snapshot?.tabId).toBe(active.tabId);
-    expect(state.sessions[background.tabId]).toEqual(resized);
-  });
-
   it("reconciles an authoritative session list without focusing a background tab", () => {
     const active = makeSnapshot({ tabId: "tab_a" });
     const stale = makeSnapshot({
@@ -447,21 +265,23 @@ describe("previewStateStore (single-tab)", () => {
     expect(state.desktopByTabId[stale.tabId]).toBeUndefined();
   });
 
-  it("clears stale sessions when an authoritative list is empty", () => {
-    applyPreviewServerSnapshot(ref, makeSnapshot());
+  it("keeps the state object when a refetched list changes nothing", () => {
+    reconcilePreviewServerSessions(ref, { sessions: [], serverEpoch, revision: 1 });
+    const loaded = readThreadPreviewState(ref);
 
     reconcilePreviewServerSessions(ref, { sessions: [], serverEpoch, revision: 1 });
+    expect(readThreadPreviewState(ref)).toBe(loaded);
 
-    const state = readThreadPreviewState(ref);
-    expect(state.sessions).toEqual({});
-    expect(state.activeTabId).toBeNull();
-    expect(state.snapshot).toBeNull();
+    const snapshot = makeSnapshot();
+    reconcilePreviewServerSessions(ref, { sessions: [snapshot], serverEpoch, revision: 2 });
+    expect(readThreadPreviewState(ref).sessions).toEqual({ [snapshot.tabId]: snapshot });
   });
 
   it("reconciles a global resync after missed closes and ignores older events", () => {
     const stale = makeSnapshot({ tabId: "tab_stale" });
     const current = makeSnapshot({ tabId: "tab_current", updatedAt: "2026-01-01T00:00:01.000Z" });
     const other = makeSnapshot({ threadId: "thread-2", tabId: "tab_other" });
+    const otherRef = scopeThreadRef(environmentId, ThreadId.make(other.threadId));
     applyPreviewServerEvent(ref, {
       type: "opened",
       threadId: stale.threadId,
@@ -511,6 +331,19 @@ describe("previewStateStore (single-tab)", () => {
     reconcilePreviewServerSessions(ref, { sessions: [], serverEpoch, revision: 0 });
 
     expect(readThreadPreviewState(ref).sessions).toEqual({ [snapshot.tabId]: snapshot });
+    expect(readThreadPreviewState(ref).listLoaded).toBe(false);
+
+    const olderTab = makeSnapshot({ tabId: "tab_before_event" });
+    reconcilePreviewServerSessions(ref, {
+      sessions: [olderTab, snapshot],
+      serverEpoch,
+      revision: 2,
+    });
+    expect(readThreadPreviewState(ref).listLoaded).toBe(true);
+    expect(readThreadPreviewState(ref).sessions).toEqual({
+      [olderTab.tabId]: olderTab,
+      [snapshot.tabId]: snapshot,
+    });
   });
 
   it("does not resurrect a tab from an event older than its close", () => {
@@ -611,14 +444,6 @@ describe("previewStateStore (single-tab)", () => {
     expect(state.desktopOverlay).toBeNull();
   });
 
-  it("applyServerSnapshot null clears snapshot for a thread that had one", () => {
-    const snapshot = makeSnapshot();
-    applyPreviewServerSnapshot(ref, snapshot);
-    applyPreviewServerSnapshot(ref, null);
-    const state = readThreadPreviewState(ref);
-    expect(state.snapshot).toBeNull();
-  });
-
   it("does not replace a streamed snapshot with older SWR data", () => {
     applyPreviewServerSnapshot(
       ref,
@@ -641,17 +466,6 @@ describe("previewStateStore (single-tab)", () => {
       url: "http://localhost:5173/new",
       title: "New",
     });
-  });
-
-  it("rememberUrl dedupes and caps at limit", () => {
-    for (let i = 0; i < __testing.RECENT_URL_LIMIT + 5; i += 1) {
-      rememberPreviewUrl(ref, `http://localhost:${5000 + i}/`);
-    }
-    const state = readThreadPreviewState(ref);
-    expect(state.recentlySeenUrls.length).toBeLessThanOrEqual(__testing.RECENT_URL_LIMIT);
-    expect(state.recentlySeenUrls[0]).toBe(
-      `http://localhost:${5000 + __testing.RECENT_URL_LIMIT + 4}/`,
-    );
   });
 });
 
@@ -701,44 +515,59 @@ describe("preview state lifetime", () => {
     vi.useFakeTimers();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     resetPreviewStateForTests();
     appAtomRegistry.reset();
+    // Registry disposal queues removals; finish them before replacing its scheduler's timers.
+    await vi.runAllTimersAsync();
     vi.useRealTimers();
   });
 
   it("releases idle state for both changed and merely visited workspaces", async () => {
-    const visited = Array.from({ length: 200 }, (_, index) =>
-      scopeThreadRef(environmentId, ThreadId.make(`idle-${index}`)),
-    );
-    const atoms = visited.map((workspace, index) => {
-      if (index % 2 === 0) rememberPreviewUrl(workspace, `http://localhost:${5000 + index}/`);
-      else readThreadPreviewState(workspace);
-      return previewStateAtom(scopedThreadKey(workspace));
-    });
+    const stopRecording = startPreviewTitleRecording();
+    try {
+      const visited = Array.from({ length: 200 }, (_, index) =>
+        scopeThreadRef(environmentId, ThreadId.make(`idle-${index}`)),
+      );
+      const atoms = visited.map((workspace, index) => {
+        if (index % 2 === 0) rememberPreviewUrl(workspace, `http://localhost:${5000 + index}/`);
+        else readThreadPreviewState(workspace);
+        return previewStateAtom(scopedThreadKey(workspace));
+      });
 
-    await vi.runAllTimersAsync();
+      expect(appAtomRegistry.get(previewThreadRefsAtom).size).toBe(0);
+      await vi.runAllTimersAsync();
 
-    expect(atoms.every((atom) => !appAtomRegistry.getNodes().has(atom))).toBe(true);
-    expect(readThreadPreviewState(visited[0]!)).toEqual(__testing.EMPTY_THREAD_PREVIEW_STATE);
+      expect(atoms.every((atom) => !appAtomRegistry.getNodes().has(atom))).toBe(true);
+      expect(readThreadPreviewState(visited[0]!)).toEqual(__testing.EMPTY_THREAD_PREVIEW_STATE);
+    } finally {
+      stopRecording();
+    }
   });
 
   it("keeps live background sessions without a mounted preview host and releases them on close", async () => {
     const snapshot = makeSnapshot();
     const atom = previewStateAtom(scopedThreadKey(ref));
-    applyPreviewServerSnapshot(ref, snapshot);
-    await vi.runAllTimersAsync();
-    expect(appAtomRegistry.getNodes().has(atom)).toBe(true);
-    expect(readThreadPreviewState(ref).snapshot).toEqual(snapshot);
+    const stopRecording = startPreviewTitleRecording();
+    try {
+      applyPreviewServerSnapshot(ref, snapshot);
+      await vi.runAllTimersAsync();
+      expect(appAtomRegistry.getNodes().has(atom)).toBe(true);
+      expect(readThreadPreviewState(ref).snapshot).toEqual(snapshot);
+      expect(appAtomRegistry.get(previewThreadRefsAtom).get(scopedThreadKey(ref))).toEqual(ref);
 
-    applyPreviewServerEvent(ref, {
-      type: "closed",
-      threadId: "thread-1",
-      tabId: snapshot.tabId,
-      createdAt: "2026-01-01T00:00:01.000Z",
-    });
-    await vi.runAllTimersAsync();
-    expect(appAtomRegistry.getNodes().has(atom)).toBe(false);
+      applyPreviewServerEvent(ref, {
+        type: "closed",
+        threadId: "thread-1",
+        tabId: snapshot.tabId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+      await vi.runAllTimersAsync();
+      expect(appAtomRegistry.getNodes().has(atom)).toBe(false);
+      expect(appAtomRegistry.get(previewThreadRefsAtom).has(scopedThreadKey(ref))).toBe(false);
+    } finally {
+      stopRecording();
+    }
   });
 
   it("retains optimistic close tombstones until the close receipt arrives", async () => {

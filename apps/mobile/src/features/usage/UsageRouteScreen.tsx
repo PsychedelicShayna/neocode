@@ -4,10 +4,11 @@ import { useState } from "react";
 import { RefreshControl, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
-import { ScreenScrollView } from "../../components/ScreenScrollView";
-import { SegmentedControl } from "../../components/SegmentedControl";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
+import { ScreenScrollView } from "../../components/ui/ScreenScrollView";
+import { SegmentedControl } from "../../components/ui/SegmentedControl";
+import { useWorkspaceSettledContentWidth } from "../layout/workspace-content-width";
 import { useServerConfigs } from "../../state/entities";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
@@ -22,17 +23,29 @@ const TABS = [
 ] as const;
 type UsageTab = (typeof TABS)[number]["value"];
 
-/** Native stats owns history and analysis; the existing quota view retains live limits and reset actions. */
-export function UsageRouteScreen() {
+const WIDE_WIDTH = 600;
+const MAX_CONTENT_WIDTH = 1080;
+
+export function UsageRouteScreen(props: { readonly workspace?: boolean }) {
   const route = useRoute<RouteProp<{ Usage: { tab?: string } | undefined }, "Usage">>();
+  return <UsageScreen workspace={props.workspace} tabParam={route.params?.tab} />;
+}
+
+function UsageScreen(props: {
+  readonly workspace?: boolean;
+  readonly tabParam: string | undefined;
+}) {
   const insets = useSafeAreaInsets();
   const focused = useIsFocused();
   const [selection, setSelection] = useState(() => ({
-    params: route.params,
-    tab: (route.params?.tab === "usage" ? "usage" : "limits") as UsageTab,
+    params: props.tabParam,
+    tab: (props.tabParam === "usage" ? "usage" : "limits") as UsageTab,
   }));
-  if (selection.params !== route.params)
-    setSelection({ params: route.params, tab: route.params?.tab === "usage" ? "usage" : "limits" });
+  if (selection.params !== props.tabParam)
+    setSelection({
+      params: props.tabParam,
+      tab: props.tabParam === "usage" ? "usage" : "limits",
+    });
   const [selectedEnvironmentIds, setSelectedEnvironmentIds] =
     useState<ReadonlySet<EnvironmentId> | null>(null);
   const [selectedStatsKey, setSelectedStatsKey] = useState<string | null>(null);
@@ -55,13 +68,16 @@ export function UsageRouteScreen() {
     selectedStatsKey === null
       ? targets[0]
       : targets.find((entry) => entry.key === selectedStatsKey);
+  const [measuredWidth, setWidth] = useState(0);
+  const width = useWorkspaceSettledContentWidth() ?? measuredWidth;
+  const wide = width >= WIDE_WIDTH;
   return (
-    <SettingsScreen title="Usage">
+    <SettingsScreen title="Usage" workspaceRoot={props.workspace}>
       <View className="gap-3 px-5 py-3">
         <SegmentedControl
           options={TABS}
           selected={selection.tab}
-          onSelect={(tab) => setSelection({ params: route.params, tab })}
+          onSelect={(tab) => setSelection({ params: props.tabParam, tab })}
           role="tab"
         />
       </View>
@@ -69,6 +85,7 @@ export function UsageRouteScreen() {
         <ScreenScrollView
           contentInsetAdjustmentBehavior="automatic"
           className="flex-1"
+          onLayout={(event) => setWidth(event.nativeEvent.layout.width)}
           contentContainerClassName="gap-6 px-5 pt-2"
           contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
           refreshControl={
@@ -78,42 +95,45 @@ export function UsageRouteScreen() {
             />
           }
         >
-          <View className="gap-2">
-            <Text className="text-sm text-foreground-muted">Quota environments</Text>
-            <ScrollView
-              horizontal
-              contentContainerClassName="gap-2"
-              showsHorizontalScrollIndicator={false}
-            >
-              <MaterialButton
-                label="All environments"
-                tone={selectedEnvironmentIds === null ? "primary" : "secondary"}
-                onPress={() => setSelectedEnvironmentIds(null)}
-              />
-              {environments.map((environment) => (
-                <MaterialButton
-                  key={environment.environmentId}
-                  label={environment.environmentLabel}
-                  tone={
-                    selectedEnvironmentIds === null ||
-                    selectedEnvironmentIds.has(environment.environmentId)
-                      ? "primary"
-                      : "secondary"
-                  }
-                  onPress={() =>
-                    setSelectedEnvironmentIds((current) =>
-                      toggleUsageEnvironment(current, environments, environment.environmentId),
-                    )
-                  }
+          <View className="w-full gap-6 self-center" style={{ maxWidth: MAX_CONTENT_WIDTH }}>
+            <View className="gap-2">
+              <Text className="text-sm text-foreground-muted">Quota environments</Text>
+              <ScrollView
+                horizontal
+                contentContainerClassName="gap-2"
+                showsHorizontalScrollIndicator={false}
+              >
+                <Button
+                  label="All environments"
+                  tone={selectedEnvironmentIds === null ? "primary" : "secondary"}
+                  onPress={() => setSelectedEnvironmentIds(null)}
                 />
-              ))}
-            </ScrollView>
+                {environments.map((environment) => (
+                  <Button
+                    key={environment.environmentId}
+                    label={environment.environmentLabel}
+                    tone={
+                      selectedEnvironmentIds === null ||
+                      selectedEnvironmentIds.has(environment.environmentId)
+                        ? "primary"
+                        : "secondary"
+                    }
+                    onPress={() =>
+                      setSelectedEnvironmentIds((current) =>
+                        toggleUsageEnvironment(current, environments, environment.environmentId),
+                      )
+                    }
+                  />
+                ))}
+              </ScrollView>
+            </View>
+            <UsageLimitsSection
+              now={limits.now}
+              failedLabels={limits.failedLabels}
+              selectedEnvironmentIds={selectedEnvironmentIds}
+              wide={wide}
+            />
           </View>
-          <UsageLimitsSection
-            now={limits.now}
-            failedLabels={limits.failedLabels}
-            selectedEnvironmentIds={selectedEnvironmentIds}
-          />
         </ScreenScrollView>
       ) : (
         <View className="flex-1" style={{ paddingBottom: insets.bottom }}>
@@ -128,7 +148,7 @@ export function UsageRouteScreen() {
               showsHorizontalScrollIndicator={false}
             >
               {targets.map((entry) => (
-                <MaterialButton
+                <Button
                   key={entry.key}
                   label={entry.label}
                   tone={target?.key === entry.key ? "primary" : "secondary"}

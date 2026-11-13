@@ -1,4 +1,8 @@
-import { UsageLimitSourceId, type ServerSettingsPatch } from "@t3tools/contracts";
+import {
+  UsageLimitSourceId,
+  type SecretReference,
+  type ServerSettingsPatch,
+} from "@t3tools/contracts";
 
 import { randomUUID } from "../../lib/utils";
 
@@ -6,7 +10,7 @@ import { randomUUID } from "../../lib/utils";
 export function buildUsageLimitSourcePatch(input: {
   label: string;
   url: string;
-  managementKey: string;
+  managementKey: string | SecretReference;
 }) {
   const id = UsageLimitSourceId.make(`cliproxy-${randomUUID()}`);
   const label = input.label.trim();
@@ -16,7 +20,10 @@ export function buildUsageLimitSourcePatch(input: {
         kind: "cliproxy",
         ...(label ? { label } : {}),
         url: input.url.trim(),
-        managementKey: input.managementKey.trim(),
+        managementKey:
+          typeof input.managementKey === "string"
+            ? input.managementKey.trim()
+            : input.managementKey,
         enabled: true,
       },
     },

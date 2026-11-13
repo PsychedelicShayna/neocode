@@ -1,9 +1,9 @@
 import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { useThreadShell } from "../../state/entities";
 import { neopiSessionConfiguration } from "../../state/neopiSessions";
 import { useEnvironmentQuery } from "../../state/query";
@@ -21,11 +21,7 @@ export function NeoPiSessionBrowser({
   const [open, setOpen] = useState(false);
   return (
     <>
-      <MaterialButton
-        label="Resume NeoPi session"
-        disabled={disabled}
-        onPress={() => setOpen(true)}
-      />
+      <Button label="Resume NeoPi session" disabled={disabled} onPress={() => setOpen(true)} />
       {open ? (
         <SessionModal title="Sessions" onClose={() => setOpen(false)}>
           <NativeSessionBrowser environmentId={environmentId} />
@@ -38,14 +34,10 @@ export function NeoPiSessionBrowser({
 export function NeoPiSessionConfiguration({ threadRef }: { threadRef: ScopedThreadRef }) {
   const [open, setOpen] = useState(false);
   const thread = useThreadShell(threadRef);
-  const instanceId = thread?.session?.providerInstanceId ?? thread?.modelSelection.instanceId;
+  const instanceId = thread?.modelSelection.instanceId;
   return (
     <View className="flex-row flex-wrap items-center px-4 py-1">
-      <MaterialButton
-        label="NeoPi session configuration"
-        tone="text"
-        onPress={() => setOpen(true)}
-      />
+      <Button label="NeoPi session configuration" tone="text" onPress={() => setOpen(true)} />
       {instanceId ? (
         <NeoPiModelsEntry
           environmentId={threadRef.environmentId}
@@ -74,9 +66,6 @@ function ConfigurationSnapshot({
       input: { threadId: threadRef.threadId },
     }),
   );
-  useEffect(() => {
-    result.refresh();
-  }, [result.refresh]);
   const snapshot =
     !result.error && !result.isPending && result.data?.status === "available" ? result.data : null;
   return (
@@ -87,7 +76,7 @@ function ConfigurationSnapshot({
           the chat header to edit native role definitions, scoped effort rules and
           inference-provider accounts.
         </Text>
-        <MaterialButton label="Refresh" disabled={result.isPending} onPress={result.refresh} />
+        <Button label="Refresh" disabled={result.isPending} onPress={result.refresh} />
         {result.isPending ? (
           <Text className="text-foreground-muted">Reading native configuration…</Text>
         ) : result.error ? (

@@ -1,9 +1,10 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
 import { EnvironmentId, type PersistedSavedEnvironmentRecord } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Encoding from "effect/Encoding";
+import * as Base64 from "effect/encoding/Base64";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
@@ -31,7 +32,7 @@ type EncryptionAvailability =
   | boolean
   | ElectronSafeStorage.ElectronSafeStorage["Service"]["isEncryptionAvailable"];
 
-function makeSafeStorageLayer(
+function layerSafeStorageFor(
   available: EncryptionAvailability,
   failDecrypt: Ref.Ref<boolean> | null = null,
 ) {
@@ -63,7 +64,7 @@ function makeLayer(
   fileSystemLayer: Layer.Layer<FileSystem.FileSystem> = NodeServices.layer,
   platform: NodeJS.Platform = "darwin",
 ) {
-  const environmentLayer = DesktopEnvironment.layer({
+  const layerEnvironment = DesktopEnvironment.layer({
     dirname: "/repo/apps/desktop/src",
     homeDirectory: baseDir,
     platform,
@@ -78,20 +79,21 @@ function makeLayer(
       Layer.mergeAll(NodeServices.layer, DesktopConfig.layerTest({ T3CODE_HOME: baseDir })),
     ),
   );
-  const safeStorageLayer = makeSafeStorageLayer(encryptionAvailable, failDecrypt);
-  const dependencies = Layer.mergeAll(
-    environmentLayer,
-    safeStorageLayer,
+  const layerSafeStorage = layerSafeStorageFor(encryptionAvailable, failDecrypt);
+  const layerDependencies = Layer.mergeAll(
+    layerEnvironment,
+    layerSafeStorage,
     NodeServices.layer,
+    NodeCrypto.layer,
     fileSystemLayer,
   );
-  const savedEnvironmentsLayer = DesktopSavedEnvironments.layer.pipe(
-    Layer.provideMerge(dependencies),
+  const layerSavedEnvironments = DesktopSavedEnvironments.layer.pipe(
+    Layer.provideMerge(layerDependencies),
   );
 
   return DesktopConnectionCatalogStore.layer.pipe(
-    Layer.provideMerge(savedEnvironmentsLayer),
-    Layer.provideMerge(dependencies),
+    Layer.provideMerge(layerSavedEnvironments),
+    Layer.provideMerge(layerDependencies),
   );
 }
 
@@ -108,7 +110,7 @@ const withStore = <A, E, R>(
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
 describe("DesktopConnectionCatalogStore", () => {
-  it.effect("persists, reads, and clears an encrypted connection catalog", () =>
+  it.effect("persists and reads an encrypted connection catalog", () =>
     withStore(
       Effect.gen(function* () {
         const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
@@ -211,7 +213,7 @@ describe("DesktopConnectionCatalogStore", () => {
               record.environmentId === "bearer-environment"
                 ? {
                     ...record,
-                    encryptedBearerToken: Encoding.encodeBase64(
+                    encryptedBearerToken: Base64.encode(
                       textEncoder.encode("encrypted:legacy-token"),
                     ),
                   }
@@ -595,74 +597,73 @@ describe("DesktopConnectionCatalogStore", () => {
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 
-  for (const available of [true, false]) {
-    it.effect(
-      `allows Windows recovery, re-add and restart when encryption is ${available ? "available" : "unavailable"}`,
-      () =>
-        Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem;
-          const base = yield* fs.makeTempDirectoryScoped({ prefix: "catalog-windows-sync-" });
-          const catalogPath = `${base}/userdata/connection-catalog.json`;
-          const initial = yield* DesktopConnectionCatalogStore.make.pipe(
-            Effect.provide(makeLayer(base)),
-          );
-          yield* initial.set('{"old":true}');
-          const original = yield* fs.readFile(catalogPath);
-          const denied = PlatformError.systemError({
-            _tag: "PermissionDenied",
-            module: "FileSystem",
-            method: "sync",
-            cause: Object.assign(new Error("operation not permitted"), { code: "EPERM" }),
-          });
-          const windowsFs = Layer.succeed(FileSystem.FileSystem, {
-            ...fs,
-            open: (file, options) =>
-              fs
-                .open(file, options)
-                .pipe(
-                  Effect.map((handle) =>
-                    file === `${base}/userdata` ||
-                    (file.endsWith(".unreadable.json") && options?.flag === "r")
-                      ? { ...handle, sync: Effect.fail(denied) }
-                      : handle,
-                  ),
+  it.effect.each([true, false])(
+    "allows Windows recovery, re-add and restart when encryption is available: %s",
+    (available) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const base = yield* fs.makeTempDirectoryScoped({ prefix: "catalog-windows-sync-" });
+        const catalogPath = `${base}/userdata/connection-catalog.json`;
+        const initial = yield* DesktopConnectionCatalogStore.make.pipe(
+          Effect.provide(makeLayer(base)),
+        );
+        yield* initial.set('{"old":true}');
+        const original = yield* fs.readFile(catalogPath);
+        const denied = PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "sync",
+          cause: Object.assign(new Error("operation not permitted"), { code: "EPERM" }),
+        });
+        const windowsFs = Layer.succeed(FileSystem.FileSystem, {
+          ...fs,
+          open: (file, options) =>
+            fs
+              .open(file, options)
+              .pipe(
+                Effect.map((handle) =>
+                  file === `${base}/userdata` ||
+                  (file.endsWith(".unreadable.json") && options?.flag === "r")
+                    ? { ...handle, sync: Effect.fail(denied) }
+                    : handle,
                 ),
-          });
-          const failDecrypt = yield* Ref.make(true);
-          const store = yield* DesktopConnectionCatalogStore.make.pipe(
-            Effect.provide(makeLayer(base, available, failDecrypt, windowsFs, "win32")),
-          );
-          const recovered = yield* store.get;
-          assert.equal(recovered.recovery?.status, "preserved");
-          const preservedPath = recovered.recovery!.preservedPath!;
-          assert.isTrue(Buffer.from(yield* fs.readFile(preservedPath)).equals(original));
-          assert.isFalse(yield* fs.exists(catalogPath));
-          yield* Ref.set(failDecrypt, false);
-          const writable = yield* DesktopConnectionCatalogStore.make.pipe(
-            Effect.provide(makeLayer(base, true, failDecrypt, windowsFs, "win32")),
-          );
-          assert.isTrue(yield* writable.set('{"replacement":true}'));
-          const restarted = yield* DesktopConnectionCatalogStore.make.pipe(
-            Effect.provide(makeLayer(base, true, failDecrypt, windowsFs, "win32")),
-          );
-          assert.deepEqual(yield* restarted.get, {
-            catalog: '{"replacement":true}',
-            recovery: recovered.recovery,
-          });
-          yield* restarted.clear;
-          assert.isNull((yield* restarted.get).catalog);
-          assert.isTrue(Buffer.from(yield* fs.readFile(preservedPath)).equals(original));
-        }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
-    );
-  }
+              ),
+        });
+        const failDecrypt = yield* Ref.make(true);
+        const store = yield* DesktopConnectionCatalogStore.make.pipe(
+          Effect.provide(makeLayer(base, available, failDecrypt, windowsFs, "win32")),
+        );
+        const recovered = yield* store.get;
+        assert.equal(recovered.recovery?.status, "preserved");
+        const preservedPath = recovered.recovery!.preservedPath!;
+        assert.isTrue(Buffer.from(yield* fs.readFile(preservedPath)).equals(original));
+        assert.isFalse(yield* fs.exists(catalogPath));
+        yield* Ref.set(failDecrypt, false);
+        const writable = yield* DesktopConnectionCatalogStore.make.pipe(
+          Effect.provide(makeLayer(base, true, failDecrypt, windowsFs, "win32")),
+        );
+        assert.isTrue(yield* writable.set('{"replacement":true}'));
+        const restarted = yield* DesktopConnectionCatalogStore.make.pipe(
+          Effect.provide(makeLayer(base, true, failDecrypt, windowsFs, "win32")),
+        );
+        assert.deepEqual(yield* restarted.get, {
+          catalog: '{"replacement":true}',
+          recovery: recovered.recovery,
+        });
+        yield* restarted.clear;
+        assert.isNull((yield* restarted.get).catalog);
+        assert.isTrue(Buffer.from(yield* fs.readFile(preservedPath)).equals(original));
+      }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
 
-  for (const { platform, code, target } of [
+  it.effect.each([
     { platform: "linux", code: "EPERM", target: "directory" },
     { platform: "win32", code: "EACCES", target: "directory" },
     { platform: "win32", code: "EIO", target: "directory" },
     { platform: "win32", code: "EPERM", target: "file" },
-  ] as const) {
-    it.effect(`retains the active catalog on ${platform} ${target} sync ${code}`, () =>
+  ] as const)(
+    "retains the active catalog on $platform $target sync $code",
+    ({ platform, code, target }) =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const base = yield* fs.makeTempDirectoryScoped({ prefix: "catalog-sync-error-" });
@@ -710,11 +711,11 @@ describe("DesktopConnectionCatalogStore", () => {
         );
         assert.isTrue(Buffer.from(yield* fs.readFile(catalogPath)).equals(original));
       }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
-    );
-  }
+  );
 
-  for (const failure of ["preservation", "record", "directory-sync", "remove"] as const) {
-    it.effect(`blocks destructive writes when ${failure} fails and resumes safely on restart`, () =>
+  it.effect.each(["preservation", "record", "directory-sync", "remove"] as const)(
+    "blocks destructive writes when %s fails and resumes safely on restart",
+    (failure) =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const base = yield* fs.makeTempDirectoryScoped({ prefix: "catalog-preservation-failure-" });
@@ -793,8 +794,7 @@ describe("DesktopConnectionCatalogStore", () => {
           );
         }
       }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
-    );
-  }
+  );
 
   it.effect("does not reimport legacy credentials after recovery removed the active catalog", () =>
     Effect.gen(function* () {

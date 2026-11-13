@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { ProviderInstanceId, type NeoPiModelsAuthState } from "@t3tools/contracts";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import type { UiRequestFrame } from "effect-neopi-rpc/client";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -80,7 +81,7 @@ const fixture = Effect.fnUntraced(function* (
         yield* Effect.addFinalizer(() => Ref.update(releases, (count) => count + 1));
         return native;
       }),
-    ),
+    ).pipe(Effect.provide(SecureRandom.layerWebCrypto)),
   );
   const flow = yield* auth.startAuth({ target, providerId: "fixture-provider" });
   return {
@@ -490,13 +491,13 @@ describe("native Models login lifecycle", () => {
       ),
   );
 
-  it.live("keeps a login alive after the scope that built the auth has closed", () =>
+  it.effect("keeps a login alive after the scope that built the auth has closed", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const { auth, flow, result, releases, cancelCalls, requestEnded } = yield* fixture(
+        const { auth, flow, result, releases, cancelCalls, requestEnded, loginId } = yield* fixture(
           Effect.void,
         );
-        yield* Effect.sleep("50 millis");
+        yield* Deferred.await(loginId);
         expect(yield* Ref.get(cancelCalls)).toBe(0);
         expect(yield* Ref.get(releases)).toBe(0);
         expect(yield* Deferred.isDone(requestEnded)).toBe(false);

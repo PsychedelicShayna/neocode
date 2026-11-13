@@ -24,6 +24,7 @@ const NativeFailure = Schema.Struct({
 const decodePage = Schema.decodeUnknownEffect(NeoPiJournalPage);
 const decodeState = Schema.decodeUnknownEffect(State);
 const decodeFailure = Schema.decodeUnknownOption(Schema.fromJsonString(NativeFailure));
+const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export const sameNeoPiJournalIdentity = (
   left: NeoPiConfigurationIdentity,
@@ -44,7 +45,7 @@ export const neoPiJournalError = (cause: unknown): Extract<ReadResult, { status:
   message: cause instanceof Error ? cause.message : "Could not read the native NeoPi journal.",
 });
 
-export const validateNeoPiJournalPage = Effect.fn("NeoPiJournal.validatePage")(function* (
+const validateNeoPiJournalPage = Effect.fn("NeoPiJournal.validatePage")(function* (
   value: unknown,
   expected: NeoPiConfigurationIdentity,
 ): Effect.fn.Return<ReadResult> {
@@ -78,9 +79,7 @@ export const decodeNeoPiJournalCli = Effect.fn("NeoPiJournal.decodeCli")(functio
       code: "journal_read_failed",
       message: `NeoPi journal reader exited ${exitCode} without a structured error.`,
     };
-  const value = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
-    stdout,
-  ).pipe(Effect.option);
+  const value = yield* decodeJson(stdout).pipe(Effect.option);
   if (value._tag === "None")
     return {
       status: "error",

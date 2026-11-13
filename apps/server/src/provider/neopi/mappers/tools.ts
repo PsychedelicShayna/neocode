@@ -1,54 +1,26 @@
-/**
- * Pure NeoPi RPC tool-lifecycle mapper (§2.5 / N6).
- *
- * `tool_execution_*` frames become one runtime item per `toolCallId`.
- * `host_tool_call` is recorded and otherwise ignored — the host bridge
- * executes it. Bash `partialResult` text is a rolling tail snapshot. Prefix
- * growth and rollover both publish the current window on `item.updated`
- * as `item.aggregatedOutput` / `rawOutput`, the shapes ingestion and the
- * work log keep. `content.delta` is not used: T3 drops non-assistant deltas.
- * The completing result replaces that window.
- */
-import {
-  EventId,
-  ProviderItemId,
-  RuntimeItemId,
-  type CanonicalItemType,
-  type ItemLifecyclePayload,
-  type ProviderRuntimeEvent,
-  type ToolActivitySource,
-} from "@t3tools/contracts";
-
-import { scopedItemId } from "./MapCtx.ts";
-
+import type { OrchestrationV2TurnItem, ToolActivitySource } from "@t3tools/contracts";
+import type { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 
+import { nativeItemBase, type MapCtx } from "./MapCtx.ts";
 import { snapshotDelta } from "./snapshotDelta.ts";
-
-/** Alias to the shared mapper context, exported for callers of this mapper. */
-export type ToolMapCtx = import("./MapCtx.ts").MapCtx;
 
 export interface InFlightTool {
   readonly toolCallId: string;
   readonly toolName: string;
   readonly args: unknown;
-  readonly itemType: CanonicalItemType;
-  readonly title: string;
+  readonly startedAt: string;
   readonly host: boolean;
   readonly bashSnapshot?: string;
 }
 
 export interface ToolState {
   readonly inFlightTools: Readonly<Record<string, InFlightTool>>;
-  /** Names registered with NeoPi via `set_host_tools`. */
   readonly hostToolNames: ReadonlySet<string>;
-  /** `toolCallId`s seen on `host_tool_call`, including calls that already finished. */
   readonly hostToolCallIds: ReadonlySet<string>;
-  /** Finished `toolCallId`s. A replay must not open a second item. */
   readonly completedToolCallIds: ReadonlySet<string>;
 }
 
-/** Wire `toolSource` for T3-owned host tools. Key is the plan's `"t3-code"`. */
 const T3_CODE_TOOL_SOURCE = {
   key: "t3-code",
   name: "NeoCode",
@@ -56,8 +28,6 @@ const T3_CODE_TOOL_SOURCE = {
 } as const satisfies ToolActivitySource;
 
 const FILE_CHANGE_TOOLS = new Set(["edit", "write", "delete", "move"]);
-const MAX_COMMAND_DISPLAY_CHARS = 2048;
-const OMITTED_COMMAND_OUTPUT = "[earlier output omitted]\n";
 
 export function emptyToolState(): ToolState {
   return {
@@ -77,356 +47,153 @@ export function withHostToolNames(state: ToolState, names: Iterable<string>): To
 }
 
 export function mapToolFrame(
-  ctx: ToolMapCtx,
+  ctx: MapCtx,
   frame: unknown,
   state: ToolState,
-): { events: ProviderRuntimeEvent[]; state: ToolState } {
+): { events: ProviderAdapterV2Event[]; state: ToolState } {
   const record = asRecord(frame);
-  const type = typeof record?.type === "string" ? record.type : undefined;
-  if (!record || !type) {
-    return { events: [], state };
+  if (!record) return { events: [], state };
+  if (record.type === "host_tool_call") {
+    const id = stringField(record.toolCallId);
+    return { events: [], state: id ? addId(state, "hostToolCallIds", id) : state };
   }
-
-  if (type === "host_tool_call") {
-    return mapHostToolCall(record, state);
-  }
-  if (type === "tool_execution_start") {
-    return mapStart(ctx, record, frame, state);
-  }
-  if (type === "tool_execution_update") {
-    return mapUpdate(ctx, record, frame, state);
-  }
-  if (type === "tool_execution_end") {
-    return mapEnd(ctx, record, frame, state);
-  }
-  return { events: [], state };
-}
-
-function mapHostToolCall(
-  record: Record<string, unknown>,
-  state: ToolState,
-): { events: ProviderRuntimeEvent[]; state: ToolState } {
-  const toolCallId = stringField(record.toolCallId);
-  return {
-    events: [],
-    state: toolCallId ? addId(state, "hostToolCallIds", toolCallId) : state,
-  };
-}
-
-function mapStart(
-  ctx: ToolMapCtx,
-  record: Record<string, unknown>,
-  frame: unknown,
-  state: ToolState,
-): { events: ProviderRuntimeEvent[]; state: ToolState } {
-  const identity = callIdentity(record);
-  if (!identity) return { events: [], state };
   if (
-    state.inFlightTools[identity.toolCallId] ||
-    state.completedToolCallIds.has(identity.toolCallId)
-  ) {
+    record.type !== "tool_execution_start" &&
+    record.type !== "tool_execution_update" &&
+    record.type !== "tool_execution_end"
+  )
     return { events: [], state };
-  }
-
-  const call = beginCall(state, identity.toolCallId, identity.toolName, record.args);
-  return {
-    events: [startedEvent(ctx, frame, call)],
-    state: putInFlight(state, call),
-  };
-}
-
-function mapUpdate(
-  ctx: ToolMapCtx,
-  record: Record<string, unknown>,
-  frame: unknown,
-  state: ToolState,
-): { events: ProviderRuntimeEvent[]; state: ToolState } {
   const identity = callIdentity(record);
-  if (!identity) return { events: [], state };
-  if (state.completedToolCallIds.has(identity.toolCallId)) {
+  if (!identity || state.completedToolCallIds.has(identity.toolCallId))
     return { events: [], state };
-  }
 
-  const events: ProviderRuntimeEvent[] = [];
-  let next = state;
-  let call = next.inFlightTools[identity.toolCallId];
-  if (!call) {
-    call = beginCall(next, identity.toolCallId, identity.toolName, record.args);
-    events.push(startedEvent(ctx, frame, call));
-    next = putInFlight(next, call);
-  } else if (record.args !== undefined) {
-    call = { ...call, args: record.args };
-    next = putInFlight(next, call);
-  }
-
-  if (call.itemType !== "command_execution") {
-    return { events, state: next };
-  }
-
-  const snapshot = snapshotText(record.partialResult);
-  if (snapshot === undefined) {
-    return { events, state: next };
-  }
-
-  const compared = snapshotDelta(call.bashSnapshot ?? "", snapshot);
-  const visible = visibleCommandSnapshot(compared, snapshot);
-  call = { ...call, bashSnapshot: snapshot };
-  next = putInFlight(next, call);
-  if (visible === undefined) {
-    return { events, state: next };
-  }
-
-  events.push(
-    itemEvent(ctx, frame, call, "item.updated", {
-      itemType: call.itemType,
-      status: "inProgress",
-      title: call.title,
-      data: commandData(call, visible),
-      ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
-    }),
-  );
-  return { events, state: next };
-}
-
-function mapEnd(
-  ctx: ToolMapCtx,
-  record: Record<string, unknown>,
-  frame: unknown,
-  state: ToolState,
-): { events: ProviderRuntimeEvent[]; state: ToolState } {
-  const identity = callIdentity(record);
-  if (!identity) return { events: [], state };
-  if (state.completedToolCallIds.has(identity.toolCallId)) {
-    return { events: [], state };
-  }
-
-  const events: ProviderRuntimeEvent[] = [];
-  let call = state.inFlightTools[identity.toolCallId];
-  if (!call) {
-    call = beginCall(state, identity.toolCallId, identity.toolName, record.args);
-    events.push(startedEvent(ctx, frame, call));
-  } else if (record.args !== undefined) {
-    call = { ...call, args: record.args };
-  }
-  if (!call.host && state.hostToolCallIds.has(identity.toolCallId)) {
-    const classified = classify(call.toolName, true, call.args);
-    call = { ...call, host: true, itemType: classified.itemType, title: classified.title };
-  }
-  const previewPath = workspaceImagePath(call.args, asRecord(asRecord(record.result)?.details));
-  if (previewPath && !call.host && call.itemType === "dynamic_tool_call") {
-    call = { ...call, itemType: "image_view", title: "Image view" };
-  }
-
-  const failed = record.isError === true || asRecord(record.result)?.isError === true;
-  events.push(
-    itemEvent(ctx, frame, call, "item.completed", {
-      itemType: call.itemType,
-      status: failed ? "failed" : "completed",
-      title: call.title,
-      data: completedData(call, record.result),
-      ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
-    }),
-  );
-
-  const inFlightTools = { ...state.inFlightTools };
-  delete inFlightTools[identity.toolCallId];
-  return {
-    events,
-    state: {
-      ...state,
-      inFlightTools,
-      completedToolCallIds: addToSet(state.completedToolCallIds, identity.toolCallId),
-    },
+  const existing = state.inFlightTools[identity.toolCallId];
+  if (existing && record.type === "tool_execution_start") return { events: [], state };
+  let call: InFlightTool = existing ?? {
+    ...identity,
+    args: record.args,
+    startedAt: ctx.now(),
+    host:
+      state.hostToolNames.has(identity.toolName) || state.hostToolCallIds.has(identity.toolCallId),
   };
-}
+  if (existing && record.args !== undefined) call = { ...call, args: record.args };
+  if (!call.host && state.hostToolCallIds.has(call.toolCallId)) call = { ...call, host: true };
+  const events: ProviderAdapterV2Event[] = [];
+  if (!existing) events.push(toolEvent(ctx, call, "running"));
 
-function beginCall(
-  state: ToolState,
-  toolCallId: string,
-  toolName: string,
-  args: unknown,
-): InFlightTool {
-  const host = state.hostToolNames.has(toolName) || state.hostToolCallIds.has(toolCallId);
-  const classified = classify(toolName, host, args);
-  return {
-    toolCallId,
-    toolName,
-    args,
-    itemType: classified.itemType,
-    title: classified.title,
-    host,
-  };
-}
-
-function classify(
-  toolName: string,
-  host: boolean,
-  args: unknown,
-): { itemType: CanonicalItemType; title: string } {
-  if (host) return { itemType: "mcp_tool_call", title: toolName };
-  if (toolName === "bash") return { itemType: "command_execution", title: "Ran command" };
-  if (FILE_CHANGE_TOOLS.has(toolName)) return { itemType: "file_change", title: "File change" };
-  if (workspaceImagePath(args, undefined)) return { itemType: "image_view", title: "Image view" };
-  if (toolName === "web_search") return { itemType: "web_search", title: "Web search" };
-  if (toolName.startsWith("mcp__")) return { itemType: "mcp_tool_call", title: toolName };
-  return { itemType: "dynamic_tool_call", title: toolName };
-}
-
-function startedEvent(ctx: ToolMapCtx, frame: unknown, call: InFlightTool): ProviderRuntimeEvent {
-  return itemEvent(ctx, frame, call, "item.started", {
-    itemType: call.itemType,
-    status: "inProgress",
-    title: call.title,
-    ...(startData(call) !== undefined ? { data: startData(call) } : {}),
-    ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
-  });
-}
-
-function startData(call: InFlightTool): unknown {
-  if (call.host || call.itemType === "mcp_tool_call") {
+  if (record.type === "tool_execution_end") {
+    const failed = record.isError === true || asRecord(record.result)?.isError === true;
+    events.push(toolEvent(ctx, call, failed ? "failed" : "completed", record.result));
+    const inFlightTools = { ...state.inFlightTools };
+    delete inFlightTools[call.toolCallId];
     return {
-      toolName: call.toolName,
-      args: call.args,
-      ...(asRecord(call.args) ? { arguments: call.args } : {}),
-      ...(call.host ? { server: "t3-code", tool: call.toolName } : {}),
+      events,
+      state: {
+        ...state,
+        inFlightTools,
+        completedToolCallIds: addToSet(state.completedToolCallIds, call.toolCallId),
+      },
     };
   }
-  if (call.itemType === "command_execution") {
-    return commandData(call, undefined);
-  }
-  if (call.itemType === "file_change") {
-    const paths = pathsFromArgs(call.args);
-    return paths.length > 0 ? { paths, files: paths.map((path) => ({ path })) } : undefined;
-  }
-  if (call.itemType === "image_view") {
-    return imageData(call, undefined, []);
-  }
-  if (call.itemType === "web_search") {
-    const query = stringField(asRecord(call.args)?.query);
-    return query === undefined ? { args: call.args } : { query, args: call.args };
-  }
-  return { args: call.args };
-}
-
-function completedData(call: InFlightTool, result: unknown): unknown {
-  const base = asRecord(startData(call)) ?? {};
-  const data: Record<string, unknown> = { ...base };
-  const blocks = contentBlocks(result);
-  const text = joinText(blocks);
-  const images = imageBlocks(blocks);
-  const details = asRecord(asRecord(result)?.details);
-  const diff = call.toolName === "edit" && !call.host ? editDiff(details) : undefined;
-
-  if (call.toolName === "write" && !call.host) {
-    const written = asRecord(call.args)?.content;
-    if (typeof written === "string") data.content = written;
-  } else if (text !== undefined) {
-    data.content = text;
-  }
-
-  if (call.itemType === "command_execution") {
-    // The completing result is authoritative, including when it replaces a tail window.
-    const output = text !== undefined ? text : call.bashSnapshot;
-    Object.assign(data, commandData(call, output, integerField(details?.exitCode)));
-    if (output) {
-      data.displayOutput =
-        output.length <= MAX_COMMAND_DISPLAY_CHARS
-          ? output
-          : OMITTED_COMMAND_OUTPUT +
-            // A UTF-16 tail may start halfway through a surrogate pair.
-            output
-              .slice(OMITTED_COMMAND_OUTPUT.length - MAX_COMMAND_DISPLAY_CHARS)
-              .replace(/^[\uDC00-\uDFFF]/u, "");
-    }
-  } else if (diff !== undefined) {
-    data.diff = diff;
-    data.rawOutput = { content: diff };
-    data.item = { aggregatedOutput: diff };
-  } else {
-    assignPresentedText(data, call, text);
-  }
-
-  if (images.length > 0 || call.itemType === "image_view") {
-    Object.assign(data, imageData(call, details, images));
-  }
-
-  const exitCode = integerField(details?.exitCode);
-  if (exitCode !== undefined && call.itemType !== "command_execution") {
-    data.exitCode = exitCode;
-  }
-
-  if (call.itemType === "file_change") {
-    const paths = uniqueStrings([
-      ...(Array.isArray(data.paths) ? data.paths : []),
-      ...pathsFromArgs(call.args),
-      ...pathsFromDetails(details),
-    ]);
-    if (paths.length > 0) {
-      data.paths = paths;
-      data.files = paths.map((path) => ({ path }));
+  if (record.type === "tool_execution_update" && call.toolName === "bash" && !call.host) {
+    const snapshot = snapshotText(record.partialResult);
+    if (snapshot !== undefined) {
+      const visible = visibleCommandSnapshot(
+        snapshotDelta(call.bashSnapshot ?? "", snapshot),
+        snapshot,
+      );
+      call = { ...call, bashSnapshot: snapshot };
+      if (visible !== undefined) events.push(toolEvent(ctx, call, "running", undefined, visible));
     }
   }
-
-  return Object.keys(data).length > 0 ? data : undefined;
+  return { events, state: putInFlight(state, call) };
 }
 
-function commandData(
-  call: InFlightTool,
-  output: string | undefined,
-  exitCode?: number,
-): Record<string, unknown> {
-  const command = commandFromArgs(call.args);
-  const data: Record<string, unknown> = {};
-  if (command !== undefined) data.command = command;
-  const item: Record<string, unknown> = {};
-  if (command !== undefined) item.command = command;
-  if (output !== undefined && output.length > 0) {
-    item.aggregatedOutput = output;
-    data.rawOutput = { content: output, stdout: output };
-    data.result = { content: output };
-  }
-  if (exitCode !== undefined) {
-    item.exitCode = exitCode;
-    data.exitCode = exitCode;
-  }
-  if (Object.keys(item).length > 0) data.item = item;
-  return data;
-}
-
-function assignPresentedText(
-  data: Record<string, unknown>,
-  call: InFlightTool,
-  text: string | undefined,
-): void {
-  if (text === undefined || text.length === 0) return;
-  data.rawOutput = { content: text };
-  data.result = { content: [{ type: "text", text }] };
-  if (call.itemType !== "mcp_tool_call") return;
-  data.item = {
-    type: "mcpToolCall",
-    id: call.toolCallId,
-    tool: call.toolName,
-    status: "completed",
-    arguments: call.args,
-    result: { content: [{ type: "text", text }] },
-    ...(call.host ? { server: "t3-code" } : {}),
+export function settleTools(
+  ctx: MapCtx,
+  state: ToolState,
+  status: "completed" | "failed" | "cancelled" | "interrupted",
+): { events: ProviderAdapterV2Event[]; state: ToolState } {
+  const calls = Object.values(state.inFlightTools);
+  if (calls.length === 0) return { events: [], state };
+  const completedToolCallIds = new Set(state.completedToolCallIds);
+  const events = calls.map((call) => {
+    completedToolCallIds.add(call.toolCallId);
+    return toolEvent(ctx, call, status);
+  });
+  return {
+    events,
+    state: { ...state, inFlightTools: {}, completedToolCallIds },
   };
 }
 
-function imageData(
+function toolEvent(
+  ctx: MapCtx,
   call: InFlightTool,
-  details: Record<string, unknown> | undefined,
-  images: ReadonlyArray<{ mimeType: string; data: string }>,
-): Record<string, unknown> {
-  const imagePath = workspaceImagePath(call.args, details);
-  const data: Record<string, unknown> = { args: call.args };
-  if (imagePath) {
-    data.imagePath = imagePath;
-    data.toolName = call.toolName;
-    data.input = { file_path: imagePath, path: imagePath };
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted",
+  result?: unknown,
+  snapshot?: string,
+): ProviderAdapterV2Event {
+  const args = asRecord(call.args);
+  const intent = stringField(args?.i)?.trim();
+  const base = nativeItemBase(
+    ctx,
+    call.toolCallId,
+    status,
+    intent || call.toolName,
+    call.startedAt,
+  );
+  const details = asRecord(asRecord(result)?.details);
+  const output = joinText(contentBlocks(result));
+  let turnItem: OrchestrationV2TurnItem;
+  if (call.toolName === "bash" && !call.host) {
+    const text =
+      output ??
+      snapshot ??
+      (call.bashSnapshot === undefined
+        ? undefined
+        : withoutTrailingIncompleteCodePoint(call.bashSnapshot));
+    const exitCode = integerField(details?.exitCode);
+    turnItem = {
+      ...base,
+      type: "command_execution",
+      input: commandFromArgs(call.args) ?? "",
+      ...(text !== undefined ? { output: text } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(status === "failed" ? { outputIndicatesFailure: true } : {}),
+    };
+  } else {
+    const paths =
+      !call.host && FILE_CHANGE_TOOLS.has(call.toolName)
+        ? uniqueStrings([...pathsFromArgs(call.args), ...pathsFromDetails(details)])
+        : [];
+    const fileName = paths[0];
+    if (fileName !== undefined) {
+      const diff = call.toolName === "edit" ? editDiff(details) : undefined;
+      turnItem = {
+        ...base,
+        type: "file_change",
+        fileName,
+        changes: paths.map((path) => ({ path, operation: call.toolName })),
+        ...(diff !== undefined ? { diffStr: diff } : {}),
+        ...(call.toolName === "write" && typeof args?.content === "string"
+          ? { newStr: args.content }
+          : {}),
+      };
+    } else {
+      const viewedImagePath = workspaceImagePath(call.args, details);
+      turnItem = {
+        ...base,
+        type: "dynamic_tool",
+        toolName: call.toolName,
+        input: call.args,
+        ...(result !== undefined ? { output: result } : {}),
+        ...(viewedImagePath ? { viewedImagePath } : {}),
+        ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
+      };
+    }
   }
-  if (images.length > 0) data.images = images;
-  return data;
+  return { type: "turn_item.updated", driver: ctx.provider, turnItem };
 }
 
 function editDiff(details: Record<string, unknown> | undefined): string | undefined {
@@ -485,38 +252,6 @@ function localImagePath(value: unknown): string | undefined {
   }
   if (/^[a-z][a-z\d+.-]*:/i.test(trimmed) && !/^[a-z]:[\\/]/i.test(trimmed)) return undefined;
   return trimmed;
-}
-
-function itemEvent(
-  ctx: ToolMapCtx,
-  frame: unknown,
-  call: InFlightTool,
-  type: "item.started" | "item.updated" | "item.completed",
-  payload: ItemLifecyclePayload,
-): ProviderRuntimeEvent {
-  const data = payload.data;
-  return {
-    type,
-    eventId: EventId.make(ctx.newEventId()),
-    provider: ctx.provider,
-    providerInstanceId: ctx.providerInstanceId,
-    threadId: ctx.threadId,
-    createdAt: ctx.now(),
-    ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    itemId: RuntimeItemId.make(scopedItemId(ctx, call.toolCallId)),
-    payload: {
-      itemType: payload.itemType,
-      ...(payload.status ? { status: payload.status } : {}),
-      ...(payload.title ? { title: payload.title } : {}),
-      ...(payload.detail ? { detail: payload.detail } : {}),
-      ...(data !== undefined ? { data } : {}),
-      ...(payload.toolSource ? { toolSource: payload.toolSource } : {}),
-      ...(ctx.agentId ? { agentId: ctx.agentId } : {}),
-      ...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
-    },
-    providerRefs: { providerItemId: ProviderItemId.make(call.toolCallId) },
-    raw: { source: "neopi.rpc", payload: frame },
-  };
 }
 
 function visibleCommandSnapshot(
@@ -656,17 +391,6 @@ function joinText(blocks: ReadonlyArray<unknown>): string | undefined {
     if (record?.type === "text" && typeof record.text === "string") parts.push(record.text);
   }
   return parts.length > 0 ? parts.join("") : undefined;
-}
-
-function imageBlocks(blocks: ReadonlyArray<unknown>): Array<{ mimeType: string; data: string }> {
-  const images: Array<{ mimeType: string; data: string }> = [];
-  for (const block of blocks) {
-    const record = asRecord(block);
-    if (record?.type !== "image") continue;
-    if (typeof record.mimeType !== "string" || typeof record.data !== "string") continue;
-    images.push({ mimeType: record.mimeType, data: record.data });
-  }
-  return images;
 }
 
 function pushPath(paths: string[], value: unknown): void {

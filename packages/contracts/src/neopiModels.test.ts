@@ -3,6 +3,9 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { NeoPiModelsAuthRespond, NeoPiModelsAuthState, NeoPiNativeModel } from "./neopiModels.ts";
 
+const decodeNativeModel = Schema.decodeEffect(NeoPiNativeModel);
+const encodeNativeModel = Schema.encodeEffect(NeoPiNativeModel);
+
 const model = {
   provider: "native-provider",
   id: "unknown-limits",
@@ -27,8 +30,8 @@ describe("native Models catalog contract", () => {
         for (const contextWindow of [null, 0, 200000]) {
           for (const maxTokens of [null, 0, 32000]) {
             const input = { ...model, contextWindow, maxTokens };
-            const decoded = yield* Schema.decodeUnknownEffect(NeoPiNativeModel)(input);
-            const encoded = yield* Schema.encodeEffect(NeoPiNativeModel)(decoded);
+            const decoded = yield* decodeNativeModel(input);
+            const encoded = yield* encodeNativeModel(decoded);
             expect(encoded).toEqual(input);
           }
         }

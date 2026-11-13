@@ -5,7 +5,6 @@ import type {
   ServerSettings,
 } from "@t3tools/contracts";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
-import { useMemo } from "react";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -33,7 +32,7 @@ export function NativeSessionModelPicker({
 }: {
   target: NativeSessionTarget;
   providers: ReadonlyArray<ServerProvider>;
-  settings: Pick<ServerSettings, "providerInstances" | "providers">;
+  settings: Pick<ServerSettings, "providerInstances" | "projectSettingsOverrides">;
   keybindings: ResolvedKeybindingsConfig;
   modelLabel: string;
   /** `provider/id` of the active model, matched against the selector rows. */
@@ -46,28 +45,23 @@ export function NativeSessionModelPicker({
   onSelect: (choice: NativeModelChoice) => void;
 }) {
   const { environmentId, ref } = target;
-  const entries = useMemo(
-    () =>
-      applyProviderInstanceSettings(
-        deriveProviderInstanceEntries(
-          providers.filter((provider) => provider.instanceId === ref.providerInstanceId),
-        ),
-        settings,
-      ),
-    [providers, ref.providerInstanceId, settings],
+  const entries = applyProviderInstanceSettings(
+    deriveProviderInstanceEntries(
+      providers.filter((provider) => provider.instanceId === ref.providerInstanceId),
+    ),
+    settings,
+    null,
   );
-  const selectorContext = useMemo(
-    () => ({
-      environmentId,
-      connectedSession: {
-        sessionFile: ref.sessionFile,
-        providerInstanceId: ref.providerInstanceId,
-      },
-    }),
-    [environmentId, ref.sessionFile, ref.providerInstanceId],
-  );
+  const selectorContext = {
+    environmentId,
+    connectedSession: {
+      sessionFile: ref.sessionFile,
+      providerInstanceId: ref.providerInstanceId,
+    },
+  };
   return (
     <ProviderModelPicker
+      environmentId={environmentId}
       isComposerOwned
       activeInstanceId={ref.providerInstanceId}
       selectorContext={selectorContext}

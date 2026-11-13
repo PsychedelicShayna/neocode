@@ -11,7 +11,7 @@ import {
 
 import { cancelIdle, scheduleIdle } from "./reviewIdle";
 
-export function prewarmReviewDiffSection(input: {
+function prewarmReviewDiffSection(input: {
   readonly threadKey: string;
   readonly section: ReviewSectionItem;
 }): void {
@@ -28,8 +28,7 @@ export function prewarmReviewDiffSection(input: {
   getCachedNativeReviewDiffData({ parsedDiff, comments: [] });
 }
 
-/** Selects nearby loaded sections that fit in the cache with the selected section. */
-export function getReviewDiffPrewarmSections(input: {
+function getReviewDiffPrewarmSections(input: {
   readonly threadKey: string;
   readonly sections: ReadonlyArray<ReviewSectionItem>;
   readonly selectedSectionId: string | null;
@@ -75,7 +74,6 @@ export function getReviewDiffPrewarmSections(input: {
   return pendingSections;
 }
 
-/** Warms one nearby section per idle period, after navigation animations finish. */
 export function useReviewDiffPrewarming(input: {
   readonly threadKey: string | null;
   readonly sections: ReadonlyArray<ReviewSectionItem>;
@@ -83,6 +81,7 @@ export function useReviewDiffPrewarming(input: {
 }): void {
   const { sections, selectedSectionId, threadKey } = input;
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- prewarms pending review diff sections in idle callbacks and cancels the idle handle on cleanup
   useEffect(() => {
     if (!threadKey) {
       return;

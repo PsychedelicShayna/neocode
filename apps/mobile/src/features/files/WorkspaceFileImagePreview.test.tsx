@@ -21,7 +21,7 @@ vi.mock("react-native", () => ({
   },
 }));
 vi.mock("./FilePreviewFeedback", () => ({ FilePreviewLoading: () => null }));
-vi.mock("../../components/EmptyState", () => ({
+vi.mock("../../components/ui/EmptyState", () => ({
   EmptyState: (props: NonNullable<typeof state.failure>) => {
     useLayoutEffect(() => {
       state.failure = props;
@@ -32,16 +32,16 @@ vi.mock("../../components/EmptyState", () => ({
     return null;
   },
 }));
-vi.mock("../../components/FilePreviewModal", () => ({
+vi.mock("../../components/ui/FilePreviewModal", () => ({
   FilePreviewModal: ({ source }: { source: { uri: string } | null }) => {
     state.previewUri = source?.uri ?? null;
     return null;
   },
 }));
-vi.mock("../../components/NativePresentation", () => ({
+vi.mock("../../components/ui/NativePresentation", () => ({
   PresentationSource: ({ children }: { children: ReactNode }) => children,
 }));
-vi.mock("../../lib/mediaActions", () => ({ useMediaActions: () => ({ actions: [] }) }));
+vi.mock("../../state/mediaActions", () => ({ useMediaActions: () => ({ actions: [] }) }));
 vi.mock("../../components/MediaActionsMenu", () => ({
   MediaActionsMenu: ({ children }: { children: ReactNode }) => children,
 }));

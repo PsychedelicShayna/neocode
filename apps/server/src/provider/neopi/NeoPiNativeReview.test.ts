@@ -1,7 +1,9 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   NeoPiNativeSessionsError,
+  NeoPiNativeSessionsGetBranchCommitsInput,
   NeoPiNativeSessionsGetDiffFileContentsInput,
   NeoPiNativeSessionsGetDiffPreviewInput,
   ProviderInstanceId,
@@ -13,6 +15,10 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { ServerConfig } from "../../config.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ServerSettings from "../../serverSettings.ts";
+import * as KnownWorkspaces from "../../workspace/KnownWorkspaces.ts";
 import * as ReviewService from "../../review/ReviewService.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
@@ -26,13 +32,21 @@ import {
 
 const decodePreviewInput = Schema.decodeUnknownEffect(NeoPiNativeSessionsGetDiffPreviewInput);
 const decodeContentsInput = Schema.decodeUnknownEffect(NeoPiNativeSessionsGetDiffFileContentsInput);
+const decodeCommitsInput = Schema.decodeUnknownEffect(NeoPiNativeSessionsGetBranchCommitsInput);
 
 const TestLayer = ReviewService.layer.pipe(
+  Layer.provide(
+    KnownWorkspaces.layer.pipe(
+      Layer.provide(ProjectStore.layer),
+      Layer.provide(SqlitePersistence.layerMemory),
+      Layer.provide(ServerSettings.layerTest()),
+    ),
+  ),
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provide(VcsDriverRegistry.layer),
   Layer.provide(VcsProcess.layer),
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-native-review-config-" })),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
 );
 
 const contentsSelectors = {
@@ -186,12 +200,37 @@ describe("NeoPiNativeReview", () => {
           .pipe(Effect.flip);
         assert.equal(genericPreview._tag, "VcsRepositoryDetectionError");
         assert.equal(genericContents._tag, "VcsRepositoryDetectionError");
+        const git = yield* GitVcsDriver.GitVcsDriver;
+        const base = (yield* git.execute({
+          operation: "NeoPiNativeReview.test",
+          cwd,
+          args: ["rev-parse", "HEAD"],
+        })).stdout.trim();
+        yield* git.execute({
+          operation: "NeoPiNativeReview.test",
+          cwd,
+          args: ["add", "file.txt", "other.txt"],
+        });
+        yield* git.execute({
+          operation: "NeoPiNativeReview.test",
+          cwd,
+          args: ["-c", "commit.gpgsign=false", "commit", "-m", "Native review edit"],
+        });
+        const commits = yield* review.getBranchCommits({ ref, baseRef: base });
+        assert.deepEqual(
+          commits.commits.map((commit) => commit.subject),
+          ["Native review edit"],
+        );
+        const genericCommits = yield* generic
+          .getBranchCommits({ cwd, baseRef: base })
+          .pipe(Effect.flip);
+        assert.equal(genericCommits._tag, "VcsRepositoryDetectionError");
         assert.equal(authority.starts, 0);
       }).pipe(Effect.provide(TestLayer)),
   );
 
   it.effect(
-    "refuses unavailable sessions, invalid paths and other profiles for both operations",
+    "refuses unavailable sessions, invalid paths and other profiles for native review operations",
     () =>
       Effect.gen(function* () {
         const { review, authority, ref, unavailableFile, cwd } = yield* fixture;
@@ -211,6 +250,8 @@ describe("NeoPiNativeReview", () => {
             .pipe(Effect.flip);
           assert.equal(preview._tag, "NeoPiNativeSessionsError");
           assert.equal(contents._tag, "NeoPiNativeSessionsError");
+          const commits = yield* review.getBranchCommits({ ref: invalidRef }).pipe(Effect.flip);
+          assert.equal(commits._tag, "NeoPiNativeSessionsError");
         }
         authority.profileValid = false;
         const preview = yield* review.getDiffPreview({ ref }).pipe(Effect.flip);
@@ -219,6 +260,8 @@ describe("NeoPiNativeReview", () => {
           .pipe(Effect.flip);
         assert.equal(preview._tag, "NeoPiNativeSessionsError");
         assert.equal(contents._tag, "NeoPiNativeSessionsError");
+        const commits = yield* review.getBranchCommits({ ref }).pipe(Effect.flip);
+        assert.equal(commits._tag, "NeoPiNativeSessionsError");
         if (preview._tag === "NeoPiNativeSessionsError")
           assert.equal(preview.code, "profile_changed");
         if (contents._tag === "NeoPiNativeSessionsError")
@@ -231,6 +274,10 @@ describe("NeoPiNativeReview", () => {
     "requires native identity and preserves required file-content selectors on the wire",
     () =>
       Effect.gen(function* () {
+        const missingCommitRef = yield* decodeCommitsInput({ cwd: process.cwd() }).pipe(
+          Effect.result,
+        );
+        assert.equal(missingCommitRef._tag, "Failure");
         const missingRef = yield* decodePreviewInput({
           cwd: process.cwd(),
         }).pipe(Effect.result);

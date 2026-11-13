@@ -1,16 +1,18 @@
 import type { AssetResource, NeoPiNativeSessionRef, ThreadId } from "@t3tools/contracts";
-import { mediaMimeType, mediaMimeTypeFromExtension } from "@t3tools/shared/filePreview";
+import {
+  audioMimeTypeFromExtension,
+  mediaMimeType,
+  mediaMimeTypeFromExtension,
+} from "@t3tools/shared/mediaPreview";
 
 import {
   classifyMarkdownImageSource,
   markdownImageSourceFragment,
   type MarkdownImageSource,
 } from "./markdownImages.ts";
-import {
-  fileBasename,
-  splitFilePathPosition,
-  splitMarkdownLinkSearchAndHash,
-} from "./markdownLinks.ts";
+import { fileBasename } from "@t3tools/shared/path";
+import { splitFilePathPosition } from "@t3tools/shared/fileLinks";
+import { splitMarkdownLinkSearchAndHash } from "@t3tools/shared/markdownLinks";
 import {
   mediaFileReference,
   mediaReferenceFileName,
@@ -23,7 +25,6 @@ export type MediaSourceResource = Extract<
   { readonly _tag: "media-file" | "native-media-file" }
 >;
 
-/** What a piece of authored media is and how its bytes can be reached. */
 export type ResolvedMediaSource = {
   readonly kind: "image" | "video";
   readonly mimeType: string;
@@ -81,9 +82,10 @@ export function resolveMediaSource(
       ? mediaMimeType(classified.uri)
       : extensionIndex < 0
         ? null
-        : mediaMimeTypeFromExtension(basename.slice(extensionIndex));
+        : (mediaMimeTypeFromExtension(basename.slice(extensionIndex)) ??
+          audioMimeTypeFromExtension(basename.slice(extensionIndex)));
   const mimeType = detectedMimeType ?? (input.imageEmbed ? "image/*" : null);
-  if (mimeType === null) return null;
+  if (mimeType === null || mimeType.startsWith("audio/")) return null;
   const kind = mimeType.startsWith("video/") ? "video" : "image";
 
   const reference =

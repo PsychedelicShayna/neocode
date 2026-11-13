@@ -8,10 +8,16 @@ import { executeAuthenticatedEnvironmentHttpRequest } from "./environmentHttpAut
 import { createEnvironmentCommand } from "./runtime.ts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { HttpClient, HttpClientRequest } from "effect/unstable/http";
-import { Atom } from "effect/unstable/reactivity";
+import { HttpClient, HttpClientRequest } from "effect/http";
+import { Atom } from "effect/reactivity";
+
+export class NativeStatsConsumerError extends Schema.TaggedError<NativeStatsConsumerError>()(
+  "NativeStatsConsumerError",
+  { message: Schema.String, cause: Schema.Defect() },
+) {}
 
 export interface NativeStatsResponse {
   readonly status: number;
@@ -58,7 +64,7 @@ export const requestNativeStats = (input: NativeStatsRequest) =>
         group: "metadata",
         method: input.method,
         timeoutMs: 45_000,
-        url: (base) => `${environmentEndpointUrl(base, path)}${search}`,
+        url: (_urls, base) => `${environmentEndpointUrl(base, path)}${search}`,
         request: ({ headers, url }) =>
           client.execute(
             HttpClientRequest.make(input.method)(url).pipe(
@@ -71,35 +77,41 @@ export const requestNativeStats = (input: NativeStatsRequest) =>
         response.status === 204 || response.status === 304
           ? null
           : yield* Stream.toReadableStreamEffect(response.stream);
-      yield* Effect.tryPromise(() =>
-        input.consume({
-          status: response.status,
-          ok: response.status >= 200 && response.status < 300,
-          headers: new Headers(
-            Object.fromEntries(
-              Object.entries(response.headers).filter(
-                (entry): entry is [string, string] => entry[1] !== undefined,
+      yield* Effect.tryPromise({
+        try: () =>
+          input.consume({
+            status: response.status,
+            ok: response.status >= 200 && response.status < 300,
+            headers: new Headers(
+              Object.fromEntries(
+                Object.entries(response.headers).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
+                ),
               ),
             ),
-          ),
-          body,
-          text: async () => {
-            if (!body) return "";
-            const reader = body.getReader();
-            const decoder = new TextDecoder();
-            let text = "";
-            try {
-              while (true) {
-                const chunk = await reader.read();
-                if (chunk.done) return text + decoder.decode();
-                text += decoder.decode(chunk.value, { stream: true });
+            body,
+            text: async () => {
+              if (!body) return "";
+              const reader = body.getReader();
+              const decoder = new TextDecoder();
+              let text = "";
+              try {
+                while (true) {
+                  const chunk = await reader.read();
+                  if (chunk.done) return text + decoder.decode();
+                  text += decoder.decode(chunk.value, { stream: true });
+                }
+              } finally {
+                reader.releaseLock();
               }
-            } finally {
-              reader.releaseLock();
-            }
-          },
-        }),
-      );
+            },
+          }),
+        catch: (cause) =>
+          new NativeStatsConsumerError({
+            message: "Could not consume the native usage response.",
+            cause,
+          }),
+      });
     }),
   ).pipe(
     Effect.raceFirst(

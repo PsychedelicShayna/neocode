@@ -1,10 +1,15 @@
-import { UsageLimitSourceId } from "@t3tools/contracts";
-import { applyServerSettingsPatch, DEFAULT_SERVER_SETTINGS } from "@t3tools/shared/serverSettings";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  SecretProviderId,
+  UsageLimitSourceId,
+  type SecretReference,
+} from "@t3tools/contracts";
+import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { describe, expect, it } from "vite-plus/test";
 
 import { buildUsageLimitSourcePatch } from "./AddUsageLimitSourceDialog.logic";
 
-const source = (url: string, managementKey: string) => ({
+const source = (url: string, managementKey: string | SecretReference) => ({
   kind: "cliproxy" as const,
   url,
   managementKey,
@@ -16,6 +21,8 @@ const collidingUrls = [
   ["https://hub:8318", "https://hub-8318"],
   ["https://hub/first", "https://hub/second"],
   ["https://hub:8318", "https://hub:8318"],
+  ["http://proxy.test:8318/hub-a", "http://proxy.test:8318/hub-b"],
+  ["localhost:8318", "localhost:9318"],
 ] as const;
 
 describe("buildUsageLimitSourcePatch", () => {
@@ -32,7 +39,7 @@ describe("buildUsageLimitSourcePatch", () => {
       url: `  ${addedUrl}  `,
       managementKey: "  new-secret  ",
     });
-    const addedId = Object.keys(patch.usageLimitSources)[0]!;
+    const addedId = UsageLimitSourceId.make(Object.keys(patch.usageLimitSources)[0]!);
     const updated = applyServerSettingsPatch(current, patch);
 
     expect(addedId).not.toBe(legacyId);
@@ -45,11 +52,15 @@ describe("buildUsageLimitSourcePatch", () => {
   });
 
   it.each(collidingUrls)("keeps independent additions of %s and %s", (firstUrl, secondUrl) => {
+    const firstKey: SecretReference = {
+      provider: SecretProviderId.make("vault"),
+      reference: "secret/usage",
+    };
     // Both patches are created before either client's settings snapshot has updated.
     const firstPatch = buildUsageLimitSourcePatch({
       label: "",
       url: firstUrl,
-      managementKey: "first-secret",
+      managementKey: firstKey,
     });
     const secondPatch = buildUsageLimitSourcePatch({
       label: "",
@@ -65,7 +76,7 @@ describe("buildUsageLimitSourcePatch", () => {
 
     expect(firstId).not.toBe(secondId);
     expect(updated.usageLimitSources).toEqual({
-      [firstId]: source(firstUrl, "first-secret"),
+      [firstId]: source(firstUrl, firstKey),
       [secondId]: source(secondUrl, "second-secret"),
     });
   });

@@ -1,7 +1,10 @@
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The plain xdg-utils integration oracle runs synchronously in private XDG directories.
+import * as NodeChildProcess from "node:child_process";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Plain synchronous xdg-utils fixtures must exist before launching the external oracle.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Plain synchronous xdg-utils fixtures resolve paths before launching the external oracle.
+import * as NodePath from "node:path";
 import { assert, describe, it } from "vite-plus/test";
 import {
   escapeDesktopEntryExecArgument,
@@ -11,13 +14,13 @@ import {
 } from "./DesktopUrlRegistration.ts";
 
 const withPrivateRoot = (run: (root: string) => void) => {
-  const cache = join(homedir(), ".cache", "npi-canary");
-  mkdirSync(cache, { recursive: true });
-  const root = mkdtempSync(join(cache, "url-registration-test-"));
+  const cache = NodePath.join(NodeOS.homedir(), ".cache", "npi-canary");
+  NodeFS.mkdirSync(cache, { recursive: true });
+  const root = NodeFS.mkdtempSync(NodePath.join(cache, "url-registration-test-"));
   try {
     run(root);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    NodeFS.rmSync(root, { recursive: true, force: true });
   }
 };
 
@@ -81,6 +84,13 @@ describe("DesktopUrlRegistration", () => {
       escapeDesktopEntryExecArgument('/home/al ice/Apps/T3 "100%" $HOME\\x.AppImage'),
       '"/home/al ice/Apps/T3 \\\\"100%%\\\\" \\\\$HOME\\\\\\\\x.AppImage"',
     );
+    const entry = renderUrlHandlerDesktopEntry({
+      displayName: "NeoCode",
+      command: ["/usr/bin/env", "/app"],
+      scheme: "t3code",
+      iconPath: "/home/al ice/icons/T3\\x.png",
+    });
+    assert.include(entry, "Icon=/home/al ice/icons/T3\\\\x.png");
   });
 
   it("makes configured and effective generic xdg-utils ownership agree with two candidates", () =>
@@ -94,7 +104,7 @@ describe("DesktopUrlRegistration", () => {
         "system-config",
         "system-data",
       ]) {
-        mkdirSync(join(root, dir), { recursive: true, mode: 0o700 });
+        NodeFS.mkdirSync(NodePath.join(root, dir), { recursive: true, mode: 0o700 });
       }
       const plan = resolveDesktopUrlRegistration({
         platform: "linux",
@@ -105,43 +115,43 @@ describe("DesktopUrlRegistration", () => {
         appPath: '/source app/main "entry".cjs',
       });
       const canonical = "com.t3tools.T3Code.desktop";
-      const applications = join(root, "data/applications");
+      const applications = NodePath.join(root, "data/applications");
       const entry = renderUrlHandlerDesktopEntry({
         displayName: "NeoCode",
         command: plan.command,
         scheme: plan.scheme,
       });
-      writeFileSync(join(applications, canonical), entry);
-      writeFileSync(
-        join(applications, "old-handler.desktop"),
+      NodeFS.writeFileSync(NodePath.join(applications, canonical), entry);
+      NodeFS.writeFileSync(
+        NodePath.join(applications, "old-handler.desktop"),
         '[Desktop Entry]\nType=Application\nName=Older app\nExec="/usr/bin/false" %U\nMimeType=x-scheme-handler/t3code;\n',
       );
-      writeFileSync(
-        join(applications, "mimeinfo.cache"),
+      NodeFS.writeFileSync(
+        NodePath.join(applications, "mimeinfo.cache"),
         "[MIME Cache]\nx-scheme-handler/t3code=old-handler.desktop;\n",
       );
       const env = {
         PATH: "/usr/bin:/bin",
         LANG: "C.UTF-8",
-        HOME: join(root, "home"),
-        XDG_CONFIG_HOME: join(root, "config"),
-        XDG_DATA_HOME: join(root, "data"),
-        XDG_CACHE_HOME: join(root, "cache"),
-        XDG_RUNTIME_DIR: join(root, "runtime"),
-        XDG_CONFIG_DIRS: join(root, "system-config"),
-        XDG_DATA_DIRS: join(root, "system-data"),
+        HOME: NodePath.join(root, "home"),
+        XDG_CONFIG_HOME: NodePath.join(root, "config"),
+        XDG_DATA_HOME: NodePath.join(root, "data"),
+        XDG_CACHE_HOME: NodePath.join(root, "cache"),
+        XDG_RUNTIME_DIR: NodePath.join(root, "runtime"),
+        XDG_CONFIG_DIRS: NodePath.join(root, "system-config"),
+        XDG_DATA_DIRS: NodePath.join(root, "system-data"),
         XDG_CURRENT_DESKTOP: "X-Generic",
         XDG_SESSION_TYPE: "none",
         DBUS_SESSION_BUS_ADDRESS: `unix:path=${root}/no-session-bus`,
       };
-      const setDefault = spawnSync(
+      const setDefault = NodeChildProcess.spawnSync(
         "/usr/bin/xdg-mime",
         ["default", canonical, "x-scheme-handler/t3code"],
         { env, encoding: "utf8", timeout: 5000 },
       );
       assert.equal(setDefault.status, 0, setDefault.stderr);
-      const configured = readFileSync(join(root, "config/mimeapps.list"), "utf8");
-      const effective = spawnSync(
+      const configured = NodeFS.readFileSync(NodePath.join(root, "config/mimeapps.list"), "utf8");
+      const effective = NodeChildProcess.spawnSync(
         "/usr/bin/xdg-mime",
         ["query", "default", "x-scheme-handler/t3code"],
         { env, encoding: "utf8", timeout: 5000 },
@@ -149,7 +159,10 @@ describe("DesktopUrlRegistration", () => {
       assert.include(configured, `x-scheme-handler/t3code=${canonical}`);
       assert.equal(effective.status, 0, effective.stderr);
       assert.equal(effective.stdout.trim(), canonical);
-      assert.equal(readFileSync(join(applications, effective.stdout.trim()), "utf8"), entry);
+      assert.equal(
+        NodeFS.readFileSync(NodePath.join(applications, effective.stdout.trim()), "utf8"),
+        entry,
+      );
       assert.include(entry, '"/source app/main \\\\"entry\\\\".cjs" %U');
     }));
 });

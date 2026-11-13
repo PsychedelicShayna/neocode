@@ -1,303 +1,386 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import {
-  MessageId,
-  CommandId,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  ProjectId,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  ThreadId,
-} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import {
+  CommandId,
+  MessageId,
+  ProjectId,
+  ThreadId,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ThreadProjection,
+} from "@t3tools/contracts";
+import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
-import * as Queue from "effect/Queue";
+import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import * as SubscriptionRef from "effect/SubscriptionRef";
-import { ChildProcessSpawner } from "effect/unstable/process";
-import { makeOrchestrationIntegrationHarness } from "./OrchestrationEngineHarness.integration.ts";
-import { makeNeoPiAdapter } from "../src/provider/Layers/NeoPiAdapter.ts";
-import { makeNeoPiDiscoveryHub } from "../src/provider/neopi/NeoPiDiscovery.ts";
-import type { NeoPiRuntimeInput } from "../src/provider/neopi/NeoPiSessionRuntime.ts";
-import type {
-  NeoPiResumeCursor,
-  NeoPiRuntimeFrame,
-  NeoPiRuntimeState,
-  NeoPiSessionRuntimeShape,
-} from "../src/provider/neopi/NeoPiRuntimeTypes.ts";
+import * as SqlitePersistence from "../src/persistence/Sqlite.ts";
+import * as EffectWorker from "../src/orchestration-v2/EffectWorker.ts";
+import * as EventSink from "../src/orchestration-v2/EventSink.ts";
+import * as Orchestrator from "../src/orchestration-v2/Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../src/orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderSessionManager from "../src/orchestration-v2/ProviderSessionManager.ts";
+import { layerWithRegistry } from "../src/orchestration-v2/testkit/ProviderReplayHarness.ts";
+import {
+  makeNativeAdapterHarness,
+  modelSelection,
+} from "../src/provider/neopi/NeoPiAdapterTestHarness.ts";
 
-const provider = ProviderDriverKind.make("neopi");
-const instanceId = ProviderInstanceId.make("neopi");
 const firstThread = ThreadId.make("neopi-ingestion-first");
 const otherThread = ThreadId.make("neopi-ingestion-other");
-const createdAt = "2026-09-27T00:00:00.000Z";
-
-/** Controlled native frames, but the adapter, ProviderService, ingestion and sqlite are real. */
-const makeRuntime = (input: NeoPiRuntimeInput) =>
-  Effect.gen(function* () {
-    const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
-    const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
-    const sessionDir = `${input.t3Home}/neopi/sessions/default/${input.threadId}`;
-    const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>(
-      input.cursor ?? {
-        v: 1,
-        sessionDir,
-        sessionId: `native-${input.threadId}`,
-        sessionFile: `${sessionDir}/session.jsonl`,
-        turnBoundaries: [],
-      },
-    );
-    return {
-      threadId: input.threadId,
-      state,
-      cursor,
-      capabilities: new Set(["v2"]),
-      start: SubscriptionRef.set(state, "ready"),
-      startTurn: (turn) =>
-        Effect.gen(function* () {
-          yield* SubscriptionRef.set(state, "running");
-          const previous = yield* SubscriptionRef.get(cursor);
-          yield* SubscriptionRef.set(cursor, {
-            ...previous,
-            turnBoundaries: [
-              ...previous.turnBoundaries,
-              { turnId: turn.turnId, userEntryId: `native-user-${turn.turnId}` },
-            ],
-          });
-          const text = `answer: ${turn.text}`;
-          for (const frame of [
-            { type: "agent_start", turnId: turn.turnId },
-            {
-              type: "message_start",
-              message: { role: "assistant", content: [] },
-              turnId: turn.turnId,
-            },
-            {
-              type: "message_update",
-              assistantMessageEvent: { type: "text_delta", delta: text },
-              turnId: turn.turnId,
-            },
-            {
-              type: "message_end",
-              message: { role: "assistant", content: [{ type: "text", text }] },
-              turnId: turn.turnId,
-            },
-            ...(turn.text === "first"
-              ? [
-                  {
-                    type: "tool_execution_start",
-                    toolCallId: "tool-1",
-                    toolName: "bash",
-                    args: { command: "pwd" },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "tool_execution_end",
-                    toolCallId: "tool-1",
-                    toolName: "bash",
-                    result: { content: [{ type: "text", text: "workspace" }] },
-                    turnId: turn.turnId,
-                  },
-                ]
-              : []),
-            { type: "t3.turn.outcome", state: "completed", turnId: turn.turnId },
-          ])
-            yield* Queue.offer(frames, frame);
-          yield* SubscriptionRef.set(state, "ready");
-          return { turnId: turn.turnId };
-        }),
-      steer: () => Effect.void,
-      interrupt: SubscriptionRef.set(state, "ready"),
-      compact: () => Effect.void,
-      resolvePlanProposal: () => Effect.void,
-      respondUi: () => Effect.void,
-      writeFrame: () => Effect.void,
-      request: () => Effect.succeed({ messages: [] }),
-      frames: Stream.fromQueue(frames),
-      restart: () => Effect.void,
-      stop: SubscriptionRef.set(state, "stopped").pipe(Effect.andThen(Queue.shutdown(frames))),
-      setRuntimeMode: () => Effect.void,
-      onSessionIdentityMayHaveChanged: Effect.void,
-      applyModelSelection: () => Effect.void,
-    } satisfies NeoPiSessionRuntimeShape;
+const createThread = (
+  orchestrator: Orchestrator.OrchestratorV2["Service"],
+  threadId: ThreadId,
+  cwd: string,
+) =>
+  orchestrator.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make(`create:${threadId}`),
+    threadId,
+    projectId: ProjectId.make("native-ingestion"),
+    title: String(threadId),
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: cwd,
+    createdBy: "user",
+    creationSource: "web",
   });
+const dispatch = (
+  orchestrator: Orchestrator.OrchestratorV2["Service"],
+  threadId: ThreadId,
+  text: string,
+) =>
+  orchestrator.dispatch({
+    type: "message.dispatch",
+    commandId: CommandId.make(`send:${threadId}:${text}`),
+    threadId,
+    messageId: MessageId.make(`message:${threadId}:${text}`),
+    text,
+    attachments: [],
+    dispatchMode: { type: "start_immediately" },
+    createdBy: "user",
+    creationSource: "web",
+  });
+const savedNative = (projection: OrchestrationV2ThreadProjection) => {
+  const providerThread = projection.providerThreads.find(
+    (thread) => thread.id === projection.thread.activeProviderThreadId,
+  );
+  const cursor = providerThread?.nativeMetadata?.neopiResumeCursor;
+  if (!providerThread || !cursor) throw new Error("Missing persisted native identity");
+  return { providerThread, cursor };
+};
+const watch = Effect.fn("nativeIngestion.watch")(function* (
+  sink: EventSink.EventSinkV2["Service"],
+  threadId: ThreadId,
+  predicate: (event: OrchestrationV2DomainEvent) => boolean,
+) {
+  const afterSequence = yield* sink.latestSequence({ threadId });
+  return yield* sink.stream({ threadId, afterSequence }).pipe(
+    Stream.filter((event) => predicate(event.event)),
+    Stream.take(1),
+    Stream.runDrain,
+    Effect.forkScoped,
+  );
+});
 
 it.live(
-  "preserves NeoPi turns, tool activities and cursor across threads and session restart",
+  "persists actual native turns, tools, identities and cursor across V2 sessions and SQLite restart",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-        const adapter = yield* makeNeoPiAdapter({
-          settings: {
-            enabled: true,
-            binaryPath: "npi",
-            profile: "",
-            launchArgs: "",
-            customModels: [],
-          },
-          instanceId,
-          binary: "npi",
-          cwd: "/tmp",
-          t3Home: "/tmp",
-          attachmentsDir: "/tmp",
-          environment: {},
-          spawn: spawner.spawn,
-          discovery: yield* makeNeoPiDiscoveryHub(),
-          makeRuntime,
-        });
-        const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
-        yield* Effect.addFinalizer(() => harness.dispose);
-        yield* harness.engine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make("neopi-project-create"),
-          projectId: ProjectId.make("neopi-project"),
-          title: "NeoPi project",
-          workspaceRoot: harness.workspaceDir,
-          defaultModelSelection: { instanceId, model: "neopi-current" },
-          createdAt,
-        });
-        for (const [index, threadId] of [firstThread, otherThread].entries()) {
-          yield* harness.engine.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(`neopi-thread-create-${index}`),
-            threadId,
-            projectId: ProjectId.make("neopi-project"),
-            title: `NeoPi thread ${index}`,
-            modelSelection: { instanceId, model: "neopi-current" },
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            runtimeMode: "approval-required",
-            branch: null,
-            worktreePath: harness.workspaceDir,
-            createdAt,
+        const h = yield* makeNativeAdapterHarness();
+        const cwd = yield* checkpointWorkspace("native-ingestion");
+        const fs = yield* FileSystem.FileSystem;
+        const databaseLayer = SqlitePersistence.layerFromPath(`${h.home}/ingestion.sqlite`).pipe(
+          Layer.provide(NodeServices.layer),
+        );
+        const registry = ProviderAdapterRegistry.layerSingle(h.adapter);
+        const services = () =>
+          layerWithRegistry({ name: "native-ingestion" }, registry, {
+            databaseLayer,
+            runEffectWorker: false,
           });
-          yield* harness.providerService.startSession(threadId, {
-            threadId,
-            provider,
-            providerInstanceId: instanceId,
-            cwd: harness.workspaceDir,
-            runtimeMode: "approval-required",
+        const expectedMessages = ["first", "second", "after restart", "cwd mode restart"];
+        const original = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          yield* createThread(orchestrator, firstThread, cwd);
+          yield* createThread(orchestrator, otherThread, cwd);
+          const send = Effect.fn("nativeIngestion.send")(function* (
+            threadId: ThreadId,
+            text: string,
+            tool = false,
+          ) {
+            const completed = yield* watch(
+              sink,
+              threadId,
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.status === "completed" &&
+                event.payload.userMessageId === MessageId.make(`message:${threadId}:${text}`),
+            );
+            const checkpointReady = yield* watch(
+              sink,
+              threadId,
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.status === "waiting" &&
+                event.payload.userMessageId === MessageId.make(`message:${threadId}:${text}`),
+            );
+            const accepted = yield* watch(
+              sink,
+              threadId,
+              (event) =>
+                event.type === "provider-turn.updated" && event.payload.inputAccepted === true,
+            );
+            yield* dispatch(orchestrator, threadId, text);
+            yield* worker.drain();
+            yield* Fiber.join(accepted);
+            const pending = yield* orchestrator.getThreadProjection(threadId);
+            const { cursor } = savedNative(pending);
+            const run = pending.runs.find(
+              (run) => run.userMessageId === MessageId.make(`message:${threadId}:${text}`),
+            );
+            assert.isDefined(run);
+            const attempt = pending.attempts.find((attempt) => attempt.id === run?.activeAttemptId);
+            assert.isTrue(
+              pending.providerTurns.some(
+                (turn) => turn.runAttemptId === attempt?.id && turn.inputAccepted === true,
+              ),
+            );
+            if (tool) {
+              yield* h.emit(
+                {
+                  type: "tool_execution_start",
+                  toolCallId: "tool-1",
+                  toolName: "bash",
+                  args: { command: "pwd" },
+                },
+                cursor.sessionFile,
+              );
+              yield* h.emit(
+                {
+                  type: "tool_execution_end",
+                  toolCallId: "tool-1",
+                  toolName: "bash",
+                  result: { content: [{ type: "text", text: "workspace" }] },
+                },
+                cursor.sessionFile,
+              );
+            }
+            yield* h.complete(`answer: ${text}`, cursor.sessionFile);
+            yield* Fiber.join(checkpointReady);
+            yield* worker.drain();
+            yield* Fiber.join(completed);
+            return yield* orchestrator.getThreadProjection(threadId);
           });
-        }
-        yield* harness.providerService.sendTurn({ threadId: firstThread, input: "first" });
-        yield* harness.providerService.sendTurn({ threadId: otherThread, input: "parallel" });
-        yield* harness.waitForThread(
-          firstThread,
-          (thread) =>
-            thread.messages.some(
-              (message) =>
-                message.role === "assistant" &&
-                message.text === "answer: first" &&
-                !message.streaming,
-            ) && thread.activities.some((activity) => activity.kind === "tool.completed"),
-        );
-        yield* harness.waitForThread(otherThread, (thread) =>
-          thread.messages.some(
-            (message) =>
-              message.role === "assistant" &&
-              message.text === "answer: parallel" &&
-              !message.streaming,
-          ),
-        );
-        yield* harness.providerService.sendTurn({ threadId: firstThread, input: "second" });
-        yield* harness.waitForThread(firstThread, (thread) =>
-          thread.messages.some(
-            (message) =>
-              message.role === "assistant" &&
-              message.text === "answer: second" &&
-              !message.streaming,
-          ),
-        );
-        yield* harness.providerService.stopSession({ threadId: firstThread });
-        yield* harness.providerService.startSession(firstThread, {
-          threadId: firstThread,
-          provider,
-          providerInstanceId: instanceId,
-          cwd: harness.workspaceDir,
-          runtimeMode: "approval-required",
-        });
-        const resumed = (yield* adapter.listSessions()).find(
-          (session) => session.threadId === firstThread,
-        );
-        assert.equal((resumed?.resumeCursor as NeoPiResumeCursor).turnBoundaries.length, 2);
-        yield* harness.providerService.sendTurn({ threadId: firstThread, input: "after restart" });
-        const first = yield* harness.waitForThread(
-          firstThread,
-          (thread) =>
-            thread.messages.filter((message) => message.role === "assistant" && !message.streaming)
-              .length === 3 && thread.session?.status === "ready",
-        );
-        const other = yield* harness.waitForThread(otherThread, (thread) =>
-          thread.messages.some((message) => message.role === "assistant" && !message.streaming),
-        );
-        assert.deepEqual(
-          first.messages
+          const first = yield* send(firstThread, "first", true);
+          const firstIdentity = savedNative(first).cursor;
+          const other = yield* send(otherThread, "parallel");
+          const otherIdentity = savedNative(other).cursor;
+          assert.notEqual(firstIdentity.sessionFile, otherIdentity.sessionFile);
+          assert.notEqual(firstIdentity.sessionId, otherIdentity.sessionId);
+          const second = yield* send(firstThread, "second");
+          assert.equal(savedNative(second).cursor.turnBoundaries.length, 2);
+          const liveSession = second.providerSessions.find((session) => session.status === "ready");
+          assert.isDefined(liveSession);
+          yield* manager.close(liveSession!.id);
+          const restarted = yield* send(firstThread, "after restart");
+          assert.equal(savedNative(restarted).cursor.sessionFile, firstIdentity.sessionFile);
+          assert.equal(savedNative(restarted).cursor.sessionId, firstIdentity.sessionId);
+          assert.equal(savedNative(restarted).cursor.turnBoundaries.length, 3);
+          const newCwd = `${cwd}/moved`;
+          yield* fs.makeDirectory(newCwd);
+          yield* orchestrator.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make("move-cwd"),
+            threadId: firstThread,
+            worktreePath: newCwd,
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("change-mode"),
+            threadId: firstThread,
+            runtimeMode: "auto",
+          });
+          const moved = yield* send(firstThread, "cwd mode restart");
+          assert.equal(savedNative(moved).cursor.sessionFile, firstIdentity.sessionFile);
+          assert.equal(savedNative(moved).cursor.turnBoundaries.length, 4);
+          assert.equal(h.runtimeInputs.at(-1)?.cwd, newCwd);
+          assert.equal(h.runtimeInputs.at(-1)?.runtimeMode, "auto");
+          assert.deepEqual(
+            moved.messages
+              .filter((message) => message.role === "assistant")
+              .map((message) => message.text),
+            expectedMessages.map((text) => `answer: ${text}`),
+          );
+          const tool = moved.turnItems.find((item) => item.type === "command_execution");
+          assert.equal(tool?.status, "completed");
+          if (tool?.type !== "command_execution")
+            throw new Error("Missing native command execution");
+          assert.equal(tool.input, "pwd");
+          const ids = [...moved.messages, ...other.messages]
             .filter((message) => message.role === "assistant")
-            .map((message) => message.text),
-          ["answer: first", "answer: second", "answer: after restart"],
+            .map((message) => message.id);
+          assert.equal(new Set(ids).size, 5);
+          return { firstIdentity, otherIdentity, newCwd };
+        }).pipe(Effect.provide(services()));
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const restored = yield* orchestrator.getThreadProjection(firstThread);
+          const other = yield* orchestrator.getThreadProjection(otherThread);
+          assert.equal(
+            savedNative(restored).cursor.sessionFile,
+            original.firstIdentity.sessionFile,
+          );
+          assert.equal(savedNative(other).cursor.sessionFile, original.otherIdentity.sessionFile);
+          assert.equal(savedNative(restored).cursor.turnBoundaries.length, 4);
+          assert.equal(restored.thread.worktreePath, original.newCwd);
+          assert.equal(restored.thread.runtimeMode, "auto");
+          assert.equal(restored.providerTurns.filter((turn) => turn.inputAccepted).length, 4);
+          const completed = yield* watch(
+            sink,
+            firstThread,
+            (event) => event.type === "run.updated" && event.payload.status === "completed",
+          );
+          const checkpointReady = yield* watch(
+            sink,
+            firstThread,
+            (event) => event.type === "run.updated" && event.payload.status === "waiting",
+          );
+          yield* dispatch(orchestrator, firstThread, "after database restart");
+          yield* worker.drain();
+          const running = yield* orchestrator.getThreadProjection(firstThread);
+          assert.equal(savedNative(running).cursor.sessionId, original.firstIdentity.sessionId);
+          yield* h.complete("answer: after database restart", original.firstIdentity.sessionFile);
+          yield* Fiber.join(checkpointReady);
+          yield* worker.drain();
+          yield* Fiber.join(completed);
+          const final = yield* orchestrator.getThreadProjection(firstThread);
+          assert.equal(savedNative(final).cursor.turnBoundaries.length, 5);
+          assert.deepEqual(
+            final.messages
+              .filter((message) => message.role === "assistant")
+              .map((message) => message.text),
+            [...expectedMessages, "after database restart"].map((text) => `answer: ${text}`),
+          );
+        }).pipe(Effect.provide(services()));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "records only correlated native acceptance before a fast terminal and retains rejected input across SQLite restart",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeNativeAdapterHarness();
+        const cwd = yield* checkpointWorkspace("native-acceptance");
+        const databaseLayer = SqlitePersistence.layerFromPath(`${h.home}/acceptance.sqlite`).pipe(
+          Layer.provide(NodeServices.layer),
         );
-        const assistantIds = [...first.messages, ...other.messages]
-          .filter((message) => message.role === "assistant")
-          .map((message) => message.id);
-        assert.equal(new Set(assistantIds).size, 4);
-        assert.equal(
-          first.activities.filter((activity) => activity.kind === "tool.completed").length,
-          1,
-        );
-        assert.equal(
-          first.activities.filter((activity) => activity.kind === "tool.completed")[0]?.id !==
-            undefined,
-          true,
-        );
-        const finalSession = (yield* adapter.listSessions()).find(
-          (session) => session.threadId === firstThread,
-        );
-        assert.equal((finalSession?.resumeCursor as NeoPiResumeCursor).turnBoundaries.length, 3);
-        const newCwd = `${harness.workspaceDir}/moved`;
-        yield* (yield* FileSystem.FileSystem).makeDirectory(newCwd, { recursive: true });
-        yield* harness.engine.dispatch({
-          type: "thread.meta.update",
-          commandId: CommandId.make("neopi-move-worktree"),
-          threadId: firstThread,
-          worktreePath: newCwd,
-        });
-        yield* harness.engine.dispatch({
-          type: "thread.runtime-mode.set",
-          commandId: CommandId.make("neopi-change-mode"),
-          threadId: firstThread,
-          runtimeMode: "auto",
-          createdAt,
-        });
-        yield* harness.engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("neopi-restart-through-reactor"),
-          threadId: firstThread,
-          message: {
-            messageId: MessageId.make("neopi-user-after-cwd-change"),
-            role: "user",
-            text: "cwd mode restart",
-            attachments: [],
-          },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "auto",
-          createdAt,
-        });
-        yield* harness.waitForThread(
-          firstThread,
-          (thread) =>
-            thread.messages.some(
-              (message) =>
-                message.role === "assistant" &&
-                message.text === "answer: cwd mode restart" &&
-                !message.streaming,
-            ) && thread.session?.status === "ready",
-        );
-        const moved = (yield* adapter.listSessions()).find(
-          (session) => session.threadId === firstThread,
-        );
-        assert.equal(moved?.cwd, newCwd);
-        assert.equal(moved?.runtimeMode, "auto");
-        assert.equal((moved?.resumeCursor as NeoPiResumeCursor).turnBoundaries.length, 4);
-      }).pipe(Effect.provide(NodeServices.layer)),
-    ),
+        const services = () =>
+          layerWithRegistry(
+            { name: "native-acceptance" },
+            ProviderAdapterRegistry.layerSingle(h.adapter),
+            { databaseLayer, runEffectWorker: false },
+          );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* createThread(orchestrator, firstThread, cwd);
+          const seen = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          h.gatePrompt(
+            Deferred.await(release),
+            Deferred.succeed(seen, undefined).pipe(Effect.asVoid),
+          );
+          const completed = yield* watch(
+            sink,
+            firstThread,
+            (event) => event.type === "run.updated" && event.payload.status === "completed",
+          );
+          const checkpointReady = yield* watch(
+            sink,
+            firstThread,
+            (event) => event.type === "run.updated" && event.payload.status === "waiting",
+          );
+          const running = yield* watch(
+            sink,
+            firstThread,
+            (event) => event.type === "provider-turn.updated" && event.payload.status === "running",
+          );
+          yield* dispatch(orchestrator, firstThread, "delayed acknowledgment");
+          const starting = yield* worker.drain().pipe(Effect.forkScoped);
+          yield* Deferred.await(seen);
+          yield* Fiber.join(running);
+          const pending = yield* orchestrator.getThreadProjection(firstThread);
+          assert.equal(pending.runs[0]?.status, "running");
+          assert.isFalse(pending.providerTurns.some((turn) => turn.inputAccepted === true));
+          yield* h.complete("finished before acknowledgment");
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(starting);
+          yield* Fiber.join(checkpointReady);
+          yield* worker.drain();
+          yield* Fiber.join(completed);
+          const accepted = yield* orchestrator.getThreadProjection(firstThread);
+          assert.equal(accepted.runs[0]?.status, "completed");
+          assert.isTrue(accepted.providerTurns.some((turn) => turn.inputAccepted === true));
+          h.failNextPrompt("native rejected input");
+          const failed = yield* watch(
+            sink,
+            firstThread,
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.status === "failed" &&
+              event.payload.userMessageId ===
+                MessageId.make(`message:${firstThread}:rejected input`),
+          );
+          yield* dispatch(orchestrator, firstThread, "rejected input");
+          yield* worker.drain();
+          yield* Fiber.join(failed);
+        }).pipe(Effect.provide(services()));
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const restored = yield* orchestrator.getThreadProjection(firstThread);
+          const accepted = restored.runs.find(
+            (run) =>
+              run.userMessageId === MessageId.make(`message:${firstThread}:delayed acknowledgment`),
+          );
+          const rejected = restored.runs.find(
+            (run) => run.userMessageId === MessageId.make(`message:${firstThread}:rejected input`),
+          );
+          assert.equal(accepted?.status, "completed");
+          assert.equal(rejected?.status, "failed");
+          const acceptance = (runId: typeof accepted) =>
+            restored.providerTurns.some(
+              (turn) =>
+                turn.inputAccepted === true &&
+                restored.attempts.some(
+                  (attempt) =>
+                    attempt.id === turn.runAttemptId &&
+                    attempt.rootNodeId === turn.nodeId &&
+                    attempt.runId === runId?.id,
+                ),
+            );
+          assert.isTrue(acceptance(accepted));
+          assert.isFalse(acceptance(rejected));
+          assert.deepEqual(
+            restored.messages
+              .filter((message) => message.role === "user")
+              .map((message) => message.text),
+            ["delayed acknowledgment", "rejected input"],
+          );
+        }).pipe(Effect.provide(services()));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );

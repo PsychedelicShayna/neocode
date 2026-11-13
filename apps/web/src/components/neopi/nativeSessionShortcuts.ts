@@ -3,7 +3,7 @@ import { nativeRecord } from "@t3tools/client-runtime/neopi-native-sessions";
 import { nativeEffortLabel } from "./nativeTraits";
 
 /** Keybinding commands only the native session workspace implements. */
-export const NATIVE_SESSION_COMMANDS = [
+const NATIVE_SESSION_COMMANDS = [
   "composer.thinking.cycle",
   "composer.role.cycleForward",
   "composer.role.cycleBackward",

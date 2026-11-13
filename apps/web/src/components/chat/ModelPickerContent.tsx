@@ -1,11 +1,23 @@
-import type {
-  ProviderInstanceId,
-  ProviderDriverKind,
-  ResolvedKeybindingsConfig,
+import { useLegendListRef } from "~/hooks/useLegendListRef";
+import { useStableCallback } from "~/hooks/useStableCallback";
+import {
+  type ProviderInstanceId,
+  type ProviderDriverKind,
+  type ResolvedKeybindingsConfig,
+  MODEL_PICKER_JUMP_KEYBINDING_COMMANDS,
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
-import { memo, useMemo, useState, useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import {
+  memo,
+  useState,
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useRef,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { ModelListRow } from "./ModelListRow";
 import { ModelPickerSidebar, type ModelPickerRailEntry } from "./ModelPickerSidebar";
 import { modelPickerModelKey, parseModelPickerModelKey } from "./modelPickerKeys";
@@ -17,6 +29,7 @@ import {
 } from "../ui/combobox";
 import type { ModelEsque } from "./providerIconUtils";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
+import { registerModelPickerContent } from "../../modelPickerVisibility";
 import { primaryServerKeybindingsAtom } from "../../state/server";
 import {
   modelPickerJumpCommandForIndex,
@@ -24,9 +37,15 @@ import {
   resolveShortcutCommand,
   shortcutLabelForCommand,
 } from "../../keybindings";
+import {
+  useEnvironmentModelPreferences,
+  useToggleEnvironmentModelFavorite,
+} from "~/hooks/useSettings";
+import { announce } from "~/lib/announce";
+import { cn } from "~/lib/utils";
+import { getVirtualizedScrollFadeClassName } from "../ui/scroll-area";
 import { TooltipProvider } from "../ui/tooltip";
 import { providerModelKey } from "../../modelOrdering";
-import { useClientSettings, useUpdateClientSettings } from "~/hooks/useSettings";
 import type { ProviderInstanceEntry } from "../../providerInstances";
 import {
   nativeSwitcherModels,
@@ -52,7 +71,126 @@ export function resolveModelPickerSelectedModel(input: {
 }) {
   return input.options.find((option) => option.slug === input.model);
 }
-export const ModelPickerContent = memo(function ModelPickerContent(props: {
+const EMPTY_MODEL_JUMP_LABELS = new Map<string, string>();
+const MODEL_LIST_ESTIMATED_ITEM_SIZE = 44;
+const ROW_UNITS = 11;
+const ROW_SEPARATOR_UNITS = 0.5;
+const LIST_CHROME_UNITS = 15.5;
+
+function ModelListSeparator() {
+  return <div className="h-0.5" />;
+}
+
+function modelJumpLabelsByKey(
+  modelKeys: ReadonlyArray<string>,
+  keybindings: ResolvedKeybindingsConfig,
+  terminalOpen: boolean,
+): ReadonlyMap<string, string> {
+  const shortcutLabelOptions = {
+    platform: navigator.platform,
+    context: { terminalFocus: false, terminalOpen, modelPickerOpen: true },
+  };
+  const mapping = new Map<string, string>();
+  for (const [index, modelKey] of modelKeys.entries()) {
+    const command = modelPickerJumpCommandForIndex(index);
+    const label = command && shortcutLabelForCommand(keybindings, command, shortcutLabelOptions);
+    if (label) {
+      mapping.set(modelKey, label);
+    }
+  }
+  return mapping.size > 0 ? mapping : EMPTY_MODEL_JUMP_LABELS;
+}
+
+function ModelPickerList({
+  listRef,
+  itemKeys,
+  extraData,
+  renderItem,
+}: {
+  listRef: RefObject<LegendListRef | null>;
+  itemKeys: ReadonlyArray<string>;
+  extraData: unknown;
+  renderItem: (props: { item: string; index: number }) => ReactNode;
+}) {
+  const [showTopScrollFade, setShowTopScrollFade] = useState(false);
+  const [showBottomScrollFade, setShowBottomScrollFade] = useState(false);
+  const updateScrollFades = () => {
+    const metrics = listRef.current?.getState();
+    if (!metrics) return;
+    setShowTopScrollFade(!metrics.isAtStart);
+    setShowBottomScrollFade(!metrics.isAtEnd);
+  };
+  const scrollRef = useLegendListRef(listRef, updateScrollFades);
+
+  return (
+    <div
+      className={cn(
+        "relative min-h-0 overflow-hidden pr-px",
+        itemKeys.length > 0 ? "flex-1" : "h-0",
+      )}
+    >
+      <ComboboxListVirtualized>
+        <LegendList<string>
+          ref={scrollRef}
+          data={itemKeys}
+          extraData={extraData}
+          keyExtractor={(modelKey) => modelKey}
+          renderItem={renderItem}
+          estimatedItemSize={MODEL_LIST_ESTIMATED_ITEM_SIZE}
+          drawDistance={480}
+          recycleItems
+          contentContainerClassName="pl-2 pr-px"
+          ItemSeparatorComponent={ModelListSeparator}
+          onLayout={updateScrollFades}
+          onScroll={updateScrollFades}
+          onReady={updateScrollFades}
+          className={cn(
+            "scrollbar-gutter-stable h-full overflow-x-hidden overscroll-y-contain py-1.5 [&::-webkit-scrollbar-track]:my-2",
+            getVirtualizedScrollFadeClassName({
+              top: showTopScrollFade,
+              bottom: showBottomScrollFade,
+            }),
+          )}
+        />
+      </ComboboxListVirtualized>
+    </div>
+  );
+}
+
+// Capture gives picker shortcuts priority over the composer.
+function WindowKeyDownListener({ onKeyDown }: { onKeyDown: (event: KeyboardEvent) => void }) {
+  const handleKeyDown = useEffectEvent(onKeyDown);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes a capture-phase window keydown listener for the picker's lifetime
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => handleKeyDown(event);
+    window.addEventListener("keydown", listener, true);
+    return () => {
+      window.removeEventListener("keydown", listener, true);
+    };
+  }, []);
+  return null;
+}
+
+export const ModelPickerContent = memo(function ModelPickerContent({
+  activeInstanceId,
+  selectorContext,
+  model,
+  selectedModels,
+  onToggleModel,
+  lockedProvider,
+  lockedContinuationGroupKey,
+  instanceEntries,
+  keybindings: providedKeybindings,
+  modelOptionsByInstance,
+  terminalOpen,
+  onRequestClose,
+  getModelDisabledReason,
+  onInstanceModelChange,
+  searchInputRef,
+  docked,
+  onFocusEffort,
+  listFooter,
+}: {
   activeInstanceId: ProviderInstanceId;
   selectorContext: NativeSelectorContext;
   model: string;
@@ -71,89 +209,99 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     model: string,
     choice?: NativeModelChoice,
   ) => void;
+  /** The owning popup supplies its initial focus target. */
+  searchInputRef: RefObject<HTMLInputElement | null>;
+  docked?: boolean;
+  onFocusEffort?: () => void;
+  listFooter?: ReactNode;
 }) {
   const [query, setQuery] = useState("");
   const [selectedRail, setSelectedRail] = useState<string | null>(() => {
-    if (!props.model) return null;
-    const group = nativeSwitcherGroup({ slug: props.model, name: props.model });
+    if (!model) return null;
+    const group = nativeSwitcherGroup({ slug: model, name: model });
     return group === ROLES_GROUP ? ROLES_KEY : providerRailKey(group);
   });
-  const searchInputRef = useRef<HTMLInputElement>(null);
+  const pickerContentRef = useRef<HTMLDivElement>(null);
+  const [searchHeight, setSearchHeight] = useState(0);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes this picker's mount to global keydown handlers
+  useLayoutEffect(() => registerModelPickerContent(), []);
   const listRef = useRef<LegendListRef | null>(null);
   const highlightedRef = useRef<string | null>(null);
   const serverKeybindings = useAtomValue(primaryServerKeybindingsAtom);
-  const keybindings = props.keybindings ?? serverKeybindings;
-  const favorites = useClientSettings().favorites;
-  const updateSettings = useUpdateClientSettings();
-  const favoriteKeys = useMemo(
-    () => new Set(favorites.map((favorite) => providerModelKey(favorite.provider, favorite.model))),
-    [favorites],
+  const keybindings = providedKeybindings ?? serverKeybindings;
+  const { favorites } = useEnvironmentModelPreferences(selectorContext.environmentId);
+  const toggleFavorite = useToggleEnvironmentModelFavorite(selectorContext.environmentId);
+  const favoriteKeys = new Set(
+    favorites.map((favorite) => providerModelKey(favorite.provider, favorite.model)),
   );
-  const applicableEntries = useMemo(
-    () =>
-      props.instanceEntries.filter(
-        (entry) =>
-          entry.driverKind === "neopi" &&
-          (props.lockedProvider === null || entry.driverKind === props.lockedProvider) &&
-          (!props.lockedContinuationGroupKey ||
-            entry.continuationGroupKey === props.lockedContinuationGroupKey),
-      ),
-    [props.instanceEntries, props.lockedProvider, props.lockedContinuationGroupKey],
+  const applicableEntries = instanceEntries.filter(
+    (entry) =>
+      entry.driverKind === "neopi" &&
+      (lockedProvider === null || entry.driverKind === lockedProvider) &&
+      (!lockedContinuationGroupKey || entry.continuationGroupKey === lockedContinuationGroupKey),
   );
-  const native = useNeoPiModelSelector(props.selectorContext, applicableEntries, query);
-  const queried = useMemo(
-    () =>
-      nativeSwitcherModels({
-        entries: applicableEntries,
-        results: native.results,
-        activeInstanceId: props.activeInstanceId,
-        activeModel: props.model,
-        activeOption: props.modelOptionsByInstance
-          .get(props.activeInstanceId)
-          ?.find((option) => option.slug === props.model),
-        includeUnavailableSelection: !native.pending && query === "",
-      }),
-    [
-      applicableEntries,
-      native.results,
-      native.pending,
-      props.activeInstanceId,
-      props.model,
-      props.modelOptionsByInstance,
-      query,
-    ],
-  );
-  // Keep unfiltered answers while searching, but never carry them into another native scope.
-  const [browse, setBrowse] = useState({
-    scopeKey: native.scopeKey,
-    models: EMPTY_MODELS,
+  const native = useNeoPiModelSelector(selectorContext, applicableEntries, query);
+  const queried = nativeSwitcherModels({
+    entries: applicableEntries,
+    results: native.results,
+    activeInstanceId: activeInstanceId,
+    activeModel: model,
+    activeOption: modelOptionsByInstance
+      .get(activeInstanceId)
+      ?.find((option) => option.slug === model),
+    includeUnavailableSelection: !native.pending && query === "",
   });
-  const cachedBrowse = browse.scopeKey === native.scopeKey ? browse.models : EMPTY_MODELS;
-  const browseModels = query === "" && native.hasResponse ? queried : cachedBrowse;
-  if (browseModels !== browse.models || browse.scopeKey !== native.scopeKey)
-    setBrowse({ scopeKey: native.scopeKey, models: browseModels });
+  // Keep unfiltered native responses while searching, never a derived row-array identity.
+  const [browse, setBrowse] = useState<{
+    scopeKey: string;
+    results: typeof native.results | null;
+    includeUnavailable: boolean;
+  }>({ scopeKey: native.scopeKey, results: null, includeUnavailable: false });
+  const captureBrowse = query === "" && native.hasResponse;
+  const browseResults = captureBrowse
+    ? native.results
+    : browse.scopeKey === native.scopeKey
+      ? browse.results
+      : null;
+  const includeUnavailable = captureBrowse
+    ? !native.pending
+    : browse.scopeKey === native.scopeKey && browse.includeUnavailable;
+  if (
+    browse.results !== browseResults ||
+    browse.scopeKey !== native.scopeKey ||
+    browse.includeUnavailable !== includeUnavailable
+  )
+    setBrowse({ scopeKey: native.scopeKey, results: browseResults, includeUnavailable });
+  const browseModels = captureBrowse
+    ? queried
+    : browseResults
+      ? nativeSwitcherModels({
+          entries: applicableEntries,
+          results: browseResults,
+          activeInstanceId,
+          activeModel: model,
+          activeOption: modelOptionsByInstance
+            .get(activeInstanceId)
+            ?.find((option) => option.slug === model),
+          includeUnavailableSelection: includeUnavailable,
+        })
+      : EMPTY_MODELS;
   // While NeoPi ranks a typed query, the unfiltered catalog narrows locally so results appear
   // at once; the ranked answer then replaces them, keeping the user's highlighted row in place.
-  const highlightPinRef = useRef<{ key: string; index: number } | null>(null);
-  const searchModels = useMemo(
-    () =>
-      native.hasResponse
-        ? pinNativeSwitcherModel(queried, highlightPinRef.current)
-        : filterNativeSwitcherModels(browseModels, query),
-    [native.hasResponse, browseModels, query, queried],
-  );
+  const [highlightPin, setHighlightPin] = useState<{ key: string; index: number } | null>(null);
+  const searchModels = native.hasResponse
+    ? pinNativeSwitcherModel(queried, highlightPin)
+    : filterNativeSwitcherModels(browseModels, query);
   const models = query === "" ? browseModels : searchModels;
-  const allModelsByKey = useMemo(
-    () =>
-      new Map(models.map((model) => [modelPickerModelKey(model.instanceId, model.slug), model])),
-    [models],
+  const allModelsByKey = new Map(
+    models.map((model) => [modelPickerModelKey(model.instanceId, model.slug), model]),
   );
-  const rail = useMemo<ReadonlyArray<ModelPickerRailEntry>>(() => {
+  const rail: ReadonlyArray<ModelPickerRailEntry> = (() => {
     const providers = [
       ...new Set(
         applicableEntries
           .flatMap((entry) =>
-            (props.modelOptionsByInstance.get(entry.instanceId) ?? []).map(nativeSwitcherGroup),
+            (modelOptionsByInstance.get(entry.instanceId) ?? []).map(nativeSwitcherGroup),
           )
           .concat(browseModels.map((model) => model.group)),
       ),
@@ -165,11 +313,11 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       { key: FAVORITES_KEY, label: "Favorites", pinned: true },
       ...providers.map((group) => ({ key: providerRailKey(group), label: group, pinned: false })),
     ];
-  }, [applicableEntries, props.modelOptionsByInstance, browseModels]);
+  })();
   const effectiveRail = rail.some((entry) => entry.key === selectedRail)
     ? selectedRail
     : (rail[0]?.key ?? null);
-  const visibleModels = useMemo(() => {
+  const visibleModels = (() => {
     if (query !== "") return models;
     if (effectiveRail === ROLES_KEY) return models.filter((model) => model.group === ROLES_GROUP);
     if (effectiveRail === FAVORITES_KEY)
@@ -179,173 +327,138 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           favoriteKeys.has(providerModelKey(model.instanceId, model.slug)),
       );
     return models.filter((model) => providerRailKey(model.group) === effectiveRail);
-  }, [models, query, effectiveRail, favoriteKeys]);
-  const selectedKeys = useMemo(
-    () =>
-      new Set(
-        (props.selectedModels ?? [{ instanceId: props.activeInstanceId, model: props.model }]).map(
-          (selection) => modelPickerModelKey(selection.instanceId, selection.model),
-        ),
-      ),
-    [props.selectedModels, props.activeInstanceId, props.model],
+  })();
+  const selectedKeys = new Set(
+    (selectedModels ?? [{ instanceId: activeInstanceId, model: model }]).map((selection) =>
+      modelPickerModelKey(selection.instanceId, selection.model),
+    ),
   );
-  const disabledReason = useCallback(
-    (instanceId: ProviderInstanceId, slug: string) => {
-      const model = allModelsByKey.get(modelPickerModelKey(instanceId, slug));
-      return (
-        props.getModelDisabledReason?.(instanceId, slug) ??
-        (model?.isUnavailable
-          ? "This saved model or role is not available in the native selector scope."
-          : null)
-      );
-    },
-    [allModelsByKey, props.getModelDisabledReason],
+  const disabledReason = (instanceId: ProviderInstanceId, slug: string) => {
+    const model = allModelsByKey.get(modelPickerModelKey(instanceId, slug));
+    return (
+      getModelDisabledReason?.(instanceId, slug) ??
+      (model?.isUnavailable
+        ? "This saved model or role is not available in the native selector scope."
+        : null)
+    );
+  };
+  const select = (key: string, additive = false) => {
+    const parsed = parseModelPickerModelKey(key);
+    const model = parsed
+      ? visibleModels.find(
+          (row) => row.instanceId === parsed.instanceId && row.slug === parsed.slug,
+        )
+      : undefined;
+    if (!model || disabledReason(model.instanceId, model.slug)) return null;
+    if (additive && onToggleModel) onToggleModel(model.instanceId, model.slug);
+    else onInstanceModelChange(model.instanceId, model.slug, model.choice);
+    return model;
+  };
+  const focusSearch = useStableCallback(() =>
+    searchInputRef.current?.focus({ preventScroll: true }),
   );
-  const select = useCallback(
-    (key: string, additive = false) => {
-      const parsed = parseModelPickerModelKey(key);
-      const model = parsed
-        ? visibleModels.find(
-            (row) => row.instanceId === parsed.instanceId && row.slug === parsed.slug,
-          )
-        : undefined;
-      if (!model || disabledReason(model.instanceId, model.slug)) return;
-      if (additive && props.onToggleModel) props.onToggleModel(model.instanceId, model.slug);
-      else props.onInstanceModelChange(model.instanceId, model.slug, model.choice);
-    },
-    [visibleModels, disabledReason, props.onToggleModel, props.onInstanceModelChange],
-  );
-  const toggleFavorite = useCallback(
-    (instanceId: ProviderInstanceId, slug: string) => {
-      const key = providerModelKey(instanceId, slug);
-      void updateSettings({
-        favorites: favoriteKeys.has(key)
-          ? favorites.filter(
-              (favorite) => providerModelKey(favorite.provider, favorite.model) !== key,
-            )
-          : [...favorites, { provider: instanceId, model: slug }],
-      });
-    },
-    [favorites, favoriteKeys, updateSettings],
-  );
-  const focusSearch = useCallback(() => searchInputRef.current?.focus({ preventScroll: true }), []);
-  const selectRail = useCallback(
-    (key: string) => {
-      highlightedRef.current = null;
-      highlightPinRef.current = null;
-      setSelectedRail(key);
-      setQuery("");
-      focusSearch();
-    },
-    [focusSearch],
-  );
-  // The popover's own focus management can land on the rail or the trigger first,
-  // so the search box claims focus again after layout, the next frame and the next task.
-  useLayoutEffect(() => {
+  const selectRail = useStableCallback((key: string) => {
+    highlightedRef.current = null;
+    setHighlightPin(null);
+    setSelectedRail(key);
+    setQuery("");
     focusSearch();
-    const frame = window.requestAnimationFrame(focusSearch);
-    const timeout = window.setTimeout(focusSearch, 0);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      window.clearTimeout(timeout);
-    };
-  }, [focusSearch]);
-  const allKeys = useMemo(
-    () => models.map((model) => modelPickerModelKey(model.instanceId, model.slug)),
-    [models],
+  });
+  const allKeys = models.map((model) => modelPickerModelKey(model.instanceId, model.slug));
+  const visibleKeys = visibleModels.map((model) =>
+    modelPickerModelKey(model.instanceId, model.slug),
   );
-  const visibleKeys = useMemo(
-    () => visibleModels.map((model) => modelPickerModelKey(model.instanceId, model.slug)),
-    [visibleModels],
+  const modelByKey = new Map(
+    visibleModels.map((model) => [modelPickerModelKey(model.instanceId, model.slug), model]),
   );
-  const modelByKey = useMemo(
-    () =>
-      new Map(
-        visibleModels.map((model) => [modelPickerModelKey(model.instanceId, model.slug), model]),
-      ),
-    [visibleModels],
-  );
-  const shortcutContext = useMemo(
-    () => ({ terminalFocus: false, terminalOpen: props.terminalOpen, modelPickerOpen: true }),
-    [props.terminalOpen],
-  );
-  const jumpKeys = useMemo(
-    () =>
-      visibleModels
-        .filter((model) => !disabledReason(model.instanceId, model.slug))
-        .map((model) => modelPickerModelKey(model.instanceId, model.slug)),
-    [visibleModels, disabledReason],
-  );
-  const jumpLabels = useMemo(
-    () =>
-      new Map(
-        jumpKeys.flatMap((key, index) => {
-          const command = modelPickerJumpCommandForIndex(index);
-          const label = command
-            ? shortcutLabelForCommand(keybindings, command, {
-                platform: navigator.platform,
-                context: shortcutContext,
-              })
-            : null;
-          return label ? [[key, label] as const] : [];
-        }),
-      ),
-    [jumpKeys, keybindings, shortcutContext],
-  );
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.repeat || isCommandPaletteOpen()) return;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        props.onRequestClose?.();
-        return;
-      }
-      const command = resolveShortcutCommand(event, keybindings, {
-        platform: navigator.platform,
-        context: shortcutContext,
-      });
-      if (command === "modelPicker.previousProvider" || command === "modelPicker.nextProvider") {
-        event.preventDefault();
-        event.stopPropagation();
-        const index = rail.findIndex((entry) => entry.key === effectiveRail);
-        const next =
-          rail[
-            (index + (command === "modelPicker.nextProvider" ? 1 : -1) + rail.length) % rail.length
-          ];
-        if (next) selectRail(next.key);
-        return;
-      }
-      const jumpIndex = modelPickerJumpIndexFromCommand(command ?? "");
-      if (jumpIndex !== null) {
-        event.preventDefault();
-        event.stopPropagation();
-        const key = jumpKeys[jumpIndex];
-        if (key) select(key);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [
-    keybindings,
-    shortcutContext,
-    rail,
-    effectiveRail,
-    selectRail,
-    jumpKeys,
-    select,
-    props.onRequestClose,
-  ]);
-  const extraData = useMemo(
-    () => ({ selectedKeys, jumpLabels, disabledReason, favoriteKeys, searching: query !== "" }),
-    [selectedKeys, jumpLabels, disabledReason, favoriteKeys, query],
-  );
+
+  const shortcutContext = {
+    terminalFocus: false,
+    terminalOpen: terminalOpen,
+    modelPickerOpen: true,
+  };
+  const jumpKeys = visibleModels
+    .filter((model) => !disabledReason(model.instanceId, model.slug))
+    .slice(0, MODEL_PICKER_JUMP_KEYBINDING_COMMANDS.length)
+    .map((model) => modelPickerModelKey(model.instanceId, model.slug));
+  const jumpLabels = modelJumpLabelsByKey(jumpKeys, keybindings, terminalOpen);
+  const extraData = { selectedKeys, jumpLabels, disabledReason, favoriteKeys, query };
   const showProvider = query !== "" || effectiveRail === FAVORITES_KEY;
+  const tallestTabUnits = (() => {
+    const counts = new Map<string, number>();
+    for (const model of browseModels) {
+      counts.set(model.group, (counts.get(model.group) ?? 0) + 1);
+      if (
+        model.group !== ROLES_GROUP &&
+        favoriteKeys.has(providerModelKey(model.instanceId, model.slug))
+      ) {
+        counts.set(FAVORITES_KEY, (counts.get(FAVORITES_KEY) ?? 0) + 1);
+      }
+    }
+    let tallest = 0;
+    for (const count of counts.values()) tallest = Math.max(tallest, count);
+    return tallest === 0 ? 0 : tallest * (ROW_UNITS + ROW_SEPARATOR_UNITS) - ROW_SEPARATOR_UNITS;
+  })();
+  const onWindowKeyDown = (event: KeyboardEvent) => {
+    if (
+      event.defaultPrevented ||
+      event.repeat ||
+      event.isComposing ||
+      event.keyCode === 229 ||
+      isCommandPaletteOpen()
+    )
+      return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onRequestClose?.();
+      return;
+    }
+    const command = resolveShortcutCommand(event, keybindings, {
+      platform: navigator.platform,
+      context: shortcutContext,
+    });
+    if (command === "modelPicker.previousProvider" || command === "modelPicker.nextProvider") {
+      event.preventDefault();
+      event.stopPropagation();
+      const index = rail.findIndex((entry) => entry.key === effectiveRail);
+      const next =
+        rail[
+          (index + (command === "modelPicker.nextProvider" ? 1 : -1) + rail.length) % rail.length
+        ];
+      if (next) {
+        selectRail(next.key);
+        announce(next.label, "model-picker");
+      }
+      return;
+    }
+    const jumpIndex = modelPickerJumpIndexFromCommand(command ?? "");
+    if (jumpIndex === null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const key = jumpKeys[jumpIndex];
+    const selected = key ? select(key) : null;
+    if (selected) announce(`Model: ${selected.name}`, "model-picker");
+  };
 
   return (
     <TooltipProvider delay={0}>
+      <WindowKeyDownListener onKeyDown={onWindowKeyDown} />
       <div
-        className="flex h-[min(26rem,var(--available-height,70vh))] min-h-0 w-[min(36rem,calc(100vw-2rem))] overflow-hidden rounded-[calc(var(--radius-lg)-1px)]"
+        ref={pickerContentRef}
+        className={cn(
+          "relative flex w-screen max-w-[36rem] flex-row overflow-hidden",
+          docked ? "max-sm:h-56 max-sm:w-full max-sm:max-w-none" : "max-h-86.5",
+        )}
+        style={
+          docked
+            ? undefined
+            : query !== ""
+              ? { height: searchHeight }
+              : {
+                  minHeight: `min(calc(var(--spacing) * ${tallestTabUnits + LIST_CHROME_UNITS} + 1px), calc(var(--spacing) * 86.5))`,
+                }
+        }
         data-model-picker-content="true"
       >
         <ModelPickerSidebar
@@ -362,18 +475,16 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           autoHighlight
           open
           virtualized
-          multiple={props.onToggleModel !== undefined}
-          value={
-            props.onToggleModel
-              ? [...selectedKeys]
-              : modelPickerModelKey(props.activeInstanceId, props.model)
-          }
+          multiple={onToggleModel !== undefined}
+          value={onToggleModel ? [...selectedKeys] : modelPickerModelKey(activeInstanceId, model)}
           onItemHighlighted={(key, details) => {
             highlightedRef.current = typeof key === "string" ? key : null;
-            highlightPinRef.current =
-              typeof key === "string" && details.reason !== "none" && details.index >= 0
-                ? { key, index: details.index }
-                : highlightPinRef.current;
+            if (typeof key === "string" && details.reason !== "none" && details.index >= 0)
+              setHighlightPin((previous) =>
+                previous?.key === key && previous.index === details.index
+                  ? previous
+                  : { key, index: details.index },
+              );
             if (details.reason === "keyboard" && details.index >= 0)
               void listRef.current?.scrollIndexIntoView?.({
                 index: details.index,
@@ -396,10 +507,18 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
               aria-label="Search models and roles"
               value={query}
               onChange={(event) => {
-                highlightPinRef.current = null;
+                if (query === "") setSearchHeight(pickerContentRef.current?.offsetHeight ?? 0);
+                setHighlightPin(null);
                 setQuery(event.target.value);
               }}
               onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) {
+                  (
+                    event as typeof event & { preventBaseUIHandler?: () => void }
+                  ).preventBaseUIHandler?.();
+                  event.stopPropagation();
+                  return;
+                }
                 if (
                   (event.key === "ArrowLeft" && !query && !event.shiftKey) ||
                   (event.key === "Tab" && event.shiftKey)
@@ -416,6 +535,28 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                     button.focus();
                     return;
                   }
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onRequestClose?.();
+                  return;
+                }
+                if (
+                  onFocusEffort &&
+                  event.key === "ArrowRight" &&
+                  !event.altKey &&
+                  !event.ctrlKey &&
+                  !event.metaKey &&
+                  !event.shiftKey &&
+                  event.currentTarget.selectionStart === query.length
+                ) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const key = highlightedRef.current;
+                  const pickedNew = key !== null && !selectedKeys.has(key) && select(key) !== null;
+                  if (!pickedNew) onFocusEffort();
+                  return;
                 }
                 if (event.key === "Enter" && highlightedRef.current) {
                   (
@@ -441,37 +582,27 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                 {error}
               </p>
             ))}
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <ComboboxListVirtualized>
-                <LegendList<string>
-                  ref={listRef}
-                  data={visibleKeys}
-                  extraData={extraData}
-                  keyExtractor={(key) => key}
-                  renderItem={({ item: key, index }) => {
-                    const model = modelByKey.get(key);
-                    return model ? (
-                      <ModelListRow
-                        index={index}
-                        model={model}
-                        isSelected={selectedKeys.has(key)}
-                        isFavorite={favoriteKeys.has(
-                          providerModelKey(model.instanceId, model.slug),
-                        )}
-                        showProvider={showProvider}
-                        jumpLabel={jumpLabels.get(key) ?? null}
-                        disabledReason={disabledReason(model.instanceId, model.slug)}
-                        onToggleFavorite={() => toggleFavorite(model.instanceId, model.slug)}
-                      />
-                    ) : null;
-                  }}
-                  estimatedItemSize={44}
-                  drawDistance={480}
-                  recycleItems
-                  className="h-full overflow-x-hidden overscroll-y-contain"
-                />
-              </ComboboxListVirtualized>
-            </div>
+            <ModelPickerList
+              listRef={listRef}
+              itemKeys={visibleKeys}
+              extraData={extraData}
+              renderItem={({ item: key, index }) => {
+                const model = modelByKey.get(key);
+                return model ? (
+                  <ModelListRow
+                    index={index}
+                    model={model}
+                    isSelected={selectedKeys.has(key)}
+                    isFavorite={favoriteKeys.has(providerModelKey(model.instanceId, model.slug))}
+                    favoriteStarOnHover={query === "" && effectiveRail === FAVORITES_KEY}
+                    showProvider={showProvider}
+                    jumpLabel={jumpLabels.get(key) ?? null}
+                    disabledReason={disabledReason(model.instanceId, model.slug)}
+                    onToggleFavorite={toggleFavorite}
+                  />
+                ) : null;
+              }}
+            />
             {!native.pending && native.errors.length === 0 ? (
               <ComboboxEmpty className="empty:h-0">
                 {query === "" && effectiveRail === FAVORITES_KEY
@@ -479,6 +610,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
                   : "No native models match this query."}
               </ComboboxEmpty>
             ) : null}
+            {listFooter}
           </div>
         </Combobox>
       </div>

@@ -6,7 +6,6 @@ import {
   snapshotNativeSubagents,
 } from "./neopiNativeSubagents.ts";
 import { subagentFlashFor } from "./neopiNativeStatus.ts";
-import { deriveAgentPanelModel } from "./state/subagentRuntime.ts";
 
 const at = "2026-10-29T00:00:00.000Z";
 const owner = { parentToolCallId: "task-1", sessionFile: "/artifacts/worker.jsonl" };
@@ -43,7 +42,7 @@ const snapshot = (extra: Record<string, unknown> = {}) => ({
 });
 
 describe("native subagent roster", () => {
-  it("projects nested native progress and observed model facts directly into the stock panel", () => {
+  it("projects native progress and observed model facts", () => {
     let agents = reduceNativeSubagents([], lifecycle("started", { model: "@configured" }), 1, at);
     expect(agents[0]?.model).toBeNull();
     agents = reduceNativeSubagents(
@@ -68,9 +67,6 @@ describe("native subagent roster", () => {
       3,
       at,
     );
-    const panel = deriveAgentPanelModel({ agents });
-    expect(panel.runningCount).toBe(1);
-    expect(panel.totalTokens).toBe(120);
     expect(agents[0]).toMatchObject({
       id: "worker",
       role: "scout",
@@ -100,7 +96,6 @@ describe("native subagent roster", () => {
       result: "Found the boundary",
       usage: { totalTokens: 150 },
     });
-    expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
   });
 
   it("does not resurrect missing agents on reconnect or charge repeated cumulative snapshots", () => {
@@ -116,7 +111,7 @@ describe("native subagent roster", () => {
       at,
     );
     agents = disconnectNativeSubagents(agents, 4, at);
-    expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
+    expect(agents[0]?.native.disconnected).toBe(true);
     agents = snapshotNativeSubagents(agents, [snapshot()], 4, 5, at);
     agents = snapshotNativeSubagents(agents, [snapshot()], 5, 6, at);
     expect(agents.find((agent) => agent.id === "worker")).toMatchObject({
@@ -130,7 +125,7 @@ describe("native subagent roster", () => {
       ["worker", "interrupted"],
       ["finished", "completed"],
     ]);
-    expect(deriveAgentPanelModel({ agents }).totalTokens).toBe(120);
+    expect(agents[0]?.usage).toMatchObject({ totalTokens: 120 });
   });
 
   it("reactivates a reused id without terminal detail or stale owner frames and accumulates each activation once", () => {
@@ -230,7 +225,6 @@ describe("native subagent history roster", () => {
     expect(agents.find((agent) => agent.id === "late")?.completedAt).toBe(
       "2026-10-28T11:02:00.000Z",
     );
-    expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
   });
 
   it("never overrides a child a frame touched after the read began, nor one still observed live", () => {

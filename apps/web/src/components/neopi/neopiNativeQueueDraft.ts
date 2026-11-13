@@ -10,6 +10,7 @@ import { nativeWorkspaceResourceId } from "@t3tools/shared/neopiWorkspace";
 import {
   replaceComposerContextReferences,
   formatComposerContextReference,
+  toKindScopedComposerContextId,
 } from "@t3tools/shared/composerContextReferences";
 import {
   composerTargetKey,
@@ -23,10 +24,7 @@ import {
   reviewCommentFromRecord,
   terminalContextDraftFromRecord,
 } from "../../lib/composerContextRecords";
-import {
-  producerIdFromComposerContextId,
-  toKindScopedComposerContextId,
-} from "../../lib/composerContextReferences";
+import { producerIdFromComposerContextId } from "../../lib/composerContextReferences";
 import { randomUUID } from "../../lib/utils";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { assetEnvironment } from "../../state/assets";

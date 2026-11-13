@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as ByteSize from "effect/ByteSize";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 
@@ -18,8 +19,12 @@ const makeSpiedFileSystem = Effect.gen(function* () {
   const spied: FileSystem.FileSystem = Object.assign({}, fs, {
     stream: (path: string, options?: Parameters<FileSystem.FileSystem["stream"]>[1]) => {
       streamCalls.push({
-        offset: Number(options?.offset ?? 0),
-        bytesToRead: options?.bytesToRead === undefined ? undefined : Number(options.bytesToRead),
+        offset:
+          options?.offset === undefined ? 0 : Number(ByteSize.fromInputUnsafe(options.offset)),
+        bytesToRead:
+          options?.bytesToRead === undefined
+            ? undefined
+            : Number(ByteSize.fromInputUnsafe(options.bytesToRead)),
       });
       return fs.stream(path, options);
     },

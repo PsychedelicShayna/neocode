@@ -11,10 +11,24 @@ import {
 } from "./neopiNativeConversation.ts";
 
 const identity = { sessionId: "session", sessionFile: "/sessions/native.jsonl", leafId: "entry" };
+const decodeJournalEventOption = Schema.decodeUnknownOption(NeoPiJournalNativeEvent);
+const decodeJournalEvent = Schema.decodeEffect(NeoPiJournalNativeEvent);
+const encodeJournalEvent = Schema.encodeEffect(NeoPiJournalNativeEvent);
+const decodeJournalStreamEvent = Schema.decodeEffect(NeoPiJournalStreamEvent);
+const encodeJournalStreamEvent = Schema.encodeEffect(NeoPiJournalStreamEvent);
+const decodeNavigateTreeOption = Schema.decodeUnknownOption(NeoPiNavigateTreeInput);
+const decodeResumeTreeUnknownOption = Schema.decodeUnknownOption(NeoPiResumeTreeInput);
+const decodeResumeTreeOption = Schema.decodeOption(NeoPiResumeTreeInput);
+const decodeTreeOperation = Schema.decodeEffect(NeoPiTreeOperationResult);
+const encodeTreeOperation = Schema.encodeEffect(NeoPiTreeOperationResult);
+const decodeStreamingSnapshot = Schema.decodeEffect(NeoPiStreamingMessageSnapshot);
+const encodeStreamingSnapshot = Schema.encodeEffect(NeoPiStreamingMessageSnapshot);
+const decodeStreamingSnapshotOption = Schema.decodeUnknownOption(NeoPiStreamingMessageSnapshot);
+
 describe("native conversation wire", () => {
   it("accepts optional snapshot recovery IDs and rejects malformed associations", () => {
     const snapshot = { type: "journal_state", reason: "snapshot", ...identity };
-    const decode = Schema.decodeUnknownOption(NeoPiJournalNativeEvent);
+    const decode = decodeJournalEventOption;
     assert.equal(decode(snapshot)._tag, "Some");
     assert.equal(decode({ ...snapshot, messageEntryIds: [] })._tag, "Some");
     assert.equal(
@@ -41,8 +55,8 @@ describe("native conversation wire", () => {
           future: { blocks: [{ type: "image", data: "encoded", mimeType: "image/png" }] },
         },
       } as const;
-      const decoded = yield* Schema.decodeUnknownEffect(NeoPiJournalNativeEvent)(event);
-      assert.deepEqual(yield* Schema.encodeEffect(NeoPiJournalNativeEvent)(decoded), event);
+      const decoded = yield* decodeJournalEvent(event);
+      assert.deepEqual(yield* encodeJournalEvent(decoded), event);
       const frame = {
         type: "native",
         event: {
@@ -53,8 +67,8 @@ describe("native conversation wire", () => {
           future: true,
         },
       } as const;
-      const wire = yield* Schema.decodeUnknownEffect(NeoPiJournalStreamEvent)(frame);
-      assert.deepEqual(yield* Schema.encodeEffect(NeoPiJournalStreamEvent)(wire), frame);
+      const wire = yield* decodeJournalStreamEvent(frame);
+      assert.deepEqual(yield* encodeJournalStreamEvent(wire), frame);
     }),
   );
 
@@ -66,15 +80,12 @@ describe("native conversation wire", () => {
       expectedLeafId: null,
       targetId: "entry",
     };
-    const decode = Schema.decodeUnknownOption(NeoPiNavigateTreeInput);
+    const decode = decodeNavigateTreeOption;
     assert.equal(decode(options)._tag, "Some");
     const { expectedLeafId: _, ...withoutLeaf } = options;
     assert.equal(decode(withoutLeaf)._tag, "None");
-    assert.equal(Schema.decodeUnknownOption(NeoPiResumeTreeInput)(options)._tag, "None");
-    assert.equal(
-      Schema.decodeUnknownOption(NeoPiResumeTreeInput)({ ...options, resumeToken: "opaque" })._tag,
-      "Some",
-    );
+    assert.equal(decodeResumeTreeUnknownOption(options)._tag, "None");
+    assert.equal(decodeResumeTreeOption({ ...options, resumeToken: "opaque" })._tag, "Some");
   });
 
   it.effect(
@@ -105,8 +116,8 @@ describe("native conversation wire", () => {
             },
           },
         } as const;
-        const decoded = yield* Schema.decodeUnknownEffect(NeoPiTreeOperationResult)(value);
-        assert.deepEqual(yield* Schema.encodeEffect(NeoPiTreeOperationResult)(decoded), value);
+        const decoded = yield* decodeTreeOperation(value);
+        assert.deepEqual(yield* encodeTreeOperation(decoded), value);
       }),
   );
 
@@ -126,18 +137,12 @@ describe("native conversation wire", () => {
           future: ["preserved"],
         },
       } as const;
-      const decoded = yield* Schema.decodeUnknownEffect(NeoPiStreamingMessageSnapshot)(snapshot);
-      assert.deepEqual(
-        yield* Schema.encodeEffect(NeoPiStreamingMessageSnapshot)(decoded),
-        snapshot,
-      );
+      const decoded = yield* decodeStreamingSnapshot(snapshot);
+      assert.deepEqual(yield* encodeStreamingSnapshot(decoded), snapshot);
       assert.equal("entryId" in decoded, false);
-      assert.equal(Schema.decodeUnknownOption(NeoPiJournalNativeEvent)(snapshot)._tag, "None");
+      assert.equal(decodeJournalEventOption(snapshot)._tag, "None");
       const { messageId: _, ...withoutMessageId } = snapshot;
-      assert.equal(
-        Schema.decodeUnknownOption(NeoPiStreamingMessageSnapshot)(withoutMessageId)._tag,
-        "None",
-      );
+      assert.equal(decodeStreamingSnapshotOption(withoutMessageId)._tag, "None");
     }),
   );
 });

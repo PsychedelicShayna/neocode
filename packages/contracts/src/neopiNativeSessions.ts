@@ -1,18 +1,33 @@
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
-import { ReviewDiffFileContentsInput, ReviewDiffPreviewInput } from "./review.ts";
+import { ProjectId } from "./baseSchemas.ts";
+import { ModelSelection } from "./modelSelection.ts";
+import { RuntimeMode } from "./providerPolicy.ts";
+import { OrchestrationV2ThreadLaunchWorkspaceStrategy } from "./orchestrationV2.ts";
+import {
+  ReviewBranchCommitsInput,
+  ReviewDiffFileContentsInput,
+  ReviewDiffPreviewInput,
+} from "./review.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   ChatFileAttachment,
   ChatImageAttachment,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
-} from "./orchestration.ts";
+} from "./chatAttachment.ts";
 
 export const NeoPiNativeSessionRef = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   sessionFile: Schema.String,
 });
 export type NeoPiNativeSessionRef = typeof NeoPiNativeSessionRef.Type;
+
+export const NeoPiNativeSessionsGetBranchCommitsInput = Schema.Struct({
+  ref: NeoPiNativeSessionRef,
+  ...Struct.omit(ReviewBranchCommitsInput.fields, ["cwd"]),
+});
+export type NeoPiNativeSessionsGetBranchCommitsInput =
+  typeof NeoPiNativeSessionsGetBranchCommitsInput.Type;
 
 export const NeoPiNativeSessionsGetDiffPreviewInput = Schema.Struct({
   ref: NeoPiNativeSessionRef,
@@ -94,6 +109,18 @@ export const NeoPiNativeSessionsOpenResult = Schema.Struct({
   state: NeoPiNativeSessionRecord,
 });
 export type NeoPiNativeSessionsOpenResult = typeof NeoPiNativeSessionsOpenResult.Type;
+export const NeoPiNativeSessionsLaunchInput = Schema.Struct({
+  projectId: ProjectId,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+});
+export type NeoPiNativeSessionsLaunchInput = typeof NeoPiNativeSessionsLaunchInput.Type;
+export const NeoPiNativeSessionsLaunchResult = Schema.Struct({
+  ...NeoPiNativeSessionsOpenResult.fields,
+  preparationError: Schema.optional(Schema.String),
+});
+export type NeoPiNativeSessionsLaunchResult = typeof NeoPiNativeSessionsLaunchResult.Type;
 export const NeoPiNativeSessionsRequestInput = Schema.Struct({
   ref: NeoPiNativeSessionRef,
   command: NeoPiNativeSessionCommand,

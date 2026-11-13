@@ -7,7 +7,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { makeNeoPiDiscoveryHub } from "./NeoPiDiscovery.ts";
 import { makeNeoPiDiscoveryProbe } from "./NeoPiDiscoveryProbe.ts";
 
@@ -20,7 +20,7 @@ it.live(
     Effect.scoped(
       Effect.gen(function* () {
         const hub = yield* makeNeoPiDiscoveryHub();
-        const launches: ReadonlyArray<string>[] = [];
+        const launches: Array<ChildProcess.StandardCommand["args"]> = [];
         const probe = makeNeoPiDiscoveryProbe({
           binary: "npi",
           profile: "work",

@@ -7,13 +7,46 @@ import {
 } from "@t3tools/contracts";
 import { selectRunningSubprocessTerminalIds } from "@t3tools/client-runtime/state/terminal";
 import { workspaceResourceId } from "@t3tools/client-runtime/environment";
+import * as Cause from "effect/Cause";
+import * as Option from "effect/Option";
+import { AsyncResult, AtomRegistry } from "effect/reactivity";
 
-import { selectKnownTerminalSessions } from "./terminalSessions";
+import {
+  attachedTerminalSessionAtom,
+  knownTerminalSessionsAtom,
+  selectKnownTerminalSessions,
+} from "./terminalSessions";
 
-vi.mock("./terminal", () => ({ terminalEnvironment: {} }));
+const attachCalls = vi.hoisted(() => [] as unknown[]);
+const metadataAtom = await vi.hoisted(async () => {
+  const { AsyncResult, Atom } = await import("effect/reactivity");
+  return Atom.make<AsyncResult.AsyncResult<ReadonlyArray<TerminalSummary>>>(
+    AsyncResult.initial(true),
+  );
+});
+vi.mock("./terminal", async () => {
+  const { AsyncResult, Atom } = await import("effect/reactivity");
+  return {
+    terminalEnvironment: {
+      attach: (request: unknown) => {
+        attachCalls.push(request);
+        return Atom.make(AsyncResult.initial(true));
+      },
+      metadata: () => metadataAtom,
+    },
+  };
+});
+vi.mock("./session", async () => {
+  const { AsyncResult, Atom } = await import("effect/reactivity");
+  const granted = Atom.make(AsyncResult.success({}));
+  return {
+    environmentSession: { sessionStateAtom: () => granted },
+    sessionHasScope: () => true,
+    useEnvironmentScope: () => true,
+  };
+});
 
 const environmentA = EnvironmentId.make("environment-a");
-const environmentB = EnvironmentId.make("environment-b");
 const threadA = ThreadId.make("thread-a");
 const threadB = ThreadId.make("thread-b");
 
@@ -158,53 +191,53 @@ describe("selectKnownTerminalSessions", () => {
     expect(selectKnownTerminalSessions([other], environmentA, threadA)).toEqual([]);
     expect(selectKnownTerminalSessions([other], environmentA, threadB)).toBe(beforeB);
   });
+});
 
-  it("keeps environment targets separate when snapshots share the same objects", () => {
-    const metadata = [summary(threadA, "terminal-1")];
-    const first = selectKnownTerminalSessions(metadata, environmentA, threadA);
-    const second = selectKnownTerminalSessions(metadata, environmentB, threadA);
-    expect(first[0]?.target.environmentId).toBe(environmentA);
-    expect(second[0]?.target.environmentId).toBe(environmentB);
-    expect(first).not.toBe(second);
-    expect(first[0]).not.toBe(second[0]);
-    expect(selectKnownTerminalSessions([...metadata], environmentA, threadA)).toBe(first);
-    expect(selectKnownTerminalSessions([...metadata], environmentB, threadA)).toBe(second);
+describe("knownTerminalSessionsAtom", () => {
+  const metadataResult = (...terminals: ReadonlyArray<TerminalSummary>) =>
+    AsyncResult.success<ReadonlyArray<TerminalSummary>>(terminals);
+
+  it("notifies only when the thread's own terminals change", () => {
+    const registry = AtomRegistry.make();
+    const sessions = knownTerminalSessionsAtom(environmentA, threadA);
+    expect(registry.get(sessions)).toBeNull();
+
+    const first = summary(threadA, "terminal-1");
+    const other = summary(threadB, "terminal-1");
+    registry.set(metadataAtom, metadataResult(first));
+    const notified: unknown[] = [];
+    const unsubscribe = registry.subscribe(sessions, (value) => notified.push(value));
+    const before = registry.get(sessions);
+
+    registry.set(metadataAtom, metadataResult(first, other));
+    registry.set(metadataAtom, metadataResult(first, { ...other, label: "Renamed" }));
+    expect(notified).toEqual([]);
+    expect(registry.get(sessions)).toBe(before);
+
+    registry.set(metadataAtom, metadataResult({ ...first, label: "Renamed" }, other));
+    expect(notified).toHaveLength(1);
+
+    const previousSuccess = Option.some(metadataResult(first));
+    registry.set(metadataAtom, AsyncResult.failure(Cause.die("unavailable"), { previousSuccess }));
+    expect(registry.get(sessions)).toBeNull();
+    unsubscribe();
   });
+});
 
-  it("returns stable empty results without a connected environment or matching sessions", () => {
-    const metadata = [summary(threadA, "terminal-1")];
-    const empty = selectKnownTerminalSessions(null, environmentA, threadA);
-    expect(selectKnownTerminalSessions(metadata, null, threadA)).toBe(empty);
-    expect(selectKnownTerminalSessions([], environmentA, null)).toBe(empty);
-    expect(selectKnownTerminalSessions(metadata, environmentA, threadB)).toBe(empty);
-  });
+describe("attachedTerminalSessionAtom", () => {
+  it("attaches with the launch input it was keyed by", () => {
+    attachCalls.length = 0;
+    const input = {
+      threadId: threadA,
+      terminalId: "terminal-1",
+      cwd: "/repo",
+      worktreePath: null,
+      env: { T3CODE_PROJECT_ROOT: "/repo" },
+    };
+    const atom = attachedTerminalSessionAtom(environmentA, input);
+    expect(attachedTerminalSessionAtom(environmentA, { ...input })).toBe(atom);
 
-  it("does not materialize unrelated raw thread identifiers", () => {
-    const metadata = [summary(" untrimmed-thread ", "terminal-1"), summary(threadA, "terminal-2")];
-    expect(
-      selectKnownTerminalSessions(metadata, environmentA, threadA).map(
-        (session) => session.target.threadId,
-      ),
-    ).toEqual([threadA]);
-  });
-
-  it("reads the metadata array once for all thread selectors", () => {
-    const source = Array.from({ length: 40 }, (_, index) =>
-      summary(`thread-${index}`, "terminal-1"),
-    );
-    let reads = 0;
-    const metadata = new Proxy(source, {
-      get(target, property, receiver) {
-        if (typeof property === "string" && /^(0|[1-9]\d*)$/.test(property)) reads += 1;
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    for (const item of source) {
-      expect(
-        selectKnownTerminalSessions(metadata, environmentA, ThreadId.make(item.threadId)),
-      ).toHaveLength(1);
-    }
-    expect(selectKnownTerminalSessions(metadata, environmentA, null)).toHaveLength(source.length);
-    expect(reads).toBe(source.length);
+    AtomRegistry.make().get(atom);
+    expect(attachCalls).toEqual([{ environmentId: environmentA, input }]);
   });
 });

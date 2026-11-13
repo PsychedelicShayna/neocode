@@ -1,7 +1,7 @@
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { isCurrentPreviewRuntimeTab, previewRuntimeTabId } from "./previewRuntimeTabId";
+import { previewRuntimeTabId } from "./previewRuntimeTabId";
 
 describe("previewRuntimeTabId", () => {
   it("does not reuse another renderer's native webview identity", async () => {
@@ -35,25 +35,6 @@ describe("previewRuntimeTabId", () => {
       previewRuntimeTabId(base, "epoch-b", "tab_1"),
     );
   });
-
-  it("is stable for the same runtime tab", () => {
-    const ref = {
-      environmentId: EnvironmentId.make("environment-a"),
-      threadId: ThreadId.make("thread-a"),
-    };
-    expect(previewRuntimeTabId(ref, null, "tab_1")).toBe(previewRuntimeTabId(ref, null, "tab_1"));
-  });
-
-  it("rejects a pinned operation target after the server epoch changes", () => {
-    const ref = {
-      environmentId: EnvironmentId.make("environment-a"),
-      threadId: ThreadId.make("thread-a"),
-    };
-    const runtimeTabId = previewRuntimeTabId(ref, "epoch-a", "tab_1");
-
-    expect(isCurrentPreviewRuntimeTab(ref, "epoch-a", "tab_1", runtimeTabId)).toBe(true);
-    expect(isCurrentPreviewRuntimeTab(ref, "epoch-b", "tab_1", runtimeTabId)).toBe(false);
-  });
 });
 
 describe("native preview runtime ownership", () => {
@@ -75,9 +56,8 @@ describe("native preview runtime ownership", () => {
       { ...target, ref: { ...target.ref, sessionFile: "/sessions/b.jsonl" } },
     ];
     for (const other of others) {
-      expect(isCurrentPreviewRuntimeTab(other, "epoch", "tab_1", runtimeId)).toBe(false);
+      expect(previewRuntimeTabId(other, "epoch", "tab_1")).not.toBe(runtimeId);
     }
-    expect(isCurrentPreviewRuntimeTab(target, "epoch", "tab_1", runtimeId)).toBe(true);
     expect(runtimeId).not.toContain(target.ref.sessionFile);
   });
 });

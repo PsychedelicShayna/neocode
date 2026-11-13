@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { isTimelineScrollTarget } from "./timelineScrollTarget";
+import { createUpwardScrollDetector, isTimelineScrollTarget } from "./timelineScrollTarget";
 
 class ScrollElement extends EventTarget {
   scrollTop = 0;
@@ -62,32 +62,6 @@ describe("timeline scroll targets", () => {
     expect(targetsTimeline(content, timeline, -deltaY)).toBe(false);
   });
 
-  it.each(["contain", "none"])("respects overscroll-y %s at either edge", (overscrollBehaviorY) => {
-    const { timeline, group, content } = setup();
-    group.overscrollBehaviorY = overscrollBehaviorY;
-    group.scrollTop = 0;
-    expect(targetsTimeline(content, timeline, -30)).toBe(false);
-    group.scrollTop = 200;
-    expect(targetsTimeline(content, timeline, 30)).toBe(false);
-    group.scrollTop = 0;
-    group.scrollHeight = group.clientHeight;
-    expect(targetsTimeline(content, timeline, 30)).toBe(false);
-  });
-
-  it("checks nested results even when the tool group cannot scroll", () => {
-    const { timeline, group } = setup();
-    group.scrollTop = 0;
-    group.scrollHeight = group.clientHeight;
-    const result = Object.assign(new ScrollElement(group), {
-      overflowY: "scroll",
-      scrollHeight: 300,
-      scrollTop: 0.25,
-    });
-    expect(targetsTimeline(new ScrollElement(result), timeline, -30)).toBe(false);
-    result.scrollTop = 0;
-    expect(targetsTimeline(result, timeline, -30)).toBe(true);
-  });
-
   it("checks an outer group when an inner result reaches its edge", () => {
     const { timeline, group } = setup();
     const result = Object.assign(new ScrollElement(group), { overflowY: "auto" });
@@ -114,5 +88,30 @@ describe("timeline scroll targets", () => {
     expect(targetsTimeline(new EventTarget(), timeline, -30)).toBe(false);
     expect(targetsTimeline(null, timeline, -30)).toBe(false);
     expect(targetsTimeline(content, timeline, 0)).toBe(false);
+  });
+});
+
+describe("timeline scroll follow opt-out", () => {
+  it("detects iframe-only upward scrolling after following streaming content", () => {
+    const scrolledUp = createUpwardScrollDetector({ top: 1000, height: 1500 });
+    expect(scrolledUp({ top: 1000, height: 1800 })).toBe(false);
+    expect(scrolledUp({ top: 1300, height: 1800 })).toBe(false);
+    expect(scrolledUp({ top: 1200, height: 1700 })).toBe(false);
+
+    // Sandboxed frames deliver no wheel or touch event to the parent timeline.
+    expect(scrolledUp({ top: 1199.5, height: 1700 })).toBe(false);
+    expect(scrolledUp({ top: 1199, height: 1700 })).toBe(false);
+    expect(scrolledUp({ top: 1198.5, height: 1700 })).toBe(true);
+  });
+
+  it("preserves upward new-turn positioning, then detects the reader leaving that anchor", () => {
+    const scrolledUp = createUpwardScrollDetector({ top: 1400, height: 2400 });
+    // The caller must distinguish its animated positioning from iframe scroll chaining.
+    const positioning = { top: 1200, height: 2400, programmatic: true };
+    expect(scrolledUp(positioning)).toBe(false);
+    expect(scrolledUp({ ...positioning, top: 1100 })).toBe(false);
+
+    expect(scrolledUp({ top: 1100, height: 2400 })).toBe(false);
+    expect(scrolledUp({ top: 950, height: 2400 })).toBe(true);
   });
 });

@@ -2,14 +2,8 @@ import type { ComposerContextRecord, ElementContextDetails } from "@t3tools/cont
 
 import { collectComposerContextReferences } from "./composerContextReferences.ts";
 
-/**
- * Serializes a canonical message (inline reference links plus records) into the pre-inline-context
- * wire shape, for servers that do not advertise `inlineMessageContext`. Those servers drop the
- * records and forward the links as literal text, so the payload has to travel inside the message.
- *
- * The output is the format `upgradeLegacyContextMessage` parses, so a newer client reading the
- * resulting message reconstructs the same records.
- */
+// Peers without inlineMessageContext drop records, so their payload must travel in the text.
+// Keep the format readable by upgradeLegacyContextMessage to recover the same records.
 export function serializeLegacyContextMessage(input: {
   text: string;
   records: ReadonlyArray<ComposerContextRecord>;
@@ -24,7 +18,13 @@ export function serializeLegacyContextMessage(input: {
   for (const occurrence of [...occurrences].reverse()) {
     const record = recordsById.get(occurrence.contextId);
     if (!record) continue;
-    if (record.kind === "image" || record.kind === "file") continue;
+    if (
+      record.kind === "image" ||
+      record.kind === "file" ||
+      record.kind === "thread" ||
+      record.kind === "environment"
+    )
+      continue;
     used.add(occurrence.contextId);
     const replacement =
       record.kind === "review-comment" ? renderReviewComment(record) : inlineLabel(record);
@@ -46,11 +46,20 @@ export function serializeLegacyContextMessage(input: {
     ...input.records
       .filter((record) => record.kind === "review-comment" && !used.has(record.contextId))
       .map(renderReviewComment),
-    ...(input.records.some((record) => record.kind === "image" || record.kind === "file")
+    ...(input.records.some(
+      (record) =>
+        record.kind === "image" ||
+        record.kind === "file" ||
+        record.kind === "thread" ||
+        record.kind === "environment",
+    )
       ? [
           `<attachment_context>\n${JSON.stringify({
             attachments: input.records.filter(
               (record) => record.kind === "image" || record.kind === "file",
+            ),
+            contexts: input.records.filter(
+              (record) => record.kind === "thread" || record.kind === "environment",
             ),
             screenshots: input.records.flatMap((record) =>
               record.kind === "preview-annotation" &&

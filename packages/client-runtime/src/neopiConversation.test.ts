@@ -3,6 +3,7 @@ import type { NeoPiJournalEntry, NeoPiJournalPage } from "@t3tools/contracts";
 import {
   emptyNativeConversation,
   nativeNavigationGuards,
+  nativeNavigationStillCurrent,
   reduceNativeConversation,
 } from "./neopiConversation.ts";
 import {
@@ -330,6 +331,18 @@ describe("native main conversation", () => {
     expect(() => nativeNavigationGuards({ ...identity, sessionFile: null })).toThrow(
       "canonical native file",
     );
+    expect(nativeNavigationStillCurrent(identity, identity, "c")).toBe(true);
+    expect(nativeNavigationStillCurrent({ ...identity, leafId: "c" }, identity, "c")).toBe(true);
+    expect(nativeNavigationStillCurrent(null, identity, "c")).toBe(false);
+    expect(nativeNavigationStillCurrent({ ...identity, leafId: "newer" }, identity, "c")).toBe(
+      false,
+    );
+    expect(
+      nativeNavigationStillCurrent({ ...identity, sessionFile: "/other.jsonl" }, identity, "c"),
+    ).toBe(false);
+    expect(
+      nativeNavigationStillCurrent({ ...identity, sessionId: "other-session" }, identity, "c"),
+    ).toBe(false);
   });
 
   it("keeps a failed turn's error with that turn and off every later turn", () => {

@@ -11,7 +11,7 @@ describe("NeoPi legacy approval prompt", () => {
       ),
     ).toEqual({
       toolName: "bash",
-      requestType: "exec_command_approval",
+      requestType: "command",
       detail: "Allow tool: bash\nReason: destructive command\nCommand: rm -rf build\nCwd: /repo",
     });
   });
@@ -24,14 +24,14 @@ describe("NeoPi legacy approval prompt", () => {
   });
 
   it.each([
-    ["bash", "exec_command_approval"],
-    ["edit", "file_change_approval"],
-    ["write", "file_change_approval"],
-    ["delete", "file_change_approval"],
-    ["move", "file_change_approval"],
-    ["read", "file_read_approval"],
-    ["mcp__server__tool", "mcp_elicitation_approval"],
-    ["shell", "permission_approval"],
+    ["bash", "command"],
+    ["edit", "file-change"],
+    ["write", "file-change"],
+    ["delete", "file-change"],
+    ["move", "file-change"],
+    ["read", "file-read"],
+    ["mcp__server__tool", "mcp-elicitation"],
+    ["shell", "permission"],
   ] as const)("maps %s to %s", (tool, kind) => {
     expect(approvalRequestType(tool)).toBe(kind);
   });

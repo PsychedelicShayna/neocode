@@ -1,4 +1,4 @@
-import type { PtyExitEvent, PtyProcess } from "./PtyAdapter.ts";
+import type { PtyExitEvent, PtyProcess } from "@t3tools/shared/PtyAdapter";
 
 export type PendingProcessEvent =
   | { type: "output"; data: string }

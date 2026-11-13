@@ -1,10 +1,11 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   EnvironmentId,
-  EventId,
+  NodeId,
   MessageId,
+  RunAttemptId,
+  RunId,
   ThreadId,
-  type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 
@@ -70,24 +71,31 @@ const submitted: SubmittedComposerDraft = {
     },
   ],
   previewAnnotations: [],
+  threadContexts: [],
+  environmentContexts: [],
 };
-const failure = (requestId: string = messageId): OrchestrationThreadActivity => ({
-  id: EventId.make(`failure-${requestId}`),
-  tone: "error",
-  kind: "provider.turn.start.failed",
-  summary: "Provider turn start failed",
-  payload: { requestId, detail: "Native session unavailable" },
-  turnId: null,
-  createdAt,
-});
-const success = (requestId: string = messageId): OrchestrationThreadActivity => ({
-  ...failure(requestId),
-  id: EventId.make(`success-${requestId}`),
-  tone: "info",
-  kind: "provider.turn.start.succeeded",
-  summary: "Provider accepted prompt",
-  payload: { requestId, timelineBypass: true },
-});
+type SubmissionOutcomes = Parameters<
+  ReturnType<typeof useFailedSendDraftStore.getState>["reconcile"]
+>[1];
+const emptyOutcomes: SubmissionOutcomes = { runs: [], attempts: [], providerTurns: [] };
+function outcome(
+  requestId: string,
+  status: SubmissionOutcomes["runs"][number]["status"],
+  inputAccepted: boolean,
+): SubmissionOutcomes {
+  const runId = RunId.make(`run:${requestId}`);
+  const attemptId = RunAttemptId.make(`attempt:${requestId}`);
+  const nodeId = NodeId.make(`node:${requestId}`);
+  return {
+    runs: [{ id: runId, userMessageId: MessageId.make(requestId), status }],
+    attempts: [{ id: attemptId, runId, rootNodeId: nodeId }],
+    providerTurns: [
+      { runAttemptId: attemptId, nodeId, ...(inputAccepted ? { inputAccepted: true } : {}) },
+    ],
+  };
+}
+const failure = (requestId: string = messageId) => outcome(requestId, "failed", false);
+const success = (requestId: string = messageId) => outcome(requestId, "completed", true);
 const reset = () => {
   useFailedSendDraftStore.setState({ submissionsByThreadKey: {} });
   useComposerDraftStore.setState({
@@ -106,11 +114,11 @@ describe("captured provider send recovery", () => {
   it("keeps an orchestration-accepted submission until its exact provider failure and restores once", async () => {
     const recovery = useFailedSendDraftStore.getState();
     recovery.capture(target, messageId, submitted);
-    recovery.reconcile(target, []);
+    recovery.reconcile(target, emptyOutcomes);
     expect(recovery.restore(target, messageId)).toBeNull();
-    recovery.reconcile(target, [failure("another-message")]);
+    recovery.reconcile(target, failure("another-message"));
     expect(recovery.restore(target, messageId)).toBeNull();
-    recovery.reconcile(target, [failure()]);
+    recovery.reconcile(target, failure());
     const restored = recovery.restore(target, messageId);
     expect(restored?.prompt).toBe(submitted.prompt);
     expect(await restored?.images[0]?.file.text()).toBe("image bytes");
@@ -125,11 +133,11 @@ describe("captured provider send recovery", () => {
   it("releases exact successful sends and does not replay a later failure", () => {
     const recovery = useFailedSendDraftStore.getState();
     recovery.capture(target, messageId, submitted);
-    recovery.reconcile(target, [success("another-message")]);
+    recovery.reconcile(target, success("another-message"));
     expect(useFailedSendDraftStore.getState().submissionsByThreadKey).not.toEqual({});
-    recovery.reconcile(target, [success()]);
+    recovery.reconcile(target, success());
     expect(useFailedSendDraftStore.getState().submissionsByThreadKey).toEqual({});
-    recovery.reconcile(target, [failure()]);
+    recovery.reconcile(target, failure());
     expect(recovery.restore(target, messageId)).toBeNull();
     expect(useComposerDraftStore.getState().getComposerDraft(target)).toBeNull();
   });
@@ -157,37 +165,60 @@ describe("captured provider send recovery", () => {
   it("prefers a durable success over a stale failure in a catch-up snapshot", () => {
     const recovery = useFailedSendDraftStore.getState();
     recovery.capture(target, messageId, submitted);
-    recovery.reconcile(target, [failure(), success()]);
+    recovery.reconcile(target, outcome(messageId, "failed", true));
     expect(useFailedSendDraftStore.getState().submissionsByThreadKey).toEqual({});
     expect(recovery.restore(target, messageId)).toBeNull();
   });
 
-  it("does not revisit historical activity on append, but reconciles replacement snapshots", () => {
+  it("does not mistake running admission or a child's acceptance for the submitted root", () => {
     const recovery = useFailedSendDraftStore.getState();
     recovery.capture(target, messageId, submitted);
-    let historicalReads = 0;
-    const history: OrchestrationThreadActivity = {
-      ...failure("old-message"),
-      get kind() {
-        historicalReads++;
-        return "tool.completed";
-      },
+    const running = outcome(messageId, "running", false);
+    recovery.reconcile(target, running);
+    expect(recovery.restore(target, messageId)).toBeNull();
+    const childOnly = {
+      ...running,
+      providerTurns: [
+        {
+          ...running.providerTurns[0]!,
+          nodeId: NodeId.make("child-node"),
+          inputAccepted: true as const,
+        },
+      ],
     };
-    recovery.reconcile(target, [history]);
-    historicalReads = 0;
-    recovery.reconcile(target, [history, failure("other-message")]);
-    expect(historicalReads).toBe(0);
-    // A reconnect can replace all array rows, not merely append.
-    recovery.reconcile(target, [failure(), { ...history }]);
+    recovery.reconcile(target, childOnly);
+    expect(useFailedSendDraftStore.getState().submissionsByThreadKey).not.toEqual({});
+    recovery.reconcile(target, failure());
     expect(recovery.restore(target, messageId)?.prompt).toBe(submitted.prompt);
+  });
+
+  it("retains acceptance from an earlier attempt when a later retry fails", () => {
+    const recovery = useFailedSendDraftStore.getState();
+    recovery.capture(target, messageId, submitted);
+    const accepted = success();
+    const retry = {
+      ...accepted.attempts[0]!,
+      id: RunAttemptId.make("retry-attempt"),
+      rootNodeId: NodeId.make("retry-root"),
+    };
+    recovery.reconcile(target, {
+      runs: failure().runs,
+      attempts: [...accepted.attempts, retry],
+      providerTurns: [
+        ...accepted.providerTurns,
+        { runAttemptId: retry.id, nodeId: retry.rootNodeId },
+      ],
+    });
+    expect(useFailedSendDraftStore.getState().submissionsByThreadKey).toEqual({});
+    expect(recovery.restore(target, messageId)).toBeNull();
   });
 
   it("isolates identical message ids across environments", () => {
     const recovery = useFailedSendDraftStore.getState();
     recovery.capture(target, messageId, submitted);
     recovery.capture(otherTarget, messageId, { ...submitted, images: [], files: [] });
-    recovery.reconcile(otherTarget, [success()]);
-    recovery.reconcile(target, [failure()]);
+    recovery.reconcile(otherTarget, success());
+    recovery.reconcile(target, failure());
     expect(recovery.restore(otherTarget, messageId)).toBeNull();
     expect(recovery.restore(target, messageId)?.prompt).toBe(submitted.prompt);
     expect(useComposerDraftStore.getState().getComposerDraft(otherTarget)).toBeNull();

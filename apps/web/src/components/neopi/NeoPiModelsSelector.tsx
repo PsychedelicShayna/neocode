@@ -6,7 +6,6 @@ import type {
   ProviderInstanceId,
   ServerProvider,
 } from "@t3tools/contracts";
-import { useMemo } from "react";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { SETTINGS_PICKER_TRIGGER_CLASSNAME } from "../settings/settingsLayout";
@@ -69,7 +68,7 @@ export function NeoPiModelsSelector({
   exactOnly?: boolean;
   selectionLabel?: string;
 }) {
-  const entries = useMemo(() => deriveProviderInstanceEntries([provider]), [provider]);
+  const entries = deriveProviderInstanceEntries([provider]);
   const options = selectorOptions(configuration.models, provider.instanceId);
   const index = modelsIndex(configuration.models);
   const selected = index.bySelector.get(value);
@@ -87,6 +86,7 @@ export function NeoPiModelsSelector({
         : "Not available";
   return (
     <ProviderModelPicker
+      environmentId={environmentId}
       activeInstanceId={provider.instanceId}
       selectorContext={{
         environmentId,

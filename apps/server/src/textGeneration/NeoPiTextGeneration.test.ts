@@ -1,5 +1,4 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -8,19 +7,20 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as NeoPiRpcClient from "effect-neopi-rpc/client";
 import type { SpawnFn } from "effect-neopi-rpc/client";
 import { expect } from "vite-plus/test";
 
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeNeoPiTextGeneration } from "./NeoPiTextGeneration.ts";
-import { sanitizeCommitSubject } from "./TextGenerationUtils.ts";
+import { sanitizeCommitSubject } from "@t3tools/provider-core/server/textGenerationUtils";
 
 const MOCK_PEER_PATH = new URL(
   "../../../../packages/effect-neopi-rpc/test/fixtures/neopi-mock-peer.ts",
@@ -39,13 +39,14 @@ const GENERATED_REPLY = {
   title: "  Improve NeoPi pull request output\nsecondary title line",
   branch: "../Add!!! NeoPi Provider...",
   needsRefinement: false,
+  transcription: "Let's keep the existing native session.",
 };
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const GENERATED_JSON = encodeJson(GENERATED_REPLY);
 
 interface SpawnCapture {
-  readonly args: ReadonlyArray<string>;
-  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly args: ChildProcess.StandardCommand["args"];
+  readonly env: NonNullable<ChildProcess.StandardCommand["options"]["env"]>;
   readonly sessionDir: string;
   pid?: number;
 }
@@ -61,6 +62,7 @@ interface Harness {
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
   readonly captures: Array<SpawnCapture>;
   readonly root: string;
+  readonly promptStarted: Deferred.Deferred<void>;
 }
 
 const scenarioFor = (reply: string) => ({
@@ -144,8 +146,6 @@ lines.on("line", (line) => {
 
 const hangingPeer = `
 import * as readline from "node:readline";
-import * as fs from "node:fs";
-const marker = process.argv[2];
 const write = (frame) => new Promise((resolve) => process.stdout.write(JSON.stringify(frame) + "\\n", resolve));
 const ready = { type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576, maxReassembledFrameBytes: 67108864, capabilities: ["rpc-ui"] };
 await write(ready);
@@ -158,8 +158,6 @@ lines.on("line", (line) => {
     void (async () => {
       await write({ id: message.id, type: "response", command: "prompt", success: true });
       await write({ type: "agent_start" });
-      fs.writeFileSync(marker, "prompt received");
-      setInterval(() => {}, 1000);
     })();
   }
 });
@@ -194,6 +192,7 @@ const makeHarness = (
   options: HarnessOptions = {},
 ): Effect.Effect<Harness, never, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope> =>
   Effect.gen(function* () {
+    const promptStarted = yield* Deferred.make<void>();
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-neopi-text-test-"));
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => NodeFS.rmSync(root, { recursive: true, force: true })),
@@ -222,10 +221,13 @@ const makeHarness = (
     const captures: Array<SpawnCapture> = [];
     const spawn: SpawnFn = (command) =>
       Effect.gen(function* () {
-        const standard = command as ChildProcess.StandardCommand;
+        if (!ChildProcess.isStandardCommand(command)) {
+          return yield* Effect.die("Unexpected piped text-generation command");
+        }
+        const standard = command;
         const sessionIndex = standard.args.indexOf("--session-dir");
         const sessionDir = standard.args[sessionIndex + 1];
-        if (sessionIndex < 0 || sessionDir === undefined) {
+        if (sessionIndex < 0 || typeof sessionDir !== "string") {
           return yield* Effect.die("NeoPi text generation omitted --session-dir");
         }
         const capture: SpawnCapture = {
@@ -242,17 +244,33 @@ const makeHarness = (
 
     const textGeneration = makeNeoPiTextGeneration({
       binary: "npi",
+      attachmentsDir: root,
       env: { OMP_PROFILE: PROFILE },
       spawn,
       makeClient: (clientOptions) =>
-        NeoPiRpcClient.make({
-          ...clientOptions,
-          command: process.execPath,
-          args: [peerPath, ...peerArgs, ...clientOptions.args],
+        Effect.gen(function* () {
+          const scope = yield* Scope.Scope;
+          const client = yield* NeoPiRpcClient.make({
+            ...clientOptions,
+            command: process.execPath,
+            args: [peerPath, ...peerArgs, ...clientOptions.args],
+          });
+          return {
+            ...client,
+            prompt: (command: Parameters<typeof client.prompt>[0]) =>
+              client.prompt(command).pipe(
+                Effect.tap((handle) =>
+                  Deferred.await(handle.outcome).pipe(
+                    Effect.tap(() => Deferred.succeed(promptStarted, undefined)),
+                    Effect.forkIn(scope),
+                  ),
+                ),
+              ),
+          };
         }),
       deadlineMs: options.deadlineMs ?? 5_000,
     });
-    return { textGeneration, captures, root };
+    return { textGeneration, captures, root, promptStarted };
   });
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -270,16 +288,7 @@ const isProcessAlive = (pid: number): boolean => {
   }
 };
 
-const waitForFile = (path: string): Effect.Effect<boolean> =>
-  Effect.gen(function* () {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (NodeFS.existsSync(path)) return true;
-      yield* Effect.sleep("10 millis");
-    }
-    return false;
-  });
-
-it.live("generates all four text operations through a trimmed disposable RPC loadout", () =>
+it.live("isolates structured generation in disposable native RPC sessions", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
@@ -311,6 +320,11 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           message: "Implement NeoPi automatic titles",
           modelSelection: CURRENT_MODEL,
         });
+        const transcription = yield* textGeneration.generateTranscriptionPostProcessing({
+          cwd: process.cwd(),
+          prompt: "Correct the dictated sentence without changing its meaning.",
+          modelSelection: TEST_MODEL,
+        });
 
         expect(commit.subject).toBe(sanitizeCommitSubject(GENERATED_REPLY.subject));
         expect(commit.subject.length).toBeLessThanOrEqual(72);
@@ -326,7 +340,8 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
         expect(branch.branch).toBe("add-neopi-provider");
         expect(title.title).toBe("Improve NeoPi pull request output");
         expect(title.needsRefinement).toBeUndefined();
-        expect(captures).toHaveLength(4);
+        expect(transcription.transcription).toBe(GENERATED_REPLY.transcription);
+        expect(captures).toHaveLength(5);
 
         const disabledFlags = [
           "--no-tools",
@@ -334,6 +349,9 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           "--no-skills",
           "--no-rules",
           "--no-session",
+          "--no-mcp",
+          "--no-context-files",
+          "--no-lsp",
         ];
         for (const capture of captures) {
           for (const flag of disabledFlags) expect(capture.args).toContain(flag);
@@ -348,6 +366,30 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
         expect(captures[0]?.args).toContain("openai-codex/gpt-5.6-luna");
         const titleArgs = captures[3]?.args ?? [];
         expect(titleArgs).not.toContain("--model");
+      }),
+    ),
+  ),
+);
+
+it.live("refuses checkout investigation without a native restricted loadout", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { textGeneration, captures } = yield* makeHarness();
+        const error = yield* textGeneration
+          .generateReviewGuide({
+            cwd: process.cwd(),
+            number: 42,
+            title: "Review native integration",
+            description: "Preserve native session identity.",
+            baseBranch: "nightly",
+            baseCommit: "base",
+            settledReview: "",
+            modelSelection: TEST_MODEL,
+          })
+          .pipe(Effect.flip);
+        expect(error.operation).toBe("generateReviewGuide");
+        expect(captures).toEqual([]);
       }),
     ),
   ),
@@ -375,7 +417,7 @@ it.live("fails invalid JSON as TextGenerationError and still removes the session
         expect("error" in result).toBe(true);
         if ("error" in result) {
           expect(result.error._tag).toBe("TextGenerationError");
-          expect(result.error.detail).toContain("not valid JSON");
+          expect(result.error.operation).toBe("generateThreadTitle");
         }
         expect(captures).toHaveLength(1);
         expect(NodeFS.existsSync(captures[0]!.sessionDir)).toBe(false);
@@ -601,10 +643,8 @@ it.live("closes the RPC process when the generation deadline expires", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
-        const marker = NodePath.join(NodeOS.tmpdir(), `t3-neopi-hang-${NodeCrypto.randomUUID()}`);
         const { textGeneration, captures } = yield* makeHarness({
           peerSource: hangingPeer,
-          peerArgs: [marker],
           deadlineMs: 700,
         });
         const result = yield* textGeneration
@@ -628,7 +668,6 @@ it.live("closes the RPC process when the generation deadline expires", () =>
         expect(captures[0]?.pid).toBeDefined();
         expect(isProcessAlive(captures[0]!.pid!)).toBe(false);
         expect(NodeFS.existsSync(captures[0]!.sessionDir)).toBe(false);
-        NodeFS.rmSync(marker, { force: true });
       }),
     ),
   ),
@@ -638,13 +677,8 @@ it.live("closes the RPC process when a generation fiber is interrupted", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
-        const marker = NodePath.join(
-          NodeOS.tmpdir(),
-          `t3-neopi-interrupt-${NodeCrypto.randomUUID()}`,
-        );
-        const { textGeneration, captures } = yield* makeHarness({
+        const { textGeneration, captures, promptStarted } = yield* makeHarness({
           peerSource: hangingPeer,
-          peerArgs: [marker],
           deadlineMs: 10_000,
         });
         const fiber = yield* textGeneration
@@ -654,14 +688,13 @@ it.live("closes the RPC process when a generation fiber is interrupted", () =>
             modelSelection: TEST_MODEL,
           })
           .pipe(Effect.forkChild);
-        expect(yield* waitForFile(marker)).toBe(true);
+        yield* Deferred.await(promptStarted);
         expect(captures).toHaveLength(1);
         const pid = captures[0]?.pid;
         expect(pid).toBeDefined();
         yield* Fiber.interrupt(fiber);
         expect(isProcessAlive(pid!)).toBe(false);
         expect(NodeFS.existsSync(captures[0]!.sessionDir)).toBe(false);
-        NodeFS.rmSync(marker, { force: true });
       }),
     ),
   ),

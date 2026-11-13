@@ -1,12 +1,17 @@
 import { EnvironmentId, ProjectId, type NeoPiModelsTarget } from "@t3tools/contracts";
 import { makeNeoPiModelsClientState } from "@t3tools/client-runtime/neopi-models";
-import { useLocation, useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo } from "react";
+import { type AnyRouter, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
 import { connectionAtomRuntime } from "../../connection/runtime";
-import { useActiveEnvironmentId, useProjects, useServerConfigs } from "../../state/entities";
-import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
+import { useProjects } from "../../state/entities";
+import {
+  useEnvironments,
+  useEnvironmentProviders,
+  usePrimaryEnvironmentId,
+} from "../../state/environments";
 import { nativeSessionAtoms, useNativeSessionSelection } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
+import { useComposerDraftStore } from "../../composerDraftStore";
+import { resolveThreadRouteTarget } from "../../threadRoutes";
 
 export const neopiModels = makeNeoPiModelsClientState(connectionAtomRuntime);
 export interface ModelsSearch {
@@ -36,11 +41,11 @@ export function useModelsPageTarget() {
   const environmentId = search.environment
     ? EnvironmentId.make(search.environment)
     : (selected?.environmentId ?? primary);
-  const configs = useServerConfigs();
+  const providersByEnvironment = useEnvironmentProviders();
   const providers = environmentId
-    ? (configs
+    ? (providersByEnvironment
         .get(environmentId)
-        ?.providers.filter((provider) => provider.driver === "neopi" && provider.enabled) ?? [])
+        ?.filter((provider) => provider.driver === "neopi" && provider.enabled) ?? [])
     : [];
   const selectedInstanceId =
     search.instance ??
@@ -64,17 +69,14 @@ export function useModelsPageTarget() {
       ? projects.find((project) => project.workspaceRoot === nativeCwd)?.id
       : undefined;
   const providerInstanceId = provider?.instanceId;
-  const target = useMemo<NeoPiModelsTarget | null>(
-    () =>
-      providerInstanceId && onModelsRoute
-        ? {
-            providerInstanceId,
-            ...(projectId ? { projectId } : {}),
-            ...(search.sessionFile ? { sessionFile: search.sessionFile } : {}),
-          }
-        : null,
-    [providerInstanceId, projectId, search.sessionFile, onModelsRoute],
-  );
+  const target: NeoPiModelsTarget | null =
+    providerInstanceId && onModelsRoute
+      ? {
+          providerInstanceId,
+          ...(projectId ? { projectId } : {}),
+          ...(search.sessionFile ? { sessionFile: search.sessionFile } : {}),
+        }
+      : null;
   const inventory = useEnvironmentQuery(
     environmentId && target?.sessionFile
       ? nativeSessionAtoms.list({ environmentId, input: {} })
@@ -118,22 +120,31 @@ export function useModelsPageTarget() {
     changeSearch,
   };
 }
+export function openModels(router: AnyRouter) {
+  if (router.state.location.pathname === "/models") return;
+  const selected = useNativeSessionSelection.getState().target;
+  const routeTarget = resolveThreadRouteTarget(router.state.matches.at(-1)?.params ?? {});
+  const activeEnvironment =
+    routeTarget?.kind === "server"
+      ? routeTarget.threadRef.environmentId
+      : routeTarget?.kind === "draft"
+        ? useComposerDraftStore.getState().getDraftSession(routeTarget.draftId)?.environmentId
+        : undefined;
+  void router.navigate({
+    to: "/models",
+    search: selected
+      ? {
+          environment: selected.environmentId,
+          instance: selected.ref.providerInstanceId,
+          sessionFile: selected.ref.sessionFile,
+        }
+      : activeEnvironment
+        ? { environment: activeEnvironment }
+        : {},
+  });
+}
+
 export function useOpenModels() {
-  const navigate = useNavigate();
-  const selected = useNativeSessionSelection((state) => state.target);
-  const activeEnvironment = useActiveEnvironmentId();
-  const isOpen = useLocation({ select: (location) => location.pathname === "/models" });
-  return useCallback(() => {
-    if (isOpen) return;
-    void navigate({
-      to: "/models",
-      search: selected
-        ? {
-            environment: selected.environmentId,
-            instance: selected.ref.providerInstanceId,
-            sessionFile: selected.ref.sessionFile,
-          }
-        : { ...(activeEnvironment ? { environment: activeEnvironment } : {}) },
-    });
-  }, [navigate, selected, activeEnvironment, isOpen]);
+  const router = useRouter();
+  return () => openModels(router);
 }

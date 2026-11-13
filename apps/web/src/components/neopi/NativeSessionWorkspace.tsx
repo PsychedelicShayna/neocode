@@ -1,10 +1,13 @@
 import { BracesIcon, GitForkIcon, PlugIcon, UnplugIcon, XIcon } from "lucide-react";
+import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
+import { useEnvironmentScope, usePreparedConnection } from "../../state/session";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
   deferNativeEditorText,
   executeNativeSessionCommand,
   nativeCommandCompletions,
+  nativeValueItems,
   nativeRecord,
   nativeSessionKey,
   nativeDisconnectLabel,
@@ -23,7 +26,9 @@ import {
   type CommandRow,
 } from "@t3tools/client-runtime/neopi-transcript";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useStableCallback } from "../../hooks/useStableCallback";
+import * as Option from "effect/Option";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { isElectron } from "../../env";
@@ -148,11 +153,15 @@ function HeaderIconButton(props: {
   );
 }
 
-export function NativeSessionWorkspace() {
+export function NativeSessionWorkspace({ background = false }: { readonly background?: boolean }) {
   const target = useNativeSessionSelection((state) => state.target);
   const [actionsSlot, setActionsSlot] = useState<HTMLDivElement | null>(null);
   return (
-    <SidebarInset className="h-dvh min-h-0 overflow-hidden">
+    <SidebarInset
+      className={cn("h-dvh min-h-0 overflow-hidden", background && "hidden")}
+      inert={background || undefined}
+      aria-hidden={background || undefined}
+    >
       <NativeSessionTabBar actionsRef={setActionsSlot} />
       {target ? (
         <NativeSessionView
@@ -198,7 +207,7 @@ function NativeSessionStart() {
   );
 }
 
-export function NativeSessionView({
+function NativeSessionView({
   target,
   actionsSlot,
 }: {
@@ -207,6 +216,7 @@ export function NativeSessionView({
   actionsSlot?: HTMLElement | null;
 }) {
   const { feed, session, conversation, request, loading, error } = useNativeSession(target);
+  const canOperateThread = useEnvironmentScope(target.environmentId, AuthOrchestrationOperateScope);
   // Dismissing hides that one message; a different failure shows again.
   const [dismissedError, setDismissedError] = useState<string | null>(null);
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
@@ -218,7 +228,6 @@ export function NativeSessionView({
     }),
   ).label;
   const agentHub = useNativeAgentHubSource({ target, feed, request });
-  const draftStore = useComposerDraftStore;
   const panelOpen = useRightPanelStore(
     (value) => selectThreadRightPanelState(value.byThreadKey, target).isOpen,
   );
@@ -235,7 +244,7 @@ export function NativeSessionView({
   // stored prompt once here: subscribing would re-render the whole workspace
   // (transcript, panels) on every keystroke.
   const [initialPrompt] = useState(
-    () => draftStore.getState().getComposerDraft(target)?.prompt ?? "",
+    () => useComposerDraftStore.getState().getComposerDraft(target)?.prompt ?? "",
   );
   const promptRef = useRef(initialPrompt);
   const imagesRef = useRef<ComposerImageAttachment[]>([]);
@@ -244,18 +253,17 @@ export function NativeSessionView({
   const localComposerRef = useRef<ChatComposerHandle | null>(null);
   const composerRef = useComposerHandleContext() ?? localComposerRef;
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const preparedConnection = usePreparedConnection(target.environmentId);
   const timelineRef = useRef<LegendListRef | null>(null);
   const [followSignal, setFollowSignal] = useState(0);
-  const submit = useCallback<Request>(
-    async (command, attachments) => {
-      const result = await request(command, attachments);
-      if (command.type === "prompt") setFollowSignal((value) => value + 1);
-      return result;
-    },
-    [request],
-  );
+  const submit: Request = useStableCallback(async (command, attachments) => {
+    const result = await request(command, attachments);
+    if (command.type === "prompt") setFollowSignal((value) => value + 1);
+    return result;
+  });
   const [composerElement, setComposerElement] = useState<HTMLDivElement | null>(null);
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Revoke the expanded video's owned blob URL when its preview closes.
   useEffect(() => {
     const item = expandedImage?.images[expandedImage.index];
     // Local video expansions mint their own URL; image previews belong to the draft.
@@ -264,52 +272,56 @@ export function NativeSessionView({
     return () => URL.revokeObjectURL(src);
   }, [expandedImage]);
   const sendingRef = useRef(false);
-  const focusComposer = useCallback(() => composerRef.current?.focusAtEnd(), [composerRef]);
-  // The workspace remounts after Models Back; the draft stays in its store.
+  const focusComposer = useStableCallback(() => composerRef.current?.focusAtEnd());
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Restore DOM focus after this workspace mounts.
   useEffect(() => focusComposer(), [focusComposer]);
-  const pageScroll = useMemo(
-    () =>
-      createPageScrollController({
-        getContainer: () => timelineRef.current?.getScrollableNode() ?? null,
-        getScrollPaddingBottomPx: () => 0,
-      }),
-    [],
+  const getScrollContainer = useStableCallback(
+    () => timelineRef.current?.getScrollableNode() ?? null,
   );
+  const [pageScroll] = useState(() =>
+    createPageScrollController({
+      getContainer: getScrollContainer,
+      getScrollPaddingBottomPx: () => 0,
+    }),
+  );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Release held keys and scheduled scroll frames on unmount.
   useEffect(() => () => pageScroll.dispose(), [pageScroll]);
   const [debug, setDebug] = useState(false);
-  const openTree = useCallback(
-    () => useRightPanelStore.getState().open(target, "native-history"),
-    [target],
+  const openTree = useStableCallback(() =>
+    useRightPanelStore.getState().open(target, "native-history"),
   );
   const [models, setModels] = useState(false);
   const [sending, setSending] = useState(false);
   const [paging, setPaging] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
-  const [state, setState] = useState<Record<string, unknown>>({});
-  const [commands, setCommands] = useState<readonly NativeSlashCommand[]>([]);
+  const state = session?.state ?? {};
+  const [commandCatalog, setCommandCatalog] = useState<{
+    revision: number;
+    commands: readonly NativeSlashCommand[];
+  } | null>(null);
+  const commands =
+    commandCatalog?.revision === feed.commandsRevision ? commandCatalog.commands : [];
   const [dismissed, setDismissed] = useState(() => answeredDialogs.get(key) ?? new Set<string>());
   const reconnect = useNativeSessionReconnect(target);
   const [reconnecting, setReconnecting] = useState(false);
-  const reconnectNow = useCallback(() => {
+  const reconnectNow = useStableCallback(() => {
     setReconnecting(true);
     setLocalError(null);
     void reconnect()
       .catch((cause) => setLocalError(cause instanceof Error ? cause.message : String(cause)))
       .finally(() => setReconnecting(false));
-  }, [reconnect]);
+  });
   // A reconnecting session still takes sends (the server holds them); an orphaned one
   // takes them by starting an owner first.
-  const canSend = feed.connected || feed.ownerLoss === "orphaned";
+  const canSend = canOperateThread && (feed.connected || feed.ownerLoss === "orphaned");
   const ownerNotice = nativeOwnerNotice(feed.ownerLoss, session?.attachment);
-  useEffect(() => {
-    if (session) setState(session.state);
-  }, [session]);
   const sttEnabled = state.dictationEnabled;
   const availability = nativeDictationAvailability({
     isDesktop: isElectron,
     localEnvironmentDisabled: isLocalEnvironmentDisabled(),
     environmentId: target.environmentId,
     primaryEnvironmentId,
+    connection: Option.getOrNull(preparedConnection),
     attachment: session?.attachment,
     capabilities: session?.capabilities ?? null,
     connected: feed.connected,
@@ -325,32 +337,30 @@ export function NativeSessionView({
   // Turning stt.enabled on happens in NeoPi's own settings, which announce nothing:
   // coming back to this window re-reads it, so the button does not stay disabled.
   const sttOff = state.dictationEnabled === false;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Window focus refreshes native dictation settings changed outside the GUI.
   useEffect(() => {
     if (!sttOff) return;
     const refresh = () => {
-      void request({ type: "get_state" })
-        .then((observed) => setState(nativeRecord(observed)))
-        .catch(() => undefined);
+      void request({ type: "get_state" }).catch(() => undefined);
     };
     window.addEventListener("focus", refresh);
     return () => window.removeEventListener("focus", refresh);
   }, [sttOff, request]);
-  // NeoPi moved this session to another file (`/wt`, fork): the selection and
-  // its tab follow in place, never a second tab for the same session.
   const movedRef = feed.movedTo ?? session?.ref ?? null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Follow NeoPi's file relocation in the external selection and tab stores.
   useEffect(() => {
     if (movedRef && movedRef.sessionFile !== target.ref.sessionFile)
       replaceNativeSession(target, { environmentId: target.environmentId, ref: movedRef });
   }, [movedRef, target]);
-  // The sidebar and tab titles read the session list, which still names the old file.
   const hasMoved = feed.movedTo !== null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- A native file move invalidates the separately owned session catalog.
   useEffect(() => {
     if (hasMoved)
       appAtomRegistry.refresh(
         nativeSessionAtoms.list({ environmentId: target.environmentId, input: {} }),
       );
   }, [hasMoved, target.environmentId]);
-  const loadOlder = async () => {
+  const loadOlder = useStableCallback(async () => {
     if (paging || !conversation.cursor) return;
     setPaging(true);
     try {
@@ -366,14 +376,15 @@ export function NativeSessionView({
     } finally {
       setPaging(false);
     }
-  };
-  // NeoPi owns the command list; an announcement of a changed list re-reads it.
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- NeoPi announcements invalidate this session's native command catalog.
   useEffect(() => {
     if (!feed.connected) return;
+    const revision = feed.commandsRevision;
     let active = true;
     void request({ type: "get_available_commands" })
       .then((value) => {
-        if (active) setCommands(nativeSlashCommands(value));
+        if (active) setCommandCatalog({ revision, commands: nativeSlashCommands(value) });
       })
       .catch((cause) => {
         if (active) setLocalError(String(cause));
@@ -384,24 +395,24 @@ export function NativeSessionView({
   }, [feed.connected, feed.commandsRevision, request]);
   const completesArguments =
     session?.capabilities.includes(NATIVE_COMMAND_COMPLETIONS_CAPABILITY) === true;
-  const completeCommandArgument = useCallback(
-    async (command: string, prefix: string) =>
-      nativeCommandCompletions(
-        await request({ type: "get_command_completions", command, prefix }),
-        prefix,
-      ),
-    [request],
+  const completeCommandArgument = useStableCallback(async (command: string, prefix: string) =>
+    nativeCommandCompletions(
+      await request({ type: "get_command_completions", command, prefix }),
+      prefix,
+    ),
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Observe stored draft availability before applying native editor text.
   useEffect(() => {
     const editor = feed.editor;
     if (!editor || consumedEditors.get(key) === editor.id) return;
     return deferNativeEditorText({
-      hasDraft: () => composerDraftHasUserContent(draftStore.getState().getComposerDraft(target)),
+      hasDraft: () =>
+        composerDraftHasUserContent(useComposerDraftStore.getState().getComposerDraft(target)),
       apply: () => {
         consumedEditors.set(key, editor.id);
-        draftStore.getState().setPrompt(target, editor.text);
+        useComposerDraftStore.getState().setPrompt(target, editor.text);
       },
-      subscribe: (changed) => draftStore.subscribe(changed),
+      subscribe: (changed) => useComposerDraftStore.subscribe(changed),
       onDeferred: () =>
         toastManager.add({
           id: "native-editor-draft-kept",
@@ -412,59 +423,52 @@ export function NativeSessionView({
         }),
     });
   }, [feed.editor, key, target]);
-  const execute = useCallback(
-    async (command: Record<string, unknown> & { type: string }) => {
-      setLocalError(null);
-      return executeNativeSessionCommand({
-        command,
-        submit: () => submit(command),
-        readState: () => request({ type: "get_state" }),
-        onState: setState,
-        onRefreshError: setLocalError,
-      });
-    },
-    [request, submit],
-  );
+  const execute = useStableCallback(async (command: Record<string, unknown> & { type: string }) => {
+    setLocalError(null);
+    return executeNativeSessionCommand({
+      command,
+      submit: () => submit(command),
+      readState: () => request({ type: "get_state" }),
+      onRefreshError: setLocalError,
+    });
+  });
   // While NeoPi runs, a prompt steers in at the next tool boundary, which is
   // what T3's queue promises; the alternate intent waits for the whole run.
-  const send = useCallback(
-    async (intent?: ComposerSubmissionIntent) => {
-      const snapshot = draftStore.getState().getComposerDraft(target);
-      if (!composerDraftHasUserContent(snapshot) || !snapshot || sendingRef.current || !canSend)
-        return;
-      if (composerRef.current?.hasPendingAttachments()) {
-        setLocalError("Wait for the attachment to finish preparing before sending.");
-        return;
-      }
-      const refocus = captureNativeComposerFocus(composerRef);
-      sendingRef.current = true;
-      setSending(true);
-      setLocalError(null);
-      try {
-        const prompt = await prepareNativePrompt(target, snapshot);
-        // Nothing owns the session: take it over first, so the prompt lands in a live one.
-        if (!feed.connected) await reconnect();
-        const busy = nativeSessionAtoms.cached(target)?.busy ?? feed.busy;
-        await submit(
-          {
-            type: "prompt",
-            message: prompt.message,
-            ...(busy ? { streamingBehavior: intent === "alternate" ? "followUp" : "steer" } : {}),
-          },
-          prompt.attachments,
-        );
-        consumeNativeDraft(target, snapshot, prompt.attachments);
-      } catch (cause) {
-        setLocalError(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        sendingRef.current = false;
-        setSending(false);
-        refocus();
-      }
-    },
-    [target, canSend, feed.connected, feed.busy, submit, reconnect, composerRef, focusComposer],
-  );
-  const commandOutputs = useMemo(() => {
+  const send = useStableCallback(async (intent?: ComposerSubmissionIntent) => {
+    const snapshot = useComposerDraftStore.getState().getComposerDraft(target);
+    if (!composerDraftHasUserContent(snapshot) || !snapshot || sendingRef.current || !canSend)
+      return;
+    if (composerRef.current?.hasPendingAttachments()) {
+      setLocalError("Wait for the attachment to finish preparing before sending.");
+      return;
+    }
+    const refocus = captureNativeComposerFocus(composerRef);
+    sendingRef.current = true;
+    setSending(true);
+    setLocalError(null);
+    try {
+      const prompt = await prepareNativePrompt(target, snapshot);
+      // Nothing owns the session: take it over first, so the prompt lands in a live one.
+      if (!feed.connected) await reconnect();
+      const busy = nativeSessionAtoms.cached(target)?.busy ?? feed.busy;
+      await submit(
+        {
+          type: "prompt",
+          message: prompt.message,
+          ...(busy ? { streamingBehavior: intent === "alternate" ? "followUp" : "steer" } : {}),
+        },
+        prompt.attachments,
+      );
+      consumeNativeDraft(target, snapshot, prompt.attachments);
+    } catch (cause) {
+      setLocalError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+      refocus();
+    }
+  });
+  const commandOutputs = (() => {
     // Command results are local display history anchored after the entry they followed.
     const outputs = new Map<string | null, CommandRow[]>();
     for (const output of feed.commandOutputs) {
@@ -477,100 +481,68 @@ export function NativeSessionView({
       else outputs.set(anchor, [row]);
     }
     return outputs;
-  }, [feed.commandOutputs, conversation.persisted]);
+  })();
   // Streaming replaces only live messages; the projector keeps the rest of the rows as they were.
   const [projectRows] = useState(createTranscriptProjector);
-  const rows = useMemo(
-    () =>
-      projectRows(
-        {
-          entries: conversation.entries,
-          pending: conversation.pending,
-          leafId: conversation.identity?.leafId ?? null,
-        },
-        { debug, commandOutputs },
-      ),
-    [
-      projectRows,
-      conversation.entries,
-      conversation.pending,
-      conversation.identity?.leafId,
-      debug,
-      commandOutputs,
-    ],
+  const rows = projectRows(
+    {
+      entries: conversation.entries,
+      pending: conversation.pending,
+      leafId: conversation.identity?.leafId ?? null,
+    },
+    { debug, commandOutputs },
   );
   const queueStamp = conversation.entries.at(-1)?.timestamp ?? "";
-  const queuedMessages = useMemo(
-    () => nativeQueuedMessages(feed.queue, queueStamp),
-    [feed.queue, queueStamp],
-  );
-  const steerQueued = useCallback(
-    (id: string) => {
-      const queued = parseNativeQueuedMessageId(id);
-      if (!queued) return;
-      void request({ type: "promote_queued_message", message: queued.text }).catch((cause) =>
-        setLocalError(String(cause)),
-      );
-    },
-    [request],
-  );
+  const queuedMessages = nativeQueuedMessages(feed.queue, queueStamp);
+  const steerQueued = useStableCallback((id: string) => {
+    const queued = parseNativeQueuedMessageId(id);
+    if (!queued) return;
+    void request({ type: "promote_queued_message", message: queued.text }).catch((cause) =>
+      setLocalError(String(cause)),
+    );
+  });
   // Enter on an empty composer sends the oldest queued follow-up now.
-  const sendNextQueuedNow = useCallback(() => {
+  const sendNextQueuedNow = useStableCallback(() => {
     const id = nextPromotableNativeQueuedMessageId(queuedMessages);
     if (id === null) return false;
     steerQueued(id);
     return true;
-  }, [queuedMessages, steerQueued]);
-  const removeQueued = useCallback(
-    (id: string) => {
-      const queued = parseNativeQueuedMessageId(id);
-      if (!queued) return;
-      void takeNativeQueuedInput(request, queued)
-        .then(async (restoration) => {
-          if (restoration === null) {
-            setLocalError("That queued message has already been dispatched.");
-            return;
-          }
-          const notice = await restoreNativeQueuedDraft(target, restoration);
-          if (notice) setLocalError(notice);
-          focusComposer();
-        })
-        .catch((cause) => setLocalError(String(cause)));
-    },
-    [request, target, focusComposer],
-  );
+  });
+  const removeQueued = useStableCallback((id: string) => {
+    const queued = parseNativeQueuedMessageId(id);
+    if (!queued) return;
+    void takeNativeQueuedInput(request, queued)
+      .then(async (restoration) => {
+        if (restoration === null) {
+          setLocalError("That queued message has already been dispatched.");
+          return;
+        }
+        const notice = await restoreNativeQueuedDraft(target, restoration);
+        if (notice) setLocalError(notice);
+        focusComposer();
+      })
+      .catch((cause) => setLocalError(String(cause)));
+  });
   // Selecting a user message in the tree hands its text back for editing, as the
   // TUI does. A draft already in the composer stays; the notice says why.
-  const onTreeNavigated = useCallback(
-    (answer: Record<string, unknown>) => {
-      try {
-        if (restoreNativeEditor(target, answer) === "kept")
-          toastManager.add({
-            id: "native-tree-editor",
-            title: "Draft kept",
-            description: "The selected message was not placed in the composer.",
-            timeout: 4000,
-          });
-      } catch (cause) {
-        setLocalError(cause instanceof Error ? cause.message : String(cause));
-      }
-      focusComposer();
-    },
-    [target, focusComposer],
-  );
-  const loadEarlier = useMemo(
-    () =>
-      conversation.cursor
-        ? { loading: paging, cursor: conversation.cursor, onLoadEarlier: () => void loadOlder() }
-        : null,
-    // loadOlder reads the latest cursor and paging state on each render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [conversation.cursor, paging],
-  );
-  const promptHistory = useMemo(
-    () => transcriptUserText(conversation.entries),
-    [conversation.entries],
-  );
+  const onTreeNavigated = useStableCallback((answer: Record<string, unknown>) => {
+    try {
+      if (restoreNativeEditor(target, answer) === "kept")
+        toastManager.add({
+          id: "native-tree-editor",
+          title: "Draft kept",
+          description: "The selected message was not placed in the composer.",
+          timeout: 4000,
+        });
+    } catch (cause) {
+      setLocalError(cause instanceof Error ? cause.message : String(cause));
+    }
+    focusComposer();
+  });
+  const loadEarlier = conversation.cursor
+    ? { loading: paging, cursor: conversation.cursor, onLoadEarlier: () => void loadOlder() }
+    : null;
+  const promptHistory = transcriptUserText(conversation.entries);
   const model = nativeRecord(state.model);
   const modelId = typeof model.id === "string" ? model.id : null;
   const thinkingLevelsKey = `${String(model.provider)}/${String(modelId)}`;
@@ -578,7 +550,7 @@ export function NativeSessionView({
     readonly key: string;
     readonly levels: readonly string[];
   } | null>(null);
-  // The levels belong to the model; ask NeoPi again whenever the model changes.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- The active native model owns its available thinking levels.
   useEffect(() => {
     if (!feed.connected || modelId === null) return;
     let active = true;
@@ -596,7 +568,7 @@ export function NativeSessionView({
   }, [feed.connected, modelId, thinkingLevelsKey, request]);
   const nativeThinkingLevel = typeof state.thinkingLevel === "string" ? state.thinkingLevel : null;
   const nativeFastModeEnabled = state.fastModeEnabled === true;
-  const changeTraits = useCallback(
+  const changeTraits = useStableCallback(
     async (next: Parameters<typeof nativeTraitsCommands>[1]) => {
       try {
         for (const command of nativeTraitsCommands(
@@ -608,9 +580,8 @@ export function NativeSessionView({
         setLocalError(cause instanceof Error ? cause.message : String(cause));
       }
     },
-    [execute, nativeThinkingLevel, nativeFastModeEnabled],
   );
-  const traits = useMemo(() => {
+  const traits = (() => {
     if (modelId === null) return null;
     const descriptors = nativeTraitsDescriptors(
       nativeTraitsStateFromSession(
@@ -626,7 +597,7 @@ export function NativeSessionView({
           onModelOptionsChange: (next: Parameters<typeof nativeTraitsCommands>[1]) =>
             void changeTraits(next),
         };
-  }, [modelId, state, thinkingLevels, thinkingLevelsKey, changeTraits]);
+  })();
   const modelLabel = String(model.name ?? model.id ?? "Choose native model");
   const displayState =
     [
@@ -639,18 +610,15 @@ export function NativeSessionView({
     ]
       .filter((value) => typeof value === "string")
       .join(" · ") || null;
-  const selectModel = useCallback(
-    (choice: NativeModelChoice) => {
-      setModels(false);
-      void execute(
-        choice.kind === "role"
-          ? { type: "set_role", role: choice.role }
-          : { type: "set_model", provider: choice.provider, modelId: choice.modelId },
-      ).catch((cause) => setLocalError(String(cause)));
-    },
-    [execute],
-  );
-  const interrupt = useCallback(() => {
+  const selectModel = useStableCallback((choice: NativeModelChoice) => {
+    setModels(false);
+    void execute(
+      choice.kind === "role"
+        ? { type: "set_role", role: choice.role }
+        : { type: "set_model", provider: choice.provider, modelId: choice.modelId },
+    ).catch((cause) => setLocalError(String(cause)));
+  });
+  const interrupt = useStableCallback(() => {
     void interruptNativeQueuedInput(request, session?.capabilities ?? [])
       .then(async (restoration) => {
         const notice = await restoreNativeQueuedDraft(target, restoration);
@@ -658,50 +626,45 @@ export function NativeSessionView({
         focusComposer();
       })
       .catch((cause) => setLocalError(String(cause)));
-  }, [request, session?.capabilities, target, focusComposer]);
+  });
   const hideThinking = useNativeTranscriptView((state) => state.hideThinking);
   const [toolOutputSerial, setToolOutputSerial] = useState(0);
   const canCycleRole = session?.capabilities.includes(NATIVE_CYCLE_ROLE_CAPABILITY) === true;
-  const runNativeCommand = useCallback(
-    (command: NativeSessionCommand) => {
-      const notify = (title: string) =>
-        toastManager.add({ id: `native-shortcut:${command}`, title, timeout: 1500 });
-      const fail = (cause: unknown) =>
-        setLocalError(cause instanceof Error ? cause.message : String(cause));
-      switch (command) {
-        case "composer.thinking.cycle":
-          void execute({ type: "cycle_thinking_level" })
-            .then((result) => notify(nativeThinkingCycleNotice(result)))
-            .catch(fail);
+  const runNativeCommand = useStableCallback((command: NativeSessionCommand) => {
+    const notify = (title: string) =>
+      toastManager.add({ id: `native-shortcut:${command}`, title, timeout: 1500 });
+    const fail = (cause: unknown) =>
+      setLocalError(cause instanceof Error ? cause.message : String(cause));
+    switch (command) {
+      case "composer.thinking.cycle":
+        void execute({ type: "cycle_thinking_level" })
+          .then((result) => notify(nativeThinkingCycleNotice(result)))
+          .catch(fail);
+        return;
+      case "composer.role.cycleForward":
+      case "composer.role.cycleBackward":
+        if (!canCycleRole) {
+          notify(NATIVE_ROLE_CYCLE_UNSUPPORTED);
           return;
-        case "composer.role.cycleForward":
-        case "composer.role.cycleBackward":
-          if (!canCycleRole) {
-            notify(NATIVE_ROLE_CYCLE_UNSUPPORTED);
-            return;
-          }
-          void execute({
-            type: "cycle_role",
-            direction: command === "composer.role.cycleForward" ? "forward" : "backward",
-          })
-            .then((result) => notify(nativeRoleCycleNotice(result)))
-            .catch(fail);
-          return;
-        case "transcript.thinking.toggle":
-          toggleNativeThinkingVisibility();
-          notify(
-            useNativeTranscriptView.getState().hideThinking
-              ? "Reasoning hidden"
-              : "Reasoning shown",
-          );
-          return;
-        case "transcript.tools.toggleExpand":
-          setToolOutputSerial((value) => value + 1);
-          return;
-      }
-    },
-    [execute, canCycleRole],
-  );
+        }
+        void execute({
+          type: "cycle_role",
+          direction: command === "composer.role.cycleForward" ? "forward" : "backward",
+        })
+          .then((result) => notify(nativeRoleCycleNotice(result)))
+          .catch(fail);
+        return;
+      case "transcript.thinking.toggle":
+        toggleNativeThinkingVisibility();
+        notify(
+          useNativeTranscriptView.getState().hideThinking ? "Reasoning hidden" : "Reasoning shown",
+        );
+        return;
+      case "transcript.tools.toggleExpand":
+        setToolOutputSerial((value) => value + 1);
+        return;
+    }
+  });
   // Streamed tokens re-render this view, and the composer is the costliest
   // subtree on it: everything it takes stays referentially stable until its own
   // inputs change, so only keystrokes and real composer state re-render it.
@@ -709,92 +672,72 @@ export function NativeSessionView({
   const modelProvider = typeof model.provider === "string" ? model.provider : null;
   const modelSelector =
     modelProvider !== null && modelId !== null ? `${modelProvider}/${modelId}` : "";
-  const modelControl = useMemo(
-    () => (
-      <NativeSessionModelPicker
-        target={target}
-        providers={providers}
-        settings={settings}
-        keybindings={keybindings}
-        modelLabel={modelLabel}
-        modelSelector={modelSelector}
-        displayState={displayState}
-        open={models}
-        onOpenChange={setModels}
-        disabled={sending}
-        terminalOpen={terminalOpen}
-        onSelect={selectModel}
-      />
-    ),
-    [
-      target,
-      providers,
-      settings,
-      keybindings,
-      modelLabel,
-      modelSelector,
-      displayState,
-      models,
-      sending,
-      terminalOpen,
-      selectModel,
-    ],
+  const modelControl = (
+    <NativeSessionModelPicker
+      target={target}
+      providers={providers}
+      settings={settings}
+      keybindings={keybindings}
+      modelLabel={modelLabel}
+      modelSelector={modelSelector}
+      displayState={displayState}
+      open={models}
+      onOpenChange={setModels}
+      disabled={sending}
+      terminalOpen={terminalOpen}
+      onSelect={selectModel}
+    />
   );
-  const nativeSessionComposer = useMemo<NativeChatComposerProps["nativeSession"]>(
-    () => ({
-      modelControl,
-      commands,
-      attachment: session?.attachment,
-      ...(completesArguments ? { completeCommandArgument } : {}),
-      traits,
-      onSendQueuedNow: sendNextQueuedNow,
-      promptHistory,
-      modelPickerOpen: models,
-      onOpenModelPicker: () => setModels(true),
-      onOpenSessionTree: openTree,
-      onOpenModeControl: () => {
-        void execute({ type: "prompt", message: "/chat" }).catch((cause) =>
-          setLocalError(String(cause)),
+  const nativeSessionComposer: NativeChatComposerProps["nativeSession"] = {
+    modelControl,
+    commands,
+    attachment: session?.attachment,
+    ...(completesArguments ? { completeCommandArgument } : {}),
+    traits,
+    onSendQueuedNow: sendNextQueuedNow,
+    stepReasoningEffort: (direction) => {
+      if (thinkingLevels?.key !== thinkingLevelsKey || thinkingLevels.levels.length < 2) return;
+      const levels = thinkingLevels.levels;
+      const current = levels.indexOf(nativeThinkingLevel ?? "");
+      const next =
+        current < 0
+          ? direction === 1
+            ? 0
+            : levels.length - 1
+          : (current + direction + levels.length) % levels.length;
+      const level = levels[next];
+      if (level !== undefined) {
+        void execute({ type: "set_thinking_level", level }).catch((cause) =>
+          setLocalError(cause instanceof Error ? cause.message : String(cause)),
         );
-      },
-      onToggleModelPicker: () => setModels((value) => !value),
-      onCompactContext: () => {
-        void execute({ type: "prompt", message: "/compact" }).catch((cause) =>
-          setLocalError(String(cause)),
-        );
-      },
-      ...(dictationShown ? { dictation } : {}),
-    }),
-    [
-      modelControl,
-      commands,
-      session?.attachment,
-      completesArguments,
-      completeCommandArgument,
-      traits,
-      sendNextQueuedNow,
-      promptHistory,
-      models,
-      openTree,
-      execute,
-      dictationShown,
-      dictation,
-    ],
-  );
-  const onComposerSend = useCallback<NativeChatComposerProps["onSend"]>(
-    (event, intent) => {
-      event?.preventDefault();
-      void send(intent);
+      }
     },
-    [send],
-  );
-  const setComposerError = useCallback<NativeChatComposerProps["setThreadError"]>(
+    promptHistory,
+    modelPickerOpen: models,
+    onOpenModelPicker: () => setModels(true),
+    onOpenSessionTree: openTree,
+    onOpenModeControl: () => {
+      void execute({ type: "prompt", message: "/chat" }).catch((cause) =>
+        setLocalError(String(cause)),
+      );
+    },
+    onToggleModelPicker: () => setModels((value) => !value),
+    onCompactContext: () => {
+      void execute({ type: "prompt", message: "/compact" }).catch((cause) =>
+        setLocalError(String(cause)),
+      );
+    },
+    ...(dictationShown ? { dictation } : {}),
+  };
+  const onComposerSend: NativeChatComposerProps["onSend"] = useStableCallback((event, intent) => {
+    event?.preventDefault();
+    void send(intent);
+  });
+  const setComposerError: NativeChatComposerProps["setThreadError"] = useStableCallback(
     (_, message) => setLocalError(message),
-    [],
   );
-  const openComposerFile = useCallback<NativeChatComposerProps["onFileOpen"]>(
-    (attachment) => useRightPanelStore.getState().openAttachment(target, attachment),
-    [target],
+  const openComposerFile: NativeChatComposerProps["onFileOpen"] = useStableCallback((attachment) =>
+    useRightPanelStore.getState().openAttachment(target, attachment),
   );
   const dialog = feed.dialogs.find(
     (item) => typeof item.id === "string" && !dismissed.has(item.id),
@@ -889,6 +832,7 @@ export function NativeSessionView({
             busy={feed.busy}
             assistantName={assistantName}
             environmentId={target.environmentId}
+            nativeRef={target.ref}
             timelineKey={nativeTimelineKey(target.environmentId, target.ref.sessionFile)}
             cwd={session?.cwd}
             listRef={timelineRef}
@@ -902,7 +846,7 @@ export function NativeSessionView({
             onRemoveQueuedMessage={removeQueued}
           />
         </div>
-        <ComposerSurface.Shell ref={setComposerElement} contextStrip className="shrink-0">
+        <ComposerSurface.Shell ref={setComposerElement} contextRow className="shrink-0">
           {ownerNotice ? (
             <div
               role="status"
@@ -923,10 +867,10 @@ export function NativeSessionView({
           ) : null}
           {Object.values(feed.notices).some(Boolean) ? (
             <div className="flex flex-col gap-0.5 ps-(--workspace-gutter-start) pe-(--workspace-gutter-end) pt-2 text-xs text-muted-foreground">
-              {Object.values(feed.notices)
-                .filter(Boolean)
-                .map((notice, index) => (
-                  <p key={index} className="whitespace-pre-wrap">
+              {Object.entries(feed.notices)
+                .filter(([, notice]) => Boolean(notice))
+                .map(([id, notice]) => (
+                  <p key={id} className="whitespace-pre-wrap">
                     {notice}
                   </p>
                 ))}
@@ -938,6 +882,8 @@ export function NativeSessionView({
               routeThreadRef={target}
               composerDraftTarget={target}
               environmentId={target.environmentId}
+              canOperateThread={canOperateThread}
+              canInterrupt={canOperateThread && feed.busy}
               attachmentUploadsCapabilityKnown={serverConfig !== null}
               supportsAttachmentUploads={
                 serverConfig?.environment.capabilities.attachmentUploads === true
@@ -958,7 +904,13 @@ export function NativeSessionView({
               }
               isConnecting={loading}
               isSendBusy={sending}
-              sendDisabledReason={canSend ? null : "Reconnect NeoPi before sending."}
+              sendDisabledReason={
+                !canOperateThread
+                  ? "This connection cannot change sessions."
+                  : canSend
+                    ? null
+                    : "Reconnect NeoPi before sending."
+              }
               settings={settings}
               resolvedTheme={resolvedTheme}
               keybindings={keybindings}
@@ -975,7 +927,6 @@ export function NativeSessionView({
               onSend={onComposerSend}
               onInterrupt={interrupt}
               focusComposer={focusComposer}
-              scheduleComposerFocus={focusComposer}
               setThreadError={setComposerError}
               onExpandImage={setExpandedImage}
               onFileOpen={openComposerFile}
@@ -1016,7 +967,7 @@ export function NativeSessionView({
   );
 }
 
-export function NativeSessionDialog({
+function NativeSessionDialog({
   dialog,
   request,
   onAnswered,
@@ -1086,17 +1037,17 @@ export function NativeSessionDialog({
                 {JSON.stringify(dialog.args, null, 2)}
               </pre>
               {Array.isArray(dialog.details)
-                ? dialog.details.map((detail, index) => (
-                    <p key={index} className="text-sm">
+                ? nativeValueItems(dialog.details).map(({ key, value: detail }) => (
+                    <p key={key} className="text-sm">
                       {String(detail)}
                     </p>
                   ))
                 : null}
               {Array.isArray(dialog.safetyChecks)
-                ? dialog.safetyChecks.map((item, index) => {
+                ? nativeValueItems(dialog.safetyChecks).map(({ key, value: item }) => {
                     const check = nativeRecord(item);
                     return (
-                      <p key={index} role="alert" className="text-sm text-destructive">
+                      <p key={key} role="alert" className="text-sm text-destructive">
                         {String(check.message ?? check.code ?? check.id)}
                       </p>
                     );
@@ -1116,8 +1067,8 @@ export function NativeSessionDialog({
             </>
           ) : null}
           {dialog.method === "select" && Array.isArray(dialog.options)
-            ? dialog.options.map((option, index) => (
-                <div key={index}>
+            ? nativeValueItems(dialog.options).map(({ key, value: option }) => (
+                <div key={key}>
                   <Button
                     variant="outline"
                     disabled={pending}
@@ -1151,32 +1102,34 @@ export function NativeSessionDialog({
             return (
               <fieldset key={id} className="space-y-2">
                 <legend className="text-sm font-medium">{String(question.question)}</legend>
-                {(Array.isArray(question.options) ? question.options : []).map((item, index) => {
-                  const option = nativeRecord(item);
-                  const label = String(option.label);
-                  return (
-                    <label key={index} className="flex items-center gap-2 text-sm">
-                      <Checkbox
-                        checked={answer.selectedOptions.includes(label)}
-                        onCheckedChange={() =>
-                          setAnswers({
-                            ...answers,
-                            [id]: {
-                              ...answer,
-                              selectedOptions: question.multi
-                                ? answer.selectedOptions.includes(label)
-                                  ? answer.selectedOptions.filter((value) => value !== label)
-                                  : [...answer.selectedOptions, label]
-                                : [label],
-                            },
-                          })
-                        }
-                      />
-                      {label}
-                      {typeof option.description === "string" ? ` · ${option.description}` : ""}
-                    </label>
-                  );
-                })}
+                {nativeValueItems(Array.isArray(question.options) ? question.options : []).map(
+                  ({ key, value: item }) => {
+                    const option = nativeRecord(item);
+                    const label = String(option.label);
+                    return (
+                      <label key={key} className="flex items-center gap-2 text-sm">
+                        <Checkbox
+                          checked={answer.selectedOptions.includes(label)}
+                          onCheckedChange={() =>
+                            setAnswers({
+                              ...answers,
+                              [id]: {
+                                ...answer,
+                                selectedOptions: question.multi
+                                  ? answer.selectedOptions.includes(label)
+                                    ? answer.selectedOptions.filter((value) => value !== label)
+                                    : [...answer.selectedOptions, label]
+                                  : [label],
+                              },
+                            })
+                          }
+                        />
+                        {label}
+                        {typeof option.description === "string" ? ` · ${option.description}` : ""}
+                      </label>
+                    );
+                  },
+                )}
                 <Input
                   aria-label={`Other answer: ${String(question.question)}`}
                   value={answer.customInput}

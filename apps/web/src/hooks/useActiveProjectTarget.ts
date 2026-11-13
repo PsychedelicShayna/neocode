@@ -2,7 +2,7 @@ import { scopeThreadRef, type WorkspaceRef } from "@t3tools/client-runtime/envir
 import type { EnvironmentId } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { useLocation } from "@tanstack/react-router";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { nativeSessionAtoms, useNativeSessionSelection } from "~/state/neopiNativeSessions";
 
 import { useProjects } from "~/state/entities";

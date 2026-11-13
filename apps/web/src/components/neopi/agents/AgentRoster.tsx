@@ -1,12 +1,11 @@
-import {
-  formatSubagentModelLabel,
-  formatSubagentTokenCount,
-} from "@t3tools/client-runtime/state/subagentRuntime";
+import { formatModelSlugName } from "@t3tools/shared/model";
+import { formatTokens } from "@t3tools/shared/usageFormat";
 import type { AgentHubAgent } from "@t3tools/client-runtime/neopi-native-agent-hub";
 import { useEffect, useRef, type KeyboardEvent } from "react";
 
 import { cn } from "~/lib/utils";
 import { elapsedBetween, formatCost } from "./agentFormat";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../../ui/tooltip";
 
 const STATUS_VISUALS: Record<AgentHubAgent["status"], { dot: string; label: string }> = {
   pending: { dot: "bg-info", label: "Working" },
@@ -40,6 +39,7 @@ export function AgentElapsed({
 }) {
   const textRef = useRef<HTMLSpanElement>(null);
   const { live, startedAt } = agent;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- updates elapsed DOM text from the wall clock without per-second React renders
   useEffect(() => {
     if (!live || !startedAt) return;
     const update = () => {
@@ -58,15 +58,17 @@ export function AgentElapsed({
 }
 
 /** Model, effort and fast mode as one compact chip line; absent facts are left out. */
-export function agentModelText(agent: AgentHubAgent): string | null {
-  const label = formatSubagentModelLabel(agent.model, agent.effort);
+function agentModelText(agent: AgentHubAgent): string | null {
+  const label = agent.model ? formatModelSlugName(agent.model) : null;
   const fast = agent.fast?.enabled ? "fast" : null;
-  return [label, fast].filter((part): part is string => part !== null).join(" · ") || null;
+  return (
+    [label, agent.effort, fast].filter((part): part is string => part !== null).join(" · ") || null
+  );
 }
 
-export function agentMetricsText(agent: AgentHubAgent): string {
+function agentMetricsText(agent: AgentHubAgent): string {
   return [
-    agent.tokens !== null ? `${formatSubagentTokenCount(agent.tokens)} tok` : "— tok",
+    agent.tokens !== null ? `${formatTokens(agent.tokens)} tok` : "Unknown tok",
     agent.toolUses !== null ? `${agent.toolUses} tools` : null,
     agent.requests !== null ? `${agent.requests} req` : null,
     agent.cost !== null ? formatCost(agent.cost) : null,
@@ -86,6 +88,7 @@ function AgentRow({
   onToggle: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- keeps the externally scrolled roster's selected DOM row visible
   useEffect(() => {
     if (selected) ref.current?.scrollIntoView({ block: "nearest" });
   }, [selected]);
@@ -113,12 +116,14 @@ function AgentRow({
       </span>
       <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
         <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
-        <span
-          className="shrink-0 text-2xs text-muted-foreground/70"
-          title={`${agent.identity.label} · ${agent.identity.pronouns}`}
-        >
-          {agent.identity.label}
-        </span>
+        <Tooltip>
+          <TooltipTrigger render={<span className="shrink-0 text-2xs text-muted-foreground/70" />}>
+            {agent.identity.label}
+          </TooltipTrigger>
+          <TooltipPopup>
+            {agent.identity.label} · {agent.identity.pronouns}
+          </TooltipPopup>
+        </Tooltip>
         {role ? (
           <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 text-3xs text-muted-foreground">
             {role}
@@ -167,6 +172,7 @@ export function AgentRoster({
   className?: string;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- focuses the mounted roster DOM when its host requests autofocus
   useEffect(() => {
     if (autoFocus) listRef.current?.focus({ preventScroll: true });
   }, [autoFocus]);

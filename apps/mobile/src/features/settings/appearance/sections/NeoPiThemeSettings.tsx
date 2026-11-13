@@ -1,9 +1,9 @@
 import { RegistryContext, useAtomRefresh, useAtomSet } from "@effect/atom-react";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, Modal, Pressable, View } from "react-native";
-import { AppText as Text } from "../../../../components/AppText";
+import { AppText as Text } from "../../../../components/ui/AppText";
 import { neoPiMobileThemeVariables, resolveMobileNeoPiTheme } from "../../../../lib/mobileTheme";
 import { neopiThemesPalette, useMobileNeoPiThemeCatalog } from "../../../../state/neopiThemes";
 import {
@@ -23,6 +23,7 @@ export function NeoPiThemeSettings() {
   const [error, setError] = useState<string | null>(null);
   const requestVersion = useRef(0);
   const mounted = useRef(true);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- invalidates outstanding palette reads when this settings screen unmounts
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -30,7 +31,7 @@ export function NeoPiThemeSettings() {
       requestVersion.current += 1;
     };
   }, []);
-  const options = useMemo(
+  const options = useMemo<Array<{ key: string; label: string; name: string | null }>>(
     () =>
       picker === "target"
         ? native.choices.map((choice) => ({ key: choice.key, label: choice.label, name: null }))
@@ -133,8 +134,8 @@ export function NeoPiThemeSettings() {
       </Pressable>
       {!native.enabled && (native.stored?.nativeDarkTheme || native.stored?.nativeLightTheme) ? (
         <Text className="text-sm text-foreground-muted">
-          Local palettes: Dark — {native.stored.nativeDarkTheme?.name ?? "Saved graphical palette"};
-          Light — {native.stored.nativeLightTheme?.name ?? "Saved graphical palette"}. Select a
+          Local palettes: Dark: {native.stored.nativeDarkTheme?.name ?? "Saved graphical palette"};
+          Light: {native.stored.nativeLightTheme?.name ?? "Saved graphical palette"}. Select a
           graphical palette below to replace either choice.
         </Text>
       ) : null}

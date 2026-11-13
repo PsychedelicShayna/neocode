@@ -217,6 +217,7 @@ function observe(
     workflowName: null,
     phases: previous?.phases ?? [],
     runHandles: null,
+    childThreadId: null,
     recentActivity,
     firstSeenAt: previous?.firstSeenAt ?? at,
     startedAt: fresh ? (terminal ? null : at) : previous.startedAt,

@@ -8,7 +8,7 @@ import { nativeWorkspaceResourceId } from "@t3tools/shared/neopiWorkspace";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
 import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
 import * as Effect from "effect/Effect";
-import * as Encoding from "effect/Encoding";
+import * as Base64 from "effect/encoding/Base64";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
@@ -90,7 +90,7 @@ export const prepareNeoPiNativePrompt = Effect.fn("NeoPiNativeSessions.preparePr
       promotedIds.set(attachment.id, claim.finalId);
       if (attachment.type === "image") {
         const bytes = yield* fs.readFile(claim.finalPath);
-        images.push({ type: "image", data: Encoding.encodeBase64(bytes), mimeType });
+        images.push({ type: "image", data: Base64.encode(bytes), mimeType });
       } else {
         text.push(`Attached file "${attachment.name}": "${claim.finalPath}"`);
       }

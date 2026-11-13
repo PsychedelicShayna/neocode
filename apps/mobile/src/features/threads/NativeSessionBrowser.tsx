@@ -1,16 +1,20 @@
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import type { EnvironmentId, NeoPiNativeSessionRef, ProviderInstanceId } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import { nativeValueItems } from "@t3tools/client-runtime/neopi-native-sessions";
 import { useCallback, useState } from "react";
 import { AppState, Pressable, ScrollView, TextInput, View } from "react-native";
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { useEnvironments } from "../../state/environments";
 import { useServerConfigs, useThreadShells } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
 import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { NeoPiModelsEntry } from "./NeoPiModelsScreen";
+import { settingsNavigationState } from "../settings/settings-navigation";
+import { resetRootStack } from "../../lib/root-stack-reset";
+import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
 
 export function useOpenNativeSession() {
   const navigation = useNavigation();
@@ -33,15 +37,18 @@ export function NativeSessionBrowser({
   environmentId,
   onOpenSettings,
   onOpenEnvironments,
+  onOpenLegacyHistory,
 }: {
   environmentId?: EnvironmentId;
   onOpenSettings?: () => void;
   onOpenEnvironments?: () => void;
+  onOpenLegacyHistory?: () => void;
 }) {
   const { environments } = useEnvironments();
   const configs = useServerConfigs();
   const open = useOpenNativeSession();
   const navigation = useNavigation();
+  const selectDetail = useSelectWorkspaceDetail();
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -66,16 +73,22 @@ export function NativeSessionBrowser({
   return (
     <View className="flex-1 bg-screen">
       <View className="flex-row flex-wrap gap-2 px-4 py-2">
-        <MaterialButton
+        <Button
           label="Settings"
           tone="text"
-          onPress={onOpenSettings ?? (() => navigation.navigate("SettingsSheet"))}
+          onPress={
+            onOpenSettings ??
+            (() => resetRootStack(navigation, (state) => settingsNavigationState(state, undefined)))
+          }
         />
-        <MaterialButton
+        <Button
           label="Connections"
           tone="text"
           onPress={onOpenEnvironments ?? (() => navigation.navigate("Connections"))}
         />
+        {onOpenLegacyHistory ? (
+          <Button label="Saved threads" tone="text" onPress={onOpenLegacyHistory} />
+        ) : null}
       </View>
       <View className="px-4 py-2">
         <TextInput
@@ -107,7 +120,7 @@ export function NativeSessionBrowser({
                     provider.availability !== "unavailable",
                 )
                 .map((provider) => (
-                  <MaterialButton
+                  <Button
                     key={provider.instanceId}
                     label={
                       configs
@@ -131,7 +144,7 @@ export function NativeSessionBrowser({
             Connect an environment to start a conversation.
           </Text>
         ) : null}
-        {legacy.length ? (
+        {!onOpenLegacyHistory && legacy.length ? (
           <View className="gap-2">
             <Text className="text-sm text-foreground-muted">
               Saved workspaces and legacy history
@@ -139,14 +152,17 @@ export function NativeSessionBrowser({
             {legacy
               .filter((thread) => thread.title.toLowerCase().includes(query.toLowerCase()))
               .map((thread) => (
-                <MaterialButton
+                <Button
                   key={`${thread.environmentId}:${thread.id}`}
                   label={thread.title}
                   tone="text"
                   onPress={() =>
-                    navigation.navigate("Thread", {
-                      environmentId: thread.environmentId,
-                      threadId: thread.id,
+                    selectDetail({
+                      name: "Thread",
+                      params: {
+                        environmentId: thread.environmentId,
+                        threadId: thread.id,
+                      },
                     })
                   }
                 />
@@ -199,8 +215,8 @@ function NativeSessionRows({
           {error ?? result.error}
         </Text>
       ) : null}
-      {result.data?.diagnostics.map((item, index) => (
-        <Text key={index} className="text-xs text-foreground-muted">
+      {nativeValueItems(result.data?.diagnostics ?? []).map(({ value: item, key }) => (
+        <Text key={key} className="text-xs text-foreground-muted">
           {item.message}
         </Text>
       ))}

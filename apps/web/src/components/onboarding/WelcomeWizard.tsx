@@ -16,11 +16,12 @@ import {
   LinkIcon,
   MonitorIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useBlocker } from "@tanstack/react-router";
 
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
-import { useCompleteOnboarding } from "../../onboarding/firstRun";
+import { completeOnboarding } from "../../onboarding/firstRun";
 import {
   getOnboardingProviderState,
   selectOnboardingProvidersByDriver,
@@ -35,7 +36,8 @@ import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { connectPairing } from "../../connection/onboarding";
 import { getProviderSummary } from "../settings/providerStatus";
-import { getDriverOption } from "../settings/providerDriverMeta";
+import { providerClients } from "../settings/providerDriverMeta";
+import { ProviderPackageIcon } from "../chat/ProviderPackageIcon";
 import { CloudEnvironmentConnectRows } from "../cloud/CloudEnvironmentConnectList";
 import { NeoPiInstallHelp } from "../neopi/NeoPiInstallHelp";
 import { NeoProxyConnect } from "../neopi/NeoProxyConnect";
@@ -49,6 +51,7 @@ import { WizardPanel, WizardSteps, WizardPopup, WizardHeader } from "../ui/wizar
 import { Dialog } from "../ui/dialog";
 import { toastManager } from "../ui/toast";
 import { cn } from "../../lib/utils";
+import { WelcomeExtras } from "./WelcomePage";
 
 /**
  * First-run flow: connect a computer, meet NeoProxy, confirm NeoPi. Project
@@ -70,29 +73,63 @@ export type WelcomeWizardDestination =
 
 export function WelcomeWizard({
   localAvailable,
+  resumeEnvironmentId,
   onDone,
 }: {
   /** Whether this client is authenticated to the server serving the app. */
   readonly localAvailable: boolean;
-  readonly onDone: (destination: WelcomeWizardDestination) => void;
+  readonly resumeEnvironmentId?: EnvironmentId | undefined;
+  readonly onDone: (destination: WelcomeWizardDestination) => void | Promise<void>;
 }) {
-  const completeOnboarding = useCompleteOnboarding();
-  const [step, setStep] = useState<WizardStep>("connection");
   const { environments } = useEnvironments();
-  const [selection, setSelection] = useState<ReadonlySet<EnvironmentId> | null>(null);
-  const autoSelectedComputers = useRef(new Set<EnvironmentId>());
-  const [setupIds, setSetupIds] = useState<readonly EnvironmentId[]>([]);
+  const [step, setStep] = useState<WizardStep>(resumeEnvironmentId ? "agents" : "connection");
+  const [selection, setSelection] = useState<ReadonlySet<EnvironmentId> | null>(
+    resumeEnvironmentId ? new Set([resumeEnvironmentId]) : null,
+  );
+  const [autoSelectedComputers] = useState(
+    () =>
+      new Set<EnvironmentId>(
+        resumeEnvironmentId ? environments.map((environment) => environment.environmentId) : [],
+      ),
+  );
+  const [catalogComputers, setCatalogComputers] = useState<ReadonlySet<EnvironmentId>>(
+    () =>
+      new Set(
+        resumeEnvironmentId ? environments.map((environment) => environment.environmentId) : [],
+      ),
+  );
+  const [setupIds, setSetupIds] = useState<readonly EnvironmentId[]>(
+    resumeEnvironmentId ? [resumeEnvironmentId] : [],
+  );
   const finishingPromiseRef = useRef<Promise<boolean> | null>(null);
   const completionErrorToastIdRef = useRef<ReturnType<typeof toastManager.add> | null>(null);
+  const mountedRef = useRef(true);
+  const holdPageRef = useRef(false);
+  const [isFinishing, setIsFinishing] = useState(false);
   const primaryEnvironment = usePrimaryEnvironment();
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- ignore completion callbacks after this wizard unmounts
   useEffect(() => {
-    const newComputers = environments.filter(
-      (environment) => !autoSelectedComputers.current.has(environment.environmentId),
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  useBlocker({
+    shouldBlockFn: () => holdPageRef.current,
+    enableBeforeUnload: false,
+  });
+  const newComputers = environments.filter(
+    (environment) =>
+      !catalogComputers.has(environment.environmentId) &&
+      !autoSelectedComputers.has(environment.environmentId),
+  );
+  if (newComputers.length > 0) {
+    setCatalogComputers(
+      new Set([
+        ...catalogComputers,
+        ...newComputers.map((environment) => environment.environmentId),
+      ]),
     );
-    if (newComputers.length === 0) return;
-    for (const environment of newComputers) {
-      autoSelectedComputers.current.add(environment.environmentId);
-    }
     setSelection(
       (current) =>
         new Set([
@@ -100,7 +137,11 @@ export function WelcomeWizard({
           ...newComputers.map((environment) => environment.environmentId),
         ]),
     );
-  }, [environments]);
+  }
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- keeps discovery's shared seen ledger aligned with external catalog arrivals
+  useEffect(() => {
+    for (const environment of environments) autoSelectedComputers.add(environment.environmentId);
+  }, [environments, autoSelectedComputers]);
   const selectedIds =
     selection ?? new Set(primaryEnvironment ? [primaryEnvironment.environmentId] : []);
   const startSetup = (ids: readonly EnvironmentId[]) => {
@@ -109,46 +150,50 @@ export function WelcomeWizard({
     setStep("neoproxy");
   };
   const stageIndex = STEP_ORDER.indexOf(step);
-  const finish = useCallback(
-    (destination: WelcomeWizardDestination) => {
-      if (finishingPromiseRef.current !== null) return finishingPromiseRef.current;
-      if (completionErrorToastIdRef.current !== null) {
-        toastManager.close(completionErrorToastIdRef.current);
-        completionErrorToastIdRef.current = null;
-      }
+  const finish = (destination: WelcomeWizardDestination) => {
+    if (finishingPromiseRef.current !== null) return finishingPromiseRef.current;
+    if (completionErrorToastIdRef.current !== null) {
+      toastManager.close(completionErrorToastIdRef.current);
+      completionErrorToastIdRef.current = null;
+    }
 
-      const completion = completeOnboarding()
-        .then(() => {
-          if (completionErrorToastIdRef.current !== null) {
-            toastManager.close(completionErrorToastIdRef.current);
-            completionErrorToastIdRef.current = null;
-          }
-          onDone(destination);
-          return true;
-        })
-        .catch(() => {
-          const errorToast = {
-            type: "error",
-            title: "Could not finish setup",
-            description: "Your settings could not be saved. Try again.",
-          } as const;
-          if (completionErrorToastIdRef.current === null) {
-            completionErrorToastIdRef.current = toastManager.add(errorToast);
-          } else {
-            toastManager.update(completionErrorToastIdRef.current, errorToast);
-          }
-          return false;
-        })
-        .finally(() => {
-          if (finishingPromiseRef.current === completion) {
-            finishingPromiseRef.current = null;
-          }
-        });
-      finishingPromiseRef.current = completion;
-      return completion;
-    },
-    [completeOnboarding, onDone],
-  );
+    holdPageRef.current = true;
+    setIsFinishing(true);
+    const completion = completeOnboarding()
+      .then(async () => {
+        if (!mountedRef.current) return false;
+        if (completionErrorToastIdRef.current !== null) {
+          toastManager.close(completionErrorToastIdRef.current);
+          completionErrorToastIdRef.current = null;
+        }
+        holdPageRef.current = false;
+        await onDone(destination);
+        return true;
+      })
+      .catch(() => {
+        if (!mountedRef.current) return false;
+        const errorToast = {
+          type: "error",
+          title: "Could not finish setup",
+          description: "Your settings could not be saved. Try again.",
+        } as const;
+        if (completionErrorToastIdRef.current === null) {
+          completionErrorToastIdRef.current = toastManager.add(errorToast);
+        } else {
+          toastManager.update(completionErrorToastIdRef.current, errorToast);
+        }
+        return false;
+      })
+      .finally(() => {
+        holdPageRef.current = false;
+        if (mountedRef.current) setIsFinishing(false);
+        if (finishingPromiseRef.current === completion) {
+          finishingPromiseRef.current = null;
+        }
+      });
+    finishingPromiseRef.current = completion;
+    return completion;
+  };
 
   const skip = () => void finish({ kind: "workspace" });
   return (
@@ -177,7 +222,7 @@ export function WelcomeWizard({
           <WizardSteps
             steps={ONBOARDING_STAGES}
             currentStep={stageIndex}
-            isStepDisabled={(index) => index >= stageIndex}
+            isStepDisabled={(index) => isFinishing || index >= stageIndex}
             onStepChange={(index) => {
               if (index > stageIndex) return;
               setStep(STEP_ORDER[index] ?? "connection");
@@ -186,55 +231,58 @@ export function WelcomeWizard({
         </WizardHeader>
 
         <WizardPanel>
-          {step === "connection" ? (
-            <ConnectionStep
-              expandPairingInitially={!localAvailable && !hasCloudPublicConfig()}
-              selectedIds={selectedIds}
-              autoSelectedComputers={autoSelectedComputers.current}
-              onSelectionChange={setSelection}
-              onToggleEnvironment={(environmentId, checked) =>
-                setSelection((current) => {
-                  const next = new Set(current ?? selectedIds);
-                  if (checked) next.add(environmentId);
-                  else next.delete(environmentId);
-                  return next;
-                })
-              }
-              onContinue={() =>
-                startSetup(
-                  environments
-                    .filter((environment) => selectedIds.has(environment.environmentId))
-                    .map((environment) => environment.environmentId),
-                )
-              }
-              onPaired={(environmentId) => {
-                setSelection((current) => new Set([...(current ?? selectedIds), environmentId]));
-              }}
-            />
-          ) : step === "neoproxy" ? (
-            <NeoProxyStep
-              environmentIds={setupIds}
-              onBack={() => setStep("connection")}
-              onContinue={() => setStep("agents")}
-            />
-          ) : (
-            <AgentsStep
-              environmentIds={setupIds}
-              onContinue={() => void finish({ kind: "workspace" })}
-              onOpenSettings={(environmentId, instanceId) =>
-                void finish({
-                  kind: "neocore",
-                  environmentId,
-                  ...(instanceId ? { instanceId } : {}),
-                })
-              }
-            />
-          )}
-          <div className="mt-4 flex justify-center">
-            <Button variant="link" size="sm" className="text-muted-foreground" onClick={skip}>
-              Skip setup and open the workspace
-            </Button>
-          </div>
+          <fieldset disabled={isFinishing}>
+            {step === "connection" ? (
+              <ConnectionStep
+                expandPairingInitially={!localAvailable && !hasCloudPublicConfig()}
+                selectedIds={selectedIds}
+                autoSelectedComputers={autoSelectedComputers}
+                onSelectionChange={setSelection}
+                onToggleEnvironment={(environmentId, checked) =>
+                  setSelection((current) => {
+                    const next = new Set(current ?? selectedIds);
+                    if (checked) next.add(environmentId);
+                    else next.delete(environmentId);
+                    return next;
+                  })
+                }
+                onContinue={() =>
+                  startSetup(
+                    environments
+                      .filter((environment) => selectedIds.has(environment.environmentId))
+                      .map((environment) => environment.environmentId),
+                  )
+                }
+                onPaired={(environmentId) => {
+                  autoSelectedComputers.add(environmentId);
+                  setSelection((current) => new Set([...(current ?? selectedIds), environmentId]));
+                }}
+              />
+            ) : step === "neoproxy" ? (
+              <NeoProxyStep
+                environmentIds={setupIds}
+                onBack={() => setStep("connection")}
+                onContinue={() => setStep("agents")}
+              />
+            ) : (
+              <AgentsStep
+                environmentIds={setupIds}
+                onContinue={() => void finish({ kind: "workspace" })}
+                onOpenSettings={(environmentId, instanceId) =>
+                  void finish({
+                    kind: "neocore",
+                    environmentId,
+                    ...(instanceId ? { instanceId } : {}),
+                  })
+                }
+              />
+            )}
+            <div className="mt-4 flex justify-center">
+              <Button variant="link" size="sm" onClick={skip}>
+                Skip setup and open the workspace
+              </Button>
+            </div>
+          </fieldset>
         </WizardPanel>
       </WizardPopup>
     </Dialog>
@@ -248,10 +296,8 @@ type NeoProxyChoice = "have" | "host" | "later";
 /** NeoPi on the chosen computer runs the NeoProxy login; the step waits on it. */
 function useNeoPiProviderFor(environmentId: EnvironmentId) {
   const providers = useAtomValue(serverEnvironment.providersValueAtom(environmentId));
-  return useMemo(() => {
-    const provider = selectOnboardingProvidersByDriver(providers).get("neopi");
-    return { provider, state: getOnboardingProviderState(provider) };
-  }, [providers]);
+  const provider = selectOnboardingProvidersByDriver(providers).get("neopi");
+  return { provider, state: getOnboardingProviderState(provider) };
 }
 
 function NeoProxyStep({
@@ -269,9 +315,6 @@ function NeoProxyStep({
   const environmentId = resolveOnboardingNeoProxyTarget(environmentIds, chosenTarget);
   const environmentLabel = (id: EnvironmentId) =>
     environments.find((environment) => environment.environmentId === id)?.label ?? id;
-  useEffect(() => {
-    if (environmentIds.length === 0) onContinue();
-  }, [environmentIds.length, onContinue]);
   if (environmentIds.length === 0) return null;
   if (!environmentId) {
     return (
@@ -464,8 +507,8 @@ function NeoProxyFlowFigure({ className }: { readonly className?: string }) {
     >
       <defs>
         <linearGradient id="neoproxy-ribbon" x1="0" x2="1">
-          <stop offset="0" stopColor="#5ad8e6" />
-          <stop offset="1" stopColor="#f068c8" />
+          <stop offset="0" stopColor="var(--color-info)" />
+          <stop offset="1" stopColor="var(--color-primary)" />
         </linearGradient>
       </defs>
       <g fontSize="11" fontFamily="var(--font-sans)" fill="currentColor">
@@ -490,15 +533,15 @@ function NeoProxyFlowFigure({ className }: { readonly className?: string }) {
         width="118"
         height="36"
         rx="8"
-        fill="#f068c8"
+        fill="var(--color-primary)"
         fillOpacity="0.14"
-        stroke="#f068c8"
+        stroke="var(--color-primary)"
         strokeOpacity="0.55"
       />
       <text x="274" y="52" textAnchor="middle" fontSize="12" fontWeight="600" fill="currentColor">
         NeoProxy
       </text>
-      <g fill="none" stroke="#5ad8e6" strokeLinecap="round" opacity="0.85">
+      <g fill="none" stroke="var(--color-info)" strokeLinecap="round" opacity="0.85">
         <path d="M333 48 C 390 48, 400 16, 455 16" strokeWidth="4" />
         <path d="M333 48 C 390 48, 400 48, 455 48" strokeWidth="2.5" />
         <path d="M333 48 C 390 48, 400 80, 455 80" strokeWidth="2" />
@@ -506,15 +549,15 @@ function NeoProxyFlowFigure({ className }: { readonly className?: string }) {
       <g fontSize="11" fontFamily="var(--font-mono)" fill="currentColor">
         <text x="462" y="20">
           <tspan opacity="0.6">neoproxy/</tspan>
-          <tspan fill="#f068c8">heavy</tspan>
+          <tspan fill="var(--color-primary)">heavy</tspan>
         </text>
         <text x="462" y="52">
           <tspan opacity="0.6">neoproxy/</tspan>
-          <tspan fill="#f068c8">default</tspan>
+          <tspan fill="var(--color-primary)">default</tspan>
         </text>
         <text x="462" y="84">
           <tspan opacity="0.6">neoproxy/</tspan>
-          <tspan fill="#f068c8">small</tspan>
+          <tspan fill="var(--color-primary)">small</tspan>
         </text>
       </g>
     </svg>
@@ -556,6 +599,7 @@ function ConnectionStep({
       ),
     );
   const continueRef = useRef<HTMLButtonElement>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- focuses the DOM continuation control when the connection becomes ready
   useEffect(() => {
     if (
       ready &&
@@ -684,7 +728,7 @@ function ConnectAccountOption({
   const { openAuthPrompt } = useT3ConnectAuthPrompt();
   const [expanded, setExpanded] = useState(true);
   const [discoveryReady, setDiscoveryReady] = useState(false);
-  const onDiscoveryReady = useCallback(() => setDiscoveryReady(true), []);
+  const onDiscoveryReady = () => setDiscoveryReady(true);
 
   return (
     <div className="rounded-lg border border-border bg-background">
@@ -767,6 +811,7 @@ function PairingForm({
   const [errorMessage, setErrorMessage] = useState("");
   const mountedRef = useRef(true);
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- ignores outstanding pairing completions after the form unmounts
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -921,47 +966,44 @@ function ConnectedAgentsStep({
     reportFailure: false,
   });
 
-  // Re-probe on entry so freshly installed CLIs show up without a manual
-  // refresh; harmless when nothing changed (single-flighted per environment).
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- re-probes installed native runtimes on entry to the connected-computer step
   useEffect(() => {
     void refreshProviders({ environmentId, input: {} });
   }, [environmentId, refreshProviders]);
 
-  const byDriver = useMemo(() => selectOnboardingProvidersByDriver(providers), [providers]);
+  const byDriver = selectOnboardingProvidersByDriver(providers);
 
   return (
     <section>
       <h2 className="mb-2 text-sm font-medium">{machineLabel}</h2>
       <AgentCard
-        environmentId={environmentId}
         provider={byDriver.get("neopi")}
         environmentLabel={machineLabel}
         onOpenSettings={onOpenSettings}
       />
+      <WelcomeExtras environmentId={environmentId} />
     </section>
   );
 }
 
 function AgentCard({
-  environmentId,
   provider,
   environmentLabel,
   onOpenSettings,
 }: {
-  readonly environmentId: EnvironmentId;
   readonly provider: ServerProvider | undefined;
   readonly environmentLabel: string;
   readonly onOpenSettings: (instanceId?: ProviderInstanceId) => void;
 }) {
-  const meta = getDriverOption(ProviderDriverKind.make("neopi"));
-  const Icon = meta?.icon;
+  const meta = providerClients.get(ProviderDriverKind.make("neopi"));
+  const icon = meta?.icon;
   const summary = getProviderSummary(provider);
   const providerState = getOnboardingProviderState(provider);
 
   return (
     <div className="space-y-3 rounded-lg border border-border bg-background px-3 py-2.5">
       <div className="flex items-center gap-3">
-        {Icon ? <Icon className="size-5 shrink-0 fill-foreground" /> : null}
+        {icon ? <ProviderPackageIcon icon={icon} className="size-5 shrink-0" /> : null}
         <div className="min-w-0 flex-1">
           <span className="block text-sm font-medium text-foreground">
             {provider?.displayName ?? "NeoPi"}

@@ -1,27 +1,32 @@
 import { NeoPiSettings, ProviderDriverKind } from "@t3tools/contracts";
 import { make as makeClient } from "effect-neopi-rpc/client";
 import * as Effect from "effect/Effect";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Equal from "effect/Equal";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/process";
+import type { McpServer } from "effect/ai";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeNeoPiTextGeneration } from "../../textGeneration/NeoPiTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
+import { makeNeoPiAdapter } from "../neopi/NeoPiAdapterLive.ts";
 import {
   buildInitialNeoPiProviderSnapshot,
   checkNeoPiProviderStatus,
   resolveNeoPiBinary,
   neoPiSnapshotForCwd,
   type NeoPiRetainedCatalog,
-} from "../Layers/NeoPiProvider.ts";
-import { applyUsageLimits } from "../Layers/neopiUsageLimits.ts";
-import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+} from "../NeoPiProvider.ts";
+import { applyUsageLimits } from "../neopiUsageLimits.ts";
+import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import type { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import { neoPiBinarySelectionPatch } from "../neopi/NeoPiBinarySelection.ts";
 import { neoPiUsageProviderId } from "../neopi/NeoPiModelCatalog.ts";
@@ -36,9 +41,9 @@ import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
   type ProviderInstance,
-} from "../ProviderDriver.ts";
-import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import { withInstanceIdentity } from "./instanceIdentity.ts";
+} from "@t3tools/provider-core/server/driver";
+import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
 
 const DRIVER_KIND = ProviderDriverKind.make("neopi");
 const decodeSettings = Schema.decodeSync(NeoPiSettings);
@@ -49,202 +54,217 @@ export type NeoPiDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
   | FileSystem.FileSystem
+  | McpProviderSessions.McpProviderSessions
+  | McpSessionRegistry.McpSessionRegistry
+  | McpServer.McpServer
   | ServerConfig
-  | ServerSettingsService;
+  | ServerSettingsService
+  | SecureRandom.SecureRandom
+  | ProviderHost;
 
 export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "NeoPi", supportsMultipleInstances: true },
   configSchema: NeoPiSettings,
   defaultConfig: () => decodeSettings({}),
-  create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
-    Effect.gen(function* () {
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const fs = yield* FileSystem.FileSystem;
-      const serverSettings = yield* ServerSettingsService;
-      const serverConfig = yield* ServerConfig;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
-      const env = {
-        ...Object.fromEntries(
-          Object.entries(processEnv).filter(
-            (entry): entry is [string, string] => typeof entry[1] === "string",
+  create: Effect.fn("NeoPiDriver.create")(function* ({
+    instanceId,
+    displayName,
+    accentColor,
+    environment,
+    enabled,
+    config,
+  }) {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const fs = yield* FileSystem.FileSystem;
+    const serverSettings = yield* ServerSettingsService;
+    const serverConfig = yield* ServerConfig;
+    const processEnv = yield* mergeProviderInstanceEnvironment(environment);
+    const env = {
+      ...Object.fromEntries(
+        Object.entries(processEnv).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
+        ),
+      ),
+      ...(config.profile ? { OMP_PROFILE: config.profile } : {}),
+    };
+    const effectiveConfig = { ...config, enabled } satisfies NeoPiSettings;
+    const continuationIdentity = defaultProviderContinuationIdentity({
+      driverKind: DRIVER_KIND,
+      instanceId,
+    });
+    const stamp = withInstanceIdentity({
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName,
+      accentColor,
+      continuationGroupKey: continuationIdentity.continuationKey,
+    });
+    const discovery = yield* makeNeoPiDiscoveryHub();
+    const sharedSessionCapabilities = new Set<string>();
+    const retainedCatalog = yield* Ref.make<NeoPiRetainedCatalog | null>(null);
+    const settingsBeforeProbe = yield* serverSettings.getSettings.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: "Failed to read NeoPi executable settings",
+            cause,
+          }),
+      ),
+    );
+    const resolved = enabled
+      ? yield* resolveNeoPiBinary(effectiveConfig, env, serverConfig.cwd).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        )
+      : null;
+    const binary = resolved?.binary ?? (config.binaryPath || "npi");
+    if (resolved?.autoSelected && !resolved.error) {
+      yield* serverSettings
+        .updateSettings((current) =>
+          neoPiBinarySelectionPatch(
+            settingsBeforeProbe,
+            current,
+            instanceId,
+            binary,
+            resolved.bundled,
+          ),
+        )
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: "Failed to save NeoPi executable selection",
+                cause,
+              }),
+          ),
+        );
+    }
+    const capabilityProbe: NeoPiCapabilityProbe = {
+      status: "unprobed",
+      version: resolved?.version ?? null,
+    };
+    const commandProbe = makeNeoPiDiscoveryProbe({
+      binary,
+      profile: config.profile,
+      env,
+      spawn: spawner.spawn,
+      hub: discovery,
+    });
+    const adapter = yield* makeNeoPiAdapter({
+      settings: effectiveConfig,
+      instanceId,
+      binary,
+      cwd: serverConfig.cwd,
+      t3Home: serverConfig.baseDir,
+      attachmentsDir: serverConfig.attachmentsDir,
+      environment: env,
+      spawn: spawner.spawn,
+      discovery,
+      sharedSessionCapabilities,
+      makeHostBridge: makeNeoPiHostToolBridge,
+    });
+    const textGeneration = makeNeoPiTextGeneration({
+      binary,
+      attachmentsDir: serverConfig.attachmentsDir,
+      env,
+      spawn: spawner.spawn,
+      makeClient,
+    });
+    const snapshot = yield* makeManagedServerProvider<NeoPiSettings>({
+      getSettings: Effect.succeed(effectiveConfig),
+      streamSettings: Stream.empty,
+      haveSettingsChanged,
+      initialSnapshot: (settings) =>
+        buildInitialNeoPiProviderSnapshot(settings).pipe(Effect.map(stamp)),
+      checkProvider: Ref.get(retainedCatalog).pipe(
+        Effect.flatMap((previous) =>
+          checkNeoPiProviderStatus(
+            effectiveConfig,
+            env,
+            serverConfig.cwd,
+            spawner.spawn,
+            discovery,
+            sharedSessionCapabilities,
+            {
+              resolvedBinary: binary,
+              capabilityProbe,
+              ...(previous ? { previous } : {}),
+              onSuccessfulCatalog: (catalog) => Ref.set(retainedCatalog, catalog),
+            },
           ),
         ),
-        ...(config.profile ? { OMP_PROFILE: config.profile } : {}),
-      };
-      const effectiveConfig = { ...config, enabled } satisfies NeoPiSettings;
-      const continuationIdentity = defaultProviderContinuationIdentity({
-        driverKind: DRIVER_KIND,
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.map(stamp),
+      ),
+      enrichSnapshot: Effect.fn("NeoPiDriver.enrichSnapshot")(function* ({
+        snapshot: probed,
+        getSnapshot,
+        publishSnapshot,
+      }) {
+        if (!probed.installed || probed.status === "error") return;
+        const activeProvider = neoPiUsageProviderId(probed.models);
+        if (!activeProvider && probed.status === "warning") return;
+        const previous = (yield* getSnapshot).usageLimits;
+        const usageLimits = yield* applyUsageLimits({
+          binary,
+          activeProvider,
+          profile: config.profile,
+          cwd: serverConfig.cwd,
+          environment: env,
+          getLiveUsage: adapter.getLiveUsage,
+          ...(previous ? { previous } : {}),
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        yield* publishSnapshot({ ...probed, usageLimits });
+      }),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderDriverError({
+            driver: DRIVER_KIND,
+            instanceId,
+            detail: `Failed to build NeoPi snapshot: ${cause.message}`,
+            cause,
+          }),
+      ),
+    );
+    const instance = registerNeoPiSessionCatalogSource(
+      {
         instanceId,
-      });
-      const stamp = withInstanceIdentity({
-        instanceId,
         driverKind: DRIVER_KIND,
+        continuationIdentity,
         displayName,
         accentColor,
-        continuationGroupKey: continuationIdentity.continuationKey,
-      });
-      const discovery = yield* makeNeoPiDiscoveryHub();
-      const sharedSessionCapabilities = new Set<string>();
-      const retainedCatalog = yield* Ref.make<NeoPiRetainedCatalog | null>(null);
-      const settingsBeforeProbe = yield* serverSettings.getSettings.pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: "Failed to read NeoPi executable settings",
-              cause,
-            }),
-        ),
-      );
-      const resolved = enabled
-        ? yield* resolveNeoPiBinary(effectiveConfig, env, serverConfig.cwd).pipe(
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          )
-        : null;
-      const binary = resolved?.binary ?? (config.binaryPath || "npi");
-      if (resolved?.autoSelected && !resolved.error) {
-        yield* serverSettings
-          .updateSettings((current) =>
-            neoPiBinarySelectionPatch(
-              settingsBeforeProbe,
-              current,
-              instanceId,
-              binary,
-              resolved.bundled,
-            ),
-          )
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderDriverError({
-                  driver: DRIVER_KIND,
-                  instanceId,
-                  detail: "Failed to save NeoPi executable selection",
-                  cause,
-                }),
-            ),
-          );
-      }
-      const capabilityProbe: NeoPiCapabilityProbe = {
-        status: "unprobed",
-        version: resolved?.version ?? null,
-      };
-      const commandProbe = makeNeoPiDiscoveryProbe({
+        enabled,
+        snapshot,
+        orchestrationAdapter: adapter,
+        textGeneration,
+        snapshotForCwd: (cwd) =>
+          Effect.flatMap(snapshot.getSnapshot, (base) =>
+            neoPiSnapshotForCwd(base, cwd, discovery, commandProbe),
+          ).pipe(Effect.provideService(FileSystem.FileSystem, fs)),
+        invalidateCaches: commandProbe.invalidate,
+      } satisfies ProviderInstance,
+      {
         binary,
+        env,
         profile: config.profile,
-        env,
-        spawn: spawner.spawn,
-        hub: discovery,
-      });
-      const adapter = yield* makeNeoPiAdapter({
-        settings: effectiveConfig,
-        instanceId,
-        binary,
-        cwd: serverConfig.cwd,
-        t3Home: serverConfig.baseDir,
-        attachmentsDir: serverConfig.attachmentsDir,
-        environment: env,
-        spawn: spawner.spawn,
-        discovery,
-        sharedSessionCapabilities,
-        makeHostBridge: makeNeoPiHostToolBridge,
-      });
-      const textGeneration = makeNeoPiTextGeneration({
-        binary,
-        env,
-        spawn: spawner.spawn,
-        makeClient,
-      });
-      const snapshot = yield* makeManagedServerProvider<NeoPiSettings>({
-        getSettings: Effect.succeed(effectiveConfig),
-        streamSettings: Stream.empty,
-        haveSettingsChanged,
-        initialSnapshot: (settings) =>
-          buildInitialNeoPiProviderSnapshot(settings).pipe(Effect.map(stamp)),
-        checkProvider: Ref.get(retainedCatalog).pipe(
-          Effect.flatMap((previous) =>
-            checkNeoPiProviderStatus(
-              effectiveConfig,
-              env,
-              serverConfig.cwd,
-              spawner.spawn,
-              discovery,
-              sharedSessionCapabilities,
-              {
-                resolvedBinary: binary,
-                capabilityProbe,
-                ...(previous ? { previous } : {}),
-                onSuccessfulCatalog: (catalog) => Ref.set(retainedCatalog, catalog),
-              },
-            ),
-          ),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-          Effect.map(stamp),
-        ),
-        enrichSnapshot: ({ snapshot: probed, getSnapshot, publishSnapshot }) =>
-          Effect.gen(function* () {
-            if (!probed.installed || probed.status === "error") return;
-            const activeProvider = neoPiUsageProviderId(probed.models);
-            if (!activeProvider && probed.status === "warning") return;
-            const previous = (yield* getSnapshot).usageLimits;
-            const usageLimits = yield* applyUsageLimits({
-              binary,
-              activeProvider,
-              profile: config.profile,
-              cwd: serverConfig.cwd,
-              environment: env,
-              getLiveUsage: adapter.getLiveUsage,
-              ...(previous ? { previous } : {}),
-            }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
-            yield* publishSnapshot({ ...probed, usageLimits });
-          }),
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderDriverError({
-              driver: DRIVER_KIND,
-              instanceId,
-              detail: `Failed to build NeoPi snapshot: ${cause.message}`,
-              cause,
-            }),
-        ),
-      );
-      const instance = registerNeoPiSessionCatalogSource(
-        {
-          instanceId,
-          driverKind: DRIVER_KIND,
-          continuationIdentity,
-          displayName,
-          accentColor,
-          enabled,
-          snapshot,
-          adapter,
-          textGeneration,
-          snapshotForCwd: (cwd) =>
-            Effect.flatMap(snapshot.getSnapshot, (base) =>
-              neoPiSnapshotForCwd(base, cwd, discovery, commandProbe),
-            ).pipe(Effect.provideService(FileSystem.FileSystem, fs)),
-          invalidateCaches: commandProbe.invalidate,
-        } satisfies ProviderInstance,
-        {
-          binary,
-          env,
-          profile: config.profile,
-          launchArgs: config.launchArgs,
-          capabilities: sharedSessionCapabilities,
-          probe: capabilityProbe,
-          configuration: adapter.getConfiguration,
-          observeConfiguration: adapter.observeConfiguration,
-          journal: adapter.readJournal,
-          observeNative: adapter.observeNative,
-          modelsConnection: adapter.getModelsConnection,
-        },
-      );
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => unregisterNeoPiSessionCatalogSource(instance)),
-      );
-      return instance;
-    }),
+        launchArgs: config.launchArgs,
+        capabilities: sharedSessionCapabilities,
+        probe: capabilityProbe,
+        configuration: adapter.getConfiguration,
+        observeConfiguration: adapter.observeConfiguration,
+        journal: adapter.readJournal,
+        observeNative: adapter.observeNative,
+        modelsConnection: adapter.getModelsConnection,
+      },
+    );
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => unregisterNeoPiSessionCatalogSource(instance)),
+    );
+    return instance;
+  }),
 };

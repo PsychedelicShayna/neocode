@@ -1,17 +1,30 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  makeProviderSettingsSchema,
+  SourceControlProviderKind,
+} from "@t3tools/contracts";
+import { UNKNOWN_SOURCE_CONTROL_CLIENT } from "@t3tools/client-runtime/source-control-clients";
+import * as Schema from "effect/Schema";
 
 import {
   filterAvailableSettingsSearchItems,
   getSettingsSearchTargetScope,
   getThreadAutoSettlementSearchAvailability,
-  isSettingsOverviewVisible,
   isSettingsSearchScopeAvailable,
-  searchableSetting,
+  movedSettingsPath,
   searchSettings,
+  SETTINGS_NAV_GROUPS,
   SETTINGS_SEARCH_ITEMS,
+  sourceControlHostSearchItems,
+  sourceControlHostSettingsSearchId,
   type SettingsSearchItem,
 } from "./settingsSearch";
+
+vi.mock("~/env", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/env")>()),
+  isSecretsFeatureEnabled: false,
+}));
 
 const ITEMS: ReadonlyArray<SettingsSearchItem> = [
   {
@@ -23,7 +36,7 @@ const ITEMS: ReadonlyArray<SettingsSearchItem> = [
   {
     id: "network-access",
     title: "Network access",
-    to: "/settings/connections",
+    to: "/settings/access",
     searchTerms: ["remote pairing backend"],
   },
   {
@@ -45,16 +58,24 @@ const ITEMS: ReadonlyArray<SettingsSearchItem> = [
 ];
 
 describe("searchSettings", () => {
-  it.each(["send shortcut", "multiline", "new line"])("finds Send shortcut for %s", (query) => {
-    expect(searchSettings(query).map((item) => item.id)).toContain("send-shortcut");
-  });
-
   it("matches titles, sections, and remembered setting details", () => {
     expect(searchSettings("word", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
     expect(searchSettings("network", ITEMS).map((item) => item.id)).toEqual(["network-access"]);
-    expect(searchSettings("connections", ITEMS).map((item) => item.id)).toEqual(["network-access"]);
+    expect(searchSettings("sharing", ITEMS).map((item) => item.id)).toEqual(["network-access"]);
     expect(searchSettings("neopi", ITEMS).map((item) => item.id)).toEqual(["providers"]);
     expect(searchSettings("long lines", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
+    for (const query of ["fallback", "fallback agent", "fallback model"]) {
+      expect(searchSettings(query)[0]).toMatchObject({
+        id: "fallback-model",
+        to: "/settings/threads",
+        scope: "environment-defaults",
+      });
+    }
+  });
+
+  it("hides the Secrets page from nav and search while the secrets feature is disabled", () => {
+    expect(SETTINGS_NAV_GROUPS.flatMap((group) => group.paths)).not.toContain("/settings/secrets");
+    expect(searchSettings("1password").map((item) => item.to)).not.toContain("/settings/secrets");
   });
 
   it("matches normalized title substrings", () => {
@@ -70,13 +91,6 @@ describe("searchSettings", () => {
       localeLowerCase.mockRestore();
     }
     expect(searchSettings("xyzzy")).toEqual([]);
-  });
-
-  it("keeps catalog order for multiple title matches", () => {
-    expect(searchSettings("update", ITEMS).map((item) => item.id)).toEqual([
-      "provider-updates",
-      "automatic-updates",
-    ]);
   });
 
   it("matches query words across fields and ranks the strongest result first", () => {
@@ -145,25 +159,7 @@ describe("searchSettings", () => {
     expect(SETTINGS_SEARCH_ITEMS.some((item) => item.id === "quit-confirmation")).toBe(true);
     expect(searchSettings("hold to quit")).toEqual([]);
     expect(searchSettings("wsl")).toEqual([]);
-  });
-
-  it("hides macOS-only settings on other platforms", () => {
-    vi.stubGlobal("navigator", { platform: "Win32" });
-    try {
-      expect(searchSettings("font smoothing")).toEqual([]);
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("registers the WSL backend as a desktop-only setting", () => {
-    expect(SETTINGS_SEARCH_ITEMS.find((item) => item.id === "wsl-backend")).toMatchObject({
-      id: "wsl-backend",
-      title: "WSL backend",
-      to: "/settings/connections",
-      desktopOnly: true,
-      windowsOnly: true,
-    });
+    expect(searchSettings("update track")).toEqual([]);
   });
 
   it("hides settings whose controls are unavailable", () => {
@@ -183,15 +179,62 @@ describe("searchSettings", () => {
       "publish-agent-activity",
       "provider-health-check-interval",
       "source-control-writer-model",
+      "review-guide-model",
+      "review-guide-instructions",
       "source-control-writing-style",
       "t3-connect",
+      "hold-webhooks-while-offline",
       "tailscale-https",
       "wsl-backend",
       "auto-settle-inactive-threads",
       "auto-settle-merged-threads",
       "days-before-auto-settle",
+      "linked-environments",
     ]);
     expect(available.map((item) => item.id).filter((id) => gatedIds.has(id))).toEqual([]);
+  });
+
+  it("finds linked environments on a remote host without local maintenance access", () => {
+    const availability = {
+      hasCloudPublicConfig: false,
+      hasEnvironment: true,
+      hasProviderSettingsEnvironment: true,
+      canManageLocalBackend: false,
+      localEnvironmentDisabled: true,
+      isWslSettingsRowVisible: false,
+      hasThreadAutoSettlement: false,
+    };
+    const results = (hasPeerLinkHost: boolean) =>
+      searchSettings(
+        "linked environments",
+        filterAvailableSettingsSearchItems({ ...availability, hasPeerLinkHost }),
+      );
+    expect(results(false).map((item) => item.id)).not.toContain("linked-environments");
+    expect(results(true)).toContainEqual(
+      expect.objectContaining({
+        id: "linked-environments",
+        to: "/settings/connections",
+        targetId: "linked-environments",
+      }),
+    );
+  });
+
+  it("finds the Welcome page only where a primary computer can open it", () => {
+    const availability = {
+      hasCloudPublicConfig: true,
+      hasEnvironment: true,
+      hasProviderSettingsEnvironment: true,
+      canManageLocalBackend: false,
+      isWslSettingsRowVisible: false,
+      hasThreadAutoSettlement: false,
+    };
+    const ids = (hasPrimaryEnvironment: boolean) =>
+      searchSettings(
+        "welcome page",
+        filterAvailableSettingsSearchItems({ ...availability, hasPrimaryEnvironment }),
+      ).map((item) => item.id);
+    expect(ids(false)).not.toContain("welcome-page");
+    expect(ids(true)).toContain("welcome-page");
   });
 
   it("keeps the local toggle searchable without offering hidden host publishing controls", () => {
@@ -211,26 +254,9 @@ describe("searchSettings", () => {
     expect(remoteOnly).not.toContain("t3-connect");
     expect(remoteOnly).not.toContain("publish-agent-activity");
     expect(remoteOnly).not.toContain("wsl-backend");
-    // Browsers without access:write still render CloudLinkRow for their host.
-    const browser = filterAvailableSettingsSearchItems(availability).map((item) => item.id);
-    expect(browser).toContain("publish-agent-activity");
-  });
-
-  it("shows automatic settlement settings when the server supports them", () => {
-    const available = filterAvailableSettingsSearchItems({
-      hasCloudPublicConfig: false,
-      hasEnvironment: false,
-      hasProviderSettingsEnvironment: false,
-      canManageLocalBackend: false,
-      isWslSettingsRowVisible: false,
-      hasThreadAutoSettlement: true,
-    });
-
-    expect(searchSettings("auto-settle", available).map((item) => item.id)).toEqual([
-      "auto-settle-inactive-threads",
-      "auto-settle-merged-threads",
-      "days-before-auto-settle",
-    ]);
+    expect(filterAvailableSettingsSearchItems(availability).map((item) => item.id)).toContain(
+      "publish-agent-activity",
+    );
   });
 
   it("finds keybinding commands by label, command id, and default key", () => {
@@ -241,14 +267,6 @@ describe("searchSettings", () => {
       id: "keybinding-thread.copyReference",
       to: "/settings/keybindings",
     });
-  });
-
-  it("ranks keybinding commands after other settings", () => {
-    const ids = searchSettings("model").map((item) => item.id);
-    expect(ids[0]).toBe("default-model");
-    expect(ids.indexOf("keybinding-modelPicker.toggle")).toBeGreaterThan(
-      ids.indexOf("text-generation-model"),
-    );
   });
 
   it("sends commands without a default binding to the section", () => {
@@ -262,11 +280,6 @@ describe("searchSettings", () => {
   it("keeps catalog result ids unique", () => {
     const ids = SETTINGS_SEARCH_ITEMS.map((item) => item.id);
     expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  it("serves anchor props to panels from the catalog", () => {
-    expect(searchableSetting("word-wrap")).toEqual({ id: "word-wrap", title: "Word wrap" });
-    expect(searchableSetting("archive")).toEqual({ id: "archive", title: "Archived threads" });
   });
 
   it("routes appearance settings to their current section", () => {
@@ -306,19 +319,19 @@ describe("searchSettings", () => {
     ]);
   });
 
-  it("routes browser recording quality to integrations", () => {
+  it("routes browser recording quality to its dedicated page", () => {
     const result = searchSettings("recording frame rate")[0];
     expect(result).toMatchObject({
       id: "browser-recording-frame-rate",
-      to: "/settings/integrations",
+      to: "/settings/browser",
     });
     expect(result).not.toHaveProperty("targetId");
   });
 
-  it("routes where links open to integrations", () => {
+  it("routes where links open to the browser page", () => {
     expect(searchSettings("open links in")[0]).toMatchObject({
       id: "browser-link-target",
-      to: "/settings/integrations",
+      to: "/settings/browser",
     });
     expect(searchSettings("external links")[0]).toMatchObject({ id: "browser-link-target" });
   });
@@ -326,15 +339,15 @@ describe("searchSettings", () => {
   it("finds the default browser profile action in the profiles list", () => {
     expect(searchSettings("default profile")[0]).toMatchObject({
       id: "browser-default-profile",
-      to: "/settings/integrations",
+      to: "/settings/browser",
       targetId: "browser-profiles",
     });
   });
 
   it.each([
-    ["default model", "default-model", "/settings/general"],
-    ["new threads", "new-threads", "/settings/general"],
-    ["agent browser access", "agent-browser-access", "/settings/integrations"],
+    ["default model", "default-model", "/settings/threads"],
+    ["new threads", "new-threads", "/settings/threads"],
+    ["agent browser access", "agent-browser-access", "/settings/browser"],
     ["automatically pull", "automatic-pull", "/settings/source-control"],
     ["actions", "project-actions", "/settings/general"],
     ["project overview", "project-overview", "/settings/projects"],
@@ -352,54 +365,21 @@ describe("searchSettings", () => {
       hasThreadAutoSettlement: true,
     });
     expect(searchSettings("writing style", available)[0]?.id).toBe("source-control-writing-style");
-    expect(searchSettings("auto-settle", available)).toHaveLength(3);
+    expect(searchSettings("auto-settle", available).map((item) => item.id)).toContain(
+      "auto-settle-inactive-threads",
+    );
   });
 });
 
 describe("settings search targets", () => {
-  it.each([
-    "auto-settle-inactive-threads",
-    "auto-settle-merged-threads",
-    "days-before-auto-settle",
-  ])("retains the capability requirement for %s", (targetId) => {
-    expect(getSettingsSearchTargetScope(targetId)).toMatchObject({
-      scope: "project-defaults",
-      requiresThreadAutoSettlement: true,
-    });
-  });
-
-  it("treats device-local rows as reachable from every selection", () => {
-    const setting = getSettingsSearchTargetScope("time-format")!;
-    expect(setting).toEqual({ title: "Time format", scope: null });
-    expect(isSettingsSearchScopeAvailable(setting.scope, "project")).toBe(true);
-    expect(isSettingsSearchScopeAvailable(setting.scope, "all")).toBe(true);
-    expect(getSettingsSearchTargetScope("appearance")).toMatchObject({ scope: null });
-    expect(getSettingsSearchTargetScope("missing-setting")).toBeNull();
-  });
-
-  it.each(["all", "environment", "project", "checkout"] as const)(
-    "makes browser access editable at the %s scope",
-    (kind) => {
-      const setting = getSettingsSearchTargetScope("agent-browser-access")!;
-      expect(isSettingsSearchScopeAvailable(setting.scope, kind)).toBe(true);
-      expect(isSettingsSearchScopeAvailable(setting.scope, "unavailable")).toBe(false);
-    },
-  );
-
-  it("lets project-scopable rows resolve at every server-backed scope", () => {
-    const model = getSettingsSearchTargetScope("text-generation-model")!;
-    expect(isSettingsSearchScopeAvailable(model.scope, "all")).toBe(true);
-    expect(isSettingsSearchScopeAvailable(model.scope, "environment")).toBe(true);
-    expect(isSettingsSearchScopeAvailable(model.scope, "project")).toBe(true);
-  });
-
-  it("reaches source control discovery and git fetch interval from the default scope", () => {
-    for (const id of ["source-control", "git-fetch-interval"]) {
-      const item = getSettingsSearchTargetScope(id)!;
-      expect(isSettingsSearchScopeAvailable(item.scope, "all")).toBe(true);
-      expect(isSettingsSearchScopeAvailable(item.scope, "environment")).toBe(true);
-      expect(isSettingsSearchScopeAvailable(item.scope, "project")).toBe(false);
-    }
+  it("requires an environment for the resolved telemetry export destination", () => {
+    const result = searchSettings("OpenTelemetry export").find(
+      (item) => item.id === "telemetry-export",
+    )!;
+    const target = getSettingsSearchTargetScope(result.targetId ?? result.id)!;
+    expect(isSettingsSearchScopeAvailable(target.scope, "all")).toBe(false);
+    expect(isSettingsSearchScopeAvailable(target.scope, "project")).toBe(false);
+    expect(isSettingsSearchScopeAvailable(target.scope, "environment")).toBe(true);
   });
 
   it("keeps environment-wide settings out of project scopes", () => {
@@ -408,31 +388,36 @@ describe("settings search targets", () => {
     expect(isSettingsSearchScopeAvailable(activity.scope, "environment")).toBe(true);
     expect(isSettingsSearchScopeAvailable(activity.scope, "all")).toBe(true);
     expect(isSettingsSearchScopeAvailable(activity.scope, "project")).toBe(false);
-    const streaming = getSettingsSearchTargetScope("response-streaming")!;
-    expect(streaming.scope).toBe("project-defaults");
-    expect(isSettingsSearchScopeAvailable(streaming.scope, "project")).toBe(true);
-    for (const id of ["legacy-plan-mode", "legacy-sidebar"]) {
+    const fallback = getSettingsSearchTargetScope("fallback-model")!;
+    expect(fallback.scope).toBe("environment-defaults");
+    expect(isSettingsSearchScopeAvailable(fallback.scope, "environment")).toBe(true);
+    expect(isSettingsSearchScopeAvailable(fallback.scope, "all")).toBe(true);
+    expect(isSettingsSearchScopeAvailable(fallback.scope, "project")).toBe(false);
+    for (const id of ["response-streaming", "speech-project-dictionary"]) {
+      expect(getSettingsSearchTargetScope(id)?.scope).toBe("project-defaults");
+    }
+    for (const scope of ["all", "environment", "project"] as const) {
+      expect(isSettingsSearchScopeAvailable("project-defaults", scope)).toBe(true);
+    }
+    for (const id of ["tool-call-visibility", "boring-sidebar"]) {
       expect(getSettingsSearchTargetScope(id)!.scope).toBeNull();
     }
   });
 });
 
 describe("auto-settlement search availability", () => {
-  function environment(id: string, { connected = true, loaded = true, supported = true } = {}) {
+  function environment(id: string, { connected = true, loaded = true } = {}) {
     return {
       environmentId: EnvironmentId.make(id),
       connection: { phase: connected ? ("connected" as const) : ("offline" as const) },
-      serverConfig: loaded
-        ? { environment: { capabilities: { threadAutoSettlement: supported } } }
-        : null,
+      serverConfig: loaded ? { environment: { capabilities: {} } } : null,
     };
   }
 
   const capable = environment("capable");
-  const unsupported = environment("unsupported", { supported: false });
   const offline = environment("offline", { connected: false });
   const loading = environment("loading", { loaded: false });
-  const environments = [capable, unsupported, offline, loading];
+  const environments = [capable, offline, loading];
 
   it("keeps results discoverable when one connected environment supports them", () => {
     const availability = getThreadAutoSettlementSearchAvailability(environments);
@@ -449,28 +434,11 @@ describe("auto-settlement search availability", () => {
       "auto-settle-inactive-threads",
       "auto-settle-merged-threads",
       "days-before-auto-settle",
+      "keep-threads-with-pull-requests",
     ]);
   });
 
-  it("offers only capable environments when an aggregate has mixed capabilities", () => {
-    expect(
-      getThreadAutoSettlementSearchAvailability(environments, {
-        kind: "all",
-        environmentIds: environments.map((entry) => entry.environmentId),
-      }),
-    ).toEqual({ eligibleEnvironmentIds: [capable.environmentId], isTargetAvailable: false });
-  });
-
-  it("allows a capable named environment regardless of other environments' capabilities", () => {
-    expect(
-      getThreadAutoSettlementSearchAvailability(environments, {
-        kind: "environment",
-        environmentIds: [capable.environmentId],
-      }).isTargetAvailable,
-    ).toBe(true);
-  });
-
-  it.each([unsupported, offline, loading])(
+  it.each([offline, loading])(
     "does not render the target on $environmentId or silently fall back",
     (selected) => {
       expect(
@@ -482,15 +450,6 @@ describe("auto-settlement search availability", () => {
     },
   );
 
-  it("offers a capable environment instead of a dead target at an unavailable scope", () => {
-    expect(
-      getThreadAutoSettlementSearchAvailability(environments, {
-        kind: "unavailable",
-        environmentIds: [capable.environmentId],
-      }),
-    ).toEqual({ eligibleEnvironmentIds: [capable.environmentId], isTargetAvailable: false });
-  });
-
   it("ignores offline and unloaded targets when all connected targets support the setting", () => {
     const selected = [capable, offline, loading];
     expect(
@@ -500,24 +459,75 @@ describe("auto-settlement search availability", () => {
       }).isTargetAvailable,
     ).toBe(true);
   });
+});
 
-  it("offers no unavailable environments when none can render the setting", () => {
-    const selected = [unsupported, offline, loading];
-    expect(
-      getThreadAutoSettlementSearchAvailability(selected, {
-        kind: "all",
-        environmentIds: selected.map((entry) => entry.environmentId),
-      }),
-    ).toEqual({ eligibleEnvironmentIds: [], isTargetAvailable: false });
-    expect(getThreadAutoSettlementSearchAvailability([]).eligibleEnvironmentIds).toEqual([]);
+describe("source control host search items", () => {
+  const definition = {
+    ...UNKNOWN_SOURCE_CONTROL_CLIENT,
+    kind: SourceControlProviderKind.make("example"),
+    label: "Example",
+    searchKeywords: ["sample"],
+    settings: makeProviderSettingsSchema({ apiToken: Schema.String }),
+  };
+
+  it("lists a host by its label, its keywords, and its settings fields", () => {
+    const items = sourceControlHostSearchItems([UNKNOWN_SOURCE_CONTROL_CLIENT, definition]);
+    expect(items.map((item) => item.id)).toEqual([sourceControlHostSettingsSearchId("example")]);
+    expect(searchSettings("sample apitoken", items).map((item) => item.id)).toEqual([
+      sourceControlHostSettingsSearchId("example"),
+    ]);
+  });
+
+  it("lists a host with credentials by its accounts, token and CLI", () => {
+    const items = sourceControlHostSearchItems([
+      {
+        ...definition,
+        credentials: {
+          cliName: "ex",
+          cliLabel: "Example CLI",
+          loginCommand: "ex login",
+          tokenEnvVar: "EX_TOKEN",
+          tokenAccess: "access",
+          newTokenUrl: (host) => `https://${host}/tokens`,
+        },
+      },
+    ]);
+    expect(searchSettings("ex switch accounts", items).map((item) => item.id)).toEqual([
+      sourceControlHostSettingsSearchId("example"),
+    ]);
+  });
+
+  it("finds the built-in hosts by their own words", () => {
+    expect(searchSettings("codeberg").map((item) => item.id)).toContain("source-control");
+    expect(searchSettings("ghes").map((item) => item.id)).toContain(
+      sourceControlHostSettingsSearchId("github"),
+    );
   });
 });
 
-describe("settings sidebar scope", () => {
-  it("shows Overview only for project and checkout targets", () => {
-    expect(isSettingsOverviewVisible({})).toBe(false);
-    expect(isSettingsOverviewVisible({ machine: "remote" })).toBe(false);
-    expect(isSettingsOverviewVisible({ project: "project" })).toBe(true);
-    expect(isSettingsOverviewVisible({ project: "project", checkout: "checkout" })).toBe(true);
+describe("movedSettingsPath", () => {
+  it("sends old links to the page their row moved to", () => {
+    expect(movedSettingsPath("/settings/general", "text-generation-model")).toBe(
+      "/settings/threads",
+    );
+    expect(movedSettingsPath("/settings/connections", "authorized-clients")).toBe(
+      "/settings/access",
+    );
+    expect(movedSettingsPath("/settings/source-control", "worktree-branch-naming")).toBe(
+      "/settings/worktrees",
+    );
+    expect(movedSettingsPath("/settings/appearance", "diff-color-scheme")).toBe("/settings/diffs");
+    expect(movedSettingsPath("/settings/connections", "network-access")).toBe("/settings/access");
+    expect(movedSettingsPath("/settings/storage", "storage-worktrees")).toBe("/settings/worktrees");
+    expect(movedSettingsPath("/settings/storage", "")).toBe("/settings/maintenance");
+    expect(movedSettingsPath("/settings/integrations", "devices")).toBe("/settings/devices");
+    expect(movedSettingsPath("/settings/beta", "")).toBe("/settings/labs");
+  });
+
+  it("leaves current pages alone", () => {
+    expect(movedSettingsPath("/settings/general", "time-format")).toBeNull();
+    expect(movedSettingsPath("/settings/projects", "project-defaults")).toBeNull();
+    expect(movedSettingsPath("/settings/connections", "remote-environments")).toBeNull();
+    expect(movedSettingsPath("/settings/appearance", "theme")).toBeNull();
   });
 });

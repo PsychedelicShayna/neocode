@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off -- fake captured children; no subprocesses are started.
-import { EventEmitter } from "node:events";
+import * as NodeEvents from "node:events";
 import { beforeEach, vi } from "vite-plus/test";
 import { describe, expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -13,16 +13,16 @@ import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import { ServerConfig } from "../../config.ts";
-import type { ProviderInstance } from "../ProviderDriver.ts";
-import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import { ProviderInstanceRegistry } from "../ProviderInstanceRegistry.ts";
 import { registerNeoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import { NeoPiStatsService } from "./NeoPiStatsService.ts";
 
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn }));
 
-class FakeStatsChild extends EventEmitter {
-  readonly stdout = new EventEmitter();
+class FakeStatsChild extends NodeEvents.EventEmitter {
+  readonly stdout = new NodeEvents.EventEmitter();
   readonly stderr = { resume: vi.fn() };
   readonly closed = Deferred.makeUnsafe<void>();
   readonly kill = vi.fn(() => true);
@@ -89,7 +89,7 @@ const hold = Effect.fnUntraced(function* (service: NeoPiStatsService["Service"],
     Effect.gen(function* () {
       yield* service.acquire("neopi", "view", "session", bootstrap);
       yield* Deferred.succeed(ready, undefined);
-      yield* Effect.never;
+      return yield* Effect.never;
     }),
   ).pipe(Effect.forkScoped);
   return { fiber, ready: Deferred.await(ready) };

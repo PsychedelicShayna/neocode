@@ -4,6 +4,7 @@ import {
   flattenThemeColor,
   getMobileThemeVariables,
   themeColorWithAlpha,
+  themeColorWithContrast,
   type MobileThemeAppearance,
   type MobileThemeId,
   type MobileThemeVariables,
@@ -13,12 +14,43 @@ const defaults = defaultThemeVariables as Readonly<
   Record<MobileThemeAppearance, MobileThemeVariables>
 >;
 
-/**
- * Complete palette for native and third-party APIs that cannot consume a
- * Uniwind className. Every palette shares the source that generates its
- * registered CSS theme.
- */
+const CARD_TEXT_ROLES = [
+  "--color-foreground-secondary",
+  "--color-foreground-muted",
+  "--color-placeholder",
+  "--color-primary-text",
+] as const;
+
+// A selected row in a sidebar sits on the drawer, so it must stay visible there with its labels.
+function withVisibleSelection(variables: MobileThemeVariables): MobileThemeVariables {
+  const selected = themeColorWithContrast(
+    flattenThemeColor(variables["--color-thread-selected"], variables["--color-drawer"]),
+    flattenThemeColor(variables["--color-drawer"], variables["--color-screen"]),
+    1.2,
+  );
+  return {
+    ...variables,
+    "--color-thread-selected": selected,
+    "--color-thread-selected-foreground": themeColorWithContrast(
+      variables["--color-thread-selected-foreground"],
+      selected,
+    ),
+    "--color-thread-selected-foreground-muted": themeColorWithContrast(
+      variables["--color-thread-selected-foreground-muted"],
+      selected,
+    ),
+  };
+}
+
 export function getMobileThemeRuntimeVariables(
+  themeId: MobileThemeId,
+  appearance: MobileThemeAppearance,
+  platform: string,
+): MobileThemeVariables {
+  return withVisibleSelection(platformThemeVariables(themeId, appearance, platform));
+}
+
+function platformThemeVariables(
   themeId: MobileThemeId,
   appearance: MobileThemeAppearance,
   platform: string,
@@ -27,9 +59,6 @@ export function getMobileThemeRuntimeVariables(
   const variables = usesDefaultPalette
     ? defaults[appearance]
     : getMobileThemeVariables(themeId, appearance);
-  // Light iPad sidebars reuse Android's tonal frame. Their row states must
-  // be composited over that frame rather than over the original page canvas.
-  // Named palettes and dark sidebars retain their shared semantic roles.
   const frame = themeColorWithAlpha(
     variables[usesDefaultPalette ? "--color-row-hover" : "--color-drawer"],
     1,
@@ -49,9 +78,24 @@ export function getMobileThemeRuntimeVariables(
   }
   if (platform !== "android") return variables;
 
+  // Android paints the drawer as the page inside a lighter frame, so dark cards lift off both.
+  const screen = variables["--color-screen"];
+  const groupedCard =
+    appearance === "dark"
+      ? themeColorWithContrast(
+          variables["--color-grouped-card"],
+          [screen, flattenThemeColor(frame, screen)],
+          1.2,
+        )
+      : variables["--color-grouped-card"];
+  const readableOnCard = (role: (typeof CARD_TEXT_ROLES)[number]) =>
+    [role, themeColorWithContrast(variables[role], groupedCard)] as const;
   return {
     ...variables,
+    ...Object.fromEntries(CARD_TEXT_ROLES.map(readableOnCard)),
     "--color-header": frame,
     "--color-header-foreground": variables["--color-drawer-foreground"],
+    "--color-drawer": screen,
+    "--color-grouped-card": groupedCard,
   };
 }

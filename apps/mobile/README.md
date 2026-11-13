@@ -28,22 +28,40 @@ T3 Connect is optional and disabled in a fresh clone. Public configuration belon
 repository-root `.env` or `.env.local`, not an `apps/mobile/.env` file. See
 [`../../.env.example`](../../.env.example).
 
+To enable HTTPS thread links for a maintainer-owned hosted app, set
+`NEOCODE_MOBILE_APP_HOST` to its hostname before the native build. Publish the matching
+Apple association and Android asset-link files for NeoCode's bundle IDs and signing
+certificate on that host. No upstream domain is claimed by default.
+
 ## Development
 
-For simulator/emulator development, select and boot a device, then ensure its native client matches
-this checkout before starting Metro:
+For simulator, emulator, or Android phone development, boot or connect a device, then install the
+native client that matches this checkout before starting Metro:
 
 ```bash
-node ../../scripts/mobile-native-client.ts ensure ios <simulator-udid>
-# Or: node ../../scripts/mobile-native-client.ts ensure android <emulator-serial>
+vp run mobile:install ios [simulator-udid]
+# Or: vp run mobile:install android [emulator-or-phone-serial]
 vp run dev:client
 ```
 
-The helper compares a local Expo fingerprint and the installed binary with its last successful
-build record. It builds and installs missing, stale, or unverified clients and reuses matching ones.
-Use `check` instead of `ensure` for a read-only decision: exit 0 means compatible, 2 means a build is
-needed, and 1 means an operational error. Run it on the simulator host; no EAS login is required.
-An externally installed client is unverified until the helper builds it once.
+The device argument can be omitted when exactly one device is booted or connected. The helper
+compares this checkout's Expo fingerprint and the installed binary with its last install record,
+and reuses a matching client. Otherwise it installs the build for that fingerprint from
+`~/.cache/t3code/native-clients/artifacts`, then the shared task cache, and builds only when
+neither has it. One iOS simulator build serves every iPhone and iPad simulator, and one APK per
+ABI (x86_64 or arm64-v8a) serves every emulator and phone of that ABI. Build output goes to the
+log file it prints (`T3_NATIVE_CLIENT_VERBOSE=1` streams it instead). Builds are shared back when
+your task-cache login (`bash infra/task-cache/install.sh`) can write. `T3_NATIVE_CLIENT_CACHE=read`
+skips the upload and `off` skips the shared cache. Physical iPhones still use `vp run ios:dev`.
+
+`--session <name>` installs into an agent-device session opened elsewhere, such as a device pool
+or a cloud simulator, instead of a local device: `vp run mobile:install android --session pool-1
+--metro http://<this-machine>:8081`. It uses only the cached build (x86_64 by default; `--abi`
+for ARM) and fails with the next step when no machine has built this fingerprint yet.
+
+For a read-only decision, run `node ../../scripts/mobile-native-client.ts check <ios|android>
+[device]`: exit 0 means compatible, 2 means an install is needed, and 1 means an operational error.
+An externally installed client is unverified until the helper installs it once.
 
 Start Metro for an already verified dev client:
 
@@ -103,14 +121,6 @@ Build and run the local iOS preview app:
 ```bash
 vp run ios:preview
 ```
-
-Force the review diff highlighter engine:
-
-```bash
-EXPO_PUBLIC_REVIEW_HIGHLIGHTER_ENGINE=javascript vp run ios:dev
-```
-
-`javascript` is the default and recommended setting for the review diff screen. Set `EXPO_PUBLIC_REVIEW_HIGHLIGHTER_ENGINE=native` only when you explicitly want to test the native Shiki engine.
 
 Inspect the resolved Expo config for a variant:
 
@@ -219,6 +229,9 @@ At least one project must exist in that environment to supply discovery context.
 The server resolves the selected session's real cwd and project when resuming; mobile
 does not move a session into that context project.
 
+Home opens native sessions by default. Choose Saved threads for existing workspace
+history and its project/environment filters; Native sessions returns to discovery.
+
 Open Models from Home, Settings, the thread sidebar, or a chat's session-configuration panel.
 The page uses NeoPi's native model catalog and role definitions. It supports global
 and project-scoped role assignments, fixed/inherited/automatic effort, ordered effort
@@ -261,8 +274,8 @@ This client requires a compatible NeoCode server with the native session journal
 live conversation, tree-navigation and Models contracts, plus a NeoPi runtime
 implementing those capabilities. It is not a client for arbitrary upstream server
 versions. Terminal handoff has no mobile control; use NeoPi on the host for that
-action. iOS widgets and native header chrome are not Android features. Android uses
-its existing Material controls.
+action. Subscription usage widgets support Android; Agent Activity widgets and native
+header chrome remain iOS-only. Android uses its existing Material controls.
 
 The screens patch targets 4.26.2. Its Kotlin managers implement the generated setters
 for `subtitle`, `largeSubtitle`, `navigationItemStyle`, `headerCenterBarButtonItems`,
@@ -282,9 +295,11 @@ an emulator-only screenshot establishes physical-device compatibility.
 
 ## EAS
 
-The optional EAS profiles build internal binaries without upstream channels or submission
-targets. Local APK builds above are the supported sideload path. EAS will require a newly
-created, maintainer-owned project before use; no project ID or owner is invented here.
+The default EAS profiles build internal binaries without upstream channels or submission
+targets. The optional `testflight` profile builds a store-signed archive with
+maintainer-owned signing; it does not configure an App Store submission target.
+Local APK builds above are the supported sideload path. Every EAS profile requires a
+new maintainer-owned project before use; no project ID or owner is invented here.
 Do not run inherited mobile production/OTA workflows against upstream credentials.
 Enabling OTA distribution later requires an explicit fork-owned update service and a
 native rebuild. This client never downloads upstream replacement bundles.

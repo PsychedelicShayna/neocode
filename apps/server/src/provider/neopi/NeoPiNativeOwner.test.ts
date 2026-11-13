@@ -5,12 +5,12 @@ import * as Fiber from "effect/Fiber";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcessSpawner } from "effect/process";
 import { readNeoPiNativeOwnerCatalog } from "./NeoPiNativeOwner.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
 const source = { binary: "/opt/npi", env: {} };
-const catalog = { version: 1, sessions: [] };
+const catalog = { version: 1 as const, sessions: [] };
 const makeHandle = (
   exitCode: Effect.Effect<ChildProcessSpawner.ExitCode>,
   stdout = Stream.encodeText(Stream.make(JSON.stringify(catalog))),

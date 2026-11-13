@@ -1,3 +1,4 @@
+import type { ProviderInstanceId } from "@t3tools/contracts";
 import { memo } from "react";
 import { CheckIcon, StarIcon } from "lucide-react";
 import { ComboboxItem } from "../ui/combobox";
@@ -20,11 +21,13 @@ export const ModelListRow = memo(function ModelListRow(props: {
   model: NativeSwitcherModel;
   isSelected: boolean;
   isFavorite: boolean;
+  /** In Favorites every row is starred, so the star shows only on hover. */
+  favoriteStarOnHover?: boolean;
   /** Names the provider in the secondary text, for lists that mix providers. */
   showProvider: boolean;
   jumpLabel?: string | null;
   disabledReason?: string | null;
-  onToggleFavorite: () => void;
+  onToggleFavorite: (instanceId: ProviderInstanceId, slug: string) => void;
 }) {
   const { model } = props;
   const isRole = model.group === ROLES_GROUP;
@@ -44,6 +47,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
   const row = (
     <ComboboxItem
       hideIndicator
+      selectedFill={false}
       index={props.index}
       value={modelPickerModelKey(model.instanceId, model.slug)}
       disabled={Boolean(props.disabledReason)}
@@ -73,7 +77,9 @@ export const ModelListRow = memo(function ModelListRow(props: {
           ) : null}
         </TooltipTrigger>
         <TooltipPopup side="right" align="center" className="whitespace-pre-line">
-          {[model.slug, model.description, factDetail].filter(Boolean).join("\n")}
+          {[model.instanceDisplayName, model.slug, model.description, factDetail]
+            .filter(Boolean)
+            .join("\n")}
         </TooltipPopup>
       </Tooltip>
       <div className="flex shrink-0 items-center gap-1.5">
@@ -88,7 +94,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
                   className="-mr-1 shrink-0"
                   onClick={(event) => {
                     event.stopPropagation();
-                    props.onToggleFavorite();
+                    props.onToggleFavorite(model.instanceId, model.slug);
                   }}
                   onKeyDown={(event) => event.stopPropagation()}
                   disabled={Boolean(props.disabledReason)}
@@ -99,6 +105,8 @@ export const ModelListRow = memo(function ModelListRow(props: {
                     className={cn(
                       "size-3.5 sm:size-3",
                       props.isFavorite && "fill-current text-warning",
+                      (!props.isFavorite || props.favoriteStarOnHover) &&
+                        "opacity-0 group-hover:opacity-100 group-data-highlighted:opacity-100 in-focus-visible:opacity-100 pointer-coarse:opacity-100",
                     )}
                   />
                 </Button>

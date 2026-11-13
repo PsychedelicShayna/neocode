@@ -8,8 +8,8 @@ import {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type { NeoPiNativeSessionsRequestInput } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
-import { useCallback } from "react";
+import { AsyncResult } from "effect/reactivity";
+import { useStableCallback } from "../hooks/useStableCallback";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -86,7 +86,7 @@ export const moveNativeSession = (target: NativeSessionTarget, toIndex: number) 
 /** Sends one native command to the session's owner and resolves with its response. */
 export function useNativeSessionRequest(target: NativeSessionTarget) {
   const send = useAtomCommand(nativeSessionAtoms.request, { reportFailure: false });
-  return useCallback(
+  return useStableCallback(
     async (
       command: Record<string, unknown> & { type: string },
       attachments?: NeoPiNativeSessionsRequestInput["attachments"],
@@ -98,16 +98,12 @@ export function useNativeSessionRequest(target: NativeSessionTarget) {
       if (response._tag === "Failure") throw squashAtomCommandFailure(response);
       return response.value;
     },
-    [send, target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
   );
 }
 
 /** Reopens a detached or ownerless session; see `nativeSessionAtoms.reconnect`. */
 export function useNativeSessionReconnect(target: NativeSessionTarget) {
-  return useCallback(
-    () => nativeSessionAtoms.reconnect(appAtomRegistry, target),
-    [target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
-  );
+  return useStableCallback(() => nativeSessionAtoms.reconnect(appAtomRegistry, target));
 }
 
 export function useNativeSession(target: NativeSessionTarget) {
@@ -139,15 +135,12 @@ export function useNativeSessionSlice<A>(
   target: NativeSessionTarget,
   select: (feed: NativeSessionFeed) => A,
 ): A {
-  const project = useCallback(
-    (result: AsyncResult.AsyncResult<NativeSessionFeed, unknown>) =>
-      select(
-        AsyncResult.isSuccess(result)
-          ? result.value
-          : (nativeSessionAtoms.cached(target) ?? EMPTY_FEED),
-      ),
-    [select, target],
-  );
+  const project = (result: AsyncResult.AsyncResult<NativeSessionFeed, unknown>) =>
+    select(
+      AsyncResult.isSuccess(result)
+        ? result.value
+        : (nativeSessionAtoms.cached(target) ?? EMPTY_FEED),
+    );
   return useAtomValue(
     nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
     project,

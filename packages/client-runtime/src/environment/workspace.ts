@@ -49,7 +49,10 @@ export function workspaceFileResource(
   target: WorkspaceRef,
   path: string,
   kind: "workspace-file" | "media-file",
-): AssetResource {
+): Extract<
+  AssetResource,
+  { _tag: "workspace-file" | "media-file" | "native-workspace-file" | "native-media-file" }
+> {
   return "threadId" in target
     ? { _tag: kind, threadId: target.threadId, path }
     : {

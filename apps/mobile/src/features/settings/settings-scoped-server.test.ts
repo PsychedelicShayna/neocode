@@ -9,15 +9,65 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import type { SettingsTarget } from "./settings-environment-filter";
 import {
+  managedSettingReason,
   planMobileScopedSettingsClear,
   planMobileScopedSettingsPatch,
   resolveMobileSettingsTargets,
+  uniformMobileSetting,
 } from "./settings-scoped-server";
 
 const firstId = "first" as EnvironmentId;
 const secondId = "second" as EnvironmentId;
 const firstProject = "first-project" as ProjectId;
 const secondProject = "second-project" as ProjectId;
+
+describe("mobile usage-limit settings across environments", () => {
+  it.each(["autoResumeLimitedThreads", "snoozeLimitedThreads"] as const)(
+    "shows %s as mixed and can enable it everywhere without changing other settings",
+    (key) => {
+      const targets = resolveMobileSettingsTargets(
+        [
+          environment(firstId, {
+            ...DEFAULT_SERVER_SETTINGS,
+            [key]: true,
+            defaultAutoPull: true,
+          }),
+          environment(secondId, {
+            ...DEFAULT_SERVER_SETTINGS,
+            [key]: false,
+            defaultAutoPull: false,
+          }),
+        ],
+        null,
+      );
+
+      expect(uniformMobileSetting(targets, key)).toBeNull();
+      const writes = planMobileScopedSettingsPatch(targets, false, { [key]: true });
+      expect(writes).toEqual([
+        { environmentId: firstId, patch: { [key]: true } },
+        { environmentId: secondId, patch: { [key]: true } },
+      ]);
+      const updatedTargets = targets.map((target) => ({
+        ...target,
+        settings: writes.reduce(
+          (settings, write) =>
+            write.environmentId === target.environment.environmentId
+              ? applyServerSettingsPatch(settings, write.patch)
+              : settings,
+          target.settings,
+        ),
+      }));
+      expect(uniformMobileSetting(updatedTargets, key)).toBe(true);
+      expect(updatedTargets.map((target) => target.settings.defaultAutoPull)).toEqual([
+        true,
+        false,
+      ]);
+      expect(uniformMobileSetting(targets.slice(0, 1), key)).toBe(true);
+      expect(uniformMobileSetting(targets.slice(1), key)).toBe(false);
+      expect(uniformMobileSetting([], key)).toBeNull();
+    },
+  );
+});
 
 function environment(
   environmentId: EnvironmentId,
@@ -47,7 +97,7 @@ describe("mobile project settings scope", () => {
     };
     const secondSettings: ServerSettings = {
       ...DEFAULT_SERVER_SETTINGS,
-      responseStreamingMode: "token",
+      responseStreamingMode: "turn",
       projectSettingsOverrides: {},
     };
     const targets = resolveMobileSettingsTargets(
@@ -78,7 +128,7 @@ describe("mobile project settings scope", () => {
       },
     ]);
     expect(firstSettings.responseStreamingMode).toBe("paragraph");
-    expect(secondSettings.responseStreamingMode).toBe("token");
+    expect(secondSettings.responseStreamingMode).toBe("turn");
   });
 
   it("removes a project override when a picker sends null for a key that cannot store it", () => {
@@ -133,7 +183,9 @@ describe("mobile project settings scope", () => {
       },
     ]);
     expect(
-      planMobileScopedSettingsPatch(targets, true, { enableProviderUpdateChecks: false }),
+      planMobileScopedSettingsPatch(targets, true, {
+        storageCleanup: DEFAULT_SERVER_SETTINGS.storageCleanup,
+      }),
     ).toEqual([]);
   });
 
@@ -168,5 +220,30 @@ describe("mobile project settings scope", () => {
     );
     expect(planMobileScopedSettingsPatch(targets, true, { defaultAutoPull: true })).toEqual([]);
     expect(planMobileScopedSettingsClear(targets, ["defaultAutoPull"])).toEqual([]);
+  });
+});
+
+describe("managed settings across environments", () => {
+  it("names the manager when any selected environment locks the setting", () => {
+    const managed = {
+      ...environment(secondId, DEFAULT_SERVER_SETTINGS),
+      serverConfig: {
+        ...environment(secondId, DEFAULT_SERVER_SETTINGS).serverConfig,
+        managedPolicy: { organization: "Example Corp", lockedSettings: ["storageCleanup"] },
+      },
+    } as SettingsTarget;
+    const targets = resolveMobileSettingsTargets(
+      [environment(firstId, DEFAULT_SERVER_SETTINGS), managed],
+      null,
+    );
+
+    expect(managedSettingReason(targets, "storageCleanup.logsAfterDays")).toBe(
+      "Managed by Example Corp.",
+    );
+    expect(managedSettingReason(targets, "defaultAutoPull", "storageCleanup")).toBe(
+      "Managed by Example Corp.",
+    );
+    expect(managedSettingReason(targets, "defaultAutoPull")).toBeUndefined();
+    expect(managedSettingReason(targets.slice(0, 1), "storageCleanup")).toBeUndefined();
   });
 });

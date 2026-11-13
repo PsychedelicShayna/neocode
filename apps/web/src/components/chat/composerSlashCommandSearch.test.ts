@@ -39,9 +39,9 @@ describe("native slash argument completions", () => {
 });
 
 describe("searchSlashCommandItems", () => {
-  const claudeDriver = ProviderDriverKind.make("claudeAgent");
+  const nativeDriver = ProviderDriverKind.make("neopi");
 
-  it.each(["model", "plan", "default"] as const)(
+  it.each(["model", "side", "btw", "clear"] as const)(
     "keeps native /%s authoritative rather than consuming it as a local GUI action",
     (command) => {
       const nativeCommand = {
@@ -118,24 +118,24 @@ describe("searchSlashCommandItems", () => {
   it("moves exact provider command matches ahead of broader description matches", () => {
     const items = [
       {
-        id: "slash:default",
+        id: "slash:clear",
         type: "slash-command",
-        command: "default",
-        label: "/default",
-        description: "Switch this thread back to normal build mode",
+        command: "clear",
+        label: "/clear",
+        description: "Clear the current GUI conversation",
       },
       {
-        id: "provider-slash-command:claudeAgent:ui",
+        id: "provider-slash-command:neopi:ui",
         type: "provider-slash-command",
-        provider: claudeDriver,
+        provider: nativeDriver,
         command: { name: "ui" },
         label: "/ui",
         description: "Explore, build, and refine UI.",
       },
       {
-        id: "provider-slash-command:claudeAgent:frontend-design",
+        id: "provider-slash-command:neopi:frontend-design",
         type: "provider-slash-command",
-        provider: claudeDriver,
+        provider: nativeDriver,
         command: { name: "frontend-design" },
         label: "/frontend-design",
         description: "Create distinctive, production-grade frontend interfaces",
@@ -145,25 +145,25 @@ describe("searchSlashCommandItems", () => {
     >;
 
     expect(searchSlashCommandItems(items, "ui").map((item) => item.id)).toEqual([
-      "provider-slash-command:claudeAgent:ui",
-      "slash:default",
+      "provider-slash-command:neopi:ui",
+      "slash:clear",
     ]);
   });
 
   it("supports fuzzy provider command matches", () => {
     const items = [
       {
-        id: "provider-slash-command:claudeAgent:gh-fix-ci",
+        id: "provider-slash-command:neopi:gh-fix-ci",
         type: "provider-slash-command",
-        provider: claudeDriver,
+        provider: nativeDriver,
         command: { name: "gh-fix-ci" },
         label: "/gh-fix-ci",
         description: "Fix failing GitHub Actions",
       },
       {
-        id: "provider-slash-command:claudeAgent:github",
+        id: "provider-slash-command:neopi:github",
         type: "provider-slash-command",
-        provider: claudeDriver,
+        provider: nativeDriver,
         command: { name: "github" },
         label: "/github",
         description: "General GitHub help",
@@ -173,16 +173,16 @@ describe("searchSlashCommandItems", () => {
     >;
 
     expect(searchSlashCommandItems(items, "gfc").map((item) => item.id)).toEqual([
-      "provider-slash-command:claudeAgent:gh-fix-ci",
+      "provider-slash-command:neopi:gh-fix-ci",
     ]);
   });
 
   it("includes skills by name and description", () => {
     const items = [
       {
-        id: "skill:claudeAgent:browser",
+        id: "skill:neopi:browser",
         type: "skill",
-        provider: claudeDriver,
+        provider: nativeDriver,
         skill: {
           name: "browser",
           path: "/skills/browser/SKILL.md",
@@ -195,19 +195,19 @@ describe("searchSlashCommandItems", () => {
     ] satisfies Array<Extract<ComposerCommandItem, { type: "skill" }>>;
 
     expect(searchSlashCommandItems(items, "browser").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:browser",
+      "skill:neopi:browser",
     ]);
     expect(searchSlashCommandItems(items, "control").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:browser",
+      "skill:neopi:browser",
     ]);
   });
 
   it("matches skills by display name", () => {
     const items = [
       {
-        id: "skill:claudeAgent:ask-matt",
+        id: "skill:neopi:ask-matt",
         type: "skill",
-        provider: claudeDriver,
+        provider: nativeDriver,
         skill: {
           name: "ask-matt",
           displayName: "Ask Matt",
@@ -221,19 +221,19 @@ describe("searchSlashCommandItems", () => {
     ] satisfies Array<Extract<ComposerCommandItem, { type: "skill" }>>;
 
     expect(searchSlashCommandItems(items, "ask matt").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:ask-matt",
+      "skill:neopi:ask-matt",
     ]);
     expect(searchSlashCommandItems(items, "/skill:ask-matt").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:ask-matt",
+      "skill:neopi:ask-matt",
     ]);
   });
 
   it("matches skills by their rendered prefix", () => {
     const items = [
       {
-        id: "skill:claudeAgent:browser",
+        id: "skill:neopi:browser",
         type: "skill",
-        provider: claudeDriver,
+        provider: nativeDriver,
         skill: {
           name: "browser",
           path: "/skills/browser/SKILL.md",
@@ -245,10 +245,10 @@ describe("searchSlashCommandItems", () => {
     ] satisfies Array<Extract<ComposerCommandItem, { type: "skill" }>>;
 
     expect(searchSlashCommandItems(items, "/skill:brow").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:browser",
+      "skill:neopi:browser",
     ]);
     expect(searchSlashCommandItems(items, "/sk").map((item) => item.id)).toEqual([
-      "skill:claudeAgent:browser",
+      "skill:neopi:browser",
     ]);
     expect(searchSlashCommandItems(items, "/ill")).toEqual([]);
   });
@@ -263,9 +263,9 @@ describe("searchSlashCommandItems", () => {
         description: "Switch model",
       },
       {
-        id: "skill:claudeAgent:unslop",
+        id: "skill:neopi:unslop",
         type: "skill",
-        provider: claudeDriver,
+        provider: nativeDriver,
         skill: {
           name: "unslop",
           path: "/skills/unslop/SKILL.md",
@@ -278,11 +278,11 @@ describe("searchSlashCommandItems", () => {
 
     expect(searchSlashCommandItems(items, "").map((item) => item.id)).toEqual([
       "slash:model",
-      "skill:claudeAgent:unslop",
+      "skill:neopi:unslop",
     ]);
   });
 
-  it("hides provider commands from slash completion after the first message line", () => {
+  it("hides provider commands and start-only local commands after the first message line", () => {
     const items = [
       {
         id: "slash:model",
@@ -291,18 +291,25 @@ describe("searchSlashCommandItems", () => {
         label: "/model",
         description: "Switch model",
       },
+      ...(["side", "btw", "clear"] as const).map((command) => ({
+        id: `slash:${command}`,
+        type: "slash-command" as const,
+        command,
+        label: `/${command}`,
+        description: "Start-only local command",
+      })),
       {
-        id: "provider-slash-command:claudeAgent:compact",
+        id: "provider-slash-command:neopi:compact",
         type: "provider-slash-command",
-        provider: claudeDriver,
+        provider: nativeDriver,
         command: { name: "compact" },
         label: "/compact",
         description: "Compact the conversation",
       },
       {
-        id: "skill:claudeAgent:unslop",
+        id: "skill:neopi:unslop",
         type: "skill",
-        provider: claudeDriver,
+        provider: nativeDriver,
         skill: {
           name: "unslop",
           path: "/skills/unslop/SKILL.md",
@@ -317,12 +324,15 @@ describe("searchSlashCommandItems", () => {
 
     expect(slashCommandItemsForPromptPosition(items, false).map((item) => item.id)).toEqual([
       "slash:model",
-      "skill:claudeAgent:unslop",
+      "skill:neopi:unslop",
     ]);
     expect(slashCommandItemsForPromptPosition(items, true).map((item) => item.id)).toEqual([
       "slash:model",
-      "provider-slash-command:claudeAgent:compact",
-      "skill:claudeAgent:unslop",
+      "slash:side",
+      "slash:btw",
+      "slash:clear",
+      "provider-slash-command:neopi:compact",
+      "skill:neopi:unslop",
     ]);
   });
 });

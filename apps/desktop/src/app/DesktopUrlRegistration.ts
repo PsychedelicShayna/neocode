@@ -16,7 +16,8 @@ export function resolveDesktopUrlRegistration(input: {
   readonly explicitRegistration: boolean;
   readonly execPath: string;
   readonly appPath: string;
-  readonly appImagePath?: string;
+  readonly appImagePath?: string | undefined;
+  readonly desktopLauncherPath?: string | undefined;
   readonly devServerUrl?: string;
   readonly passwordStore?: string | null;
 }): DesktopUrlRegistration {
@@ -38,7 +39,7 @@ export function resolveDesktopUrlRegistration(input: {
         ? [`VITE_DEV_SERVER_URL=${input.devServerUrl}`]
         : []),
       ...(input.isPackaged
-        ? [input.appImagePath || input.execPath, ...switches]
+        ? [input.desktopLauncherPath || input.appImagePath || input.execPath, ...switches]
         : [input.execPath, ...switches, input.appPath]),
     ],
   };
@@ -68,6 +69,7 @@ export function renderUrlHandlerDesktopEntry(input: {
   readonly displayName: string;
   readonly command: readonly string[];
   readonly scheme: string;
+  readonly iconPath?: string;
 }): string {
   // The first token is our fixed /usr/bin/env, never a user-supplied path.
   if (input.command[0] !== "/usr/bin/env") throw new Error("URL handler requires /usr/bin/env");
@@ -76,6 +78,7 @@ export function renderUrlHandlerDesktopEntry(input: {
     "Type=Application",
     `Name=${escapeDesktopEntryString(input.displayName)}`,
     `Exec=/usr/bin/env ${input.command.slice(1).map(escapeDesktopEntryExecArgument).join(" ")} %U`,
+    ...(input.iconPath === undefined ? [] : [`Icon=${escapeDesktopEntryString(input.iconPath)}`]),
     "Terminal=false",
     "NoDisplay=true",
     "StartupNotify=false",

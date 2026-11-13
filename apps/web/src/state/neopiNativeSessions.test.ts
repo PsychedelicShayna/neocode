@@ -3,14 +3,15 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 vi.mock("../connection/runtime", () => ({ connectionAtomRuntime: {} }));
 vi.mock("@t3tools/client-runtime/state/neopi-native-sessions", () => ({
-  createNativeSessionAtoms: () => ({}),
+  createNativeSessionAtoms: () => ({ cached: () => undefined }),
 }));
 vi.mock("./use-atom-command", () => ({ useAtomCommand: vi.fn() }));
+vi.mock("./nativeWorkspaceRelocation", () => ({ relocateNativeWorkspace: vi.fn() }));
 
 import {
   beginNativeSessionOpen,
   closeNativeSession,
-  cycleNativeSession,
+  moveNativeSession,
   replaceNativeSession,
   selectNativeSession,
   useNativeSessionSelection,
@@ -24,9 +25,6 @@ const a = session("local", "a");
 const b = session("remote", "b");
 
 beforeEach(() => {
-  useNativeSessionSelection.persist.setOptions({
-    storage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-  });
   useNativeSessionSelection.setState({ target: a, tabs: [a, b] });
 });
 
@@ -49,7 +47,7 @@ describe("native session open selection intent", () => {
     ["select", () => selectNativeSession(b)],
     ["reselect", () => selectNativeSession(a)],
     ["close", () => closeNativeSession(a)],
-    ["cycle", () => cycleNativeSession("next")],
+    ["reorder", () => moveNativeSession(a, 1)],
     ["relocate", () => replaceNativeSession(a, session("local", "moved"))],
   ] as const)("does not override a newer %s action", (_action, mutate) => {
     const pending = beginNativeSessionOpen();

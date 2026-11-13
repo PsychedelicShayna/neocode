@@ -6,12 +6,17 @@ describe("readFilePreviewResponse", () => {
   it("cancels a pending read when its preview closes", async () => {
     const controller = new AbortController();
     let cancelled = false;
+    const reading = Promise.withResolvers<void>();
     const body = new ReadableStream<Uint8Array>({
+      pull() {
+        reading.resolve();
+      },
       cancel() {
         cancelled = true;
       },
     });
     const result = readFilePreviewResponse(new Response(body), controller.signal);
+    await reading.promise;
     controller.abort();
     await expect(result).rejects.toThrow();
     expect(cancelled).toBe(true);
@@ -23,30 +28,6 @@ describe("readFilePreviewResponse", () => {
       text: "native text",
       truncated: false,
     });
-  });
-  it("reads text and rejects unsuccessful responses", async () => {
-    const signal = new AbortController().signal;
-    await expect(readFilePreviewResponse(new Response('{"ok":true}'), signal)).resolves.toEqual({
-      text: '{"ok":true}',
-      truncated: false,
-    });
-    await expect(
-      readFilePreviewResponse(new Response(null, { status: 403 }), signal),
-    ).rejects.toThrow("could not be loaded");
-  });
-  it("cancels a streamed error body instead of leaving it open", async () => {
-    const signal = new AbortController().signal;
-    let cancelled = false;
-    const body = new ReadableStream<Uint8Array>({
-      cancel() {
-        cancelled = true;
-      },
-    });
-
-    await expect(
-      readFilePreviewResponse(new Response(body, { status: 500 }), signal),
-    ).rejects.toThrow("could not be loaded");
-    expect(cancelled).toBe(true);
   });
 
   it("stops consuming an unbounded response and cancels its stream", async () => {

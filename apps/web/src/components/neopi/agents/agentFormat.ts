@@ -5,7 +5,7 @@ export function formatCost(cost: number): string {
   return cost < 0.01 ? "<$0.01" : `$${cost.toFixed(2)}`;
 }
 
-export function formatDuration(totalSeconds: number): string {
+function formatDuration(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));
   const minutes = Math.floor(seconds / 60);
   if (minutes === 0) return `${seconds}s`;

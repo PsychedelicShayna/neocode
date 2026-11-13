@@ -7,7 +7,8 @@ import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as PlatformError from "effect/PlatformError";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import * as TestClock from "effect/testing/TestClock";
+import { ChildProcessSpawner } from "effect/process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 
@@ -51,16 +52,22 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
   readonly ready?: Record<string, unknown>;
   /** Leave stderr open after exit, as a descendant inheriting the pipe would. */
   readonly holdStderr?: boolean;
+  readonly holdKill?: boolean;
   readonly onLine: (
     message: CapturedCommand,
     emit: (frame: unknown) => Effect.Effect<void>,
   ) => Effect.Effect<void>;
 }) {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const stderr = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+  const stderr = yield* Queue.unbounded<
+    { chunk: Uint8Array; processed: Deferred.Deferred<void> },
+    Cause.Done<void>
+  >();
   const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const captured = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const exitGate = yield* Deferred.make<{ code: number | null; signal: string | null }>();
+  const killStarted = yield* Deferred.make<void>();
+  const killRelease = yield* Deferred.make<void>();
   const signals: Array<string> = [];
 
   const emit = (frame: unknown): Effect.Effect<void> =>
@@ -124,8 +131,9 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
     kill: (options) =>
       Effect.gen(function* () {
         signals.push(options?.killSignal ?? "SIGTERM");
+        yield* Deferred.succeed(killStarted, undefined);
+        if (input.holdKill) yield* Deferred.await(killRelease);
         if (options?.forceKillAfter !== undefined) {
-          yield* Effect.sleep(options.forceKillAfter);
           signals.push("SIGKILL");
           yield* finish({ code: null, signal: "SIGKILL" });
           return;
@@ -136,7 +144,14 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
       Queue.offer(stdin, chunk).pipe(Effect.andThen(Queue.offer(captured, chunk))),
     ),
     stdout: Stream.fromQueue(stdout),
-    stderr: Stream.fromQueue(stderr),
+    stderr: Stream.fromQueue(stderr).pipe(
+      Stream.flatMap(({ chunk, processed }) =>
+        Stream.concat(
+          Stream.make(chunk),
+          Stream.fromEffect(Deferred.succeed(processed, undefined)).pipe(Stream.drain),
+        ),
+      ),
+    ),
     all: Stream.empty,
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
@@ -149,8 +164,14 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
     finish,
     exitProcess,
     endStdout: Queue.end(stdout),
-    writeStderr: (text: string) => Queue.offer(stderr, encoder.encode(text)).pipe(Effect.asVoid),
+    writeStderr: Effect.fn("scriptedPeer.writeStderr")(function* (text: string) {
+      const processed = yield* Deferred.make<void>();
+      yield* Queue.offer(stderr, { chunk: encoder.encode(text), processed });
+      return processed;
+    }),
     signals,
+    killStarted: Deferred.await(killStarted),
+    releaseKill: Deferred.succeed(killRelease, undefined),
     stdin: captured,
   };
 });
@@ -294,10 +315,15 @@ it.live("escalates close from SIGTERM to SIGKILL", () =>
     Effect.gen(function* () {
       const peer = yield* scriptedPeer({
         ready: v2Ready,
+        holdKill: true,
         onLine: (message, emit) => negotiate(message, emit).pipe(Effect.asVoid),
       });
       const client = yield* makeClient(peer);
-      yield* client.close(20);
+      const closing = yield* client.close(20).pipe(Effect.forkScoped);
+      yield* peer.killStarted;
+      assert.deepEqual(peer.signals, ["SIGTERM"]);
+      yield* peer.releaseKill;
+      yield* Fiber.join(closing);
       assert.deepEqual(peer.signals, ["SIGTERM", "SIGKILL"]);
     }),
   ),
@@ -443,6 +469,62 @@ it.live("delivers a late failure for an already admitted prompt in event order",
         id: prompt.id,
         error: "late upstream rejection",
         code: undefined,
+      });
+    }),
+  ),
+);
+
+it.live("keeps a completed prompt's late acknowledgment separate from the following prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commands = yield* Queue.unbounded<CapturedCommand>();
+      const peer = yield* scriptedPeer({
+        ready: { ...v2Ready, capabilities: ["rpc-ui", "prompt_entry_ids"] },
+        onLine: (message, emit) =>
+          negotiate(message, emit).pipe(
+            Effect.flatMap((handled) => (handled ? Effect.void : Queue.offer(commands, message))),
+          ),
+      });
+      const client = yield* makeClient(peer);
+      const frames = yield* Queue.unbounded<Client.SessionEventFrame>();
+      yield* Stream.runForEach(client.events, (frame) => Queue.offer(frames, frame)).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const first = yield* client.prompt({ type: "prompt", message: "first" });
+      const firstCommand = yield* Queue.take(commands);
+      yield* peer.emit({ type: "agent_start" });
+      assert.equal((yield* Queue.take(frames)).type, "agent_start");
+      yield* peer.emit({ type: "agent_end", isTerminal: true });
+      assert.equal((yield* Queue.take(frames)).type, "agent_end");
+      const second = yield* client.prompt({ type: "prompt", message: "second" });
+      const secondCommand = yield* Queue.take(commands);
+      yield* peer.emit({ type: "agent_start" });
+      assert.equal((yield* Queue.take(frames)).type, "agent_start");
+      yield* peer.emit({
+        type: "response",
+        id: firstCommand.id,
+        command: "prompt",
+        success: true,
+        data: { agentInvoked: true, userEntryId: "first-user" },
+      });
+      yield* peer.emit({
+        type: "response",
+        id: secondCommand.id,
+        command: "prompt",
+        success: true,
+        data: { userEntryId: "second-user" },
+      });
+      yield* peer.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+      assert.equal((yield* Queue.take(frames)).type, "message_end");
+      assert.equal(yield* Deferred.isDone(first.outcome), true);
+      assert.equal(yield* Deferred.isDone(second.outcome), true);
+      assert.deepEqual(yield* Deferred.await(first.outcome), {
+        kind: "agent",
+        userEntryId: "first-user",
+      });
+      assert.deepEqual(yield* Deferred.await(second.outcome), {
+        kind: "agent",
+        userEntryId: "second-user",
       });
     }),
   ),
@@ -655,88 +737,92 @@ it.live("bounds the whole transport handshake even when the hook waits for ready
         }),
       );
       assert.equal(error.code, "timeout");
-      yield* Effect.gen(function* () {
-        while (!peer.signals.includes("SIGTERM")) yield* Effect.sleep("10 millis");
-      }).pipe(Effect.timeout("1 second"));
+      yield* peer.killStarted;
+      assert.equal(peer.signals.includes("SIGTERM"), true);
     }),
   ),
 );
 
-it.live("pauses negotiation while a startup confirmation awaits the user, then runs a prompt", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      let negotiationId: string | undefined;
-      const peer = yield* scriptedPeer({
-        ready: v2Ready,
-        onLine: (message, emit) => {
-          if (message.type === "negotiate_protocol") {
-            negotiationId = message.id;
-            return emit({
-              type: "extension_ui_request",
-              id: "startup-confirm",
-              method: "confirm",
-              title: "Enable extension?",
-            });
-          }
-          if (message.type === "extension_ui_response" && negotiationId)
-            return negotiate({ type: "negotiate_protocol", id: negotiationId }, emit).pipe(
-              Effect.asVoid,
-            );
-          if (message.type === "prompt")
-            return emit({
-              type: "response",
-              id: message.id,
-              command: "prompt",
-              success: true,
-            }).pipe(Effect.andThen(emit({ type: "agent_start" })));
-          return Effect.void;
-        },
-      });
-      const scope = yield* Effect.scope;
-      const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
-      const startupTransport = yield* Deferred.make<Client.NeoPiRpcTransport>();
-      const clientFiber = yield* Client.make({
-        spawn: () => Effect.succeed(peer.handle),
-        command: "npi",
-        args: ["--mode", "rpc-ui"],
-        cwd: "/tmp",
-        env: {},
-        requestTimeoutMs: 60,
-        onTransportReady: (transport) =>
-          Deferred.succeed(startupTransport, transport).pipe(
-            Effect.andThen(
-              Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
-                Effect.forkIn(scope),
+it.effect(
+  "pauses negotiation while a startup confirmation awaits the user, then runs a prompt",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let negotiationId: string | undefined;
+        const peer = yield* scriptedPeer({
+          ready: v2Ready,
+          onLine: (message, emit) => {
+            if (message.type === "negotiate_protocol") {
+              negotiationId = message.id;
+              return emit({
+                type: "extension_ui_request",
+                id: "startup-confirm",
+                method: "confirm",
+                title: "Enable extension?",
+              });
+            }
+            if (message.type === "extension_ui_response" && negotiationId)
+              return negotiate({ type: "negotiate_protocol", id: negotiationId }, emit).pipe(
+                Effect.asVoid,
+              );
+            if (message.type === "prompt")
+              return emit({
+                type: "response",
+                id: message.id,
+                command: "prompt",
+                success: true,
+              }).pipe(Effect.andThen(emit({ type: "agent_start" })));
+            return Effect.void;
+          },
+        });
+        const scope = yield* Effect.scope;
+        const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
+        const startupTransport = yield* Deferred.make<Client.NeoPiRpcTransport>();
+        const clientFiber = yield* Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 60,
+          onTransportReady: (transport) =>
+            Deferred.succeed(startupTransport, transport).pipe(
+              Effect.andThen(
+                Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
+                  Effect.forkIn(scope),
+                ),
               ),
+              Effect.asVoid,
             ),
-            Effect.asVoid,
-          ),
-      }).pipe(Effect.forkScoped);
-      const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
-      assert.equal(confirmation.id, "startup-confirm");
-      yield* Effect.sleep("120 millis");
-      assert.equal(peer.signals.length, 0);
-      yield* peer.emit({
-        type: "extension_ui_request",
-        id: "irrelevant-cancel",
-        method: "cancel",
-        targetId: "unknown",
-      });
-      yield* Effect.sleep("40 millis");
-      assert.equal(peer.signals.length, 0);
-      yield* (yield* Deferred.await(startupTransport)).respondUi({
-        id: confirmation.id,
-        confirmed: true,
-      });
-      const client = yield* Fiber.join(clientFiber).pipe(Effect.timeout("2 seconds"));
-      yield* Effect.addFinalizer(() => client.close(20));
-      assert.equal(client.capabilities.has("v2"), true);
-      const prompt = yield* client.prompt({ type: "prompt", message: "hello after startup" });
-      assert.deepEqual(yield* Deferred.await(prompt.outcome).pipe(Effect.timeout("2 seconds")), {
-        kind: "agent",
-      });
-    }),
-  ),
+        }).pipe(Effect.forkScoped);
+        const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
+        assert.equal(confirmation.id, "startup-confirm");
+        yield* TestClock.adjust("120 millis");
+        assert.equal(peer.signals.length, 0);
+        yield* peer.emit({
+          type: "extension_ui_request",
+          id: "irrelevant-cancel",
+          method: "cancel",
+          targetId: "unknown",
+        });
+        yield* TestClock.adjust("40 millis");
+        assert.equal(peer.signals.length, 0);
+        yield* (yield* Deferred.await(startupTransport)).respondUi({
+          id: confirmation.id,
+          confirmed: true,
+        });
+        const client = yield* Fiber.join(clientFiber).pipe(Effect.timeout("2 seconds"));
+        yield* Effect.addFinalizer(() => client.close(20));
+        assert.equal(client.capabilities.has("v2"), true);
+        const prompt = yield* client.prompt({ type: "prompt", message: "hello after startup" });
+        assert.deepEqual(yield* Deferred.await(prompt.outcome).pipe(Effect.timeout("2 seconds")), {
+          kind: "agent",
+        });
+        yield* peer.finish({ code: 0, signal: null });
+        yield* TestClock.adjust("20 millis");
+        yield* Deferred.await(client.exit);
+      }),
+    ),
 );
 
 it.live("still times out a silent negotiation without a pending dialog", () =>
@@ -766,7 +852,7 @@ it.live("still times out a silent negotiation without a pending dialog", () =>
   ),
 );
 
-it.live("resumes the negotiation deadline when a startup dialog is cancelled", () =>
+it.effect("resumes the negotiation deadline when a startup dialog is cancelled", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const peer = yield* scriptedPeer({
@@ -793,13 +879,14 @@ it.live("resumes the negotiation deadline when a startup dialog is cancelled", (
       }).pipe(Effect.forkScoped);
       const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
       assert.equal(confirmation.id, "cancel-me");
-      yield* Effect.sleep("120 millis");
+      yield* TestClock.adjust("120 millis");
       yield* peer.emit({
         type: "extension_ui_request",
         id: "cancel-frame",
         method: "cancel",
         targetId: "cancel-me",
       });
+      yield* TestClock.adjust("60 millis");
       const error = yield* Fiber.join(startup).pipe(Effect.flip, Effect.timeout("2 seconds"));
       assert.equal(error.code, "timeout");
       assert.equal(error.command, "negotiate_protocol");
@@ -977,14 +1064,12 @@ it.live("does not retain stderr written before any consumer subscribes", () =>
       });
       const client = yield* makeClient(peer);
       for (let index = 0; index < 200; index++) {
-        yield* peer.writeStderr(`early-${index}\n`);
+        yield* Deferred.await(yield* peer.writeStderr(`early-${index}\n`));
       }
-      yield* Effect.sleep("30 millis");
       const seen = yield* Queue.unbounded<string>();
       yield* Stream.runForEach(client.stderr, (text) => Queue.offer(seen, text)).pipe(
-        Effect.forkScoped,
+        Effect.forkScoped({ startImmediately: true }),
       );
-      yield* Effect.sleep("20 millis");
       yield* peer.writeStderr("after-subscribe\n");
       const received: Array<string> = [];
       yield* Effect.gen(function* () {

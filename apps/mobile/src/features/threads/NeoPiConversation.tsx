@@ -1,16 +1,20 @@
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import type { LegendListRef } from "@legendapp/list/react-native";
 import type { NeoPiJournalEntry, ScopedThreadRef } from "@t3tools/contracts";
+import { journalEntryCategory, journalEntryLabel } from "@t3tools/client-runtime/neopi-journal";
 import {
-  journalEntryCategory,
-  journalEntryLabel,
-  journalRecord,
-} from "@t3tools/client-runtime/neopi-journal";
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
-import { View } from "react-native";
+  useEffect,
+  useEffectEvent,
+  useState,
+  type ComponentPropsWithRef,
+  type RefObject,
+} from "react";
+import { Platform, View } from "react-native";
+import Animated from "react-native-reanimated";
+import { NativeScrollViewMarker } from "../../native/NativeScrollViewMarker";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { nativeSessionDraftKey, useNeoPiConversation } from "../../state/neopiConversation";
 import {
@@ -23,6 +27,14 @@ import { NativeError } from "./NativeNeoPiControls";
 import { NeoPiJournalContent } from "./NeoPiJournalContent";
 import { NeoPiSessionTree } from "./NeoPiSessionTree";
 
+function NativeConversationScrollView(props: ComponentPropsWithRef<typeof Animated.ScrollView>) {
+  return (
+    <NativeScrollViewMarker style={{ flex: 1 }}>
+      <Animated.ScrollView {...props} />
+    </NativeScrollViewMarker>
+  );
+}
+
 export function NeoPiConversation({
   threadRef,
   cwd,
@@ -32,7 +44,6 @@ export function NeoPiConversation({
   queuedMessages,
   onEditPendingMessage,
   onEndFollowEnabledChange,
-  onHasConversationChange,
 }: {
   threadRef: ScopedThreadRef;
   cwd: string | null;
@@ -40,24 +51,20 @@ export function NeoPiConversation({
   listRef: RefObject<LegendListRef | null>;
   ownerStatus: string | undefined;
   onEndFollowEnabledChange: (value: boolean) => void;
-  onHasConversationChange: (value: boolean) => void;
   queuedMessages: ReadonlyArray<QueuedThreadMessage>;
   onEditPendingMessage: (message: QueuedThreadMessage) => void;
 }) {
   const { conversation, connection, loading, error, refresh, loadOlder, paging, busy } =
     useNeoPiConversation(threadRef);
   const [treeOpen, setTreeOpen] = useState(false);
-  const currentConnected = useRef(false);
-  currentConnected.current = connection?.status === "connected";
+  const refreshOwnerConnection = useEffectEvent(() => {
+    if (connection?.status !== "connected") refresh();
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Native owner lifecycle announcements may require reopening the observer.
   useEffect(() => {
-    if (
-      ownerStatus &&
-      ownerStatus !== "starting" &&
-      ownerStatus !== "stopped" &&
-      !currentConnected.current
-    )
-      refresh();
-  }, [ownerStatus, refresh]);
+    if (ownerStatus && ownerStatus !== "starting" && ownerStatus !== "stopped")
+      refreshOwnerConnection();
+  }, [ownerStatus]);
   const nativeDraft = useComposerDraft(
     conversation.identity ? nativeSessionDraftKey(threadRef, conversation.identity) : null,
   );
@@ -72,42 +79,31 @@ export function NeoPiConversation({
     });
     clearComposerDraft(legacyBackupKey, { deferAttachmentCleanup: true });
   };
-  const hasConversation = conversation.entries.some(
-    (entry) => entry.type === "message" && journalRecord(entry.message).role === "user",
-  );
-  useEffect(() => {
-    onHasConversationChange(hasConversation);
-  }, [hasConversation, onHasConversationChange]);
-  const renderEntry = useCallback(
-    (entry: NeoPiJournalEntry, durable: boolean) => {
-      const category = journalEntryCategory(entry);
-      return (
-        <View
-          className={
-            category === "system"
-              ? "gap-3 border-b border-l-2 border-border-subtle px-4 py-4"
-              : "gap-3 border-b border-border-subtle px-4 py-4"
-          }
-        >
-          <View className="gap-1">
-            <Text className="text-xs font-t3-medium text-foreground">
-              {journalEntryLabel(entry)}
+  const renderEntry = (entry: NeoPiJournalEntry, durable: boolean) => {
+    const category = journalEntryCategory(entry);
+    return (
+      <View
+        className={
+          category === "system"
+            ? "gap-3 border-b border-l-2 border-border-subtle px-4 py-4"
+            : "gap-3 border-b border-border-subtle px-4 py-4"
+        }
+      >
+        <View className="gap-1">
+          <Text className="text-xs font-t3-medium text-foreground">{journalEntryLabel(entry)}</Text>
+          {entry.timestamp ? (
+            <Text className="text-xs text-foreground-muted">{entry.timestamp}</Text>
+          ) : null}
+          {!durable ? (
+            <Text className="text-xs text-foreground-muted">
+              Live native message · awaiting persistence
             </Text>
-            {entry.timestamp ? (
-              <Text className="text-xs text-foreground-muted">{entry.timestamp}</Text>
-            ) : null}
-            {!durable ? (
-              <Text className="text-xs text-foreground-muted">
-                Live native message · awaiting persistence
-              </Text>
-            ) : null}
-          </View>
-          <NeoPiJournalContent entry={entry} threadRef={threadRef} cwd={cwd} />
+          ) : null}
         </View>
-      );
-    },
-    [cwd, threadRef.environmentId, threadRef.threadId],
-  );
+        <NeoPiJournalContent entry={entry} threadRef={threadRef} cwd={cwd} />
+      </View>
+    );
+  };
   const attached = connection?.status === "connected";
   const status = loading
     ? "Connecting to native conversation"
@@ -149,11 +145,11 @@ export function NeoPiConversation({
           </Text>
         ) : null}
         <View className="flex-row flex-wrap gap-2">
-          <MaterialButton label="Session tree" tone="text" onPress={() => setTreeOpen(true)} />
-          <MaterialButton label="Reconnect / refresh" tone="text" onPress={refresh} />
+          <Button label="Session tree" tone="text" onPress={() => setTreeOpen(true)} />
+          <Button label="Reconnect / refresh" tone="text" onPress={refresh} />
           {conversation.identity &&
           (conversation.cursor || conversation.cursorLeaf !== conversation.identity.leafId) ? (
-            <MaterialButton
+            <Button
               label={paging ? "Reading older entries…" : "Load older native entries"}
               disabled={paging || conversation.needsSnapshot}
               onPress={() => void loadOlder()}
@@ -168,15 +164,17 @@ export function NeoPiConversation({
             A separate unsent draft was retained when this UI alias attached to an existing native
             session. Restoring it replaces the current draft, not native history.
           </Text>
-          <MaterialButton
+          <Button
             label="Restore retained local draft"
             disabled={!conversation.identity}
             onPress={restoreLegacyDraft}
           />
         </View>
       ) : null}
+      {/* oxlint-disable-next-line t3code/require-registered-list-scroll -- The registered native scroll component is supplied only on iOS. */}
       <KeyboardAwareLegendList
         ref={listRef}
+        {...(Platform.OS === "ios" ? { ScrollViewComponent: NativeConversationScrollView } : {})}
         data={conversation.entries}
         keyExtractor={(entry) => entry.id}
         renderItem={({ item }) => renderEntry(item, true)}
@@ -236,7 +234,7 @@ export function NeoPiConversation({
                     {message.attachments.length} local attachments
                   </Text>
                 ) : null}
-                <MaterialButton
+                <Button
                   label="Edit queued message"
                   tone="text"
                   onPress={() => onEditPendingMessage(message)}

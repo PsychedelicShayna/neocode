@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeAssert from "node:assert/strict";
 import { describe, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import { buildNeoPiLaunchPlan, isSharedNeoPiCursor } from "./NeoPiLaunchArgs.ts";
 
@@ -94,13 +95,14 @@ describe("NeoPi launch plan", () => {
   );
   it.effect("keeps live files isolated until a cooperating lease exists", () =>
     Effect.gen(function* () {
+      const environment = yield* HostProcess.Environment;
       const isolated = yield* buildNeoPiLaunchPlan({
         ...input,
         profile: "",
       });
       NodeAssert.equal(isolated.identity.kind, "fresh");
       NodeAssert.equal(isolated.sessionDir, "/tmp/t3home/neopi/sessions/default/project-1");
-      NodeAssert.equal(isolated.env.OMP_PROFILE, process.env.OMP_PROFILE);
+      NodeAssert.equal(isolated.env.OMP_PROFILE, environment.OMP_PROFILE);
       NodeAssert.ok(isolated.args.includes("--session-dir"));
       NodeAssert.ok(!isolated.args.includes("--new-session"));
     }),
@@ -127,41 +129,40 @@ describe("NeoPi launch plan", () => {
       NodeAssert.equal(resumed.identity.kind, "resume");
     }),
   );
-  it.effect("keeps legacy isolated cursors isolated but protects unmarked shared cursors", () =>
-    Effect.gen(function* () {
-      const cursor = {
-        v: 1 as const,
-        sessionId: "s",
-        sessionDir: "/tmp/t3home/neopi/sessions/old-profile/old-project",
-        sessionFile: "/tmp/t3home/neopi/sessions/old-profile/old-project/session.jsonl",
-        turnBoundaries: [],
-      };
-      NodeAssert.equal(isSharedNeoPiCursor(cursor, input.t3Home), false);
-      NodeAssert.equal(
-        isSharedNeoPiCursor(
-          {
-            ...cursor,
-            sessionDir: "/tmp/omp-sessions",
-            sessionFile: "/tmp/omp-sessions/session.jsonl",
-          },
-          input.t3Home,
-        ),
-        true,
-      );
-      NodeAssert.equal(isSharedNeoPiCursor({ ...cursor, sharedSession: true }, input.t3Home), true);
-      NodeAssert.equal(
-        isSharedNeoPiCursor(
-          { ...cursor, sharedSession: false, sessionDir: "/tmp/omp-sessions" },
-          input.t3Home,
-        ),
-        true,
-      );
-    }),
-  );
+  it("keeps legacy isolated cursors isolated but protects unmarked shared cursors", () => {
+    const cursor = {
+      v: 1 as const,
+      sessionId: "s",
+      sessionDir: "/tmp/t3home/neopi/sessions/old-profile/old-project",
+      sessionFile: "/tmp/t3home/neopi/sessions/old-profile/old-project/session.jsonl",
+      turnBoundaries: [],
+    };
+    NodeAssert.equal(isSharedNeoPiCursor(cursor, input.t3Home), false);
+    NodeAssert.equal(
+      isSharedNeoPiCursor(
+        {
+          ...cursor,
+          sessionDir: "/tmp/omp-sessions",
+          sessionFile: "/tmp/omp-sessions/session.jsonl",
+        },
+        input.t3Home,
+      ),
+      true,
+    );
+    NodeAssert.equal(isSharedNeoPiCursor({ ...cursor, sharedSession: true }, input.t3Home), true);
+    NodeAssert.equal(
+      isSharedNeoPiCursor(
+        { ...cursor, sharedSession: false, sessionDir: "/tmp/omp-sessions" },
+        input.t3Home,
+      ),
+      true,
+    );
+  });
   it.effect(
     "preserves the process environment, applies instance overrides, then the selected profile",
     () =>
       Effect.gen(function* () {
+        const environment = yield* HostProcess.Environment;
         const planned = yield* buildNeoPiLaunchPlan({
           ...input,
           env: {
@@ -173,7 +174,7 @@ describe("NeoPi launch plan", () => {
         NodeAssert.equal(planned.env.HOME, "/tmp/isolated-home");
         NodeAssert.equal(planned.env.CUSTOM_TOKEN, "instance");
         NodeAssert.equal(planned.env.OMP_PROFILE, "work");
-        NodeAssert.equal(planned.env.PATH, process.env.PATH);
+        NodeAssert.equal(planned.env.PATH, environment.PATH);
         const noProfile = yield* buildNeoPiLaunchPlan({
           ...input,
           profile: "",

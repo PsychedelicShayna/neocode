@@ -10,14 +10,13 @@ import {
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionSummary,
   type NeoPiNativeSessionsListInput,
-  type NeoPiNativeSessionsListResult,
   type NeoPiNativeSessionsOpenInput,
   type NeoPiNativeSessionsOpenResult,
   type NeoPiNativeSessionsRequestInput,
   type NeoPiNativeSessionsSetSettledInput,
-  type NeoPiNativeSessionsSetSettledResult,
   type NeoPiNativeSessionsStreamEvent,
   type ProviderInstanceId,
+  type RuntimeMode,
 } from "@t3tools/contracts";
 import {
   make as makeClient,
@@ -41,7 +40,9 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { McpServer } from "effect/ai";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
@@ -52,8 +53,8 @@ import {
 } from "./NeoPiNativeSettlement.ts";
 import type { McpCapability } from "../../mcp/McpInvocationContext.ts";
 import { makeNeoPiNativeHostToolPump } from "./NeoPiHostToolBridge.ts";
-import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
-import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
+import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
+import { ProviderInstanceRegistry } from "../ProviderInstanceRegistry.ts";
 import {
   neoPiAvailableCommands,
   neoPiSlashCommandName,
@@ -61,7 +62,7 @@ import {
 } from "./NeoPiCommandCatalog.ts";
 import { NEOPI_CAPABILITIES } from "./NeoPiCompatibility.ts";
 import { makeSharedListing } from "./NeoPiSharedListing.ts";
-import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
+import { neoPiApprovalModes, parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import {
   decodeNeoPiControlRegistry,
@@ -107,6 +108,18 @@ const ControlIdentity = Schema.Struct({
   cwd: Schema.String,
   revisions: Schema.Struct({ generation: Schema.Number }),
 });
+const isNativeSessionsError = Schema.is(NeoPiNativeSessionsError);
+const isRpcError = Schema.is(NeoPiRpcError);
+const decodeNativeSessionRecord = Schema.decodeUnknownEffect(NeoPiNativeSessionRecord);
+const isNativeSessionRecord = Schema.is(NeoPiNativeSessionRecord);
+const decodeStateIdentity = Schema.decodeUnknownEffect(StateIdentity);
+const decodeUiResponse = Schema.decodeUnknownEffect(UiResponse);
+const decodeControlIdentity = Schema.decodeUnknownEffect(ControlIdentity);
+const decodeJournalIdentity = Schema.decodeUnknownEffect(JournalIdentity);
+const decodeJournalPage = Schema.decodeUnknownEffect(NeoPiJournalPage);
+const decodeNativeSessionCommand = Schema.decodeUnknownEffect(NeoPiNativeSessionCommand);
+const decodeCatalog = Schema.decodeEffect(Catalog);
+const decodeReadyStatus = Schema.decodeUnknownEffect(Schema.Struct({ ready: Schema.Boolean }));
 const closedType = "neocode_native_connection_closed";
 const answeredType = "neocode_native_dialog_answered";
 /** The terminal owner exited; the server is waiting for a replacement. */
@@ -121,10 +134,10 @@ const attachedType = "neocode_native_owner_attached";
 const OWNER_REATTACH_GRACE = "10 seconds";
 const OWNER_REATTACH_POLL = "500 millis";
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
-  if (Schema.is(NeoPiNativeSessionsError)(cause)) return cause;
+  if (isNativeSessionsError(cause)) return cause;
   const error = new NeoPiNativeSessionsError({
     message: cause instanceof Error ? cause.message : String(cause),
-    ...(cause instanceof NeoPiRpcError && cause.code ? { code: cause.code } : {}),
+    ...(isRpcError(cause) && cause.code ? { code: cause.code } : {}),
   });
   // Keep the original failure server-side without extending the public error schema.
   Object.defineProperty(error, "cause", { value: cause, configurable: true });
@@ -156,6 +169,7 @@ export interface NeoPiNativeConnection {
     readonly revoke: Effect.Effect<void>;
   };
 }
+type NativeOpenInput = NeoPiNativeSessionsOpenInput & { readonly runtimeMode?: RuntimeMode };
 export interface NeoPiNativeSessionsDependencies {
   readonly profileIds: Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
   readonly profileChanges?: Stream.Stream<void>;
@@ -175,7 +189,7 @@ export interface NeoPiNativeSessionsDependencies {
   readonly invalidateCatalog?: Effect.Effect<void>;
   readonly connect: (
     profile: NeoPiNativeProfile,
-    input: NeoPiNativeSessionsOpenInput,
+    input: NativeOpenInput,
     publish: (frame: SessionEventFrame) => Effect.Effect<void>,
     /** `attach` joins a live owner only and never starts one. */
     mode?: "auto" | "attach",
@@ -254,17 +268,19 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           touch(session);
         }),
     );
-  const finish = (session: NativeSession, reason: string, code?: string) =>
-    Effect.gen(function* () {
-      if (session.closed) return;
-      session.closed = true;
-      if (sessions.get(session.ref.sessionFile) === session)
-        sessions.delete(session.ref.sessionFile);
-      if (session.recovery) yield* Deferred.fail(session.recovery, fail(reason, code ?? "closed"));
-      yield* session.native.hostTools?.revoke ?? Effect.void;
-      yield* session.hub.publish({ type: closedType, reason, ...(code ? { code } : {}) });
-      yield* PubSub.publish(session.modelChanges, undefined);
-    });
+  const finish = Effect.fn("NeoPiNativeSessions.finish")(function* (
+    session: NativeSession,
+    reason: string,
+    code?: string,
+  ) {
+    if (session.closed) return;
+    session.closed = true;
+    if (sessions.get(session.ref.sessionFile) === session) sessions.delete(session.ref.sessionFile);
+    if (session.recovery) yield* Deferred.fail(session.recovery, fail(reason, code ?? "closed"));
+    yield* session.native.hostTools?.revoke ?? Effect.void;
+    yield* session.hub.publish({ type: closedType, reason, ...(code ? { code } : {}) });
+    yield* PubSub.publish(session.modelChanges, undefined);
+  });
   const adoptIdentity = Effect.fnUntraced(function* (
     session: NativeSession,
     sessionId: string,
@@ -310,13 +326,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   const refresh = Effect.fnUntraced(function* (session: NativeSession) {
     yield* session.profile.validate;
     if (session.closed) return yield* fail("This native connection is closed.", "closed");
-    const state = yield* Schema.decodeUnknownEffect(NeoPiNativeSessionRecord)(
+    const state = yield* decodeNativeSessionRecord(
       yield* (
         session.native.readState ??
           session.native.client.request({ type: "get_state", includeDump: false })
       ),
     );
-    const identity = yield* Schema.decodeUnknownEffect(StateIdentity)(state);
+    const identity = yield* decodeStateIdentity(state);
     yield* adoptIdentity(session, identity.sessionId, identity.sessionFile);
     session.state =
       state.sessionFile === session.ref.sessionFile
@@ -339,21 +355,20 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     yield* session.profile.validate;
     return session;
   });
-  const verifyRef = (session: NativeSession, ref: NeoPiNativeSessionRef) =>
-    Effect.gen(function* () {
-      if (
-        session.closed ||
-        session.ref.sessionFile !== (yield* dependencies.canonicalize(ref.sessionFile))
-      )
-        return yield* fail(
-          "The native owner changed session. Select its new native file before sending commands.",
-          "session_changed",
-        );
-    });
-  const create = Effect.fnUntraced(function* (
-    profile: NeoPiNativeProfile,
-    input: NeoPiNativeSessionsOpenInput,
+  const verifyRef = Effect.fn("NeoPiNativeSessions.verifyRef")(function* (
+    session: NativeSession,
+    ref: NeoPiNativeSessionRef,
   ) {
+    if (
+      session.closed ||
+      session.ref.sessionFile !== (yield* dependencies.canonicalize(ref.sessionFile))
+    )
+      return yield* fail(
+        "The native owner changed session. Select its new native file before sending commands.",
+        "session_changed",
+      );
+  });
+  const create = Effect.fnUntraced(function* (profile: NeoPiNativeProfile, input: NativeOpenInput) {
     const scope = yield* Scope.fork(lifetime);
     const pendingUi = new Map<string, SessionEventFrame>();
     const hub = makeNeoPiNativeEventHub();
@@ -366,69 +381,69 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       PubSub.shutdown,
     ).pipe(Effect.provideService(Scope.Scope, scope));
     let session: NativeSession | undefined;
-    const publish = (frame: SessionEventFrame): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        if (frame.type === "extension_ui_request" && typeof frame.id === "string") {
-          if (frame.method === "cancel" && typeof frame.targetId === "string")
-            pendingUi.delete(frame.targetId);
-          else if (
-            frame.method === "select" ||
-            frame.method === "confirm" ||
-            frame.method === "input" ||
-            frame.method === "editor" ||
-            frame.method === "ask"
-          )
-            pendingUi.set(frame.id, frame);
-        }
-        if (
-          (frame.type === "tool_approval_request" || frame.type === "plan_proposal_request") &&
-          typeof frame.id === "string"
+    // Native frame delivery must not allocate a tracing span per event.
+    const publish = Effect.fnUntraced(function* (frame: SessionEventFrame) {
+      if (frame.type === "extension_ui_request" && typeof frame.id === "string") {
+        if (frame.method === "cancel" && typeof frame.targetId === "string")
+          pendingUi.delete(frame.targetId);
+        else if (
+          frame.method === "select" ||
+          frame.method === "confirm" ||
+          frame.method === "input" ||
+          frame.method === "editor" ||
+          frame.method === "ask"
         )
           pendingUi.set(frame.id, frame);
-        if (frame.type === "tool_approval_cancel" && typeof frame.targetId === "string")
-          pendingUi.delete(frame.targetId);
-        if (frame.type === "plan_proposal_cancel" && typeof frame.id === "string")
-          pendingUi.delete(frame.id);
-        const current = session;
-        if (!current || current.closed) return;
-        touch(current);
-        if (frame.type === "agent_start") current.busy = true;
-        else if (frame.type === "agent_end") current.busy = false;
-        if (
-          frame.type === "journal_state" &&
-          typeof frame.sessionId === "string" &&
-          typeof frame.sessionFile === "string"
-        ) {
-          const adopted = yield* adoptIdentity(current, frame.sessionId, frame.sessionFile).pipe(
-            Effect.result,
-          );
-          if (adopted._tag === "Failure") {
-            yield* finish(current, nativeError(adopted.failure).message);
-            yield* Scope.close(scope, Exit.void).pipe(Effect.forkIn(lifetime));
-            return;
-          }
+      }
+      if (
+        (frame.type === "tool_approval_request" || frame.type === "plan_proposal_request") &&
+        typeof frame.id === "string"
+      )
+        pendingUi.set(frame.id, frame);
+      if (frame.type === "tool_approval_cancel" && typeof frame.targetId === "string")
+        pendingUi.delete(frame.targetId);
+      if (frame.type === "plan_proposal_cancel" && typeof frame.id === "string")
+        pendingUi.delete(frame.id);
+      const current = session;
+      if (!current || current.closed) return;
+      touch(current);
+      if (frame.type === "agent_start") current.busy = true;
+      else if (frame.type === "agent_end") current.busy = false;
+      if (
+        frame.type === "journal_state" &&
+        typeof frame.sessionId === "string" &&
+        typeof frame.sessionFile === "string"
+      ) {
+        const adopted = yield* adoptIdentity(current, frame.sessionId, frame.sessionFile).pipe(
+          Effect.result,
+        );
+        if (adopted._tag === "Failure") {
+          yield* finish(current, nativeError(adopted.failure).message);
+          yield* Scope.close(scope, Exit.void).pipe(Effect.forkIn(lifetime));
+          return;
         }
-        if (frame.type === "models_configuration_changed" || frame.type === "model_changed")
-          yield* PubSub.publish(modelChanges, undefined);
-        if (
-          frame.type === "extension_ui_request" &&
-          typeof frame.id === "string" &&
-          typeof frame.method === "string"
-        )
-          yield* PubSub.publish(modelUi, frame as UiRequestFrame);
-        let outgoing = frame;
-        if (typeof frame.sessionFile === "string" && typeof frame.sessionId === "string") {
-          const canonical = yield* dependencies.canonicalize(frame.sessionFile).pipe(Effect.result);
-          if (canonical._tag === "Failure") {
-            yield* finish(current, nativeError(canonical.failure).message);
-            yield* Scope.close(scope, Exit.void).pipe(Effect.forkIn(lifetime));
-            return;
-          }
-          if (canonical.success !== frame.sessionFile)
-            outgoing = { ...frame, sessionFile: canonical.success };
+      }
+      if (frame.type === "models_configuration_changed" || frame.type === "model_changed")
+        yield* PubSub.publish(modelChanges, undefined);
+      if (
+        frame.type === "extension_ui_request" &&
+        typeof frame.id === "string" &&
+        typeof frame.method === "string"
+      )
+        yield* PubSub.publish(modelUi, frame as UiRequestFrame);
+      let outgoing = frame;
+      if (typeof frame.sessionFile === "string" && typeof frame.sessionId === "string") {
+        const canonical = yield* dependencies.canonicalize(frame.sessionFile).pipe(Effect.result);
+        if (canonical._tag === "Failure") {
+          yield* finish(current, nativeError(canonical.failure).message);
+          yield* Scope.close(scope, Exit.void).pipe(Effect.forkIn(lifetime));
+          return;
         }
-        yield* hub.publish(outgoing);
-      });
+        if (canonical.success !== frame.sessionFile)
+          outgoing = { ...frame, sessionFile: canonical.success };
+      }
+      yield* hub.publish(outgoing);
+    });
     /** One native connection in its own scope, so a successor can retire the dead one. */
     const establish = Effect.fnUntraced(function* (
       connectInput: NeoPiNativeSessionsOpenInput,
@@ -447,12 +462,12 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             "The configured NeoPi must support session_journal and session_journal_events.",
             "unsupported",
           );
-        const state = yield* Schema.decodeUnknownEffect(NeoPiNativeSessionRecord)(
+        const state = yield* decodeNativeSessionRecord(
           yield* (
             native.readState ?? native.client.request({ type: "get_state", includeDump: false })
           ),
         );
-        const identity = yield* Schema.decodeUnknownEffect(StateIdentity)(state);
+        const identity = yield* decodeStateIdentity(state);
         const file = yield* dependencies.canonicalize(identity.sessionFile);
         if (
           connectInput.sessionFile &&
@@ -598,10 +613,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       return current;
     }).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
   });
-  const open = (
-    input: NeoPiNativeSessionsOpenInput,
-  ): Effect.Effect<NeoPiNativeSessionsOpenResult, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
+  const open = Effect.fn("NeoPiNativeSessions.open")(
+    function* (input: NativeOpenInput) {
       const profile = yield* dependencies.profile(input.providerInstanceId);
       if (!input.sessionFile) {
         const created = describe(yield* create(profile, input));
@@ -636,7 +649,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           return created;
         }),
       );
-    }).pipe(Effect.scoped, Effect.mapError(nativeError));
+    },
+    Effect.scoped,
+    Effect.mapError(nativeError),
+  );
   /**
    * What a session's owner is doing. NeoCode's own connection is authoritative
    * for sessions it owns; for a terminal-owned session the control snapshot
@@ -656,186 +672,179 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       branch: reported?.branch ?? null,
     };
   };
-  const list = (
+  const list = Effect.fn("NeoPiNativeSessions.list")(function* (
     input: NeoPiNativeSessionsListInput,
-  ): Effect.Effect<NeoPiNativeSessionsListResult, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
-      const ids = input.providerInstanceId
-        ? [input.providerInstanceId]
-        : yield* dependencies.profileIds;
-      const rows: NeoPiNativeSessionSummary[] = [];
-      // Position of each catalog row by profile and file, so merging connected sessions is linear.
-      const rowIndex = new Map<string, number>();
-      const diagnostics: Array<{ providerInstanceId: ProviderInstanceId; message: string }> = [];
-      for (const id of ids) {
-        const result = yield* Effect.gen(function* () {
-          const profile = yield* dependencies.profile(id);
-          return yield* dependencies.catalog(profile, input.cwd);
-        }).pipe(Effect.result);
-        if (result._tag === "Failure") {
+  ) {
+    const ids = input.providerInstanceId
+      ? [input.providerInstanceId]
+      : yield* dependencies.profileIds;
+    const rows: NeoPiNativeSessionSummary[] = [];
+    // Position of each catalog row by profile and file, so merging connected sessions is linear.
+    const rowIndex = new Map<string, number>();
+    const diagnostics: Array<{ providerInstanceId: ProviderInstanceId; message: string }> = [];
+    for (const id of ids) {
+      const result = yield* Effect.gen(function* () {
+        const profile = yield* dependencies.profile(id);
+        return yield* dependencies.catalog(profile, input.cwd);
+      }).pipe(Effect.result);
+      if (result._tag === "Failure") {
+        diagnostics.push({
+          providerInstanceId: id,
+          message: nativeError(result.failure).message,
+        });
+        continue;
+      }
+      for (const row of result.success) {
+        const canonical = yield* dependencies.canonicalize(row.path).pipe(Effect.result);
+        if (canonical._tag === "Failure") {
           diagnostics.push({
             providerInstanceId: id,
-            message: nativeError(result.failure).message,
+            message: nativeError(canonical.failure).message,
           });
           continue;
         }
-        for (const row of result.success) {
-          const canonical = yield* dependencies.canonicalize(row.path).pipe(Effect.result);
-          if (canonical._tag === "Failure") {
-            diagnostics.push({
-              providerInstanceId: id,
-              message: nativeError(canonical.failure).message,
-            });
-            continue;
-          }
-          const file = canonical.success;
-          const connected = sessions.get(file);
-          if (connected && connected.profile.providerInstanceId === id) {
-            connected.cwd = row.cwd;
-            connected.cwdFile = file;
-          }
-          const live = liveState(
-            connected && connected.profile.providerInstanceId === id ? connected : undefined,
-            row.live,
-          );
-          const key = rowKey(id, file);
-          // The first row for a profile and file wins, as a linear scan would find it.
-          if (!rowIndex.has(key)) rowIndex.set(key, rows.length);
-          rows.push({
-            ref: { providerInstanceId: id, sessionFile: file },
-            sessionId: row.id,
-            cwd: row.cwd,
-            title: row.title,
-            firstMessage: row.firstMessage,
-            modifiedAt: row.modified,
-            owner:
-              connected && !connected.closed && connected.profile.providerInstanceId === id
-                ? { kind: "neocode", attachment: connected.native.attachment }
-                : row.inUse
-                  ? { kind: "process", pid: row.inUse.pid, attachable: row.control !== null }
-                  : { kind: "none" },
-            ...(live ? { live } : {}),
-          });
+        const file = canonical.success;
+        const connected = sessions.get(file);
+        if (connected && connected.profile.providerInstanceId === id) {
+          connected.cwd = row.cwd;
+          connected.cwdFile = file;
         }
-      }
-      // Fresh native files are deliberately lazy; the CLI cannot list their unwritten headers.
-      for (const session of sessions.values()) {
-        if (
-          session.closed ||
-          (input.providerInstanceId &&
-            session.profile.providerInstanceId !== input.providerInstanceId)
-        )
-          continue;
-        const existing =
-          rowIndex.get(rowKey(session.profile.providerInstanceId, session.ref.sessionFile)) ?? -1;
-        const cwd = existing >= 0 ? rows[existing]!.cwd : session.cwd;
-        if (
-          input.cwd &&
-          (yield* dependencies.canonicalize(cwd)) !== (yield* dependencies.canonicalize(input.cwd))
-        )
-          continue;
-        const live = existing >= 0 ? rows[existing]!.live : liveState(session, undefined);
-        const summary: NeoPiNativeSessionSummary = {
-          ref: session.ref,
-          sessionId: session.sessionId,
-          cwd,
-          title:
-            existing >= 0
-              ? rows[existing]!.title
-              : typeof session.state.sessionName === "string"
-                ? session.state.sessionName
-                : null,
-          firstMessage: existing >= 0 ? rows[existing]!.firstMessage : "",
-          modifiedAt: existing >= 0 ? rows[existing]!.modifiedAt : session.openedAt,
-          owner: { kind: "neocode", attachment: session.native.attachment },
+        const live = liveState(
+          connected && connected.profile.providerInstanceId === id ? connected : undefined,
+          row.live,
+        );
+        const key = rowKey(id, file);
+        // The first row for a profile and file wins, as a linear scan would find it.
+        if (!rowIndex.has(key)) rowIndex.set(key, rows.length);
+        rows.push({
+          ref: { providerInstanceId: id, sessionFile: file },
+          sessionId: row.id,
+          cwd: row.cwd,
+          title: row.title,
+          firstMessage: row.firstMessage,
+          modifiedAt: row.modified,
+          owner:
+            connected && !connected.closed && connected.profile.providerInstanceId === id
+              ? { kind: "neocode", attachment: connected.native.attachment }
+              : row.inUse
+                ? { kind: "process", pid: row.inUse.pid, attachable: row.control !== null }
+                : { kind: "none" },
           ...(live ? { live } : {}),
-        };
-        if (existing >= 0) rows[existing] = summary;
-        else rows.push(summary);
-      }
-      rows.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
-      const settlement = dependencies.settlement;
-      if (settlement) {
-        const records = yield* settlement.store.read;
-        const autoSettleAfterDays = yield* settlement.autoSettleAfterDays;
-        const now = DateTime.toEpochMillis(yield* DateTime.now);
-        const forgotten: Array<readonly [string, null, NeoPiNativeSettledRecord]> = [];
-        rows.forEach((row, index) => {
-          const record = records.get(row.ref.sessionFile);
-          const resolved = resolveNativeSettlement({
-            record,
-            modifiedAt: row.modifiedAt,
-            live: row.live,
-            autoSettleAfterDays,
-            now,
-          });
-          if (record && !resolved.retain) forgotten.push([row.ref.sessionFile, null, record]);
-          if (resolved.settledAt !== null) rows[index] = { ...row, settledAt: resolved.settledAt };
         });
-        // Waking is bookkeeping: a failed write only means it is retried on the next list.
-        if (forgotten.length > 0) yield* settlement.store.update(forgotten).pipe(Effect.ignore);
       }
-      return { sessions: rows, diagnostics };
-    }).pipe(Effect.mapError(nativeError));
-  const setSettled = (
-    input: NeoPiNativeSessionsSetSettledInput,
-  ): Effect.Effect<NeoPiNativeSessionsSetSettledResult, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
-      const settlement = dependencies.settlement;
-      if (!settlement) return yield* fail("Settling sessions is unavailable.", "unsupported");
-      const profile = yield* dependencies.profile(input.ref.providerInstanceId);
-      const file = yield* dependencies.canonicalize(input.ref.sessionFile);
-      // The decision holds until the file sees newer activity than this.
-      let modifiedAt = sessions.get(file)?.openedAt;
-      for (const row of yield* dependencies.catalog(profile, undefined, file)) {
-        if ((yield* dependencies.canonicalize(row.path)) === file) modifiedAt = row.modified;
-      }
-      if (modifiedAt === undefined)
-        return yield* fail("This native session is not available in the configured profile.");
-      const decidedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* settlement.store.update([
-        [
-          file,
-          { state: input.settled ? "settled" : "unsettled", settledAt: decidedAt, modifiedAt },
-        ],
-      ]);
-      return { settled: input.settled };
-    }).pipe(Effect.mapError(nativeError));
-  /** Resolve file access from native authority without starting a session. */
-  const resolveWorkspace = (ref: NeoPiNativeSessionRef) =>
-    Effect.gen(function* () {
-      const profile = yield* dependencies.profile(ref.providerInstanceId);
-      const sessionFile = yield* dependencies.canonicalize(ref.sessionFile);
-      const connected = sessions.get(sessionFile);
+    }
+    // Fresh native files are deliberately lazy; the CLI cannot list their unwritten headers.
+    for (const session of sessions.values()) {
       if (
-        connected &&
-        !connected.closed &&
-        connected.profile.providerInstanceId === ref.providerInstanceId
-      ) {
-        yield* connected.profile.validate;
-        yield* refreshCwd(connected);
-        yield* verifyRef(connected, { ...ref, sessionFile });
-        return { ref: connected.ref, cwd: connected.cwd };
-      }
-      const rows = yield* dependencies.catalog(profile, undefined, sessionFile);
-      for (const row of rows) {
-        if ((yield* dependencies.canonicalize(row.path)) !== sessionFile) continue;
-        yield* profile.validate;
-        return {
-          ref: { providerInstanceId: ref.providerInstanceId, sessionFile },
-          cwd: yield* dependencies.canonicalize(row.cwd),
-        };
-      }
-      return yield* fail(
-        "This native session is not available in the configured profile.",
-        "session_unavailable",
-      );
-    }).pipe(Effect.mapError(nativeError));
-  const requestNative = (
-    input: NeoPiNativeSessionsRequestInput,
-    preserveId = false,
-  ): Effect.Effect<unknown, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
+        session.closed ||
+        (input.providerInstanceId &&
+          session.profile.providerInstanceId !== input.providerInstanceId)
+      )
+        continue;
+      const existing =
+        rowIndex.get(rowKey(session.profile.providerInstanceId, session.ref.sessionFile)) ?? -1;
+      const cwd = existing >= 0 ? rows[existing]!.cwd : session.cwd;
+      if (
+        input.cwd &&
+        (yield* dependencies.canonicalize(cwd)) !== (yield* dependencies.canonicalize(input.cwd))
+      )
+        continue;
+      const live = existing >= 0 ? rows[existing]!.live : liveState(session, undefined);
+      const summary: NeoPiNativeSessionSummary = {
+        ref: session.ref,
+        sessionId: session.sessionId,
+        cwd,
+        title:
+          existing >= 0
+            ? rows[existing]!.title
+            : typeof session.state.sessionName === "string"
+              ? session.state.sessionName
+              : null,
+        firstMessage: existing >= 0 ? rows[existing]!.firstMessage : "",
+        modifiedAt: existing >= 0 ? rows[existing]!.modifiedAt : session.openedAt,
+        owner: { kind: "neocode", attachment: session.native.attachment },
+        ...(live ? { live } : {}),
+      };
+      if (existing >= 0) rows[existing] = summary;
+      else rows.push(summary);
+    }
+    rows.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+    const settlement = dependencies.settlement;
+    if (settlement) {
+      const records = yield* settlement.store.read;
+      const autoSettleAfterDays = yield* settlement.autoSettleAfterDays;
+      const now = DateTime.toEpochMillis(yield* DateTime.now);
+      const forgotten: Array<readonly [string, null, NeoPiNativeSettledRecord]> = [];
+      rows.forEach((row, index) => {
+        const record = records.get(row.ref.sessionFile);
+        const resolved = resolveNativeSettlement({
+          record,
+          modifiedAt: row.modifiedAt,
+          live: row.live,
+          autoSettleAfterDays,
+          now,
+        });
+        if (record && !resolved.retain) forgotten.push([row.ref.sessionFile, null, record]);
+        if (resolved.settledAt !== null) rows[index] = { ...row, settledAt: resolved.settledAt };
+      });
+      // Waking is bookkeeping: a failed write only means it is retried on the next list.
+      if (forgotten.length > 0) yield* settlement.store.update(forgotten).pipe(Effect.ignore);
+    }
+    return { sessions: rows, diagnostics };
+  }, Effect.mapError(nativeError));
+  const setSettled = Effect.fn("NeoPiNativeSessions.setSettled")(function* (
+    input: NeoPiNativeSessionsSetSettledInput,
+  ) {
+    const settlement = dependencies.settlement;
+    if (!settlement) return yield* fail("Settling sessions is unavailable.", "unsupported");
+    const profile = yield* dependencies.profile(input.ref.providerInstanceId);
+    const file = yield* dependencies.canonicalize(input.ref.sessionFile);
+    // The decision holds until the file sees newer activity than this.
+    let modifiedAt = sessions.get(file)?.openedAt;
+    for (const row of yield* dependencies.catalog(profile, undefined, file)) {
+      if ((yield* dependencies.canonicalize(row.path)) === file) modifiedAt = row.modified;
+    }
+    if (modifiedAt === undefined)
+      return yield* fail("This native session is not available in the configured profile.");
+    const decidedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* settlement.store.update([
+      [file, { state: input.settled ? "settled" : "unsettled", settledAt: decidedAt, modifiedAt }],
+    ]);
+    return { settled: input.settled };
+  }, Effect.mapError(nativeError));
+  /** Resolve file access from native authority without starting a session. */
+  const resolveWorkspace = Effect.fn("NeoPiNativeSessions.resolveWorkspace")(function* (
+    ref: NeoPiNativeSessionRef,
+  ) {
+    const profile = yield* dependencies.profile(ref.providerInstanceId);
+    const sessionFile = yield* dependencies.canonicalize(ref.sessionFile);
+    const connected = sessions.get(sessionFile);
+    if (
+      connected &&
+      !connected.closed &&
+      connected.profile.providerInstanceId === ref.providerInstanceId
+    ) {
+      yield* connected.profile.validate;
+      yield* refreshCwd(connected);
+      yield* verifyRef(connected, { ...ref, sessionFile });
+      return { ref: connected.ref, cwd: connected.cwd };
+    }
+    const rows = yield* dependencies.catalog(profile, undefined, sessionFile);
+    for (const row of rows) {
+      if ((yield* dependencies.canonicalize(row.path)) !== sessionFile) continue;
+      yield* profile.validate;
+      return {
+        ref: { providerInstanceId: ref.providerInstanceId, sessionFile },
+        cwd: yield* dependencies.canonicalize(row.cwd),
+      };
+    }
+    return yield* fail(
+      "This native session is not available in the configured profile.",
+      "session_unavailable",
+    );
+  }, Effect.mapError(nativeError));
+  const requestNative = Effect.fn("NeoPiNativeSessions.requestNative")(
+    function* (input: NeoPiNativeSessionsRequestInput, preserveId = false) {
       const session = yield* requireSession(input.ref);
       yield* retain(session);
       // A terminal owner is being replaced. A prompt asks for a takeover if none appears;
@@ -862,7 +871,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       const preparedCommand = yield* dependencies.preparePrompt(input);
       // UI and approval answers are one-way side channels, never correlated RPC requests.
       if (command.type === "extension_ui_response") {
-        const response = yield* Schema.decodeUnknownEffect(UiResponse)(command);
+        const response = yield* decodeUiResponse(command);
         yield* client.respondUi(response);
         session.pendingUi.delete(response.id);
         yield* session.hub.publish({ type: answeredType, id: response.id });
@@ -901,9 +910,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const listed = yield* client.request({ type: "get_available_commands" });
         const route = neoPiTerminalTextRoute(
           nativeCommand.message,
-          neoPiAvailableCommands(
-            Schema.is(NeoPiNativeSessionRecord)(listed) ? listed.commands : [],
-          ),
+          neoPiAvailableCommands(isNativeSessionRecord(listed) ? listed.commands : []),
           client.capabilities.has(NEOPI_CAPABILITIES.commandCatalog),
         );
         if (route === "tui") {
@@ -913,9 +920,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }
       let guardedCommand = nativeCommand;
       if (session.native.attachment === "terminal") {
-        const current = yield* Schema.decodeUnknownEffect(ControlIdentity)(
-          yield* client.request({ type: "get_status" }),
-        );
+        const current = yield* decodeControlIdentity(yield* client.request({ type: "get_status" }));
         yield* adoptIdentity(session, current.session.sessionId, current.session.sessionFile);
         session.cwd = current.cwd;
         session.cwdFile = session.ref.sessionFile;
@@ -930,7 +935,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           guardedCommand = { ...nativeCommand, if: { generation: current.revisions.generation } };
         else if (
           sessionBound &&
-          Schema.is(NeoPiNativeSessionRecord)(expected) &&
+          isNativeSessionRecord(expected) &&
           expected.generation === undefined
         )
           guardedCommand = {
@@ -940,7 +945,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }
       const result = yield* client.request(guardedCommand);
       if (
-        Schema.is(NeoPiNativeSessionRecord)(result) &&
+        isNativeSessionRecord(result) &&
         typeof result.sessionFile === "string" &&
         typeof result.sessionId === "string"
       ) {
@@ -950,7 +955,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       // Commands such as abort succeed without data; undefined cannot cross the
       // JSON wire and would turn that success into a client-side failure.
       return result ?? null;
-    }).pipe(Effect.scoped, Effect.mapError(nativeError));
+    },
+    Effect.scoped,
+    Effect.mapError(nativeError),
+  );
   const request = (input: NeoPiNativeSessionsRequestInput) => requestNative(input);
   const watch = (input: {
     ref: NeoPiNativeSessionRef;
@@ -1010,7 +1018,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             const loadSnapshot = Effect.gen(function* () {
               const snapshot = yield* refresh(session);
               yield* verifyRef(session, input.ref);
-              const boundary = yield* Schema.decodeUnknownEffect(JournalIdentity)(
+              const boundary = yield* decodeJournalIdentity(
                 yield* session.native.client.request({ type: "snapshot_session_journal" }),
               );
               if (
@@ -1022,7 +1030,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                   "The native session changed while preparing history. Reopen the new file.",
                   "session_changed",
                 );
-              const nativeJournal = yield* Schema.decodeUnknownEffect(NeoPiJournalPage)(
+              const nativeJournal = yield* decodeJournalPage(
                 yield* session.native.client.request({
                   type: "get_entries_page",
                   scope: "branch",
@@ -1093,10 +1101,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         return Stream.merge(snapshotAndEvents, ui, { haltStrategy: "either" });
       }),
     ).pipe(Stream.mapError(nativeError), Stream.scoped);
-  const close = (input: {
-    ref: NeoPiNativeSessionRef;
-  }): Effect.Effect<{ closed: boolean }, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
+  const close = Effect.fn("NeoPiNativeSessions.close")(
+    function* (input: { ref: NeoPiNativeSessionRef }) {
       const file = yield* dependencies.canonicalize(input.ref.sessionFile);
       return yield* (yield* gate(file)).withPermits(1)(
         Effect.gen(function* () {
@@ -1118,59 +1124,59 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           return { closed: true };
         }),
       );
-    }).pipe(Effect.uninterruptible, Effect.mapError(nativeError));
-  const modelsConnection = (
+    },
+    Effect.uninterruptible,
+    Effect.mapError(nativeError),
+  );
+  const modelsConnection = Effect.fn("NeoPiNativeSessions.modelsConnection")(function* (
     ref: NeoPiNativeSessionRef,
-  ): Effect.Effect<NeoPiModelsConnection, NeoPiNativeSessionsError> =>
-    Effect.gen(function* () {
-      const session = yield* requireSession(ref).pipe(
-        Effect.catch((cause) =>
-          nativeError(cause).code === "closed"
-            ? fail("Native session is not connected. Open it before using Models.", "closed")
-            : Effect.fail(cause),
+  ) {
+    const session = yield* requireSession(ref).pipe(
+      Effect.catchIf(
+        (cause) => nativeError(cause).code === "closed",
+        () => fail("Native session is not connected. Open it before using Models.", "closed"),
+      ),
+    );
+    const validate = Effect.gen(function* () {
+      yield* session.profile.validate;
+      yield* verifyRef(session, ref);
+    });
+    return {
+      capabilities: session.native.client.capabilities,
+      request: Effect.fn("NeoPiNativeSessions.modelsRequest")(
+        function* (command) {
+          yield* validate;
+          const nativeCommand = yield* decodeNativeSessionCommand(command);
+          return yield* requestNative({ ref, command: nativeCommand }, true);
+        },
+        Effect.mapError((cause) => {
+          const error = nativeError(cause);
+          return new NeoPiRpcError({
+            message: error.message,
+            ...(error.code ? { code: error.code } : {}),
+          });
+        }),
+      ),
+      respondUi: (response) =>
+        request({ ref, command: { ...response, type: "extension_ui_response" } }).pipe(
+          Effect.asVoid,
+          Effect.mapError((cause) => new NeoPiRpcError({ message: cause.message })),
         ),
-      );
-      const validate = Effect.gen(function* () {
-        yield* session.profile.validate;
-        yield* verifyRef(session, ref);
-      });
-      return {
-        capabilities: session.native.client.capabilities,
-        request: (command) =>
-          Effect.gen(function* () {
-            yield* validate;
-            const nativeCommand =
-              yield* Schema.decodeUnknownEffect(NeoPiNativeSessionCommand)(command);
-            return yield* requestNative({ ref, command: nativeCommand }, true);
-          }).pipe(
-            Effect.mapError((cause) => {
-              const error = nativeError(cause);
-              return new NeoPiRpcError({
-                message: error.message,
-                ...(error.code ? { code: error.code } : {}),
-              });
-            }),
-          ),
-        respondUi: (response) =>
-          request({ ref, command: { ...response, type: "extension_ui_response" } }).pipe(
-            Effect.asVoid,
-            Effect.mapError((cause) => new NeoPiRpcError({ message: cause.message })),
-          ),
-        ui: Stream.unwrap(retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelUi)))).pipe(
-          Stream.catch(() => Stream.empty),
-          Stream.scoped,
-        ),
-        changes: Stream.unwrap(
-          retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelChanges))),
-        ).pipe(
-          Stream.catch(() => Stream.empty),
-          Stream.scoped,
-        ),
-        validate: validate.pipe(
-          Effect.mapError((cause) => new NeoPiModelsError({ message: nativeError(cause).message })),
-        ),
-      } satisfies NeoPiModelsConnection;
-    }).pipe(Effect.mapError(nativeError));
+      ui: Stream.unwrap(retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelUi)))).pipe(
+        Stream.catch(() => Stream.empty),
+        Stream.scoped,
+      ),
+      changes: Stream.unwrap(
+        retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelChanges))),
+      ).pipe(
+        Stream.catch(() => Stream.empty),
+        Stream.scoped,
+      ),
+      validate: validate.pipe(
+        Effect.mapError((cause) => new NeoPiModelsError({ message: nativeError(cause).message })),
+      ),
+    } satisfies NeoPiModelsConnection;
+  }, Effect.mapError(nativeError));
   if (dependencies.profileChanges)
     yield* Stream.runForEach(dependencies.profileChanges, () =>
       Effect.forEach(Array.from(sessions.values()), (session) =>
@@ -1241,17 +1247,22 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const config = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
+  const mcpContext = Context.pick(
+    McpSessionRegistry.McpSessionRegistry,
+    McpServer.McpServer,
+  )(yield* Effect.context<McpSessionRegistry.McpSessionRegistry | McpServer.McpServer>());
   const canonicalize = Effect.fnUntraced(function* (file: string) {
     if (!NodePath.isAbsolute(file))
       return yield* fail("A native session file must be an absolute path.", "invalid_path");
     return yield* fs.realPath(file).pipe(
-      Effect.catch((cause) => {
+      Effect.catchIf(
+        (cause) => cause.reason._tag === "NotFound",
         // A native-created file may not have durable entries yet; only its leaf may be absent.
-        if (cause.reason._tag !== "NotFound") return Effect.fail(cause);
-        return fs
-          .realPath(NodePath.dirname(file))
-          .pipe(Effect.map((parent) => NodePath.join(parent, NodePath.basename(file))));
-      }),
+        () =>
+          fs
+            .realPath(NodePath.dirname(file))
+            .pipe(Effect.map((parent) => NodePath.join(parent, NodePath.basename(file)))),
+      ),
     );
   }, Effect.mapError(nativeError));
   const profile = Effect.fnUntraced(function* (id: ProviderInstanceId) {
@@ -1273,8 +1284,8 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   });
   // Binaries that rejected `--live` once; older NeoPi keeps listing without it.
   const liveUnsupported = new Set<string>();
-  const runCatalog = (profile: NeoPiNativeProfile, args: ReadonlyArray<string>) =>
-    Effect.gen(function* () {
+  const runCatalog = Effect.fn("NeoPiNativeSessions.runCatalog")(
+    function* (profile: NeoPiNativeProfile, args: ReadonlyArray<string>) {
       const child = yield* spawner.spawn(
         ChildProcess.make(profile.source.binary, args, {
           cwd: config.cwd,
@@ -1295,7 +1306,10 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         out: out.text,
         err: err.text,
       };
-    }).pipe(Effect.scoped, Effect.timeout("30 seconds"));
+    },
+    Effect.scoped,
+    Effect.timeout("30 seconds"),
+  );
   /** `npi ctl list --json`; `undefined` when the binary cannot list or answers with something else. */
   const readControlRegistry = (profile: NeoPiNativeProfile) =>
     runCatalog(profile, ["ctl", "list", "--json"]).pipe(
@@ -1318,7 +1332,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     const [first, registry] = yield* Effect.all(
       [
         runCatalog(profile, listArgs(live, file)),
-        live ? readControlRegistry(profile) : Effect.succeed(undefined),
+        live ? readControlRegistry(profile) : Effect.undefined,
       ],
       { concurrency: 2 },
     );
@@ -1329,7 +1343,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       output = yield* runCatalog(profile, listArgs(false, file));
     }
     if (!output.ok) return yield* fail(output.err || "Native session discovery failed.");
-    const decoded = yield* Schema.decodeUnknownEffect(Catalog)(output.out);
+    const decoded = yield* decodeCatalog(output.out);
     return live
       ? decoded.sessions.map((row) => ({
           ...row,
@@ -1379,254 +1393,245 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     }
     return undefined;
   });
-  const connect: NeoPiNativeSessionsDependencies["connect"] = (
-    profile,
-    input,
-    publish,
-    mode = "auto",
-  ) =>
-    Effect.gen(function* () {
-      const source = profile.source;
-      const row = input.sessionFile ? yield* catalogRow(profile, input.sessionFile) : undefined;
-      const cwd = row?.cwd ?? input.cwd ?? config.cwd;
-      const canonicalCwd = yield* fs.realPath(cwd);
-      const extra = yield* parseNeoPiLaunchArguments(source.launchArgs);
-      const startupUi = yield* Deferred.make<void>();
-      // Typed native side channels share this envelope; keep the original frame object.
-      const publishFrame: (frame: { readonly type: string }) => Effect.Effect<void> = publish;
-      let ownedPid: number | undefined;
-      const spawn = Effect.fnUntraced(function* (args: string[], capturePid = false) {
-        const transportScope = yield* Effect.scope;
-        let hostPump: Effect.Success<ReturnType<typeof makeNeoPiNativeHostToolPump>> | undefined;
-        let activeClient: NeoPiRpcClient | undefined;
-        const client = yield* makeClient({
-          spawn: (command) =>
-            spawner.spawn(command).pipe(
-              Effect.tap((handle) =>
-                Effect.sync(() => {
-                  if (capturePid) ownedPid = Number(handle.pid);
-                }),
-              ),
-            ),
-          command: source.binary,
-          args,
-          cwd: canonicalCwd,
-          env: source.env,
-          // Never bound the parser's queue: replies must pass even during a snapshot or slow UI.
-          onTransportReady: (transport) =>
-            Effect.gen(function* () {
-              yield* Stream.runForEach(transport.events, publish).pipe(
-                Effect.forkIn(transportScope),
-              );
-              yield* Stream.runForEach(transport.uiRequests, (frame) =>
-                Effect.gen(function* () {
-                  if (
-                    frame.method === "select" ||
-                    frame.method === "confirm" ||
-                    frame.method === "input" ||
-                    frame.method === "editor"
-                  )
-                    yield* Deferred.succeed(startupUi, undefined);
-                  yield* publish(frame);
-                }),
-              ).pipe(Effect.forkIn(transportScope));
-              hostPump = yield* makeNeoPiNativeHostToolPump(
-                {
-                  hostToolCalls: transport.hostToolCalls.pipe(Stream.tap(publishFrame)),
-                  hostToolResult: transport.hostToolResult,
-                },
-                (ref) =>
-                  Effect.gen(function* () {
-                    yield* profile.validate;
-                    if (!activeClient)
-                      return yield* fail(
-                        "Native host tools are not ready.",
-                        "host_tools_unavailable",
-                      );
-                    const identity = yield* Schema.decodeUnknownEffect(StateIdentity)(
-                      yield* activeClient.request({ type: "get_state", includeDump: false }),
-                    );
-                    if ((yield* canonicalize(identity.sessionFile)) !== ref.sessionFile)
-                      return yield* fail("The native owner changed session.", "session_changed");
-                  }).pipe(Effect.mapError(nativeError)),
-              ).pipe(Effect.provideService(Scope.Scope, transportScope));
-              yield* Stream.runForEach(transport.hostUriRequests, publishFrame).pipe(
-                Effect.forkIn(transportScope),
-              );
-            }),
-        });
-        activeClient = client;
-        // An already-running terminal may predate the installed binary. Old control
-        // owners replace session-global tools, so only the owner's capability is safe.
-        if (!capturePid && !client.capabilities.has("connection_owned_host_tools"))
-          return { client, hostTools: undefined };
-        if (!hostPump)
-          return yield* fail(
-            "Native host-tool transport is unavailable.",
-            "host_tools_unavailable",
-          );
-        const pump = hostPump;
-        const hostTools: NonNullable<NeoPiNativeConnection["hostTools"]> = {
-          revoke: pump.revoke,
-          bind: (ref) =>
-            Effect.gen(function* () {
-              yield* profile.validate;
-              const settings = yield* serverSettings.getSettings;
-              const overrides = Object.values(settings.projectSettingsOverrides);
-              // Without a SQL thread there is no authoritative project binding. An
-              // unresolved project override must not become an environment-level bypass.
-              const capabilities = new Set<McpCapability>();
-              if (
-                settings.enableAgentBrowserAccess &&
-                !overrides.some((entry) => entry.enableAgentBrowserAccess !== undefined)
-              )
-                capabilities.add("preview");
-              if (
-                settings.enableAgentDeviceAccess &&
-                !overrides.some((entry) => entry.enableAgentDeviceAccess !== undefined)
-              )
-                capabilities.add("device");
-              const tools = yield* pump.bind(ref, capabilities);
-              const registered = yield* client
-                .request({ type: "set_host_tools", tools })
-                .pipe(Effect.result);
-              if (registered._tag === "Success") return;
-              // NeoPi keeps host-tool names session-global: a second NeoCode
-              // attaching to the same session cannot take them over. Stay
-              // attached without them and say so, rather than failing the attach.
-              if (!/conflicts with an existing tool/i.test(String(registered.failure.message)))
-                return yield* registered.failure;
-              yield* pump.revoke;
-              yield* publish({
-                type: "extension_ui_request",
-                id: "neocode-host-tools",
-                method: "setStatus",
-                statusKey: "hostTools",
-                statusText:
-                  "Browser preview and device tools stay with the NeoCode window that attached first; this window follows the session without them.",
-              } as SessionEventFrame);
-            }).pipe(Effect.mapError(nativeError)),
-        };
-        return { client, hostTools };
-      });
-      const attach = (owner: CatalogRow | undefined) =>
-        Effect.gen(function* () {
-          if (!owner?.control)
-            return yield* fail(
-              "The native session is in use without an attachable control endpoint.",
-              "session_in_use",
-            );
-          const { client, hostTools } = yield* spawn([
-            "ctl",
-            "pipe",
-            owner.control.instanceId,
-            "--label",
-            "neocode-native",
-          ]);
-          if (!client.capabilities.has("control_v1"))
-            return yield* fail(
-              "The native endpoint did not establish a control attachment.",
-              "unsupported",
-            );
-          // A terminal started before session_journal existed cannot be followed here; say which
-          // release it runs instead of blaming the configured binary, which is not the owner.
-          if (
-            !client.capabilities.has("session_journal") ||
-            !client.capabilities.has("session_journal_events")
-          )
-            return yield* fail(
-              olderOwnerMessage(
-                neoPiOwnerVersion(yield* readControlRegistry(profile), owner.control.instanceId),
-              ),
-              "owner_outdated",
-            );
-          return {
-            client,
-            attachment: "terminal" as const,
-            cwd: canonicalCwd,
-            ...(hostTools ? { hostTools } : {}),
-          };
-        });
-      if (row?.inUse) return yield* attach(row);
-      if (mode === "attach") return yield* fail("No NeoPi owns this session yet.", "no_owner");
-      const args = [
-        "--mode",
-        "rpc-ui",
-        "--cwd",
-        canonicalCwd,
-        "--no-title",
-        ...(source.capabilities.has(NEOPI_CAPABILITIES.exitWithParent)
-          ? ["--exit-with-parent"]
-          : []),
-        ...extra,
-        ...(input.sessionFile ? ["--session", input.sessionFile] : ["--new-session"]),
-      ];
-      // A losing ownership attempt has its own scope; release it before attaching the real writer.
-      const attemptScope = yield* Scope.fork(yield* Effect.scope);
-      const attempt = yield* spawn(args, true).pipe(
-        Effect.provideService(Scope.Scope, attemptScope),
-        Effect.result,
-      );
-      if (attempt._tag === "Success") {
-        const { client, hostTools } = attempt.success;
-        let booting = true;
-        const readState = Effect.suspend(() => {
-          const ordinary = client.request({ type: "get_state", includeDump: false }).pipe(
-            Effect.tap(() =>
+  const connect: NeoPiNativeSessionsDependencies["connect"] = Effect.fn(
+    "NeoPiNativeSessions.connect",
+  )(function* (profile, input, publish, mode = "auto") {
+    const source = profile.source;
+    const row = input.sessionFile ? yield* catalogRow(profile, input.sessionFile) : undefined;
+    const cwd = row?.cwd ?? input.cwd ?? config.cwd;
+    const canonicalCwd = yield* fs.realPath(cwd);
+    const extra = yield* parseNeoPiLaunchArguments(source.launchArgs);
+    const startupUi = yield* Deferred.make<void>();
+    // Typed native side channels share this envelope; keep the original frame object.
+    const publishFrame: (frame: { readonly type: string }) => Effect.Effect<void> = publish;
+    let ownedPid: number | undefined;
+    const spawn = Effect.fnUntraced(function* (args: string[], capturePid = false) {
+      const transportScope = yield* Effect.scope;
+      let hostPump: Effect.Success<ReturnType<typeof makeNeoPiNativeHostToolPump>> | undefined;
+      let activeClient: NeoPiRpcClient | undefined;
+      const client = yield* makeClient({
+        spawn: (command) =>
+          spawner.spawn(command).pipe(
+            Effect.tap((handle) =>
               Effect.sync(() => {
-                booting = false;
+                if (capturePid) ownedPid = Number(handle.pid);
               }),
             ),
-          );
-          if (!booting) return ordinary;
-          // A native extension can await UI before stdio startup releases get_state.
-          // Read the same session through its existing control dispatcher, which is
-          // independent of that startup gate. Never synthesize an identity or header.
-          const duringDialog = Deferred.await(startupUi).pipe(
-            Effect.andThen(
+          ),
+        command: source.binary,
+        args,
+        cwd: canonicalCwd,
+        env: source.env,
+        // Never bound the parser's queue: replies must pass even during a snapshot or slow UI.
+        onTransportReady: Effect.fn("NeoPiNativeSessions.onTransportReady")(function* (transport) {
+          yield* Stream.runForEach(transport.events, publish).pipe(Effect.forkIn(transportScope));
+          yield* Stream.runForEach(transport.uiRequests, (frame) =>
+            Effect.gen(function* () {
+              if (
+                frame.method === "select" ||
+                frame.method === "confirm" ||
+                frame.method === "input" ||
+                frame.method === "editor"
+              )
+                yield* Deferred.succeed(startupUi, undefined);
+              yield* publish(frame);
+            }),
+          ).pipe(Effect.forkIn(transportScope));
+          hostPump = yield* makeNeoPiNativeHostToolPump(
+            {
+              hostToolCalls: transport.hostToolCalls.pipe(Stream.tap(publishFrame)),
+              hostToolResult: transport.hostToolResult,
+            },
+            (ref) =>
               Effect.gen(function* () {
-                if (ownedPid === undefined)
-                  return yield* fail(
-                    "The native process has no control identity.",
-                    "startup_unavailable",
-                  );
-                return yield* Effect.gen(function* () {
-                  const reader = yield* makeClient({
-                    spawn: spawner.spawn,
-                    command: source.binary,
-                    args: ["ctl", "pipe", `pid:${ownedPid}`, "--label", "neocode-native-startup"],
-                    cwd: canonicalCwd,
-                    env: source.env,
-                  });
-                  const status = yield* Schema.decodeUnknownEffect(
-                    Schema.Struct({ ready: Schema.Boolean }),
-                  )(yield* reader.request({ type: "get_status" }));
-                  const state = yield* reader.request({ type: "get_state", includeDump: false });
-                  if (status.ready) booting = false;
-                  return state;
-                }).pipe(Effect.scoped);
-              }),
-            ),
+                yield* profile.validate;
+                if (!activeClient)
+                  return yield* fail("Native host tools are not ready.", "host_tools_unavailable");
+                const identity = yield* decodeStateIdentity(
+                  yield* activeClient.request({ type: "get_state", includeDump: false }),
+                );
+                if ((yield* canonicalize(identity.sessionFile)) !== ref.sessionFile)
+                  return yield* fail("The native owner changed session.", "session_changed");
+              }).pipe(Effect.mapError(nativeError)),
+          ).pipe(
+            Effect.provideContext(mcpContext),
+            Effect.provideService(Scope.Scope, transportScope),
           );
-          return Effect.raceFirst(ordinary, duringDialog);
-        }).pipe(Effect.mapError(nativeError));
-        return {
-          client,
-          attachment: "owned" as const,
-          cwd: canonicalCwd,
-          readState,
-          ...(hostTools ? { hostTools } : {}),
-        };
-      }
-      yield* Scope.close(attemptScope, Exit.void);
+          yield* Stream.runForEach(transport.hostUriRequests, publishFrame).pipe(
+            Effect.forkIn(transportScope),
+          );
+        }),
+      });
+      activeClient = client;
+      // An already-running terminal may predate the installed binary. Old control
+      // owners replace session-global tools, so only the owner's capability is safe.
+      if (!capturePid && !client.capabilities.has("connection_owned_host_tools"))
+        return { client, hostTools: undefined };
+      if (!hostPump)
+        return yield* fail("Native host-tool transport is unavailable.", "host_tools_unavailable");
+      const pump = hostPump;
+      const hostTools: NonNullable<NeoPiNativeConnection["hostTools"]> = {
+        revoke: pump.revoke,
+        bind: Effect.fn("NeoPiNativeSessions.bindHostTools")(function* (ref) {
+          yield* profile.validate;
+          const settings = yield* serverSettings.getSettings;
+          const overrides = Object.values(settings.projectSettingsOverrides);
+          // Without a SQL thread there is no authoritative project binding. An
+          // unresolved project override must not become an environment-level bypass.
+          const capabilities = new Set<McpCapability>();
+          if (
+            settings.enableAgentBrowserAccess &&
+            !overrides.some((entry) => entry.enableAgentBrowserAccess !== undefined)
+          )
+            capabilities.add("preview");
+          if (
+            settings.enableAgentDeviceAccess &&
+            !overrides.some((entry) => entry.enableAgentDeviceAccess !== undefined)
+          )
+            capabilities.add("device");
+          const tools = yield* pump.bind(ref, capabilities);
+          const registered = yield* client
+            .request({ type: "set_host_tools", tools })
+            .pipe(Effect.result);
+          if (registered._tag === "Success") return;
+          // NeoPi keeps host-tool names session-global: a second NeoCode
+          // attaching to the same session cannot take them over. Stay
+          // attached without them and say so, rather than failing the attach.
+          if (!/conflicts with an existing tool/i.test(String(registered.failure.message)))
+            return yield* registered.failure;
+          yield* pump.revoke;
+          yield* publish({
+            type: "extension_ui_request",
+            id: "neocode-host-tools",
+            method: "setStatus",
+            statusKey: "hostTools",
+            statusText:
+              "Browser preview and device tools stay with the NeoCode window that attached first; this window follows the session without them.",
+          } as SessionEventFrame);
+        }, Effect.mapError(nativeError)),
+      };
+      return { client, hostTools };
+    });
+    const attach = Effect.fn("NeoPiNativeSessions.attach")(function* (
+      owner: CatalogRow | undefined,
+    ) {
+      if (!owner?.control)
+        return yield* fail(
+          "The native session is in use without an attachable control endpoint.",
+          "session_in_use",
+        );
+      const { client, hostTools } = yield* spawn([
+        "ctl",
+        "pipe",
+        owner.control.instanceId,
+        "--label",
+        "neocode-native",
+      ]);
+      if (!client.capabilities.has("control_v1"))
+        return yield* fail(
+          "The native endpoint did not establish a control attachment.",
+          "unsupported",
+        );
+      // A terminal started before session_journal existed cannot be followed here; say which
+      // release it runs instead of blaming the configured binary, which is not the owner.
       if (
-        !(attempt.failure instanceof NeoPiRpcError) ||
-        attempt.failure.code !== "session_in_use" ||
-        !input.sessionFile
+        !client.capabilities.has("session_journal") ||
+        !client.capabilities.has("session_journal_events")
       )
-        return yield* Effect.fail(attempt.failure);
-      return yield* attach(yield* catalogRow(profile, input.sessionFile));
-    }).pipe(Effect.mapError(nativeError));
+        return yield* fail(
+          olderOwnerMessage(
+            neoPiOwnerVersion(yield* readControlRegistry(profile), owner.control.instanceId),
+          ),
+          "owner_outdated",
+        );
+      return {
+        client,
+        attachment: "terminal" as const,
+        cwd: canonicalCwd,
+        ...(hostTools ? { hostTools } : {}),
+      };
+    });
+    if (row?.inUse) return yield* attach(row);
+    if (mode === "attach") return yield* fail("No NeoPi owns this session yet.", "no_owner");
+    const args = [
+      "--mode",
+      "rpc-ui",
+      "--cwd",
+      canonicalCwd,
+      "--no-title",
+      ...(source.capabilities.has(NEOPI_CAPABILITIES.exitWithParent) ? ["--exit-with-parent"] : []),
+      ...(input.runtimeMode === undefined
+        ? []
+        : ["--approval-mode", neoPiApprovalModes[input.runtimeMode]]),
+      ...extra,
+      ...(input.sessionFile ? ["--session", input.sessionFile] : ["--new-session"]),
+    ];
+    // A losing ownership attempt has its own scope; release it before attaching the real writer.
+    const attemptScope = yield* Scope.fork(yield* Effect.scope);
+    const attempt = yield* spawn(args, true).pipe(
+      Effect.provideService(Scope.Scope, attemptScope),
+      Effect.result,
+    );
+    if (attempt._tag === "Success") {
+      const { client, hostTools } = attempt.success;
+      let booting = true;
+      const readState = Effect.suspend(() => {
+        const ordinary = client.request({ type: "get_state", includeDump: false }).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              booting = false;
+            }),
+          ),
+        );
+        if (!booting) return ordinary;
+        // A native extension can await UI before stdio startup releases get_state.
+        // Read the same session through its existing control dispatcher, which is
+        // independent of that startup gate. Never synthesize an identity or header.
+        const duringDialog = Deferred.await(startupUi).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              if (ownedPid === undefined)
+                return yield* fail(
+                  "The native process has no control identity.",
+                  "startup_unavailable",
+                );
+              return yield* Effect.gen(function* () {
+                const reader = yield* makeClient({
+                  spawn: spawner.spawn,
+                  command: source.binary,
+                  args: ["ctl", "pipe", `pid:${ownedPid}`, "--label", "neocode-native-startup"],
+                  cwd: canonicalCwd,
+                  env: source.env,
+                });
+                const status = yield* decodeReadyStatus(
+                  yield* reader.request({ type: "get_status" }),
+                );
+                const state = yield* reader.request({ type: "get_state", includeDump: false });
+                if (status.ready) booting = false;
+                return state;
+              }).pipe(Effect.scoped);
+            }),
+          ),
+        );
+        return Effect.raceFirst(ordinary, duringDialog);
+      }).pipe(Effect.mapError(nativeError));
+      return {
+        client,
+        attachment: "owned" as const,
+        cwd: canonicalCwd,
+        readState,
+        ...(hostTools ? { hostTools } : {}),
+      };
+    }
+    yield* Scope.close(attemptScope, Exit.void);
+    if (
+      !isRpcError(attempt.failure) ||
+      attempt.failure.code !== "session_in_use" ||
+      !input.sessionFile
+    )
+      return yield* attempt.failure;
+    return yield* attach(yield* catalogRow(profile, input.sessionFile));
+  }, Effect.mapError(nativeError));
   const profileChanges = yield* instances.subscribeChanges;
   return yield* makeNeoPiNativeSessionsWith({
     profileChanges: Stream.fromSubscription(profileChanges),

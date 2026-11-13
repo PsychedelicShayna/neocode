@@ -1,10 +1,10 @@
 import { parseScopedThreadKey, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 import { useShallow } from "zustand/react/shallow";
 
-import { useThread, useThreadStatus } from "../state/entities";
+import { useQuietThreadProjection, useThreadStatus } from "../state/entities";
 import { buildThreadRouteParams } from "../threadRoutes";
 import { useFailedSendDraftStore } from "./chat/failedSendDraftRecovery";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -18,10 +18,12 @@ export function FailedSendDraftRecovery() {
 }
 
 function ThreadRecovery({ threadKey }: { threadKey: string }) {
-  const target = useMemo(() => parseScopedThreadKey(threadKey), [threadKey]);
-  const thread = useThread(target);
+  const target = parseScopedThreadKey(threadKey);
+  const thread = useQuietThreadProjection(target);
   const status = useThreadStatus(target);
-  const activities = thread?.activities;
+  const runs = thread?.projection.runs;
+  const attempts = thread?.projection.attempts;
+  const providerTurns = thread?.projection.providerTurns;
   const failedIds = useFailedSendDraftStore(
     useShallow((state) =>
       Object.entries(state.submissionsByThreadKey[threadKey] ?? {})
@@ -30,15 +32,16 @@ function ThreadRecovery({ threadKey }: { threadKey: string }) {
     ),
   );
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reconciles persisted send outcomes with the external draft recovery store
   useEffect(() => {
     if (!target) return;
     if (status === "deleted") {
       useFailedSendDraftStore.getState().discardThread(target);
-    } else if (activities) {
-      useFailedSendDraftStore.getState().reconcile(target, activities);
+    } else if (runs && attempts && providerTurns) {
+      useFailedSendDraftStore.getState().reconcile(target, { runs, attempts, providerTurns });
     }
-    // Streaming message deltas do not change activities and do no recovery work.
-  }, [activities, status, target]);
+    // Quiet collection identities leave streamed text out of recovery work.
+  }, [runs, attempts, providerTurns, status, target]);
 
   if (!target || status === "deleted") return null;
   return failedIds.map((messageId) => (
@@ -48,6 +51,7 @@ function ThreadRecovery({ threadKey }: { threadKey: string }) {
 
 function RecoveryNotice({ target, messageId }: { target: ScopedThreadRef; messageId: string }) {
   const navigate = useNavigate();
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- owns the external recovery notice and preserves drafts when it unmounts
   useEffect(() => {
     const store = useFailedSendDraftStore.getState();
     if (store.restore(target, messageId)) return;

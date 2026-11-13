@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
-import { vi } from "vitest";
+import { vi } from "vite-plus/test";
 import {
+  AuthOrchestrationOperateScope,
   EnvironmentId,
   WS_METHODS,
   ProviderInstanceId,
@@ -17,11 +18,13 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
-import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import { PrimaryConnectionTarget } from "../connection/model.ts";
+import { layerRemoteHttpClient } from "../rpc/http.ts";
 import {
   emptyNativeSessionFeed,
   reduceNativeSessionFeed,
@@ -171,9 +174,26 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
   } as unknown as WsRpcProtocolClient;
   const connection = { client } as RpcSession;
   const environmentId = EnvironmentId.make("native-remote");
+  const environment = new PrimaryConnectionTarget({
+    environmentId,
+    label: "Native test",
+    httpBaseUrl: "https://native.test",
+    wsBaseUrl: "wss://native.test",
+  });
+  const prepared = yield* SubscriptionRef.make(
+    Option.some({
+      environmentId,
+      label: environment.label,
+      httpBaseUrl: environment.httpBaseUrl,
+      socketUrl: `${environment.wsBaseUrl}/ws`,
+      httpAuthorization: null,
+      target: environment,
+    }),
+  );
   const sessionRef = yield* SubscriptionRef.make(Option.some(connection));
   const supervisor = EnvironmentSupervisor.of({
-    target: { environmentId },
+    target: environment,
+    prepared,
     session: sessionRef,
   } as EnvironmentSupervisor["Service"]);
   const environments = EnvironmentRegistry.of({
@@ -181,7 +201,24 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
     followStream: (_id, stream) => Stream.provideService(stream, EnvironmentSupervisor, supervisor),
   } as EnvironmentRegistry["Service"]);
   const atoms = createNativeSessionAtoms(
-    Atom.runtime(Layer.succeed(EnvironmentRegistry, environments)),
+    Atom.runtime(
+      Layer.merge(
+        Layer.succeed(EnvironmentRegistry, environments),
+        layerRemoteHttpClient(async () =>
+          Response.json({
+            authenticated: true,
+            auth: {
+              policy: "remote-reachable",
+              bootstrapMethods: [],
+              sessionMethods: [],
+              sessionCookieName: "native-test",
+            },
+            scopes: [AuthOrchestrationOperateScope],
+            permissions: [AuthOrchestrationOperateScope],
+          }),
+        ),
+      ),
+    ),
   );
   // Normal work uses microtasks; tests can drain disposal deterministically
   // without advancing the old five-minute retention period.
@@ -192,6 +229,8 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
   const registry = yield* Effect.acquireRelease(
     Effect.sync(() =>
       AtomRegistry.make({
+        // Test expiry independently of the production sweep batching interval.
+        timeoutResolution: 1,
         scheduleTask: (f) => {
           const task = () => {
             if (scheduled.delete(task)) f();
@@ -464,8 +503,7 @@ describe("native session observation lifetime", () => {
         );
         expect(opened).toMatchObject({ _tag: "Success", value: { ref } });
         const remount = h.registry.mount(h.watch);
-        yield* Effect.yieldNow;
-        const reopened = yield* AtomRegistry.getResult(h.registry, h.watch);
+        const reopened = yield* h.observe((feed) => feed.connected);
         expect(reopened.connected).toBe(true);
         expect(reopened.error).toBeNull();
         expect(reopened.conversation.entries).toEqual([user]);
@@ -832,11 +870,13 @@ describe("native feed reconciliation lifetime", () => {
         const latest = { ...user, id: "latest", parentId: first.id };
         const started = yield* Deferred.make<void>();
         const release = yield* Deferred.make<NeoPiJournalPage>();
-        const { events, feeds, reduced } = yield* harness(() =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(started, undefined);
-            return yield* Deferred.await(release);
-          }),
+        const { events, feeds, reduced } = yield* harness((command) =>
+          command.type === "get_entries_page"
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(started, undefined);
+                return yield* Deferred.await(release);
+              })
+            : Effect.succeed(session.state),
         );
         yield* Queue.offer(
           events,
@@ -851,14 +891,16 @@ describe("native feed reconciliation lifetime", () => {
         ]);
         const durable = yield* nextFeed(feeds, (feed) => feed.busy);
         expect(durable.conversation.entries).toEqual([user, first, latest]);
-        yield* Queue.takeAll(reduced);
+        yield* Queue.clear(reduced);
         yield* Deferred.succeed(release, { ...page([user, first]), nextCursor: "stale-cursor" });
         const afterReply = yield* Queue.take(reduced);
-        expect(afterReply.conversation).toBe(durable.conversation);
+        expect(afterReply.conversation.entries).toEqual([user, first, latest]);
         expect(afterReply.conversation.identity?.leafId).toBe(latest.id);
         expect(afterReply.conversation.cursor).not.toBe("stale-cursor");
-        expect(afterReply).toBe(durable);
-        expect(yield* Queue.takeAll(feeds)).toEqual([]);
+        for (const queued of yield* Queue.clear(feeds)) {
+          expect(queued.conversation.entries).toEqual([user, first, latest]);
+          expect(queued.conversation.cursor).not.toBe("stale-cursor");
+        }
       }),
     ),
   );

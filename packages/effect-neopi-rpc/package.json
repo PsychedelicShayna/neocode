@@ -1,8 +1,8 @@
 {
   "name": "effect-neopi-rpc",
   "version": "0.0.0",
-  "license": "MIT",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "exports": {
     "./client": {
@@ -31,8 +31,8 @@
     }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "vp test run"
+    "typecheck": "effect-tsgo tsrs --noEmit",
+    "test": "vp test run --config ../../vite.config.ts --dir ."
   },
   "dependencies": {
     "effect": "catalog:"

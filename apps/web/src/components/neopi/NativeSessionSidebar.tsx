@@ -4,12 +4,17 @@ import { AgentLabel } from "./AgentLabel";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import type { NativeSessionList } from "@t3tools/client-runtime/neopi-native-sessions";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { LockIcon, PlusIcon } from "lucide-react";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { isElectron } from "../../env";
+import { useStableCallback } from "../../hooks/useStableCallback";
 import { selectOnboardingProvidersByDriver } from "../../onboarding/providerReadiness.logic";
-import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
+import {
+  useEnvironments,
+  useEnvironmentProviders,
+  usePrimaryEnvironmentId,
+} from "../../state/environments";
 import { useServerConfigs, useThreadShells } from "../../state/entities";
 import {
   beginNativeSessionOpen,
@@ -35,7 +40,7 @@ export function useOpenNativeSession() {
   const open = useAtomCommand(nativeSessionAtoms.open, { reportFailure: false });
   const navigate = useNavigate();
   const router = useRouter();
-  return useCallback(
+  return useStableCallback(
     async (
       environmentId: EnvironmentId,
       input: { providerInstanceId: ProviderInstanceId; sessionFile?: string; cwd?: string },
@@ -51,7 +56,6 @@ export function useOpenNativeSession() {
       }
       return target;
     },
-    [navigate, open, router],
   );
 }
 
@@ -59,16 +63,22 @@ export type OpenNativeSession = ReturnType<typeof useOpenNativeSession>;
 
 export function useCreateNativeSession() {
   const configs = useServerConfigs();
+  const providersByEnvironment = useEnvironmentProviders();
   const primary = usePrimaryEnvironmentId();
   const selected = useNativeSessionSelection((state) => state.target);
   const open = useOpenNativeSession();
   const navigate = useNavigate();
-  return useCallback(
-    async (environmentId = selected?.environmentId ?? primary, cwd?: string) => {
+  return useStableCallback(
+    async (
+      environmentId: EnvironmentId | null = selected?.environmentId ?? primary,
+      cwd?: string,
+    ) => {
       if (!environmentId) throw new Error("Connect an environment to start a session.");
       const config = configs.get(environmentId);
       if (!config) throw new Error("Connect to this computer before starting a NeoPi session.");
-      const providers = config.providers.filter((provider) => provider.driver === "neopi");
+      const providers = (providersByEnvironment.get(environmentId) ?? []).filter(
+        (provider) => provider.driver === "neopi",
+      );
       const selectedProvider =
         selected?.environmentId === environmentId
           ? providers.find((candidate) => candidate.instanceId === selected.ref.providerInstanceId)
@@ -97,7 +107,6 @@ export function useCreateNativeSession() {
         ...(cwd ? { cwd } : {}),
       });
     },
-    [configs, navigate, open, primary, selected],
   );
 }
 
@@ -257,6 +266,7 @@ export function NativeEnvironmentSessions({
 }) {
   const result = useEnvironmentQuery(nativeSessionAtoms.list({ environmentId, input: {} }));
   const refresh = result.refresh;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- refreshes native-owner discovery when the browser window regains focus
   useEffect(() => {
     // Native terminal owners can create sessions without a NeoCode mutation.
     window.addEventListener("focus", refresh);
@@ -268,66 +278,55 @@ export function NativeEnvironmentSessions({
   const [error, setError] = useState<string | null>(null);
   // Guards a second click synchronously; `pending` only drives the disabled rows.
   const pendingRef = useRef(false);
-  const chooseSession = useCallback(
-    async (session: NativeSessionEntry) => {
-      if (pendingRef.current) return;
-      pendingRef.current = true;
-      setPending(session.ref.sessionFile);
-      setError(null);
-      try {
-        await open(environmentId, session.ref);
-        onSelect?.();
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        pendingRef.current = false;
-        setPending(null);
-      }
-    },
-    [environmentId, onSelect, open],
-  );
+  const chooseSession = useStableCallback(async (session: NativeSessionEntry) => {
+    if (pendingRef.current) return;
+    pendingRef.current = true;
+    setPending(session.ref.sessionFile);
+    setError(null);
+    try {
+      await open(environmentId, session.ref);
+      onSelect?.();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      pendingRef.current = false;
+      setPending(null);
+    }
+  });
   const sessions = result.data?.sessions;
-  const matching = useMemo(() => {
-    const needle = query.toLowerCase();
-    if (!sessions || !needle) return sessions ?? [];
-    return sessions.filter((session) =>
-      `${session.title ?? ""} ${session.firstMessage} ${session.cwd}`
-        .toLowerCase()
-        .includes(needle),
-    );
-  }, [sessions, query]);
+  const needle = query.toLowerCase();
+  const matching =
+    !sessions || !needle
+      ? (sessions ?? [])
+      : sessions.filter((session) =>
+          `${session.title ?? ""} ${session.firstMessage} ${session.cwd}`
+            .toLowerCase()
+            .includes(needle),
+        );
   // The window belongs to one query; a new search starts from the first step.
   const [shown, setShown] = useState({ query, limit: SESSION_ROWS_STEP });
   const limit = shown.query === query ? shown.limit : SESSION_ROWS_STEP;
   const hasMore = matching.length > limit;
-  // Keyed by `limit`, so each step mounts a fresh sentinel and observes it again
-  // even when it is still on screen after the rows above it grew.
-  const sentinel = useCallback(
-    (element: HTMLLIElement | null) => {
-      if (!element) return;
-      const observer = new IntersectionObserver(
-        (entries) => {
-          if (!entries.some((entry) => entry.isIntersecting)) return;
-          setShown((current) => ({
-            query,
-            limit:
-              (current.query === query ? current.limit : SESSION_ROWS_STEP) + SESSION_ROWS_STEP,
-          }));
-        },
-        {
-          root: element.closest("[data-slot=scroll-area-viewport]"),
-          rootMargin: "0px 0px 600px 0px",
-        },
-      );
-      observer.observe(element);
-      return () => observer.disconnect();
-    },
-    [query],
-  );
-  const choose = useCallback(
-    (session: NativeSessionEntry) => void chooseSession(session),
-    [chooseSession],
-  );
+  // Each query and page mounts a fresh sentinel, even while it stays visible.
+  const sentinel = useStableCallback((element: HTMLLIElement | null) => {
+    if (!element) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        setShown((current) => ({
+          query,
+          limit: (current.query === query ? current.limit : SESSION_ROWS_STEP) + SESSION_ROWS_STEP,
+        }));
+      },
+      {
+        root: element.closest("[data-slot=scroll-area-viewport]"),
+        rootMargin: "0px 0px 600px 0px",
+      },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  });
+  const choose = useStableCallback((session: NativeSessionEntry) => void chooseSession(session));
   return (
     <SidebarGroup>
       {label ? (
@@ -338,8 +337,11 @@ export function NativeEnvironmentSessions({
           {error ?? result.error}
         </p>
       ) : null}
-      {result.data?.diagnostics.map((item, index) => (
-        <p key={index} className="text-xs text-muted-foreground">
+      {result.data?.diagnostics.map((item) => (
+        <p
+          key={`${item.providerInstanceId}:${item.message}`}
+          className="text-xs text-muted-foreground"
+        >
           {item.providerInstanceId}: {item.message}
         </p>
       ))}
@@ -357,7 +359,9 @@ export function NativeEnvironmentSessions({
             onChoose={choose}
           />
         ))}
-        {hasMore ? <li key={limit} ref={sentinel} aria-hidden className="h-px" /> : null}
+        {hasMore ? (
+          <li key={`${query}:${limit}`} ref={sentinel} aria-hidden className="h-px" />
+        ) : null}
       </SidebarMenu>
       {!result.data && result.isPending ? (
         <p className="text-xs text-muted-foreground">Reading sessions…</p>

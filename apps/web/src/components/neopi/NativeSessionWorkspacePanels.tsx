@@ -2,32 +2,23 @@ import { useAtomValue } from "@effect/atom-react";
 import { workspaceKey, workspaceResourceId } from "@t3tools/client-runtime/environment";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
-  deriveAgentPanelModel,
+  isActiveSubagentStatus,
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type { PreviewAnnotationPayload, ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
 import * as Arr from "effect/Array";
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-  type RefObject,
-} from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { ComposerImageAttachment } from "~/composerDraftStore";
 import { isCommandPaletteOpen } from "~/commandPaletteBus";
 import { requestConfirmDialog } from "~/confirmDialog";
 import { isElectron } from "~/env";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
+import { useStableCallback } from "~/hooks/useStableCallback";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
-import { getTerminalFocusOwner } from "~/lib/terminalFocus";
+import { focusTerminal, getTerminalFocusOwner } from "~/lib/terminalFocus";
 import { isPreviewFocused } from "~/lib/previewFocus";
 import { confirmTerminalClose, isTerminalCloseConfirmPending } from "~/lib/terminalCloseConfirm";
 import {
@@ -68,12 +59,17 @@ import { Button } from "../ui/button";
 import { addBrowserSurface } from "../preview/addBrowserSurface";
 import { closePreviewSession } from "../preview/closePreviewSession";
 import { subscribePreviewAction } from "../preview/previewActionBus";
-import { ThreadPreviewMiniPlayer } from "../preview/ThreadPreviewMiniPlayer";
+import {
+  ThreadPreviewMiniPlayer,
+  useThreadPreviewCanvasSource,
+} from "../preview/ThreadPreviewMiniPlayer";
 import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
 import { isNativeSessionCommand, type NativeSessionCommand } from "./nativeSessionShortcuts";
 import { useNativePendingFiles } from "./useNativePendingFiles";
+import { ChatCanvas } from "../chat/ChatCanvas";
+import { createChatCanvasStore } from "../chat/canvasStore";
 
 /** Escape belongs to these while one is open; it must not also interrupt the turn. */
 const ESCAPE_OWNING_OVERLAYS = [
@@ -151,6 +147,7 @@ export function NativeSessionWorkspacePanels({
   const agentViewMode = useAgentViewStore((store) => selectAgentView(key)(store).mode);
   const agentViewActive = agentViewMode !== "session";
   const agentViewWasActive = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- restores composer focus and dismisses portaled menus when the external agent view changes
   useEffect(() => {
     // The session view was inert behind the hub or an agent; hand the keyboard back to the prompt.
     if (agentViewWasActive.current && !agentViewActive) composerRef.current?.focusAtEnd();
@@ -168,6 +165,8 @@ export function NativeSessionWorkspacePanels({
   const miniPlayer = usePreviewMiniPlayerStore((state) =>
     selectThreadPreviewMiniPlayer(state.byThreadKey, target),
   );
+  const [canvasStore] = useState(createChatCanvasStore);
+  const canvasPreview = useThreadPreviewCanvasSource(target, miniPlayer);
   const terminalUi = useTerminalUiStateStore((state) =>
     selectThreadTerminalUiState(state.terminalUiStateByThreadKey, target),
   );
@@ -175,17 +174,16 @@ export function NativeSessionWorkspacePanels({
     environmentId: target.environmentId,
     threadId: resourceId,
   });
-  const labels = useMemo(
-    () =>
-      new Map(
-        sessions.map((session) => [
-          session.target.terminalId,
-          resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
-        ]),
-      ),
-    [sessions],
+  const labels = new Map(
+    (sessions ?? []).map((session) => [
+      session.target.terminalId,
+      resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
+    ]),
   );
-  const agentModel = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
+  const liveAgentCount = agents.reduce(
+    (count, agent) => count + (isActiveSubagentStatus(agent.status) ? 1 : 0),
+    0,
+  );
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(target.environmentId));
   const gitStatus = useEnvironmentQuery(
     cwd ? vcsEnvironment.status({ environmentId: target.environmentId, input: { cwd } }) : null,
@@ -206,42 +204,35 @@ export function NativeSessionWorkspacePanels({
     panel.surfaces[0] ??
     null;
 
-  const pendingSurfaceIds = useMemo(
-    () =>
-      new Set(
-        panel.surfaces
-          .filter((surface) => surface.kind === "file" && pendingFiles.has(surface.relativePath))
-          .map((surface) => surface.id),
-      ),
-    [panel.surfaces, pendingFiles],
+  const pendingSurfaceIds = new Set(
+    panel.surfaces
+      .filter((surface) => surface.kind === "file" && pendingFiles.has(surface.relativePath))
+      .map((surface) => surface.id),
   );
 
-  const report = useCallback(
-    (cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)),
-    [],
+  const report = useStableCallback((cause: unknown) =>
+    setError(cause instanceof Error ? cause.message : String(cause)),
   );
-  const createBrowser = useCallback(
-    (profileId?: string) => {
-      void addBrowserSurface({
-        threadRef: target,
-        openPreview,
-        ...(profileId ? { profileId } : {}),
-      }).then((result) => {
-        if (result._tag === "Failure") report(squashAtomCommandFailure(result));
-      }, report);
-    },
-    [target, openPreview, report],
-  );
-  const createTerminal = useCallback(() => {
+  const createBrowser = useStableCallback((profileId?: string) => {
+    void addBrowserSurface({
+      threadRef: target,
+      openPreview,
+      ...(profileId ? { profileId } : {}),
+    }).then((result) => {
+      if (result._tag === "Failure") report(squashAtomCommandFailure(result));
+    }, report);
+  });
+  const createTerminal = useStableCallback(() => {
     if (!cwd) return;
     const terminalId = nextTerminalId([
       ...terminalUi.terminalIds,
-      ...sessions.map((session) => session.target.terminalId),
+      ...(sessions ?? []).map((session) => session.target.terminalId),
       ...panel.surfaces.flatMap((surface) =>
         surface.kind === "terminal" ? surface.terminalIds : [],
       ),
     ]);
     useRightPanelStore.getState().openTerminal(target, terminalId);
+    focusTerminal(target, terminalId);
     void openTerminal({
       environmentId: target.environmentId,
       input: {
@@ -253,81 +244,62 @@ export function NativeSessionWorkspacePanels({
     }).then((result) => {
       if (result._tag === "Failure") report(squashAtomCommandFailure(result));
     }, report);
-  }, [
-    cwd,
-    target,
-    terminalUi.terminalIds,
-    sessions,
-    panel.surfaces,
-    openTerminal,
-    resourceId,
-    report,
-  ]);
+  });
 
-  const closeSurfaces = useCallback(
-    async (surfaces: readonly RightPanelSurface[]) => {
-      if (
-        surfaces.some((surface) => pendingSurfaceIds.has(surface.id)) &&
-        !(await requestConfirmDialog("Discard unsaved file changes?", { variant: "destructive" }))
-      )
-        return;
-      const terminalIds = surfaces.flatMap((surface) =>
-        surface.kind === "terminal" ? surface.terminalIds : [],
-      );
-      if (
-        Arr.isArrayNonEmpty(terminalIds) &&
-        !(await confirmTerminalClose(Arr.map(terminalIds, (id) => labels.get(id) ?? id)))
-      )
-        return;
-      for (const surface of surfaces) {
-        if (surface.kind === "preview" && surface.resourceId) {
-          const result = await closePreviewSession({
-            closePreview,
-            threadRef: target,
-            tabId: surface.resourceId,
-            snapshot: preview.sessions[surface.resourceId] ?? null,
+  const closeSurfaces = useStableCallback(async (surfaces: readonly RightPanelSurface[]) => {
+    if (
+      surfaces.some((surface) => pendingSurfaceIds.has(surface.id)) &&
+      !(await requestConfirmDialog("Discard unsaved file changes?", { variant: "destructive" }))
+    )
+      return;
+    const terminalIds = surfaces.flatMap((surface) =>
+      surface.kind === "terminal" ? surface.terminalIds : [],
+    );
+    if (
+      Arr.isArrayNonEmpty(terminalIds) &&
+      !(await confirmTerminalClose(Arr.map(terminalIds, (id) => labels.get(id) ?? id)))
+    )
+      return;
+    for (const surface of surfaces) {
+      if (surface.kind === "preview" && surface.resourceId) {
+        const result = await closePreviewSession({
+          closePreview,
+          threadRef: target,
+          tabId: surface.resourceId,
+          snapshot: preview.sessions[surface.resourceId] ?? null,
+        });
+        if (result._tag === "Failure") {
+          report(squashAtomCommandFailure(result));
+          continue;
+        }
+      }
+      if (surface.kind === "terminal") {
+        let failed = false;
+        for (const terminalId of surface.terminalIds) {
+          const result = await closeTerminal({
+            environmentId: target.environmentId,
+            input: { threadId: resourceId, terminalId, deleteHistory: true },
           });
           if (result._tag === "Failure") {
             report(squashAtomCommandFailure(result));
-            continue;
+            failed = true;
+          } else {
+            useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
+            useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
           }
         }
-        if (surface.kind === "terminal") {
-          let failed = false;
-          for (const terminalId of surface.terminalIds) {
-            const result = await closeTerminal({
-              environmentId: target.environmentId,
-              input: { threadId: resourceId, terminalId, deleteHistory: true },
-            });
-            if (result._tag === "Failure") {
-              report(squashAtomCommandFailure(result));
-              failed = true;
-            } else {
-              useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
-              useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
-            }
-          }
-          if (failed) continue;
-        }
-        useRightPanelStore.getState().closeSurface(target, surface.id);
+        if (failed) continue;
       }
-    },
-    [
-      target,
-      pendingSurfaceIds,
-      labels,
-      closePreview,
-      preview.sessions,
-      closeTerminal,
-      resourceId,
-      report,
-    ],
-  );
+      useRightPanelStore.getState().closeSurface(target, surface.id);
+    }
+  });
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reconciles the external panel store with the preview server's authoritative sessions
   useEffect(() => {
     if (preview.serverEpoch !== null)
       useRightPanelStore.getState().reconcileBrowserSurfaces(target, Object.keys(preview.sessions));
   }, [target, preview.serverEpoch, preview.sessions]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to preview actions for this workspace and releases the listener on navigation
   useEffect(
     () =>
       subscribePreviewAction((action) => {
@@ -335,6 +307,26 @@ export function NativeSessionWorkspacePanels({
       }),
     [target],
   );
+  const getShortcutContext = useStableCallback(
+    (eventTarget: EventTarget | null = document.activeElement) => ({
+      terminalFocus: getTerminalFocusOwner() !== null,
+      terminalOpen: terminalUi.terminalOpen,
+      previewFocus: isPreviewFocused(),
+      previewOpen: panel.isOpen && activeSurface?.kind === "preview",
+      rightPanelOpen: panel.isOpen,
+      modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
+      editableFocus:
+        eventTarget instanceof HTMLElement &&
+        Boolean(eventTarget.closest("input,textarea,select,[contenteditable=true]")),
+      isWeb: !isElectron,
+      isDesktop: isElectron,
+      nativeSession: true,
+      composerFocus:
+        eventTarget instanceof HTMLElement &&
+        eventTarget.closest("[data-composer-rich-text]") !== null,
+    }),
+  );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- owns the capture-phase native workspace keyboard listener and its teardown
   useEffect(() => {
     const handle = (event: KeyboardEvent) => {
       if (
@@ -348,22 +340,7 @@ export function NativeSessionWorkspacePanels({
       const terminalFocus = getTerminalFocusOwner();
       if (event.defaultPrevented && terminalFocus === null) return;
       const command = resolveShortcutCommand(event, keybindings, {
-        context: {
-          terminalFocus: terminalFocus !== null,
-          terminalOpen: terminalUi.terminalOpen,
-          previewFocus: isPreviewFocused(),
-          previewOpen: panel.isOpen && activeSurface?.kind === "preview",
-          modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
-          editableFocus:
-            event.target instanceof HTMLElement &&
-            Boolean(event.target.closest("input,textarea,select,[contenteditable=true]")),
-          isWeb: !isElectron,
-          isDesktop: isElectron,
-          nativeSession: true,
-          composerFocus:
-            event.target instanceof HTMLElement &&
-            event.target.closest("[data-composer-rich-text]") !== null,
-        },
+        context: getShortcutContext(event.target),
       });
       let action: (() => void) | null = null;
       const terminalController =
@@ -452,7 +429,9 @@ export function NativeSessionWorkspacePanels({
     return () => window.removeEventListener("keydown", handle, true);
   }, [
     target,
+    key,
     keybindings,
+    getShortcutContext,
     terminalUi.terminalOpen,
     panel.isOpen,
     activeSurface,
@@ -475,6 +454,8 @@ export function NativeSessionWorkspacePanels({
   const tabs = (
     <RightPanelTabs
       mode={sheet ? "sheet" : "inline"}
+      keybindings={keybindings}
+      getShortcutContext={getShortcutContext}
       widthStorageKey={`t3code:preview-panel-width:${key}`}
       open={panel.isOpen}
       maximized={!sheet && maximized}
@@ -491,8 +472,8 @@ export function NativeSessionWorkspacePanels({
         if (surface.kind === "preview" && surface.resourceId)
           setActivePreviewTab(target, surface.resourceId);
       }}
-      onMoveSurface={(surface, toIndex) =>
-        useRightPanelStore.getState().moveSurface(target, surface.id, toIndex)
+      onMoveSurface={(surfaceId, toIndex) =>
+        useRightPanelStore.getState().moveSurface(target, surfaceId, toIndex)
       }
       onCloseSurface={(surface) => void closeSurfaces([surface])}
       onCloseOtherSurfaces={(surface) =>
@@ -523,7 +504,7 @@ export function NativeSessionWorkspacePanels({
       pullRequestsAvailable={false}
       agentsAvailable
       deviceAvailable
-      liveAgentCount={agentModel.liveCount}
+      liveAgentCount={liveAgentCount}
       nativeHistory={{ onOpen: onOpenTree }}
       nativeBackgroundTasks={{
         onOpen: () => useRightPanelStore.getState().open(target, "background-tasks"),
@@ -542,10 +523,12 @@ export function NativeSessionWorkspacePanels({
         ) : null}
         {activeSurface?.kind === "diff" && cwd ? (
           <DiffPanel
+            key={key}
             mode="embedded"
             composerDraftTarget={target}
             nativeWorkspace={{ target, cwd }}
             workspaceMutationId={workspaceMutationId}
+            visible={panel.isOpen}
           />
         ) : null}
         {activeSurface?.kind === "agents" ? <NativeAgentsPanel viewKey={key} /> : null}
@@ -607,6 +590,7 @@ export function NativeSessionWorkspacePanels({
                 threadRef={target}
                 composerDraftTarget={target}
                 availableEditors={serverConfig?.availableEditors ?? []}
+                openInShortcutEnabled={active(surface)}
                 relativePath={surface.kind === "file" ? surface.relativePath : null}
                 {...(surface.kind === "file" && surface.attachment
                   ? { attachment: surface.attachment }
@@ -614,6 +598,12 @@ export function NativeSessionWorkspacePanels({
                 revealLine={surface.kind === "file" ? surface.revealLine : null}
                 revealRequestId={surface.kind === "file" ? surface.revealRequestId : 0}
                 onOpenFile={openFile}
+                onNavigateFolder={(relativePath, folderTrail, keepSource) =>
+                  useRightPanelStore
+                    .getState()
+                    .navigateFolder(target, surface.id, relativePath, folderTrail, keepSource)
+                }
+                folderTrail={surface.folderTrail}
                 onPendingChange={onPendingChange}
                 selectedFilePending={
                   surface.kind === "file" && pendingFiles.has(surface.relativePath)
@@ -641,10 +631,16 @@ export function NativeSessionWorkspacePanels({
       </Suspense>
     </RightPanelTabs>
   );
+  const addFiles = useStableCallback((files: File[]) =>
+    composerRef.current?.addDroppedFiles(files),
+  );
+  const addFolders = useStableCallback((folders: File[]) =>
+    composerRef.current?.addDroppedFolders(folders),
+  );
   const dropHandlers = makeWorkspaceFileDropHandlers({
     setDragActive,
-    addFiles: (files) => composerRef.current?.addDroppedFiles(files),
-    addFolders: (folders) => composerRef.current?.addDroppedFolders(folders),
+    addFiles,
+    addFolders,
   });
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -663,14 +659,15 @@ export function NativeSessionWorkspacePanels({
         ) : null}
         <div className="pointer-events-auto flex h-full items-center">
           <PanelLayoutControls
+            showThreadPanelControl={false}
             terminalAvailable={cwd !== null}
             terminalOpen={terminalUi.terminalOpen}
             terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
             rightPanelAvailable
             rightPanelOpen={panel.isOpen}
             rightPanelShortcutLabel={shortcutLabelForCommand(keybindings, "rightPanel.toggle")}
-            liveAgentCount={
-              panel.isOpen && activeSurface?.kind === "agents" ? 0 : agentModel.liveCount
+            rightPanelBadgeCount={
+              panel.isOpen && activeSurface?.kind === "agents" ? 0 : liveAgentCount
             }
             onToggleTerminal={() =>
               useTerminalUiStateStore.getState().setTerminalOpen(target, !terminalUi.terminalOpen)
@@ -694,27 +691,30 @@ export function NativeSessionWorkspacePanels({
           {...dropHandlers}
           data-workspace-file-drag-active={dragActive || undefined}
         >
-          <div className="flex min-h-0 flex-1 flex-col" inert={agentViewActive}>
-            {children}
-          </div>
-          <NativeAgentOverlay target={target} viewKey={key} cwd={cwd} />
-          {miniPlayer ? (
-            <ThreadPreviewMiniPlayer
-              threadRef={target}
-              miniPlayer={miniPlayer}
-              composerOverlayElement={composerOverlayElement}
-            />
-          ) : null}
-          {cwd ? (
-            <NativeSessionTerminal
-              target={target}
-              cwd={cwd}
-              keybindings={keybindings}
-              visible={terminalUi.terminalOpen}
-              onAddTerminalContext={onAddTerminalContext}
-              controllerRef={drawerRef}
-            />
-          ) : null}
+          <ChatCanvas
+            store={canvasStore}
+            threadRef={null}
+            preview={canvasPreview}
+            composerOverlayElement={composerOverlayElement}
+          >
+            <div className="flex min-h-0 flex-1 flex-col" inert={agentViewActive}>
+              {children}
+            </div>
+            <NativeAgentOverlay target={target} viewKey={key} cwd={cwd} />
+            {miniPlayer ? (
+              <ThreadPreviewMiniPlayer threadRef={target} miniPlayer={miniPlayer} />
+            ) : null}
+            {cwd ? (
+              <NativeSessionTerminal
+                target={target}
+                cwd={cwd}
+                keybindings={keybindings}
+                visible={terminalUi.terminalOpen}
+                onAddTerminalContext={onAddTerminalContext}
+                controllerRef={drawerRef}
+              />
+            ) : null}
+          </ChatCanvas>
         </div>
         {sheet ? (
           <RightPanelSheet

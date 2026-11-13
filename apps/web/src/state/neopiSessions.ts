@@ -2,7 +2,6 @@ import { WS_METHODS, type NeoPiSessionConfigurationResult } from "@t3tools/contr
 import { EnvironmentSupervisor } from "@t3tools/client-runtime/connection";
 import {
   createEnvironmentRpcCommand,
-  createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "@t3tools/client-runtime/state/runtime";
 import * as Effect from "effect/Effect";
@@ -11,18 +10,6 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { connectionAtomRuntime } from "../connection/runtime";
-
-export const neopiSessionList = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
-  label: "environment-data:neopi-sessions:list",
-  tag: WS_METHODS.neopiSessionsList,
-  staleTimeMs: 5_000,
-  idleTtlMs: 60_000,
-});
-
-export const neopiSessionResume = createEnvironmentRpcCommand(connectionAtomRuntime, {
-  label: "environment-data:neopi-sessions:resume",
-  tag: WS_METHODS.neopiSessionsResume,
-});
 
 export const neopiSessionHandoff = createEnvironmentRpcCommand(connectionAtomRuntime, {
   label: "environment-data:neopi-sessions:handoff",
@@ -48,7 +35,7 @@ export const neopiSessionConfigurationChanges = createEnvironmentRpcSubscription
     transform: (stream) =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const supervisor = yield* EnvironmentSupervisor;
+          const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
           return SubscriptionRef.changes(supervisor.session).pipe(
             Stream.switchMap((session) => {
               const currentSession = Option.getOrNull(session);

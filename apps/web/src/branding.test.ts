@@ -8,6 +8,7 @@ const originalWindow = globalThis.window;
 
 afterEach(() => {
   vi.resetModules();
+  vi.unstubAllEnvs();
 
   if (originalWindow === undefined) {
     Reflect.deleteProperty(globalThis, "window");
@@ -18,7 +19,8 @@ afterEach(() => {
 });
 
 describe("branding", () => {
-  it("uses injected desktop branding when available", async () => {
+  it("prefers desktop stage metadata over a competing hosted channel", async () => {
+    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "latest");
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
@@ -34,13 +36,11 @@ describe("branding", () => {
 
     const branding = await import("./branding");
 
-    expect(branding.APP_BASE_NAME).toBe("Example App");
     expect(branding.APP_STAGE_LABEL).toBe("Nightly");
-    expect(branding.APP_DISPLAY_NAME).toBe("Example App (Nightly)");
   });
 
   it("normalizes hosted app channel metadata", async () => {
-    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "nightly");
+    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", " NIGHTLY ");
 
     const branding = await import("./branding");
 

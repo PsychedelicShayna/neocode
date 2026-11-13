@@ -1,18 +1,15 @@
 import { APP_BASE_NAME } from "~/branding";
-import type {
-  ServerProvider,
-} from "@t3tools/contracts";
+import type { ServerProvider } from "@t3tools/contracts";
 
-/**
- * Visual treatment for each server-reported provider status. Centralized so
- * the default-driver card and per-instance cards share the same language.
- */
 export const PROVIDER_STATUS_STYLES = {
   disabled: {
     dot: "bg-muted-foreground/50",
   },
   error: {
     dot: "bg-destructive",
+  },
+  neutral: {
+    dot: "bg-muted-foreground",
   },
   ready: {
     dot: "bg-success",
@@ -24,14 +21,11 @@ export const PROVIDER_STATUS_STYLES = {
 
 export type ProviderStatusKey = keyof typeof PROVIDER_STATUS_STYLES;
 
-/**
- * Derive the headline + detail copy shown under a provider's name in the
- * settings page. Prefers `provider.message` for server-supplied detail and
- * falls back to generic phrasing when the server has not yet reported any
- * state — which happens before the first probe or when an instance names a
- * driver this build does not ship. A ready provider without account metadata
- * remains available and does not imply an authentication failure.
- */
+export function getProviderStatusKey(provider: ServerProvider | undefined): ProviderStatusKey {
+  if (provider && !provider.enabled) return "disabled";
+  return provider?.status ?? "warning";
+}
+
 export function getProviderSummary(provider: ServerProvider | undefined) {
   if (!provider) {
     return {
@@ -42,9 +36,7 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
   if (!provider.enabled || provider.status === "disabled") {
     return {
       headline: "Disabled",
-      detail:
-        provider.message ??
-        `This runtime is disabled for new sessions in ${APP_BASE_NAME}.`,
+      detail: provider.message ?? `This runtime is disabled for new sessions in ${APP_BASE_NAME}.`,
     };
   }
   if (!provider.installed) {
@@ -54,8 +46,9 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
     };
   }
   if (provider.auth.status === "unauthenticated") {
+    const authLabel = provider.auth.label ?? provider.auth.type;
     return {
-      headline: "Not authenticated",
+      headline: authLabel ? `Not authenticated · ${authLabel}` : "Not authenticated",
       detail: provider.message ?? null,
     };
   }
@@ -85,14 +78,7 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
   };
 }
 
-/**
- * Normalize a version string for display. Adds the `v` prefix when the
- * driver reported a bare version (e.g. `1.2.3`) so cards render
- * consistently regardless of driver.
- */
 export function getProviderVersionLabel(version: string | null | undefined) {
   if (!version) return null;
-  // Only bare semver-like versions get a `v` prefix. Other tags are shown as-is.
   return /^\d/.test(version) ? `v${version}` : version;
 }
-

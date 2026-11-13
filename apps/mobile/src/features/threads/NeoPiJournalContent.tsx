@@ -6,20 +6,19 @@ import type {
 } from "@t3tools/contracts";
 import { journalRecord, nativeJournalImageSource } from "@t3tools/client-runtime/neopi-journal";
 import { resolveMediaSource } from "@t3tools/client-runtime/media-source";
-import { resolveMarkdownLinkPresentation } from "@t3tools/mobile-markdown-text/links";
+import { nativeValueItems } from "@t3tools/client-runtime/neopi-native-sessions";
+import { resolveMarkdownLinkPresentation } from "../../lib/markdownLinks";
 import { stripLegacyAttachmentMetadata } from "@t3tools/shared/composerContextLegacy";
 import { useNavigation } from "@react-navigation/native";
 import { useCallback, useState } from "react";
 import { Alert, View } from "react-native";
-import { Markdown } from "react-native-nitro-markdown";
 
-import { AppText as Text } from "../../components/AppText";
-import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
-import { VideoPreviewModal, type VideoPreviewSource } from "../../components/VideoPreviewModal";
+import { AppText as Text } from "../../components/ui/AppText";
+import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
+import { VideoPreviewModal, type VideoPreviewSource } from "../../components/ui/VideoPreviewModal";
 import { resolveMarkdownMediaPreview } from "../../lib/markdownMedia";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import {
-  hasNativeSelectableMarkdownText,
   SelectableMarkdownText,
   type MarkdownImageRenderer,
 } from "../../native/SelectableMarkdownText";
@@ -43,6 +42,18 @@ type ContentContext = {
   userContent?: boolean;
   cwd: string | null;
 };
+
+// Keep embedded media out of row-key strings and release identities with their records.
+const contentKeys = new WeakMap<object, string>();
+let nextContentKey = 0;
+function contentKey(value: unknown): string {
+  if (value === null || typeof value !== "object") return `${typeof value}:${String(value)}`;
+  const existing = contentKeys.get(value);
+  if (existing !== undefined) return existing;
+  const key = `record:${nextContentKey++}`;
+  contentKeys.set(value, key);
+  return key;
+}
 
 function NativeMarkdown({
   text,
@@ -146,40 +157,16 @@ function NativeMarkdown({
     },
     [cwd, environmentId, nativeRef, threadRef],
   );
-  const styles = useMarkdownPreviewStyles(renderImage);
+  const styles = useMarkdownPreviewStyles();
   const markdown = userContent ? stripLegacyAttachmentMetadata(text) : text;
   return (
     <View>
-      {hasNativeSelectableMarkdownText() ? (
-        <SelectableMarkdownText
-          markdown={markdown}
-          textStyle={styles.nativeTextStyle}
-          renderImage={renderImage}
-          onLinkPress={openLink}
-        />
-      ) : (
-        <Markdown
-          options={{ gfm: true }}
-          renderers={{
-            ...styles.renderers,
-            link: ({ href, children }) => (
-              <Text
-                className="font-t3-medium"
-                style={{ color: styles.theme.colors?.link }}
-                onPress={() => {
-                  if (href) openLink(href);
-                }}
-              >
-                {children}
-              </Text>
-            ),
-          }}
-          styles={styles.styles}
-          theme={styles.theme}
-        >
-          {markdown}
-        </Markdown>
-      )}
+      <SelectableMarkdownText
+        markdown={markdown}
+        textStyle={styles.nativeTextStyle}
+        renderImage={renderImage}
+        onLinkPress={openLink}
+      />
       <FilePreviewModal source={preview} onRequestClose={() => setPreview(null)} />
       <VideoPreviewModal source={video} onRequestClose={() => setVideo(null)} />
     </View>
@@ -187,36 +174,36 @@ function NativeMarkdown({
 }
 
 function NativeContent({ content, ...context }: ContentContext & { content: unknown }) {
-  const [reasoningOpen, setReasoningOpen] = useState<ReadonlySet<number>>(new Set());
+  const [reasoningOpen, setReasoningOpen] = useState<ReadonlySet<string>>(new Set());
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   if (typeof content === "string") return <NativeMarkdown text={content} {...context} />;
   if (!Array.isArray(content))
     return content === undefined ? null : <NativeJson value={content} label="Native content" />;
   return (
     <View className="gap-3">
-      {content.map((value, index) => {
+      {nativeValueItems(content, contentKey).map(({ key, value }) => {
         const block = journalRecord(value);
         if (block.type === "text" && typeof block.text === "string")
-          return <NativeMarkdown key={index} text={block.text} {...context} />;
+          return <NativeMarkdown key={key} text={block.text} {...context} />;
         if (block.type === "thinking" && typeof block.thinking === "string")
           return (
-            <View key={index} className="gap-2">
+            <View key={key} className="gap-2">
               <Text
                 accessibilityRole="button"
                 className="text-sm text-foreground-muted"
                 onPress={() =>
                   setReasoningOpen((current) => {
                     const next = new Set(current);
-                    if (next.has(index)) next.delete(index);
-                    else next.add(index);
+                    if (next.has(key)) next.delete(key);
+                    else next.add(key);
                     return next;
                   })
                 }
               >
-                {reasoningOpen.has(index) ? "Hide" : "Show"}{" "}
+                {reasoningOpen.has(key) ? "Hide" : "Show"}{" "}
                 {block.summary === true ? "reasoning summary" : "reasoning"}
               </Text>
-              {reasoningOpen.has(index) ? (
+              {reasoningOpen.has(key) ? (
                 <NativeMarkdown text={block.thinking} {...context} />
               ) : null}
             </View>
@@ -225,14 +212,14 @@ function NativeContent({ content, ...context }: ContentContext & { content: unkn
           const uri = nativeJournalImageSource(block);
           if (uri === null)
             return (
-              <View key={index} className="gap-2">
+              <View key={key} className="gap-2">
                 <ThreadMarkdownImageUnavailable alt="Native journal attachment" />
                 <NativeJson value={block} label="Native image record" />
               </View>
             );
           return (
             <ThreadMarkdownImageView
-              key={index}
+              key={key}
               uri={uri}
               sourceKey={uri}
               unavailable={false}
@@ -243,7 +230,7 @@ function NativeContent({ content, ...context }: ContentContext & { content: unkn
         }
         if (block.type === "toolCall")
           return (
-            <View key={index} className="gap-2 rounded-xl border border-border-subtle p-3">
+            <View key={key} className="gap-2 rounded-xl border border-border-subtle p-3">
               <Text className="font-t3-medium text-foreground">
                 {String(block.name ?? "Tool call")}
               </Text>
@@ -256,7 +243,7 @@ function NativeContent({ content, ...context }: ContentContext & { content: unkn
         if (block.type === "anthropicServerTool") {
           const tool = journalRecord(block.block);
           return (
-            <View key={index} className="gap-2 rounded-xl border border-border-subtle p-3">
+            <View key={key} className="gap-2 rounded-xl border border-border-subtle p-3">
               <Text className="font-t3-medium text-foreground">
                 Native server tool · {String(tool.name ?? tool.type ?? "unknown")}
               </Text>
@@ -272,20 +259,20 @@ function NativeContent({ content, ...context }: ContentContext & { content: unkn
         }
         if (block.type === "redactedThinking")
           return (
-            <Text key={index} className="text-sm text-foreground-muted">
+            <Text key={key} className="text-sm text-foreground-muted">
               Provider-redacted reasoning. Its opaque record remains in canonical JSON.
             </Text>
           );
         if (block.type === "fallback")
           return (
-            <Text key={index} className="text-sm text-foreground-muted">
+            <Text key={key} className="text-sm text-foreground-muted">
               Model fallback · {String(journalRecord(block.from).model ?? "unknown")} →{" "}
               {String(journalRecord(block.to).model ?? "unknown")}
             </Text>
           );
         return (
           <NativeJson
-            key={index}
+            key={key}
             value={value}
             label={`${String(block.type ?? "Unknown")} content`}
           />
@@ -324,10 +311,10 @@ export function NeoPiJournalContent({
             <NativeContent content={message.images} {...context} />
           ) : null}
           {Array.isArray(message.files)
-            ? message.files.map((value, index) => {
+            ? nativeValueItems(message.files, contentKey).map(({ key, value }) => {
                 const file = journalRecord(value);
                 return (
-                  <View key={index} className="gap-2">
+                  <View key={key} className="gap-2">
                     <Text selectable className="font-mono text-sm text-foreground">
                       {String(file.path ?? "Native file mention")}
                     </Text>

@@ -2,8 +2,8 @@ import type { NeoPiModelsConfiguration } from "@t3tools/contracts";
 import { getNeoPiModelsSelectorOptions } from "@t3tools/client-runtime/neopi-models";
 import { useMemo, useState } from "react";
 import { FlatList, View } from "react-native";
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { NativeField, NativeModal } from "./NativeNeoPiControls";
 
 /** Search text never becomes a model assignment. Saved native selectors remain pickable verbatim. */
@@ -36,7 +36,7 @@ export function NeoPiModelsSelector({
   return (
     <View className="gap-2">
       <Text className="text-sm text-foreground-muted">{label}</Text>
-      <MaterialButton
+      <Button
         label={options.get(value)?.label ?? "Choose a native model or saved selector…"}
         disabled={disabled}
         onPress={() => {
@@ -72,7 +72,7 @@ export function NeoPiModelsSelector({
               const option = options.get(selector)!;
               return (
                 <View className="gap-1">
-                  <MaterialButton
+                  <Button
                     fullWidth
                     label={option.label}
                     tone={selector === value ? "primary" : "secondary"}

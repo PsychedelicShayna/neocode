@@ -1,15 +1,32 @@
-import { EventId, type OrchestrationThreadActivity } from "@t3tools/contracts";
+import { ThreadId, TurnItemId, type OrchestrationV2ProjectedTurnItem } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 import { composerCapabilitiesForProvider, projectNeoPiComposerUi } from "./neopiComposerUi";
 
-const activity = (id: string, ui: Record<string, unknown>): OrchestrationThreadActivity => ({
-  id: EventId.make(id),
-  tone: "info",
-  kind: "runtime.warning",
-  summary: "NeoPi update",
-  payload: { detail: { neopiUi: ui } },
-  turnId: null,
-  createdAt: "2026-09-27T00:00:00.000Z",
+const activity = (id: string, ui: Record<string, unknown>): OrchestrationV2ProjectedTurnItem => ({
+  position: 0,
+  visibility: "local",
+  sourceThreadId: ThreadId.make("native-ui-thread"),
+  sourceItemId: TurnItemId.make(id),
+  item: {
+    id: TurnItemId.make(id),
+    threadId: ThreadId.make("native-ui-thread"),
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 0,
+    status: "completed",
+    title: null,
+    startedAt: null,
+    completedAt: null,
+    updatedAt: DateTime.makeUnsafe("2026-09-27T00:00:00.000Z"),
+    type: "system_notice",
+    message: "NeoPi update",
+    providerMetadata: { neopiUi: ui },
+  },
 });
 
 describe("NeoPi extension composer activity projection", () => {
@@ -37,7 +54,7 @@ describe("NeoPi extension composer activity projection", () => {
     const provider = composerCapabilitiesForProvider("neopi")!;
     const target = "neopi-editor-regression-thread";
     const other = "neopi-editor-regression-other";
-    const project = (events: OrchestrationThreadActivity[]) => provider.project(events).editor;
+    const project = (events: OrchestrationV2ProjectedTurnItem[]) => provider.project(events).editor;
     expect(
       provider.consumeEditor(target, project([activity("old", { kind: "editor", text: "X" })]), ""),
     ).toBeNull();
@@ -72,8 +89,6 @@ describe("NeoPi extension composer activity projection", () => {
         activity("branched", { kind: "plan-mode", mode: "default" }),
       ]).displayState,
     ).toBe("Chat: off · Native: Build");
-    expect(provider.commandSourceLabel("mcp_prompt")).toBe(" · MCP prompt");
-    expect(provider.skillReplacement("review")).toBe("/skill:review ");
     expect(composerCapabilitiesForProvider("codex")).toBeUndefined();
     expect(composerCapabilitiesForProvider("claudeAgent")).toBeUndefined();
   });

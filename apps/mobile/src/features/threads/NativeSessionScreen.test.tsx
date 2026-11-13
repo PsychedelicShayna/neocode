@@ -1,11 +1,10 @@
-// @vitest-environment jsdom
-
 import { act, useCallback, useSyncExternalStore, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { it } from "@effect/vitest";
 import { describe, expect, vi } from "vite-plus/test";
 import { CommonActions, StackRouter } from "@react-navigation/native";
 import {
+  AuthOrchestrationOperateScope,
   EnvironmentId,
   ProviderInstanceId,
   WS_METHODS,
@@ -27,10 +26,12 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { EnvironmentRegistry } from "../../../../../packages/client-runtime/src/connection/registry";
+import { PrimaryConnectionTarget } from "../../../../../packages/client-runtime/src/connection/model";
 import { EnvironmentSupervisor } from "../../../../../packages/client-runtime/src/connection/supervisor";
 import type { WsRpcProtocolClient } from "../../../../../packages/client-runtime/src/rpc/protocol";
+import { layerRemoteHttpClient } from "../../../../../packages/client-runtime/src/rpc/http";
 import type { RpcSession } from "../../../../../packages/client-runtime/src/rpc/session";
 import { NativeMobileModels, NativeSessionScreen } from "./NativeSessionScreen";
 
@@ -39,6 +40,7 @@ type Action = Parameters<Router["getStateForAction"]>[1];
 const fixture = vi.hoisted(() => ({
   current: undefined as Effect.Success<ReturnType<typeof makeHarness>> | undefined,
   draftText: "",
+  draftListeners: new Set<() => void>(),
   navigation: undefined as
     | {
         navigate: (name: string, params?: object) => void;
@@ -47,6 +49,11 @@ const fixture = vi.hoisted(() => ({
       }
     | undefined,
 }));
+
+function setDraftText(text: string) {
+  fixture.draftText = text;
+  for (const listener of fixture.draftListeners) listener();
+}
 
 // Keep the installed router/actions, replacing only the native navigation hook.
 // Resolve through native's own dependency graph, without adding a direct router
@@ -61,6 +68,16 @@ vi.mock("@react-navigation/native", async () => {
   );
   return { ...routers, useNavigation: () => fixture.navigation };
 });
+vi.mock("../../state/atom-registry", () => ({
+  get appAtomRegistry() {
+    return fixture.current!.registry;
+  },
+}));
+vi.mock("../../state/native-queued-draft", () => ({
+  restoreNativeMobileQueuedDraft: () => {
+    throw new Error("Queue restoration is outside this screen regression");
+  },
+}));
 
 // This is only the React adapter: registry subscription, watch boundary,
 // refresh, cache, transport requests and close commands are all production atoms.
@@ -140,11 +157,11 @@ vi.mock("react-native", async () => {
     }),
   };
 });
-vi.mock("../../components/AppText", () => ({
+vi.mock("../../components/ui/AppText", () => ({
   AppText: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 }));
-vi.mock("../../components/MaterialButton", () => ({
-  MaterialButton: ({
+vi.mock("../../components/ui/Button", () => ({
+  Button: ({
     label,
     onPress,
     disabled,
@@ -158,8 +175,8 @@ vi.mock("../../components/MaterialButton", () => ({
     </button>
   ),
 }));
-vi.mock("../../components/ScreenHeader", () => ({
-  ScreenHeader: ({ title, onBack }: { title: string; onBack: () => void }) => (
+vi.mock("../../components/ui/AppBar", () => ({
+  AppBar: ({ title, onBack }: { title: string; onBack: () => void }) => (
     <header>
       <button onClick={onBack}>Back</button>
       {title}
@@ -167,21 +184,67 @@ vi.mock("../../components/ScreenHeader", () => ({
   ),
 }));
 vi.mock("../../state/use-native-composer-state", () => ({
-  useNativeComposerState: () => ({
-    key: "unused-draft",
-    draft: { text: fixture.draftText },
-    setText: (text: string) => {
-      fixture.draftText = text;
-    },
-    send: vi.fn(),
-  }),
+  useNativeComposerState: () => {
+    const text = useSyncExternalStore(
+      useCallback((listener: () => void) => {
+        fixture.draftListeners.add(listener);
+        return () => {
+          fixture.draftListeners.delete(listener);
+        };
+      }, []),
+      () => fixture.draftText,
+    );
+    return {
+      key: "unused-draft",
+      draft: { text, attachments: [] },
+      setText: setDraftText,
+      send: vi.fn(),
+    };
+  },
 }));
 vi.mock("../../state/use-composer-drafts", () => ({
   getComposerDraftSnapshot: vi.fn(),
   setComposerDraftText: vi.fn(),
   waitForComposerDraftsLoaded: vi.fn(),
 }));
-vi.mock("./NativeSessionComposer", () => ({ NativeSessionComposer: () => null }));
+vi.mock("../../components/ComposerEditor", () => ({
+  ComposerEditor: ({ value }: { value: string }) => <textarea value={value} readOnly />,
+}));
+vi.mock("../../components/ComposerToolbar", () => ({
+  ComposerToolbarRow: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  ComposerActionButton: () => null,
+}));
+vi.mock("../../lib/composerImages", () => ({
+  composerStripAttachments: () => {
+    throw new Error("Attachment rendering is outside this screen regression");
+  },
+}));
+vi.mock("../../components/ComposerAttachmentStrip", () => ({
+  ComposerAttachmentStrip: () => null,
+}));
+vi.mock("../../components/ui/FilePreviewModal", () => ({ FilePreviewModal: () => null }));
+vi.mock("../../components/ui/VideoPreviewModal", () => ({ VideoPreviewModal: () => null }));
+vi.mock("./ComposerAttachmentButton", () => ({ ComposerAttachmentButton: () => null }));
+vi.mock("./ComposerCommandPopover", () => ({ ComposerCommandPopover: () => null }));
+vi.mock("./ThreadComposer", () => ({
+  ComposerSurface: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+}));
+vi.mock("./use-composer-command-menu", () => ({
+  useComposerCommandMenu: () => ({ selection: { start: 0, end: 0 }, skills: [], items: [] }),
+}));
+vi.mock("../voice-input/useVoiceInputController", () => ({
+  useVoiceInputController: () => ({
+    state: { phase: "idle" },
+    elapsedSeconds: 0,
+    isBusy: false,
+    blocksSubmission: false,
+  }),
+}));
+vi.mock("../voice-input/ComposerDictationControl", () => ({
+  ComposerDictationCancelAction: () => null,
+  ComposerDictationPrimaryAction: () => null,
+  ComposerDictationStatus: () => null,
+}));
 vi.mock("./NativeSessionWorkspaceControls", () => ({
   NativeSessionWorkspaceControls: () => null,
   NativeSessionAgents: () => null,
@@ -293,8 +356,25 @@ const makeHarness = Effect.fnUntraced(function* (
   } as unknown as WsRpcProtocolClient;
   const environmentId = EnvironmentId.make("mobile-retained-listener");
   const connection = { client } as RpcSession;
+  const environment = new PrimaryConnectionTarget({
+    environmentId,
+    label: "Native mobile fixture",
+    httpBaseUrl: "https://native-mobile.test",
+    wsBaseUrl: "wss://native-mobile.test",
+  });
+  const prepared = yield* SubscriptionRef.make(
+    Option.some({
+      environmentId,
+      label: environment.label,
+      httpBaseUrl: environment.httpBaseUrl,
+      socketUrl: `${environment.wsBaseUrl}/ws`,
+      httpAuthorization: null,
+      target: environment,
+    }),
+  );
   const supervisor = EnvironmentSupervisor.of({
-    target: { environmentId },
+    target: environment,
+    prepared,
     session: yield* SubscriptionRef.make(Option.some(connection)),
   } as EnvironmentSupervisor["Service"]);
   const environments = EnvironmentRegistry.of({
@@ -302,7 +382,24 @@ const makeHarness = Effect.fnUntraced(function* (
     followStream: (_id, stream) => Stream.provideService(stream, EnvironmentSupervisor, supervisor),
   } as EnvironmentRegistry["Service"]);
   const atoms = createNativeSessionAtoms(
-    Atom.runtime(Layer.succeed(EnvironmentRegistry, environments)),
+    Atom.runtime(
+      Layer.merge(
+        Layer.succeed(EnvironmentRegistry, environments),
+        layerRemoteHttpClient(async () =>
+          Response.json({
+            authenticated: true,
+            auth: {
+              policy: "remote-reachable",
+              bootstrapMethods: [],
+              sessionMethods: [],
+              sessionCookieName: "native-mobile-test",
+            },
+            scopes: [AuthOrchestrationOperateScope],
+            permissions: [AuthOrchestrationOperateScope],
+          }),
+        ),
+      ),
+    ),
   );
   // Same controllable task scheduler as the runtime atom lifetime tests. Drain
   // actual dispatchers, not timers, polling, or a fixed number of microtasks.
@@ -395,7 +492,6 @@ const mountScreen = (h: Effect.Success<ReturnType<typeof makeHarness>>) => {
       environmentId: h.target.environmentId,
       input: ref,
     });
-    expect(opened._tag).toBe("Success");
     if (opened._tag === "Failure") throw Cause.squash(opened.cause);
     fixture.navigation!.navigate("NativeSession", {
       environmentId: h.target.environmentId,
@@ -543,6 +639,7 @@ describe("NativeSessionScreen command argument completions", () => {
       const h = yield* makeHarness({
         session: { ...session, capabilities: ["command_completions"] },
         request: (command) => {
+          if (command.type === "get_subagents") return Effect.succeed({ subagents: [] });
           if (command.type === "get_available_commands")
             return Effect.succeed({ commands: [{ name: "personality" }] });
           if (command.type !== "get_command_completions") return Effect.succeed({});
@@ -590,7 +687,7 @@ describe("NativeSessionScreen command argument completions", () => {
           expect(container.textContent).toContain("Angel");
 
           await act(async () => {
-            fixture.draftText = "/personality b";
+            setDraftText("/personality b");
             render();
           });
           expect(container.textContent).not.toContain("Angel");

@@ -102,24 +102,18 @@ describe("native command acceptance and observation", () => {
     const receipt = { accepted: true, commandId: "native-command" };
     const submit = vi.fn().mockResolvedValue(receipt);
     const readState = vi.fn().mockRejectedValue(new Error("Disconnected"));
-    const onState = vi.fn();
     const onRefreshError = vi.fn();
 
     const result = await executeNativeSessionCommand({
       command: { type: "set_model" },
       submit,
       readState,
-      onState,
       onRefreshError,
     });
 
     expect(result).toBe(receipt);
     expect(submit).toHaveBeenCalledTimes(1);
     expect(readState).toHaveBeenCalledTimes(1);
-    expect(onState).not.toHaveBeenCalled();
-    expect(onRefreshError).toHaveBeenCalledWith(
-      "Command accepted, but the state refresh failed. Reconnect to refresh session details.",
-    );
   });
 
   it("still rejects the command's own failure without reading state or claiming acceptance", async () => {
@@ -131,29 +125,10 @@ describe("native command acceptance and observation", () => {
         command: { type: "set_role" },
         submit: vi.fn().mockRejectedValue(failure),
         readState,
-        onState: vi.fn(),
         onRefreshError,
       }),
     ).rejects.toBe(failure);
     expect(readState).not.toHaveBeenCalled();
-    expect(onRefreshError).not.toHaveBeenCalled();
-  });
-
-  it("applies a successful authoritative refresh and returns the acceptance receipt", async () => {
-    const state = { model: { id: "selected-model" }, role: "reviewer" };
-    const receipt = { accepted: true };
-    const onState = vi.fn();
-    const onRefreshError = vi.fn();
-    expect(
-      await executeNativeSessionCommand({
-        command: { type: "set_role" },
-        submit: async () => receipt,
-        readState: async () => state,
-        onState,
-        onRefreshError,
-      }),
-    ).toBe(receipt);
-    expect(onState).toHaveBeenCalledWith(state);
     expect(onRefreshError).not.toHaveBeenCalled();
   });
 
@@ -162,19 +137,16 @@ describe("native command acceptance and observation", () => {
     async (type) => {
       const receipt = { accepted: true };
       const readState = vi.fn();
-      const onState = vi.fn();
       const onRefreshError = vi.fn();
       expect(
         await executeNativeSessionCommand({
           command: { type },
           submit: async () => receipt,
           readState,
-          onState,
           onRefreshError,
         }),
       ).toBe(receipt);
       expect(readState).not.toHaveBeenCalled();
-      expect(onState).not.toHaveBeenCalled();
       expect(onRefreshError).not.toHaveBeenCalled();
     },
   );

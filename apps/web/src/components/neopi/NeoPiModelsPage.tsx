@@ -19,21 +19,15 @@ import {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
-import {
-  useCallback,
-  useDeferredValue,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { AsyncResult } from "effect/reactivity";
+import { useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronDownIcon, MoreHorizontalIcon, XIcon } from "lucide-react";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { formatEnvironmentQueryError } from "../../state/query";
 import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
 import { useEscapeToGoBack, useNavigateBack } from "../../hooks/useNavigateBack";
+import { useStableCallback } from "../../hooks/useStableCallback";
+import { nativeValueItems } from "@t3tools/client-runtime/neopi-native-sessions";
 import { isElectron } from "../../env";
 import { SidebarUpdatePill } from "../sidebar/SidebarUpdatePill";
 import {
@@ -161,58 +155,86 @@ function ModelsSnapshot({
   };
   const key = neopiModelsSnapshotKey(environmentId, target);
   const live = AsyncResult.isSuccess(result) ? result.value : null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Retain the last native snapshot for read-only display during reconnects.
   useEffect(() => {
     if (live) rememberNeoPiModelsConfiguration(key, live);
   }, [key, live]);
-  // An interrupted subscription (a reconnect, a restarted native owner) is not a failed read: the
-  // stream just ended. Resubscribe a few times before surfacing anything.
-  const interrupted = AsyncResult.isFailure(result) && Cause.hasInterruptsOnly(result.cause);
-  const resubscribes = useRef(0);
-  const retryRef = useRef(retry);
-  retryRef.current = retry;
-  const [exhausted, setExhausted] = useState(false);
-  useEffect(() => {
-    if (!interrupted) {
-      resubscribes.current = 0;
-      setExhausted(false);
-      return;
-    }
-    if (resubscribes.current >= MAX_RESUBSCRIBES) {
-      setExhausted(true);
-      return;
-    }
-    resubscribes.current += 1;
-    const timer = window.setTimeout(() => retryRef.current(), 400 * resubscribes.current);
-    return () => window.clearTimeout(timer);
-  }, [interrupted, result]);
-  if (AsyncResult.isFailure(result) && !(interrupted && !exhausted))
-    return (
-      <SettingsSection title="Roles">
-        <SettingsRow
-          title="Couldn't read models from NeoPi"
-          description={formatEnvironmentQueryError(result.cause)}
-          control={
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                resubscribes.current = 0;
-                setExhausted(false);
-                retry();
-              }}
-            >
-              Retry
-            </Button>
-          }
-        />
-      </SettingsSection>
-    );
+  if (AsyncResult.isFailure(result) && !Cause.hasInterruptsOnly(result.cause))
+    return <ModelsReadError message={formatEnvironmentQueryError(result.cause)} retry={retry} />;
   if (live === null || !AsyncResult.isSuccess(result)) {
-    // Stale-while-revalidate: last known catalog, read-only, until NeoPi's answer arrives.
     const stale = recallNeoPiModelsConfiguration(key);
-    return stale ? children(stale, refresh, false, true) : <ModelsLoading />;
+    const fallback = stale ? children(stale, refresh, false, true) : <ModelsLoading />;
+    return AsyncResult.isFailure(result) ? (
+      <InterruptedModelsSnapshot
+        failure={result}
+        message={formatEnvironmentQueryError(result.cause)}
+        retry={retry}
+      >
+        {fallback}
+      </InterruptedModelsSnapshot>
+    ) : (
+      fallback
+    );
   }
   return children(live, refresh, !result.waiting, false);
+}
+
+function ModelsReadError({ message, retry }: { message: string; retry: () => void }) {
+  return (
+    <SettingsSection title="Roles">
+      <SettingsRow
+        title="Couldn't read models from NeoPi"
+        description={message}
+        control={
+          <Button variant="outline" size="sm" onClick={retry}>
+            Retry
+          </Button>
+        }
+      />
+    </SettingsSection>
+  );
+}
+
+function InterruptedModelsSnapshot({
+  failure,
+  message,
+  retry,
+  children,
+}: {
+  failure: { readonly waiting: boolean };
+  message: string;
+  retry: () => void;
+  children: ReactNode;
+}) {
+  const [attempt, setAttempt] = useState<{
+    count: number;
+    failure: typeof failure | null;
+  }>({ count: 0, failure: null });
+  const exhausted =
+    !failure.waiting && attempt.count >= MAX_RESUBSCRIBES && attempt.failure !== failure;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Back off interrupted native subscriptions while preserving manual retry.
+  useEffect(() => {
+    if (failure.waiting || exhausted || attempt.failure === failure) return;
+    const timer = window.setTimeout(
+      () => {
+        setAttempt({ count: attempt.count + 1, failure });
+        retry();
+      },
+      400 * (attempt.count + 1),
+    );
+    return () => window.clearTimeout(timer);
+  }, [failure, attempt, exhausted, retry]);
+  return exhausted ? (
+    <ModelsReadError
+      message={message}
+      retry={() => {
+        setAttempt({ count: 0, failure: null });
+        retry();
+      }}
+    />
+  ) : (
+    children
+  );
 }
 
 function ProviderRailRow({
@@ -236,12 +258,14 @@ function ProviderRailRow({
   const generation = useRef(0);
   // The account only names the status tooltip, so ask NeoPi when someone looks, not for every
   // signed-in provider at page load.
-  useEffect(() => {
-    requested.current = false;
-    generation.current += 1;
-    setLabel(null);
-  }, [environmentId, target, provider.id, provider.authenticated]);
-  const loadLabel = useCallback(() => {
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Discard this scoped provider tooltip's outstanding account read on unmount.
+  useEffect(
+    () => () => {
+      generation.current += 1;
+    },
+    [],
+  );
+  const loadLabel = () => {
     if (!provider.authenticated || requested.current) return;
     requested.current = true;
     const mine = generation.current;
@@ -257,7 +281,7 @@ function ProviderRailRow({
         else requested.current = false;
       },
     );
-  }, [accountsCommand, environmentId, target, provider.id, provider.authenticated]);
+  };
   const ready = provider.available === true;
   const status = provider.authenticated
     ? label
@@ -320,16 +344,13 @@ function ModelsRail({
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
-  const groups = useMemo(
-    () => modelProviderGroups(configuration?.providers ?? [], query),
-    [configuration?.providers, query],
-  );
-  const counts = useMemo(() => {
+  const groups = modelProviderGroups(configuration?.providers ?? [], query);
+  const counts = (() => {
     const counts = new Map<string, number>();
     for (const model of configuration?.models ?? [])
       counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
     return counts;
-  }, [configuration?.models]);
+  })();
   return (
     <>
       <SidebarGroup>
@@ -359,7 +380,11 @@ function ModelsRail({
                 <SidebarMenu>
                   {group.providers.map((provider) => (
                     <ProviderRailRow
-                      key={provider.id}
+                      key={JSON.stringify([
+                        neopiModelsSnapshotKey(environmentId, target),
+                        provider.id,
+                        provider.authenticated,
+                      ])}
                       provider={provider}
                       modelCount={counts.get(provider.id) ?? 0}
                       environmentId={environmentId}
@@ -433,7 +458,11 @@ export function NeoPiModelsPage() {
         </WorkspacePageHeader>
         <SettingsPageContainer>
           {state.target && state.environmentId && state.provider ? (
-            <ModelsSnapshot environmentId={state.environmentId} target={state.target}>
+            <ModelsSnapshot
+              key={neopiModelsSnapshotKey(state.environmentId, state.target)}
+              environmentId={state.environmentId}
+              target={state.target}
+            >
               {(configuration, refresh, catalogReady, stale) => (
                 <ModelsContent
                   key={JSON.stringify([state.environmentId, state.target])}
@@ -632,20 +661,13 @@ function ModelsContent({
     : null;
   // Typing stays responsive: the list follows the filter one render behind the input.
   const deferredQuery = useDeferredValue(query);
-  const models = useMemo(
-    () =>
-      section === "all" || provider
-        ? modelsForView(configuration, provider?.id ?? null, deferredQuery)
-        : [],
-    [configuration, provider, deferredQuery, section],
-  );
-  const providerHasAvailableModels = useMemo(
-    () =>
-      provider
-        ? configuration.models.some((model) => model.provider === provider.id && model.available)
-        : false,
-    [configuration.models, provider],
-  );
+  const models =
+    section === "all" || provider
+      ? modelsForView(configuration, provider?.id ?? null, deferredQuery)
+      : [];
+  const providerHasAvailableModels = provider
+    ? configuration.models.some((model) => model.provider === provider.id && model.available)
+    : false;
   const assign = (role: Role, selector: string) =>
     save({
       operation: "role",
@@ -701,7 +723,7 @@ function ModelsContent({
         <>
           {provider ? (
             <ProviderAccounts
-              key={provider.id}
+              key={JSON.stringify([neopiModelsSnapshotKey(environmentId, target), provider.id])}
               environmentId={environmentId}
               target={target}
               connectedOwner={state.connectedOwner}
@@ -856,34 +878,31 @@ function RoleRow({
       )
     : undefined;
   const traitsModel = resolved ? `${resolved.provider}/${resolved.id}` : selector;
-  const traits: ReadonlyArray<ServerProviderModel> = useMemo(
-    () => [
-      {
-        slug: traitsModel,
-        name: resolved ? modelDisplayName(resolved) : selector,
-        isCustom: false,
-        capabilities: createModelCapabilities({
-          reasoning: resolved?.reasoning,
-          optionDescriptors: [
-            {
-              id: "reasoningEffort",
-              label: "Effort",
-              type: "select",
-              options: [
-                { id: "automatic", label: "Automatic" },
-                ...(resolved?.supportedThinkingLevels ?? MODEL_EFFORTS).map((level) => ({
-                  id: level,
-                  label: level,
-                })),
-              ],
-              currentValue: effort?.mode === "fixed" ? effort.level : "automatic",
-            },
-          ],
-        }),
-      },
-    ],
-    [resolved, traitsModel, selector, effort],
-  );
+  const traits: ReadonlyArray<ServerProviderModel> = [
+    {
+      slug: traitsModel,
+      name: resolved ? modelDisplayName(resolved) : selector,
+      isCustom: false,
+      capabilities: createModelCapabilities({
+        reasoning: resolved?.reasoning,
+        optionDescriptors: [
+          {
+            id: "reasoningEffort",
+            label: "Effort",
+            type: "select",
+            options: [
+              { id: "automatic", label: "Automatic" },
+              ...(resolved?.supportedThinkingLevels ?? MODEL_EFFORTS).map((level) => ({
+                id: level,
+                label: level,
+              })),
+            ],
+            currentValue: effort?.mode === "fixed" ? effort.level : "automatic",
+          },
+        ],
+      }),
+    },
+  ];
   const setRole = (
     nextSelector: string | null,
     nextEffort: NeoPiEffortSelection | null = scoped.effort,
@@ -1096,8 +1115,8 @@ function RoleFallbacks({
           </p>
         ) : null}
         <ol>
-          {fallbacks.chain.map((selector, index) => (
-            <li key={`${index}:${selector}`} className="flex items-center gap-1.5">
+          {nativeValueItems(fallbacks.chain).map(({ key, value: selector }, index) => (
+            <li key={key} className="flex items-center gap-1.5">
               <NeoPiModelsSelector
                 {...picker}
                 label={`Fallback ${index + 1} for ${role.id}`}
@@ -1462,12 +1481,12 @@ function RulesView({
       {rules.length === 0 && !pattern ? (
         <SettingsRow title="No rules" description="Models can use every effort they support." />
       ) : null}
-      {rules.map((rule, index) => {
+      {nativeValueItems(rules, (rule) => rule.selector).map(({ key, value: rule }, index) => {
         const model = modelsIndex(picker.configuration.models).bySelector.get(rule.selector);
         const draft = pattern?.index === index ? pattern : null;
         return (
           <SettingsRow
-            key={`${scope}:${index}:${rule.selector}`}
+            key={`${scope}:${key}`}
             title={
               draft ? (
                 patternInput(draft, "Rule pattern")
@@ -1663,8 +1682,7 @@ function ProviderAccounts({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(false);
-  const loadAccounts = useCallback(async () => {
-    setLoading(true);
+  const readAccounts = useStableCallback(async () => {
     const result = await accountsCommand({
       environmentId,
       input: { target, providerId: provider.id },
@@ -1680,14 +1698,19 @@ function ProviderAccounts({
     setAccountsReady(true);
     setError(null);
     return result.value.accounts;
-  }, [accountsCommand, environmentId, target, provider.id]);
+  });
+  const loadAccounts = useStableCallback(async () => {
+    setLoading(true);
+    return readAccounts();
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Load the scoped native account list and discard replies after this owner closes.
   useEffect(() => {
     mounted.current = true;
-    void loadAccounts();
+    void readAccounts();
     return () => {
       mounted.current = false;
     };
-  }, [loadAccounts]);
+  }, [readAccounts]);
   const login = async (providerId: string) => {
     setStarting(true);
     setError(null);
@@ -1900,6 +1923,7 @@ function ProviderAccounts({
           ) : null}
           {flowId ? (
             <NativeAuthFlow
+              key={JSON.stringify([environmentId, flowId])}
               environmentId={environmentId}
               flowId={flowId}
               providerId={provider.id}
@@ -1956,7 +1980,7 @@ function ProviderAccounts({
           error === null ? (
             <SettingsRow
               title="No NeoProxy models available here"
-              description="Check the connection, model discovery and selected scope in NeoPi, then refresh. If NeoPi's connection flow explicitly reports that this member has no granted models, ask your administrator to grant access."
+              description="Check NeoPi connection, discovery and scope, then refresh. If the connection flow reports no granted models, ask your administrator for access."
               control={
                 <Button
                   size="sm"

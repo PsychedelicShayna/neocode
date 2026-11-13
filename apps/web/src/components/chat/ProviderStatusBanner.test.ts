@@ -7,8 +7,8 @@ import {
 } from "./ProviderStatusBanner";
 
 const provider: ServerProvider = {
-  instanceId: ProviderInstanceId.make("codex-work"),
-  driver: ProviderDriverKind.make("codex"),
+  instanceId: ProviderInstanceId.make("neopi-work"),
+  driver: ProviderDriverKind.make("neopi"),
   enabled: true,
   installed: true,
   version: "1.0.0",
@@ -54,19 +54,73 @@ describe("compatibility banners", () => {
         compatibilityAdvisory: { ...provider.compatibilityAdvisory!, status: "graceful" },
       }),
     ).toBeNull();
+    const warning: ServerProvider = {
+      ...relaxed,
+      status: "warning",
+      message: "Native discovery is temporarily unavailable.",
+    };
+    expect(shouldShowProviderStatusBanner(warning, null)).toBe(true);
+    expect(shouldShowProviderStatusBanner(warning, getProviderStatusBannerKey(warning))).toBe(
+      false,
+    );
+    expect(
+      shouldShowProviderStatusBanner(
+        { ...warning, message: "Native executable is no longer reachable." },
+        getProviderStatusBannerKey(warning),
+      ),
+    ).toBe(true);
   });
 
-  it("keeps authentication failures ahead of compatibility warnings even without a probe message", () => {
-    const unauthenticated: ServerProvider = {
+  it("prioritizes compatibility guidance while preserving an authentication failure", () => {
+    const message = "This provider version is known to be incompatible. Use 1.14.19.";
+    const broken: ServerProvider = {
       ...provider,
+      version: "2.0.3",
       status: "error",
-      auth: { status: "unauthenticated" },
+      auth: { status: "unknown" },
+      message: "Native discovery timed out waiting for the configured executable.",
+      compatibilityAdvisory: {
+        status: "broken",
+        message,
+        recommendedVersion: "1.14.19",
+        recommendedRange: ">=1.14.19 <2.0.0",
+      },
     };
-    expect(getProviderStatusMessage(unauthenticated)).toBe(
-      "Sign in via the CLI to authenticate again.",
+    expect(shouldShowProviderStatusBanner(broken, null)).toBe(true);
+    const timeoutOnly: ServerProvider = {
+      ...broken,
+      compatibilityAdvisory: {
+        ...broken.compatibilityAdvisory!,
+        status: "supported",
+        message: null,
+      },
+    };
+    expect(shouldShowProviderStatusBanner(broken, getProviderStatusBannerKey(timeoutOnly))).toBe(
+      true,
     );
-    expect(getProviderStatusMessage({ ...unauthenticated, message: "Credentials expired" })).toBe(
-      "Credentials expired",
+    expect(shouldShowProviderStatusBanner(broken, getProviderStatusBannerKey(broken))).toBe(false);
+    expect(
+      shouldShowProviderStatusBanner(
+        {
+          ...broken,
+          compatibilityAdvisory: { ...broken.compatibilityAdvisory!, message: "Use 1.14.20." },
+        },
+        getProviderStatusBannerKey(broken),
+      ),
+    ).toBe(true);
+    expect(getProviderStatusMessage(broken)).toBe(message);
+    expect(
+      getProviderStatusMessage({
+        ...broken,
+        compatibilityAdvisory: {
+          ...broken.compatibilityAdvisory!,
+          status: "supported",
+          message: null,
+        },
+      }),
+    ).toBe(broken.message);
+    expect(getProviderStatusMessage({ ...broken, auth: { status: "unauthenticated" } })).toBe(
+      broken.message,
     );
   });
 });

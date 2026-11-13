@@ -217,3 +217,15 @@ export function nativeNavigationGuards(identity: NativeIdentity) {
     expectedLeafId: identity.leafId,
   };
 }
+
+export function nativeNavigationStillCurrent(
+  current: NativeIdentity | null,
+  requested: NativeIdentity,
+  resultLeafId: string | null,
+): boolean {
+  return (
+    current !== null &&
+    sameNativeSession(current, requested) &&
+    (current.leafId === requested.leafId || current.leafId === resultLeafId)
+  );
+}

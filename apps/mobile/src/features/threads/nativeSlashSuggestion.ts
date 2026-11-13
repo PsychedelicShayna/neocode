@@ -1,6 +1,5 @@
 import {
   voiceInputBlocksSubmission,
-  voiceInputFreezesEditor,
   type VoiceInputState,
 } from "@t3tools/client-runtime/voice-input";
 
@@ -12,7 +11,7 @@ export function selectNativeSlashSuggestion(
   submitsCommand = false,
 ): void {
   const state = getVoiceState();
-  if (voiceInputFreezesEditor(state) || voiceInputBlocksSubmission(state)) return;
+  if (voiceInputBlocksSubmission(state)) return;
   composer.setText(text);
   if (submitsCommand) void composer.send();
 }

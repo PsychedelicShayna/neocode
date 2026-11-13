@@ -51,7 +51,7 @@ export function resolveNativeSessionStatus(
   return toMs(session.modifiedAt) > toMs(seen) ? "done" : "idle";
 }
 
-export function nativeSessionSection(
+function nativeSessionSection(
   session: NativeSessionSummaryLike,
   status: NativeSessionStatus,
 ): NativeSessionSection {

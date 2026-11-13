@@ -19,7 +19,7 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
 }) {
   return (
     <Toolbar.Root
-      className="w-28 shrink-0 overflow-y-auto border-r border-border p-1.5 sm:w-36"
+      className="w-28 shrink-0 overflow-y-auto overscroll-contain border-r border-border p-1.5 sm:w-36"
       data-model-picker-sidebar="true"
       aria-label="Roles, favorites and inference providers"
       orientation="vertical"
@@ -39,13 +39,15 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
             type="button"
             aria-pressed={props.selectedKey === entry.key}
             className={cn(
-              "flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-2 text-left text-xs text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring",
+              "flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-2 text-left text-xs text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
               props.selectedKey === entry.key && "bg-accent font-medium text-accent-foreground",
             )}
             onClick={() => props.onSelect(entry.key)}
             title={entry.label}
           >
-            {entry.key === "favorites" ? <StarIcon className="size-3 shrink-0" /> : null}
+            {entry.key === "favorites" ? (
+              <StarIcon className="size-3 shrink-0" aria-hidden />
+            ) : null}
             <span className="truncate">{entry.label}</span>
           </Toolbar.Button>
         </div>

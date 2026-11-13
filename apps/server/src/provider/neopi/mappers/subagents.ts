@@ -1,59 +1,60 @@
-import {
-  EventId,
-  RuntimeTaskId,
-  type ProviderRuntimeEvent,
-  type RuntimeTaskStatus,
-  type RuntimeTaskUsage,
-} from "@t3tools/contracts";
+import { NodeId, TurnItemId, type OrchestrationV2Subagent } from "@t3tools/contracts";
+import type { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
+import * as DateTime from "effect/DateTime";
 
 import { coreTurnTokenUsage, emptyCoreState, mapCoreFrame, type CoreState } from "./core.ts";
-import { scopedItemId, type MapCtx } from "./MapCtx.ts";
-import { emptyToolState, mapToolFrame, withHostToolNames, type ToolState } from "./tools.ts";
+import { nativeItemBase, scopedItemId, type CoreMapCtx } from "./MapCtx.ts";
+import {
+  emptyToolState,
+  mapToolFrame,
+  settleTools,
+  withHostToolNames,
+  type ToolState,
+} from "./tools.ts";
 
-/**
- * Nested NeoPi/OMP subagents. Lifecycle and progress become the same task.*
- * rows Claude and Codex use for the Agents surface. Child session events are
- * re-entered through the core and tool mappers with an agent-scoped MapCtx,
- * so item ids and tool state cannot collide with the parent turn.
- *
- * Child assistant/reasoning deltas cannot be republished as content.delta:
- * ingestion appends them to the parent answer. The Agents surface currently
- * retains a bounded child progress preview, not a child transcript.
- * Child token totals stay on task.completed.typedUsage.
- */
 export interface SubagentState {
   readonly runs: Readonly<Record<string, ChildRun>>;
   readonly generations: Readonly<Record<string, number>>;
-  readonly toolOwners: Readonly<Record<string, string>>;
+  readonly toolOwners: Readonly<Record<string, string | null>>;
 }
 
 interface ChildRun {
   readonly nativeId: string;
-  readonly taskId: string;
+  readonly taskId: NodeId;
+  readonly itemNativeId: string;
   readonly parentToolUseId?: string;
-  readonly parentAgentId?: string;
+  readonly parentNodeId: NodeId;
   readonly description: string;
   readonly role?: string;
   readonly model?: string;
   readonly effort?: string;
+  readonly status: OrchestrationV2Subagent["status"];
   readonly terminal: boolean;
+  readonly startedAt: string;
+  readonly completedAt?: string;
   readonly core: CoreState;
   readonly tools: ToolState;
   readonly text: string;
   readonly toolUses: number;
+  readonly completedTools: ReadonlySet<string>;
   readonly lastSummary?: string;
 }
+
+type MappedSubagents = {
+  readonly events: ProviderAdapterV2Event[];
+  readonly state: SubagentState;
+};
 
 export function emptySubagentState(): SubagentState {
   return { runs: {}, generations: {}, toolOwners: {} };
 }
 
 export function mapSubagentFrame(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: unknown,
   state: SubagentState,
   hostToolNames?: ReadonlyArray<string>,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: SubagentState } {
+): MappedSubagents {
   const record = asRecord(frame);
   if (!record || typeof record.type !== "string") return { events: [], state };
   switch (record.type) {
@@ -69,301 +70,313 @@ export function mapSubagentFrame(
 }
 
 function mapLifecycle(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: SubagentState,
   hostToolNames: ReadonlyArray<string> | undefined,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: SubagentState } {
+): MappedSubagents {
   const payload = payloadOf(frame);
   const id = text(payload.id);
   const status = text(payload.status);
   if (!id || !status) return { events: [], state };
-  if (status === "started") return startRun(ctx, frame, state, id, payload, hostToolNames);
+  if (status === "started") {
+    const opened = startRun(ctx, state, id, payload, hostToolNames);
+    return { events: taskEvents(ctx, opened.run), state: opened.state };
+  }
   if (status !== "completed" && status !== "failed" && status !== "aborted") {
     return { events: [], state };
   }
-  const run = state.runs[id];
-  if (!run || run.terminal) return { events: [], state };
-  const typedUsage = taskUsage(run);
-  return {
-    events: [
-      emit(ctx, frame, "task.completed", {
-        taskId: RuntimeTaskId.make(run.taskId),
-        status: status === "failed" ? "failed" : status === "aborted" ? "stopped" : "completed",
-        ...(run.text.trim().length > 0 ? { summary: tail(run.text) } : {}),
-        ...(typedUsage ? { typedUsage } : {}),
-        ...linkage(run),
-      }),
-    ],
-    state: putRun(state, { ...run, terminal: true }),
+  const previous = state.runs[id];
+  if (!previous || previous.terminal) return { events: [], state };
+  const statusForTools = status === "aborted" ? "cancelled" : status;
+  const tools = settleTools(
+    {
+      ...ctx,
+      nodeId: previous.taskId,
+      agentId: previous.taskId,
+      parentItemId: TurnItemId.make(previous.taskId),
+    },
+    previous.tools,
+    statusForTools,
+  );
+  const run: ChildRun = {
+    ...previous,
+    status: statusForTools,
+    terminal: true,
+    completedAt: previous.completedAt ?? ctx.now(),
+    tools: tools.state,
   };
+  return { events: [...tools.events, ...taskEvents(ctx, run)], state: putRun(state, run) };
 }
 
 function mapProgress(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: SubagentState,
   hostToolNames: ReadonlyArray<string> | undefined,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: SubagentState } {
+): MappedSubagents {
   const payload = payloadOf(frame);
   const progress = asRecord(payload.progress) ?? {};
   const id = text(progress.id) ?? text(payload.id);
-  if (!id) return { events: [], state };
-  const opened = ensureRun(ctx, frame, state, id, payload, hostToolNames);
-  const description = text(payload.task) ?? opened.run.description;
-  const summary =
-    progressSummary(progress) ??
-    (opened.run.text.trim().length > 0 ? tail(opened.run.text) : undefined);
-  const status = progressStatus(text(progress.status));
-  const lastToolName = text(progress.currentTool);
-  const lastSummary = summary ?? opened.run.lastSummary;
-  const run = {
+  if (!id || state.runs[id]?.terminal) return { events: [], state };
+  const opened = ensureRun(ctx, state, id, payload, hostToolNames);
+  const summary = progressSummary(progress);
+  const status = opened.run.completedAt
+    ? opened.run.status
+    : (progressStatus(text(progress.status)) ?? opened.run.status);
+  const run: ChildRun = {
     ...opened.run,
-    description,
-    ...(lastSummary === undefined ? {} : { lastSummary }),
+    description: text(payload.task) ?? opened.run.description,
+    status,
+    ...(isTerminal(status) ? { completedAt: opened.run.completedAt ?? ctx.now() } : {}),
+    ...(summary ? { lastSummary: tail(summary) } : {}),
   };
-  return {
-    events: [
-      ...opened.events,
-      emit(ctx, frame, "task.progress", {
-        taskId: RuntimeTaskId.make(run.taskId),
-        description,
-        ...(summary ? { summary } : {}),
-        ...(status ? { status } : {}),
-        ...(lastToolName ? { lastToolName } : {}),
-        ...linkage(run),
-      }),
-    ],
-    state: putRun(opened.state, run),
-  };
+  return { events: taskEvents(ctx, run), state: putRun(opened.state, run) };
 }
 
 function mapEvent(
-  ctx: MapCtx,
+  ctx: CoreMapCtx,
   frame: Record<string, unknown>,
   state: SubagentState,
   hostToolNames: ReadonlyArray<string> | undefined,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: SubagentState } {
+): MappedSubagents {
   const payload = payloadOf(frame);
   const id = text(payload.id);
-  if (!id || payload.event === undefined) return { events: [], state };
-  const opened = ensureRun(ctx, frame, state, id, payload, hostToolNames);
-  const event = payload.event;
-  const childCtx: MapCtx = {
+  if (!id || payload.event === undefined || state.runs[id]?.terminal) {
+    return { events: [], state };
+  }
+  const opened = ensureRun(ctx, state, id, payload, hostToolNames);
+  const childCtx: CoreMapCtx = {
     ...ctx,
+    nodeId: opened.run.taskId,
     agentId: opened.run.taskId,
-    ...(opened.run.parentToolUseId ? { parentToolUseId: opened.run.parentToolUseId } : {}),
+    parentItemId: TurnItemId.make(opened.run.taskId),
   };
-  const core = mapCoreFrame(childCtx, event, opened.run.core);
-  const tools = mapToolFrame(childCtx, event, opened.run.tools);
-  const eventRecord = asRecord(event);
-  const textAdded = textFromChildEvent(eventRecord);
-  const narration = textAdded.length > 0 ? `${opened.run.text}${textAdded}` : opened.run.text;
-  const toolUses = opened.run.toolUses + (eventRecord?.type === "tool_execution_end" ? 1 : 0);
-  const toolCallId =
-    eventRecord?.type === "tool_execution_start" ? text(eventRecord.toolCallId) : undefined;
-  const model = eventRecord?.type === "agent_start" ? modelSlug(eventRecord.model) : undefined;
+  const core = mapCoreFrame(childCtx, payload.event, opened.run.core);
+  const tools = mapToolFrame(childCtx, payload.event, opened.run.tools);
+  const record = asRecord(payload.event);
+  const addition = textFromChildEvent(record);
+  const finalText = record?.type === "message_end" ? assistantText(record.message) : undefined;
+  const narration =
+    finalText !== undefined
+      ? tail(finalText)
+      : addition
+        ? tail(opened.run.text + addition)
+        : opened.run.text;
+  const toolCallId = text(record?.toolCallId);
+  const newlyCompleted =
+    record?.type === "tool_execution_end" &&
+    toolCallId !== undefined &&
+    !opened.run.completedTools.has(toolCallId);
+  const model = record?.type === "agent_start" ? modelSlug(record.model) : undefined;
   const effort =
-    eventRecord?.type === "agent_start"
-      ? (text(eventRecord.effort) ?? text(eventRecord.thinkingLevel))
+    record?.type === "agent_start"
+      ? (text(record.effort) ?? text(record.thinkingLevel))
       : undefined;
+  let summary = addition || finalText !== undefined ? narration : opened.run.lastSummary;
+  for (const event of core.events) {
+    if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
+      summary = tail(event.turnItem.message);
+    }
+  }
   const run: ChildRun = {
     ...opened.run,
     core: core.state,
     tools: tools.state,
     text: narration,
-    toolUses,
+    toolUses: opened.run.toolUses + (newlyCompleted ? 1 : 0),
+    completedTools:
+      newlyCompleted && toolCallId
+        ? new Set(opened.run.completedTools).add(toolCallId)
+        : opened.run.completedTools,
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...(summary !== undefined ? { lastSummary: summary } : {}),
   };
-  const summary = textAdded.length > 0 ? tail(narration) : undefined;
-  const progress =
-    summary && summary !== run.lastSummary
-      ? [
-          emit(ctx, frame, "task.progress", {
-            taskId: RuntimeTaskId.make(run.taskId),
-            description: run.description,
-            summary,
-            status: "running",
-            ...linkage(run),
-          }),
-        ]
-      : [];
-  const childEvents = core.events.flatMap((event): ProviderRuntimeEvent[] => {
-    if (event.type === "runtime.error") {
-      return [
-        emit(ctx, frame, "task.progress", {
-          taskId: RuntimeTaskId.make(run.taskId),
-          description: run.description,
-          error: event.payload.message,
-          status: "running",
-          ...linkage(run),
-        }),
-      ];
-    }
-    return keepChildEvent(event) ? [event] : [];
-  });
+  const owner = toolCallId ? opened.state.toolOwners[toolCallId] : undefined;
+  const changed =
+    !state.runs[id] ||
+    run.lastSummary !== opened.run.lastSummary ||
+    run.model !== opened.run.model ||
+    run.effort !== opened.run.effort ||
+    run.toolUses !== opened.run.toolUses ||
+    run.core.usage !== opened.run.core.usage;
   return {
-    events: [...opened.events, ...childEvents, ...tools.events, ...progress],
+    // Child text is progress, not a second message in the parent's conversation.
+    events: [...(changed ? taskEvents(ctx, run) : []), ...tools.events],
     state: {
-      ...putRun(opened.state, { ...run, ...(summary ? { lastSummary: summary } : {}) }),
-      ...(toolCallId
-        ? { toolOwners: { ...opened.state.toolOwners, [toolCallId]: run.taskId } }
+      ...putRun(opened.state, run),
+      ...(record?.type === "tool_execution_start" && toolCallId
+        ? {
+            toolOwners: {
+              ...opened.state.toolOwners,
+              [toolCallId]: owner === undefined || owner === run.taskId ? run.taskId : null,
+            },
+          }
         : {}),
     },
   };
 }
 
 function startRun(
-  ctx: MapCtx,
-  frame: unknown,
+  ctx: CoreMapCtx,
   state: SubagentState,
   id: string,
   payload: Record<string, unknown>,
   hostToolNames: ReadonlyArray<string> | undefined,
-): { readonly events: ProviderRuntimeEvent[]; readonly state: SubagentState } {
+): { readonly state: SubagentState; readonly run: ChildRun } {
   const existing = state.runs[id];
-  if (existing && !existing.terminal) {
+  if (existing && !existing.completedAt) {
     const description = text(payload.description) ?? existing.description;
     const run = description === existing.description ? existing : { ...existing, description };
-    return { events: [], state: run === existing ? state : putRun(state, run) };
+    return { state: run === existing ? state : putRun(state, run), run };
   }
   const generation = (state.generations[id] ?? 0) + 1;
   const nativeParentToolUseId = text(payload.parentToolCallId);
   const parentAgentId = nativeParentToolUseId ? state.toolOwners[nativeParentToolUseId] : undefined;
-  const parentToolUseId = nativeParentToolUseId
-    ? scopedItemId(parentAgentId ? { ...ctx, agentId: parentAgentId } : ctx, nativeParentToolUseId)
-    : undefined;
+  const parentToolUseId =
+    nativeParentToolUseId && parentAgentId !== null
+      ? scopedItemId(
+          parentAgentId ? { ...ctx, agentId: parentAgentId } : ctx,
+          nativeParentToolUseId,
+        )
+      : undefined;
   const role = text(payload.agent);
+  const itemNativeId = `task:${id}#${generation}`;
   const run: ChildRun = {
     nativeId: id,
-    taskId: scopedItemId(ctx, `task:${id}#${generation}`),
+    taskId: NodeId.make(scopedItemId(ctx, itemNativeId)),
+    itemNativeId,
     ...(parentToolUseId ? { parentToolUseId } : {}),
-    ...(parentAgentId ? { parentAgentId } : {}),
-    description: text(payload.description) ?? text(payload.agent) ?? id,
+    parentNodeId: parentAgentId ? NodeId.make(parentAgentId) : ctx.nodeId,
+    description: text(payload.description) ?? text(payload.task) ?? role ?? id,
     ...(role ? { role } : {}),
+    status: "running",
     terminal: false,
+    startedAt: ctx.now(),
     core: emptyCoreState(),
     tools: withHostToolNames(emptyToolState(), hostToolNames ?? []),
     text: "",
     toolUses: 0,
+    completedTools: new Set(),
   };
   return {
-    events: [taskStarted(ctx, frame, run)],
     state: {
       ...state,
       generations: { ...state.generations, [id]: generation },
       runs: { ...state.runs, [id]: run },
     },
+    run,
   };
 }
 
 function ensureRun(
-  ctx: MapCtx,
-  frame: unknown,
+  ctx: CoreMapCtx,
   state: SubagentState,
   id: string,
   payload: Record<string, unknown>,
   hostToolNames: ReadonlyArray<string> | undefined,
-): {
-  readonly events: ProviderRuntimeEvent[];
-  readonly state: SubagentState;
-  readonly run: ChildRun;
-} {
+): { readonly state: SubagentState; readonly run: ChildRun } {
   const existing = state.runs[id];
-  if (existing && !existing.terminal) return { events: [], state, run: existing };
-  const started = startRun(ctx, frame, state, id, payload, hostToolNames);
-  const run = started.state.runs[id];
-  if (!run) return { events: [], state, run: existing ?? placeholder(id) };
-  return { events: started.events, state: started.state, run };
+  return existing ? { state, run: existing } : startRun(ctx, state, id, payload, hostToolNames);
 }
 
-function taskStarted(ctx: MapCtx, frame: unknown, run: ChildRun): ProviderRuntimeEvent {
-  return emit(ctx, frame, "task.started", {
-    taskId: RuntimeTaskId.make(run.taskId),
-    description: run.description,
-    ...linkage(run),
-  });
-}
-
-function linkage(run: ChildRun): {
-  taskType: "subagent";
-  agentId: string;
-  title?: string;
-  role?: string;
-  model?: string;
-  effort?: string;
-  toolUseId?: string;
-  parentToolUseId?: string;
-  parentAgentId?: string;
-  timelineBypass: true;
-} {
-  return {
-    taskType: "subagent",
-    agentId: run.taskId,
-    ...(run.description ? { title: run.description } : {}),
-    ...(run.role ? { role: run.role } : {}),
-    ...(run.model ? { model: run.model } : {}),
-    ...(run.effort ? { effort: run.effort } : {}),
-    ...(run.parentToolUseId
-      ? { toolUseId: run.parentToolUseId, parentToolUseId: run.parentToolUseId }
-      : {}),
-    ...(run.parentAgentId ? { parentAgentId: run.parentAgentId } : {}),
-    timelineBypass: true,
+function taskEvents(ctx: CoreMapCtx, run: ChildRun): ProviderAdapterV2Event[] {
+  const now = DateTime.makeUnsafe(ctx.now());
+  const completedAt = run.completedAt ? DateTime.makeUnsafe(run.completedAt) : null;
+  const nativeTaskRef = {
+    driver: ctx.provider,
+    nativeId: run.nativeId,
+    strength: "strong" as const,
   };
-}
-
-function taskUsage(run: ChildRun): RuntimeTaskUsage | undefined {
   const usage = coreTurnTokenUsage(run.core);
-  if (usage.usageStatus === "unavailable") {
-    return run.toolUses > 0 ? { totalTokens: 0, toolUses: run.toolUses } : undefined;
-  }
-  const inputTokens = usage.inputTokens ?? 0;
-  const outputTokens = usage.outputTokens ?? 0;
-  return {
-    totalTokens: inputTokens + outputTokens,
-    inputTokens,
-    outputTokens,
-    ...(usage.cachedInputTokens !== undefined
-      ? { cachedInputTokens: usage.cachedInputTokens }
+  const subagent: OrchestrationV2Subagent = {
+    id: run.taskId,
+    threadId: ctx.threadId,
+    runId: ctx.runId,
+    parentNodeId: run.parentNodeId,
+    origin: "provider_native",
+    createdBy: "agent",
+    driver: ctx.provider,
+    providerInstanceId: ctx.providerInstanceId,
+    providerThreadId: null,
+    childThreadId: null,
+    nativeTaskRef,
+    prompt: run.description,
+    ...(run.role ? { role: run.role } : {}),
+    title: run.description,
+    model: run.model ?? null,
+    ...(run.model
+      ? {
+          modelSelection: {
+            instanceId: ctx.providerInstanceId,
+            model: run.model,
+            ...(run.effort ? { options: [{ id: "reasoningEffort", value: run.effort }] } : {}),
+          },
+        }
       : {}),
-    ...(usage.reasoningTokens !== undefined
-      ? { reasoningOutputTokens: usage.reasoningTokens }
-      : {}),
-    ...(run.toolUses > 0 ? { toolUses: run.toolUses } : {}),
+    status: run.status,
+    ...(run.lastSummary ? { progress: run.lastSummary } : {}),
+    result: completedAt ? run.text || run.lastSummary || null : null,
+    ...(usage.usageStatus !== "unavailable" ? { turnTokenUsage: usage } : {}),
+    toolUses: run.toolUses,
+    startedAt: DateTime.makeUnsafe(run.startedAt),
+    completedAt,
+    updatedAt: now,
   };
+  return [
+    {
+      type: "node.updated",
+      driver: ctx.provider,
+      node: {
+        id: run.taskId,
+        threadId: ctx.threadId,
+        runId: ctx.runId,
+        parentNodeId: run.parentNodeId,
+        rootNodeId: ctx.nodeId,
+        kind: "subagent",
+        status: run.status,
+        countsForRun: false,
+        providerThreadId: ctx.providerThreadId,
+        providerTurnId: ctx.providerTurnId,
+        nativeItemRef: nativeTaskRef,
+        runtimeRequestId: null,
+        checkpointScopeId: null,
+        startedAt: subagent.startedAt,
+        completedAt,
+      },
+    },
+    { type: "subagent.updated", driver: ctx.provider, subagent },
+    {
+      type: "turn_item.updated",
+      driver: ctx.provider,
+      turnItem: {
+        ...nativeItemBase(ctx, run.itemNativeId, run.status, run.description, run.startedAt),
+        nodeId: run.taskId,
+        completedAt,
+        nativeItemRef: nativeTaskRef,
+        parentItemId: run.parentToolUseId ? TurnItemId.make(run.parentToolUseId) : null,
+        type: "subagent",
+        subagentId: run.taskId,
+        origin: "provider_native",
+        driver: ctx.provider,
+        providerInstanceId: ctx.providerInstanceId,
+        childThreadId: null,
+        prompt: subagent.prompt,
+        ...(subagent.progress ? { progress: subagent.progress } : {}),
+        result: subagent.result,
+      },
+    },
+  ];
 }
 
-function keepChildEvent(event: ProviderRuntimeEvent): boolean {
-  if (
-    event.type === "turn.started" ||
-    event.type === "turn.completed" ||
-    event.type === "turn.aborted" ||
-    event.type === "thread.token-usage.updated" ||
-    event.type === "thread.metadata.updated" ||
-    event.type === "thread.state.changed" ||
-    event.type === "session.exited" ||
-    event.type === "session.state.changed" ||
-    event.type === "session.started" ||
-    event.type === "model.rerouted"
-  ) {
-    return false;
-  }
-  if (event.type === "content.delta") {
-    return (
-      event.payload.streamKind !== "assistant_text" &&
-      event.payload.streamKind !== "reasoning_text" &&
-      event.payload.streamKind !== "reasoning_summary_text"
-    );
-  }
-  if (
-    event.type === "item.started" ||
-    event.type === "item.updated" ||
-    event.type === "item.completed"
-  ) {
-    return event.payload.itemType !== "assistant_message" && event.payload.itemType !== "reasoning";
-  }
-  return true;
+function isTerminal(status: OrchestrationV2Subagent["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "interrupted"
+  );
 }
 
 function progressSummary(progress: Record<string, unknown>): string | undefined {
@@ -377,7 +390,7 @@ function progressSummary(progress: Record<string, unknown>): string | undefined 
   return text(progress.lastIntent) ?? text(progress.currentTool) ?? text(progress.description);
 }
 
-function progressStatus(status: string | undefined): RuntimeTaskStatus | undefined {
+function progressStatus(status: string | undefined): OrchestrationV2Subagent["status"] | undefined {
   switch (status) {
     case "pending":
     case "running":
@@ -403,44 +416,23 @@ function textFromChildEvent(event: Record<string, unknown> | undefined): string 
   return typeof assistant.delta === "string" ? assistant.delta : "";
 }
 
+function assistantText(value: unknown): string | undefined {
+  const message = asRecord(value);
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+  return message.content
+    .flatMap((block) => {
+      const part = asRecord(block);
+      return part?.type === "text" && typeof part.text === "string" ? [part.text] : [];
+    })
+    .join("");
+}
+
 function payloadOf(frame: Record<string, unknown>): Record<string, unknown> {
   return asRecord(frame.payload) ?? frame;
 }
 
 function putRun(state: SubagentState, run: ChildRun): SubagentState {
   return { ...state, runs: { ...state.runs, [run.nativeId]: run } };
-}
-
-function placeholder(id: string): ChildRun {
-  return {
-    nativeId: id,
-    taskId: id,
-    description: id,
-    terminal: true,
-    core: emptyCoreState(),
-    tools: emptyToolState(),
-    text: "",
-    toolUses: 0,
-  };
-}
-
-function emit<T extends ProviderRuntimeEvent["type"]>(
-  ctx: MapCtx,
-  frame: unknown,
-  type: T,
-  payload: Extract<ProviderRuntimeEvent, { type: T }>["payload"],
-): Extract<ProviderRuntimeEvent, { type: T }> {
-  return {
-    type,
-    eventId: EventId.make(ctx.newEventId()),
-    provider: ctx.provider,
-    providerInstanceId: ctx.providerInstanceId,
-    threadId: ctx.threadId,
-    createdAt: ctx.now(),
-    ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    payload,
-    raw: { source: "neopi.rpc", payload: frame },
-  } as Extract<ProviderRuntimeEvent, { type: T }>;
 }
 
 function modelSlug(model: unknown): string | undefined {
@@ -456,7 +448,10 @@ function modelSlug(model: unknown): string | undefined {
 
 function tail(value: string): string {
   const trimmed = value.trim();
-  return trimmed.length <= 160 ? trimmed : trimmed.slice(-160);
+  let start = Math.max(0, trimmed.length - 160);
+  const code = trimmed.charCodeAt(start);
+  if (start > 0 && code >= 0xdc00 && code <= 0xdfff) start += 1;
+  return trimmed.slice(start);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

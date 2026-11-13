@@ -12,6 +12,8 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 
+const isModelsError = Schema.is(NeoPiModelsError);
+
 /** Reading the catalog costs NeoPi seconds; a burst of change signals is one re-read. */
 const CHANGE_COALESCE = Duration.millis(100);
 /** Short: the hub pins a native connection, and a config process is hundreds of MB. Matches the adapter's own idle horizon. */
@@ -71,53 +73,48 @@ export const makeNeoPiModelsHub = Effect.fn("makeNeoPiModelsHub")(function* (
   // entries evict themselves HUB_IDLE_TTL after their last watcher, so nothing outlives use.
   const lifetime = yield* Scope.make();
   const hubs: RcMap.RcMap<string, Hub, NeoPiModelsError> = yield* RcMap.make({
-    lookup: (key: string) =>
-      Effect.gen(function* () {
-        const native = yield* connection(keyTarget(key));
-        const state = yield* SubscriptionRef.make<Entry>(LOADING);
-        live.set(key, state);
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (live.get(key) === state) live.delete(key);
-          }),
+    lookup: Effect.fn("NeoPiModelsHub.lookup")(function* (key: string) {
+      const native = yield* connection(keyTarget(key));
+      const state = yield* SubscriptionRef.make<Entry>(LOADING);
+      live.set(key, state);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (live.get(key) === state) live.delete(key);
+        }),
+      );
+      // A failed read leaves no trustworthy snapshot: retire the hub first so the next watcher builds
+      // a fresh one (and a fresh native connection), then tell the current watchers.
+      const fail = (error: NeoPiModelsError) =>
+        RcMap.invalidate(hubs, key).pipe(
+          Effect.andThen(SubscriptionRef.set(state, { _tag: "Failed", error })),
         );
-        // A failed read leaves no trustworthy snapshot: retire the hub first so the next watcher builds
-        // a fresh one (and a fresh native connection), then tell the current watchers.
-        const fail = (error: NeoPiModelsError) =>
-          RcMap.invalidate(hubs, key).pipe(
-            Effect.andThen(SubscriptionRef.set(state, { _tag: "Failed", error })),
-          );
-        // Subscribe before the first read, so a change during that read is buffered rather than
-        // lost. Reads are serialized; cancelling an in-flight native RPC would waste its work.
-        const changes = yield* Stream.toPull(native.changes);
-        yield* Stream.make(undefined).pipe(
-          Stream.concat(
-            Stream.fromPull(Effect.succeed(changes)).pipe(Stream.debounce(CHANGE_COALESCE)),
-          ),
-          Stream.mapEffect(() =>
-            read(native).pipe(
-              Effect.flatMap((configuration) =>
-                SubscriptionRef.set(state, { _tag: "Ready", configuration }),
-              ),
+      // Subscribe before the first read, so a change during that read is buffered rather than
+      // lost. Reads are serialized; cancelling an in-flight native RPC would waste its work.
+      const changes = yield* Stream.toPull(native.changes);
+      yield* Stream.make(undefined).pipe(
+        Stream.concat(
+          Stream.fromPull(Effect.succeed(changes)).pipe(Stream.debounce(CHANGE_COALESCE)),
+        ),
+        Stream.mapEffect(() =>
+          read(native).pipe(
+            Effect.flatMap((configuration) =>
+              SubscriptionRef.set(state, { _tag: "Ready", configuration }),
             ),
           ),
-          Stream.runDrain,
-          // NeoPi's change signal only ends with its connection (a closed or replaced session).
-          // A hub that stopped following would serve a frozen catalog, so retire it instead.
-          Effect.andThen(
-            Effect.fail(new NeoPiModelsError({ message: "The native connection closed." })),
-          ),
-          Effect.catch((error) =>
-            fail(
-              Schema.is(NeoPiModelsError)(error)
-                ? error
-                : new NeoPiModelsError({ message: String(error) }),
-            ),
-          ),
-          Effect.forkScoped,
-        );
-        return { state } satisfies Hub;
-      }),
+        ),
+        Stream.runDrain,
+        // NeoPi's change signal only ends with its connection (a closed or replaced session).
+        // A hub that stopped following would serve a frozen catalog, so retire it instead.
+        Effect.andThen(
+          Effect.fail(new NeoPiModelsError({ message: "The native connection closed." })),
+        ),
+        Effect.catch((error) =>
+          fail(isModelsError(error) ? error : new NeoPiModelsError({ message: String(error) })),
+        ),
+        Effect.forkScoped,
+      );
+      return { state } satisfies Hub;
+    }),
     idleTimeToLive: HUB_IDLE_TTL,
   }).pipe(Effect.provideService(Scope.Scope, lifetime));
 

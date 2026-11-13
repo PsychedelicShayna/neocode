@@ -6,8 +6,8 @@ import type {
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { AsyncResult } from "effect/unstable/reactivity";
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { AsyncResult } from "effect/reactivity";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useCustomThemes } from "../../hooks/useCustomThemes";
 import { useTheme } from "../../hooks/useTheme";
 import {
@@ -16,7 +16,7 @@ import {
   saveNeoPiClientTheme,
 } from "../../neopiLocalTheme";
 import { setShowNeoPiThemes, useShowNeoPiThemes } from "../../neopiThemeCatalogPreference";
-import { useServerConfigs } from "../../state/entities";
+import { useEnvironmentProviders } from "../../state/environments";
 import { neopiThemesPalette, neopiThemesRead } from "../../state/neopiThemes";
 import { formatEnvironmentQueryError } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -29,21 +29,21 @@ import {
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { useSettingsScope } from "./SettingsScopeContext";
+import { useThemeEditorStore } from "./themeEditorStore";
 
 export function ThemeLibrary() {
   const { targets } = useSettingsScope();
-  const configs = useServerConfigs();
-  const { theme, themeHalves, appearanceMode, setAppearanceMode, setTheme } = useTheme();
+  const providersByEnvironment = useEnvironmentProviders();
+  const { theme, themeHalves, appearanceMode, resolvedTheme, setAppearanceMode, setTheme } =
+    useTheme();
+  const openThemeEditor = useThemeEditorStore((store) => store.openThemeEditor);
   const saved = useCustomThemes();
   const showCatalog = useShowNeoPiThemes();
   const [error, setError] = useState<string | null>(null);
   const palette = getThemeDefinition(theme);
-  const savedChoices = useMemo(() => {
-    const choices = saved.map((item) => ({ id: item.id, label: item.label }));
-    if (palette && !choices.some((item) => item.id === palette.id))
-      choices.unshift({ id: palette.id, label: palette.label });
-    return choices;
-  }, [saved, palette]);
+  const savedChoices = saved.map((item) => ({ id: item.id, label: item.label }));
+  if (palette && !savedChoices.some((item) => item.id === palette.id))
+    savedChoices.unshift({ id: palette.id, label: palette.label });
   const changeCatalog = (next: boolean) => {
     try {
       setShowNeoPiThemes(next);
@@ -81,9 +81,9 @@ export function ThemeLibrary() {
         ) : (
           targets.map((target) => {
             const providers =
-              configs
+              providersByEnvironment
                 .get(target.environmentId)
-                ?.providers.filter((item) => item.driver === "neopi" && item.enabled) ?? [];
+                ?.filter((item) => item.driver === "neopi" && item.enabled) ?? [];
             return (
               <NativeThemeTarget
                 key={`${target.environmentId}:${target.projectId ?? "global"}`}
@@ -110,8 +110,9 @@ export function ThemeLibrary() {
           <Select
             value={appearanceMode}
             onValueChange={(value) => {
-              if (value === "light" || value === "dark" || value === "system")
-                setAppearanceMode(value);
+              if (value === "light" || value === "dark" || value === "system") {
+                setError(setAppearanceMode(value) ? null : "Could not save the appearance mode.");
+              }
             }}
           >
             <SelectTrigger aria-label="Appearance mode" size="sm">
@@ -129,7 +130,9 @@ export function ThemeLibrary() {
           <Select
             value={themeHalves ? "mixed" : (palette?.id ?? "system")}
             onValueChange={(value) => {
-              if (value && value !== "mixed") setTheme(value);
+              if (value && value !== "mixed") {
+                setError(setTheme(value) ? null : "Could not save the graphical palette.");
+              }
             }}
           >
             <SelectTrigger aria-label="Graphical palette" size="sm">
@@ -150,6 +153,40 @@ export function ThemeLibrary() {
             </SelectPopup>
           </Select>
         </label>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              openThemeEditor({
+                editingThemeId: null,
+                seedThemeId:
+                  getThemeDefinition(resolveThemeHalf(theme, themeHalves, resolvedTheme))?.id ??
+                  null,
+                seedName: null,
+                initialAppearance: resolvedTheme,
+              })
+            }
+          >
+            Create palette
+          </Button>
+          {palette && saved.some((item) => item.id === palette.id) ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                openThemeEditor({
+                  editingThemeId: palette.id,
+                  seedThemeId: null,
+                  seedName: null,
+                  initialAppearance: resolvedTheme,
+                })
+              }
+            >
+              Edit palette
+            </Button>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -225,6 +262,7 @@ function NativeThemeSelections({
     ? result.value
     : null;
   const currentRequest = useRef<ReturnType<typeof beginNeoPiThemeSelection> | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- cancel pending palette reads when their picker unmounts
   useLayoutEffect(
     () => () => {
       currentRequest.current?.cancel();
@@ -281,7 +319,7 @@ function NativeThemeSelections({
         <>
           {(["dark", "light"] as const).map((appearance) => {
             const current = getThemeDefinition(resolveThemeHalf(theme, themeHalves, appearance));
-            const selected = neoPiClientThemeSourceName(current);
+            const selected = neoPiClientThemeSourceName(current ?? undefined);
             const selectedValue = selected === undefined ? "saved-local" : JSON.stringify(selected);
             return (
               <div key={appearance} className="space-y-1">

@@ -3,6 +3,9 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 
+const decodeJournalResult = Schema.decodeEffect(NeoPiSessionJournalResult);
+const encodeJournalResult = Schema.encodeEffect(NeoPiSessionJournalResult);
+
 describe("native journal contract", () => {
   it.effect("retains unknown records and rich content through a wire round trip", () =>
     Effect.gen(function* () {
@@ -40,8 +43,8 @@ describe("native journal contract", () => {
           ],
         },
       } satisfies typeof NeoPiSessionJournalResult.Encoded;
-      const decoded = yield* Schema.decodeUnknownEffect(NeoPiSessionJournalResult)(value);
-      const encoded = yield* Schema.encodeEffect(NeoPiSessionJournalResult)(decoded);
+      const decoded = yield* decodeJournalResult(value);
+      const encoded = yield* encodeJournalResult(decoded);
       assert.deepEqual(encoded, value);
     }),
   );

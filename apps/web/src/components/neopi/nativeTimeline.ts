@@ -1,18 +1,11 @@
-import {
-  DEFAULT_RUNTIME_MODE,
-  MessageId,
-  ProviderInstanceId,
-  TurnId,
-  type ToolLifecycleItemType,
-} from "@t3tools/contracts";
+import { MessageId, RunId } from "@t3tools/contracts";
 import {
   modelDisplayName,
   type TranscriptRow,
   type ToolRow,
 } from "@t3tools/client-runtime/neopi-transcript";
 import type { NeoPiJournalEntry } from "@t3tools/contracts";
-import type { TimelineLatestTurn } from "../chat/MessagesTimeline.logic";
-import type { QueuedComposerMessage } from "../../queuedMessageStore";
+import type { TimelineLatestRun } from "../chat/MessagesTimeline.logic";
 import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
 import type { ChatAttachment, ChatMessage } from "../../types";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
@@ -24,24 +17,19 @@ import {
 } from "../../lib/composerContextRecords";
 
 /**
- * Native NeoPi journal rows, projected into the stock T3 timeline model so the
- * native workspace renders through `MessagesTimeline` instead of a parallel
- * renderer. NeoPi stays authoritative: this is a read-only view of its journal.
- *
- * Every user prompt opens a turn; rows before the first prompt on the loaded
- * page share an origin turn. Turn ids derive from journal entry ids, so paging
- * older history in never renames a turn the reader already expanded.
+ * Display run ids derive from native journal ids, never SQL records;
+ * paging older history cannot rename a run the reader already expanded.
  */
 export interface NativeTimeline {
   readonly entries: TimelineEntry[];
-  readonly latestTurn: TimelineLatestTurn | null;
-  readonly runningTurnId: TurnId | null;
+  readonly latestRun: TimelineLatestRun | null;
+  readonly runningRunId: RunId | null;
 }
 
 /** Tool output past this many characters is cut; NeoPi keeps the full text. */
 const TOOL_OUTPUT_LIMIT = 16_000;
 
-const ITEM_TYPE: Record<string, ToolLifecycleItemType> = {
+const ITEM_TYPE: Record<string, NonNullable<WorkLogEntry["itemType"]>> = {
   bash: "command_execution",
   python: "command_execution",
   eval: "command_execution",
@@ -49,7 +37,7 @@ const ITEM_TYPE: Record<string, ToolLifecycleItemType> = {
   write: "file_change",
   ast_edit: "file_change",
   web_search: "web_search",
-  task: "collab_agent_tool_call",
+  task: "dynamic_tool",
 };
 
 function boundedOutput(text: string): string {
@@ -96,12 +84,12 @@ function noticeText(text: string): string {
  * plus the output. Without an intent, T3's own labelling applies: a shell row
  * shows its first command line, other tools their path or pattern.
  */
-function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogEntry {
+function toolWorkEntry(row: ToolRow, runId: RunId, running: boolean): WorkLogEntry {
   const intent = row.call.intent ?? undefined;
   const fullCommand = toolCommand(row)?.trim();
   const command = fullCommand ? (intent ? fullCommand : firstLine(fullCommand)) : undefined;
   const changedFiles = toolChangedFiles(row);
-  const itemType = ITEM_TYPE[row.call.name] ?? "dynamic_tool_call";
+  const itemType = ITEM_TYPE[row.call.name] ?? "dynamic_tool";
   const output = row.result ? boundedOutput(row.result.text) : "";
   const detail = intent
     ? [fullCommand ? "" : (row.detail ?? ""), output].filter(Boolean).join("\n\n")
@@ -118,13 +106,14 @@ function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogE
     id: row.id,
     // A finished call is dated by its result, so turn durations cover the work.
     createdAt: row.result?.entry.timestamp ?? row.timestamp,
-    turnId,
+    runId,
     ...(row.call.id ? { toolCallId: row.call.id } : {}),
     label: row.label,
     ...(intent ? { intent } : {}),
     ...(detail ? { detail } : {}),
     ...(command ? { command } : {}),
     ...(changedFiles ? { changedFiles } : {}),
+    toolData: { input: row.call.arguments, output },
     ...(row.call.name === "read" ? { requestKind: "file-read" as const } : {}),
     tone: "tool",
     toolTitle: row.label,
@@ -157,10 +146,11 @@ function message(
   id: string,
   role: ChatMessage["role"],
   text: string,
-  turnId: TurnId,
+  runId: RunId,
   createdAt: string,
   streaming: boolean,
   attachments?: ChatAttachment[],
+  steering = false,
 ): TimelineEntry {
   return {
     id,
@@ -170,7 +160,10 @@ function message(
       id: MessageId.make(id),
       role,
       text,
-      turnId,
+      runId,
+      ...(role === "user"
+        ? { inputIntent: steering ? ("steer" as const) : ("turn_start" as const) }
+        : {}),
       streaming,
       createdAt,
       updatedAt: createdAt,
@@ -252,7 +245,7 @@ export function projectNativeTimeline(
   busy: boolean,
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
-  let turnId = TurnId.make("native:origin");
+  let runId = RunId.make("native:origin");
   let turnStartedAt: string | null = null;
   let lastAt: string | null = null;
   let workEndedAt: string | null = null;
@@ -261,11 +254,11 @@ export function projectNativeTimeline(
   for (const row of rows) {
     if (row.kind === "command") {
       entries.push(
-        memoized(row, turnId, lastAt, () =>
+        memoized(row, runId, lastAt, () =>
           work({
             id: row.id,
             createdAt: lastAt ?? new Date(0).toISOString(),
-            turnId,
+            runId,
             label: "Command output",
             detail: row.text,
             tone: "info",
@@ -283,32 +276,33 @@ export function projectNativeTimeline(
       case "user":
         // A steer joins the run it interrupts rather than starting a new turn.
         if (!row.steering || !sawTurn) {
-          turnId = TurnId.make(`native:${row.entry.id}`);
+          runId = RunId.make(`native:${row.entry.id}`);
           turnStartedAt = row.timestamp;
           sawTurn = true;
         }
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, runId, null, () =>
             message(
               row.id,
               "user",
               row.text,
-              turnId,
+              runId,
               row.timestamp,
               false,
               imageAttachments(row.id, row.images),
+              row.steering,
             ),
           ),
         );
         break;
       case "assistant":
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, runId, null, () =>
             message(
               row.id,
               "assistant",
               row.text,
-              turnId,
+              runId,
               row.timestamp,
               row.live,
               imageAttachments(row.id, row.images),
@@ -318,16 +312,25 @@ export function projectNativeTimeline(
         break;
       case "thinking":
         entries.push(
-          memoized(row, turnId, null, () =>
-            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live),
+          memoized(row, runId, row.live ? busy : null, () =>
+            work({
+              id: row.id,
+              createdAt: row.timestamp,
+              runId,
+              label: "Thinking",
+              detail: row.text,
+              tone: "thinking",
+              itemType: "reasoning",
+              toolLifecycleStatus: row.live && busy ? "inProgress" : "completed",
+            }),
           ),
         );
         break;
       case "tool":
         // Only a call still waiting for its result shows whether the run is live.
         entries.push(
-          memoized(row, turnId, row.result ? null : busy, () =>
-            work(toolWorkEntry(row, turnId, busy)),
+          memoized(row, runId, row.result ? null : busy, () =>
+            work(toolWorkEntry(row, runId, busy)),
           ),
         );
         lastAt = row.result?.entry.timestamp ?? lastAt;
@@ -357,11 +360,11 @@ export function projectNativeTimeline(
           break;
         }
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, runId, null, () =>
             work({
               id: row.id,
               createdAt: row.timestamp,
-              turnId,
+              runId,
               label: row.text,
               tone: "info",
               sourceActivityKind: "context-compaction",
@@ -376,11 +379,11 @@ export function projectNativeTimeline(
         const label = row.label.charAt(0).toUpperCase() + row.label.slice(1);
         const text = noticeText(row.text);
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, runId, null, () =>
             work({
               id: row.id,
               createdAt: row.timestamp,
-              turnId,
+              runId,
               label,
               // The first line is the row label, the rest opens below it.
               ...(text ? { intent: text.split("\n")[0]!.trim(), detail: boundedOutput(text) } : {}),
@@ -392,11 +395,11 @@ export function projectNativeTimeline(
       }
       case "record":
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, runId, null, () =>
             work({
               id: row.id,
               createdAt: row.timestamp,
-              turnId,
+              runId,
               label: row.label,
               detail: JSON.stringify(row.entry, null, 2),
               tone: "info",
@@ -406,22 +409,17 @@ export function projectNativeTimeline(
         break;
     }
   }
-  const latestTurn: TimelineLatestTurn | null = sawTurn
+  const latestRun: TimelineLatestRun | null = sawTurn
     ? {
-        turnId,
-        state: busy ? "running" : "completed",
+        runId,
+        status: busy ? "running" : "completed",
         startedAt: turnStartedAt,
         completedAt: busy ? null : workEndedAt,
+        turnEnded: !busy,
       }
     : null;
-  return { entries, latestTurn, runningTurnId: busy && sawTurn ? turnId : null };
+  return { entries, latestRun, runningRunId: busy && sawTurn ? runId : null };
 }
-
-const NATIVE_SEND_SETTINGS: QueuedComposerMessage["sendSettings"] = {
-  modelSelection: { instanceId: ProviderInstanceId.make("neopi"), model: "native" },
-  runtimeMode: DEFAULT_RUNTIME_MODE,
-  interactionMode: "default",
-};
 
 export interface NativeQueue {
   readonly steering: readonly string[];
@@ -429,21 +427,15 @@ export interface NativeQueue {
   readonly liveSteered: number;
 }
 
+export type NativeQueuedMessage = ReturnType<typeof nativeQueuedMessages>[number];
+
 /**
  * NeoPi's own prompt queue as timeline ghost rows; ids encode where each text
  * sits. Queued text is the serialized prompt, so context blocks (annotations,
  * terminal excerpts, review comments) are parsed back into their draft shapes.
  */
-export function nativeQueuedMessages(
-  queue: NativeQueue,
-  createdAt: string,
-): QueuedComposerMessage[] {
-  const row = (
-    lane: "steering" | "followUp",
-    text: string,
-    index: number,
-    sending: boolean,
-  ): QueuedComposerMessage => {
+export function nativeQueuedMessages(queue: NativeQueue, createdAt: string) {
+  const row = (lane: "steering" | "followUp", text: string, index: number, sending: boolean) => {
     const context = upgradeLegacyContextMessage(text);
     const records = context.records.flatMap((record) => {
       const known = asKnownContextRecord(record);
@@ -451,6 +443,7 @@ export function nativeQueuedMessages(
     });
     return {
       id: JSON.stringify([lane, index, text]),
+      lane,
       prompt: context.text,
       images: [],
       files: [],
@@ -463,8 +456,6 @@ export function nativeQueuedMessages(
       reviewComments: records.flatMap((record) =>
         record.kind === "review-comment" ? [reviewCommentFromRecord(record)] : [],
       ),
-      sendSettings: NATIVE_SEND_SETTINGS,
-      queuedAfterToolActivityId: null,
       ...(sending ? { sending: "dispatching" as const } : {}),
       createdAt,
     };
@@ -495,7 +486,7 @@ export function parseNativeQueuedMessageId(
  * follow-ups into steering, so prompts already steering (or dispatching) are skipped.
  */
 export function nextPromotableNativeQueuedMessageId(
-  queued: readonly Pick<QueuedComposerMessage, "id" | "sending">[],
+  queued: readonly Pick<NativeQueuedMessage, "id" | "sending">[],
 ): string | null {
   return (
     queued.find(

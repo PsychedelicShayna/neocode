@@ -3,6 +3,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeVM from "node:vm";
+import * as NodeURL from "node:url";
 import { build } from "vite-plus/pack";
 import { assert, it } from "vite-plus/test";
 
@@ -126,6 +127,10 @@ it("loads the emitted packaged boot entry and backend cache preload", async () =
       if (!packConfig.entry.some((entry) => entries.includes(entry))) continue;
       await build({
         ...packConfig,
+        entry: packConfig.entry.map((entry) =>
+          NodeURL.fileURLToPath(new URL(`../${entry}`, import.meta.url)),
+        ),
+        outDir: NodePath.join(directory, "dist-electron"),
         config: false,
         cwd: directory,
         tsconfig: false,

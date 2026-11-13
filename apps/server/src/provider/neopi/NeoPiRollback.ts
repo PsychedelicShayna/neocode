@@ -1,15 +1,20 @@
 // @effect-diagnostics nodeBuiltinImport:off -- compare branched session identities with Node path resolution.
 import * as NodePath from "node:path";
-import { TurnId } from "@t3tools/contracts";
-import type { NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
+import { TurnId, type NeoPiResumeCursor } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
 
-class NeoPiRollbackError extends Error {}
-export class NeoPiRollbackIntegrityError extends NeoPiRollbackError {}
+class NeoPiRollbackError extends Schema.TaggedError<NeoPiRollbackError>()("NeoPiRollbackError", {
+  message: Schema.String,
+}) {}
+export class NeoPiRollbackIntegrityError extends Schema.TaggedError<NeoPiRollbackIntegrityError>()(
+  "NeoPiRollbackIntegrityError",
+  { message: Schema.String },
+) {}
 
 /** NeoPi branch takes the user entry to REMOVE, not the entry preceding it. */
 export async function rollbackNeoPiConversation(input: {
@@ -21,10 +26,14 @@ export async function rollbackNeoPiConversation(input: {
 }): Promise<NeoPiResumeCursor> {
   const { cursor, numTurns, request, onBranched, useMessageEntryIds = false } = input;
   if (!Number.isSafeInteger(numTurns) || numTurns < 1 || numTurns > cursor.turnBoundaries.length)
-    throw new NeoPiRollbackError("rollback unavailable for turns before boundary capture");
+    throw new NeoPiRollbackError({
+      message: "rollback unavailable for turns before boundary capture",
+    });
   const removed = cursor.turnBoundaries.slice(-numTurns);
   if (removed.some((turn) => "kind" in turn && turn.kind === "unknown"))
-    throw new NeoPiRollbackError("rollback unavailable across a turn with unknown native history");
+    throw new NeoPiRollbackError({
+      message: "rollback unavailable across a turn with unknown native history",
+    });
   const target = removed.find(
     (turn): turn is Extract<typeof turn, { userEntryId: string }> => "userEntryId" in turn,
   );
@@ -33,29 +42,30 @@ export async function rollbackNeoPiConversation(input: {
       .slice(0, target ? removed.indexOf(target) : removed.length)
       .some((turn) => "kind" in turn && turn.kind === "continuation")
   )
-    throw new NeoPiRollbackError(
-      "rollback unavailable for a plan continuation without its original native turn",
-    );
+    throw new NeoPiRollbackError({
+      message: "rollback unavailable for a plan continuation without its original native turn",
+    });
   if (!target) return { ...cursor, turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns) };
   const { entries, leafId } = object(await request({ type: "get_entries" }));
   if (!Array.isArray(entries) || !(typeof leafId === "string" || leafId === null))
-    throw new NeoPiRollbackError("NeoPi did not return a valid entry ancestry");
+    throw new NeoPiRollbackError({ message: "NeoPi did not return a valid entry ancestry" });
   const byId = new Map<string, Record<string, unknown>>();
   for (const value of entries) {
     const entry = object(value);
     if (typeof entry.id !== "string" || byId.has(entry.id))
-      throw new NeoPiRollbackError("NeoPi returned duplicate or invalid entry IDs");
+      throw new NeoPiRollbackError({ message: "NeoPi returned duplicate or invalid entry IDs" });
     byId.set(entry.id, entry);
   }
   let id = leafId;
   const seen = new Set<string>();
   let selected: Record<string, unknown> | undefined;
   while (id !== null) {
-    if (seen.has(id)) throw new NeoPiRollbackError("NeoPi entry ancestry contains a cycle");
+    if (seen.has(id))
+      throw new NeoPiRollbackError({ message: "NeoPi entry ancestry contains a cycle" });
     seen.add(id);
     const entry = byId.get(id);
     if (!entry || !(typeof entry.parentId === "string" || entry.parentId === null))
-      throw new NeoPiRollbackError("NeoPi entry ancestry is incomplete");
+      throw new NeoPiRollbackError({ message: "NeoPi entry ancestry is incomplete" });
     if (id === target.userEntryId) selected = entry;
     id = entry.parentId;
   }
@@ -70,18 +80,23 @@ export async function rollbackNeoPiConversation(input: {
       selected.attribution === "user" &&
       (selected.customType === "skill-prompt" || selected.customType === "collab-prompt"));
   if (!branchable)
-    throw new NeoPiRollbackError("Rollback boundary is not a user entry on the active ancestry");
+    throw new NeoPiRollbackError({
+      message: "Rollback boundary is not a user entry on the active ancestry",
+    });
 
   const before = await readMessages(request);
   const grouped = groupNeoPiHistory(before, entries, leafId, cursor, useMessageEntryIds);
   const firstRemoved = grouped.findIndex((turn) => turn.id === target.turnId);
   if (firstRemoved < 0)
-    throw new NeoPiRollbackError("Rollback boundary is missing from native conversation history");
+    throw new NeoPiRollbackError({
+      message: "Rollback boundary is missing from native conversation history",
+    });
   const retained = grouped.slice(0, firstRemoved).flatMap((turn) => turn.items);
 
   const branch = object(await request({ type: "branch", entryId: target.userEntryId }));
   if (branch.cancelled !== false)
-    throw new NeoPiRollbackError("NeoPi cancelled conversation rollback");
+    throw new NeoPiRollbackError({ message: "NeoPi cancelled conversation rollback" });
+  let next: NeoPiResumeCursor;
   try {
     const state = object(await request({ type: "get_state" }));
     if (
@@ -92,29 +107,36 @@ export async function rollbackNeoPiConversation(input: {
       NodePath.resolve(state.sessionFile) === NodePath.resolve(cursor.sessionFile) ||
       state.sessionId === cursor.sessionId
     )
-      throw new NeoPiRollbackError("NeoPi did not report the branched session identity");
-    const next = {
-      ...cursor,
+      throw new NeoPiRollbackError({
+        message: "NeoPi did not report the branched session identity",
+      });
+    const { historyLeafId: _, ...previous } = cursor;
+    next = {
+      ...previous,
       sessionFile: NodePath.resolve(state.sessionFile),
       sessionId: state.sessionId,
       turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns),
     };
-    await onBranched?.(next);
-    const after = await readMessages(request);
-    const persisted = useMessageEntryIds
-      ? after.filter((message) => Object.hasOwn(object(message), "entryId"))
-      : after;
-    if (JSON.stringify(persisted) !== JSON.stringify(retained))
-      throw new NeoPiRollbackIntegrityError(
-        "NeoPi rollback integrity error: branched conversation still contains removed or unexpected messages",
-      );
-    return next;
   } catch (cause) {
-    if (cause instanceof NeoPiRollbackIntegrityError) throw cause;
-    throw new NeoPiRollbackIntegrityError(
-      `NeoPi rollback integrity error: cannot verify branched conversation: ${String(cause)}`,
-    );
+    throw new NeoPiRollbackIntegrityError({
+      message: `NeoPi rollback integrity error: cannot verify branched conversation: ${String(cause)}`,
+    });
   }
+  await onBranched?.(next);
+  const after = await readMessages(request);
+  const persisted = useMessageEntryIds
+    ? after.filter((message) => Object.hasOwn(object(message), "entryId"))
+    : after;
+  if (JSON.stringify(persisted) !== JSON.stringify(retained))
+    throw new NeoPiRollbackIntegrityError({
+      message:
+        "NeoPi rollback integrity error: branched conversation still contains removed or unexpected messages",
+    });
+  const branchEntries = object(await request({ type: "get_entries" }));
+  const branchLeaf = branchEntries.leafId;
+  if (branchLeaf !== null && !(typeof branchLeaf === "string" && branchLeaf.length > 0))
+    throw new NeoPiRollbackError({ message: "NeoPi did not return a valid branched history head" });
+  return { ...next, historyLeafId: branchLeaf };
 }
 
 async function readMessages(
@@ -128,11 +150,11 @@ async function readMessages(
       await request({ type: "get_messages_page", ...(cursor ? { cursor } : {}) }),
     );
     if (!Array.isArray(page.messages))
-      throw new NeoPiRollbackError("NeoPi did not return a valid conversation page");
+      throw new NeoPiRollbackError({ message: "NeoPi did not return a valid conversation page" });
     messages.push(...page.messages);
     cursor = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : undefined;
     if (cursor && seen.has(cursor))
-      throw new NeoPiRollbackError("NeoPi conversation pagination contains a cycle");
+      throw new NeoPiRollbackError({ message: "NeoPi conversation pagination contains a cycle" });
     if (cursor) seen.add(cursor);
   } while (cursor);
   return messages;
@@ -147,7 +169,7 @@ export function groupNeoPiHistory(
   useMessageEntryIds = false,
 ): Array<{ id: TurnId; items: unknown[] }> {
   if (!Array.isArray(entriesValue) || !(typeof leafValue === "string" || leafValue === null))
-    throw new NeoPiRollbackError("NeoPi did not return a valid transcript ancestry");
+    throw new NeoPiRollbackError({ message: "NeoPi did not return a valid transcript ancestry" });
   const byId = new Map<string, Record<string, unknown>>();
   for (const value of entriesValue) {
     const entry = object(value);
@@ -157,11 +179,12 @@ export function groupNeoPiHistory(
   const seen = new Set<string>();
   let id = leafValue;
   while (id !== null) {
-    if (seen.has(id)) throw new NeoPiRollbackError("NeoPi transcript ancestry contains a cycle");
+    if (seen.has(id))
+      throw new NeoPiRollbackError({ message: "NeoPi transcript ancestry contains a cycle" });
     seen.add(id);
     const entry = byId.get(id);
     if (!entry || !(typeof entry.parentId === "string" || entry.parentId === null))
-      throw new NeoPiRollbackError("NeoPi transcript ancestry is incomplete");
+      throw new NeoPiRollbackError({ message: "NeoPi transcript ancestry is incomplete" });
     ancestry.push(entry);
     id = entry.parentId;
   }
@@ -175,7 +198,9 @@ export function groupNeoPiHistory(
     if (!("kind" in boundary) || boundary.kind !== "continuation") continue;
     const preceding = ancestry.findIndex((entry) => entry.id === boundary.afterEntryId);
     if (preceding < 0)
-      throw new NeoPiRollbackError("NeoPi plan continuation boundary left the active ancestry");
+      throw new NeoPiRollbackError({
+        message: "NeoPi plan continuation boundary left the active ancestry",
+      });
     const next = ancestry[preceding + 1];
     if (next && typeof next.id === "string") boundaries.set(next.id, boundary.turnId);
   }
@@ -185,7 +210,9 @@ export function groupNeoPiHistory(
       const entryId = object(message).entryId;
       if (entryId === undefined && !Object.hasOwn(object(message), "entryId")) continue;
       if (typeof entryId !== "string" || !seen.has(entryId))
-        throw new NeoPiRollbackError("NeoPi transcript contains an unmatched native entry id");
+        throw new NeoPiRollbackError({
+          message: "NeoPi transcript contains an unmatched native entry id",
+        });
       const items = byEntry.get(entryId);
       if (items) items.push(message);
       else byEntry.set(entryId, [message]);
@@ -222,6 +249,8 @@ export function groupNeoPiHistory(
     turns[turns.length - 1]!.items.push(messages[messageIndex++]);
   }
   if (messageIndex !== messages.length)
-    throw new NeoPiRollbackError("NeoPi transcript contains unmatched native messages");
+    throw new NeoPiRollbackError({
+      message: "NeoPi transcript contains unmatched native messages",
+    });
   return turns;
 }

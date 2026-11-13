@@ -5,11 +5,11 @@ import {
   type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
 
-export const TAB_STATUS = {
+const TAB_STATUS = {
   attention: { label: "Waiting for your answer", dot: "bg-primary" },
   working: { label: "Working", dot: "bg-warning" },
   terminal: { label: "Following a terminal", dot: "bg-info" },

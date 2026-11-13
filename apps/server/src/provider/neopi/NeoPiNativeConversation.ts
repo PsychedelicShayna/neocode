@@ -8,8 +8,6 @@ import {
   type NeoPiNavigateTreeInput,
   type NeoPiResumeTreeInput,
   type NeoPiTreeOperationResult,
-  type NeoPiTreeResumeResult,
-  type NeoPiTreeCancelResult,
   type ThreadId,
   type NeoPiSessionJournalResult,
 } from "@t3tools/contracts";
@@ -31,6 +29,22 @@ import {
 import type { NeoPiConfigurationIdentity } from "./NeoPiSessionConfiguration.ts";
 import { makeNeoPiSessionJournal } from "./NeoPiSessionJournal.ts";
 import type { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
+
+const decodeJournalBoundary = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    sessionId: Schema.String,
+    sessionFile: Schema.NullOr(Schema.String),
+    leafId: Schema.NullOr(Schema.String),
+  }),
+);
+const decodeNativeRecord = Schema.decodeUnknownEffect(NeoPiNativeRecord);
+const decodeJournalEvent = Schema.decodeUnknownEffect(NeoPiJournalNativeEvent);
+const decodeStreamingSnapshot = Schema.decodeUnknownEffect(NeoPiStreamingMessageSnapshot);
+const decodeNativeFrame = Schema.decodeEffect(NeoPiNativeFrame);
+const decodeNavigateResult = Schema.decodeUnknownEffect(NeoPiNavigateTreeResult);
+const decodeResumeResult = Schema.decodeUnknownEffect(
+  Schema.Struct({ resumed: Schema.Literal(true) }),
+);
 
 const liveTypes = new Set([
   "journal_state",
@@ -83,13 +97,9 @@ export const observeNeoPiNativeOwner = (
           ),
         );
       if (owner.capabilities.has("session_journal_events")) {
-        const boundary = yield* Schema.decodeUnknownEffect(
-          Schema.Struct({
-            sessionId: Schema.String,
-            sessionFile: Schema.NullOr(Schema.String),
-            leafId: Schema.NullOr(Schema.String),
-          }),
-        )(yield* owner.request({ type: "snapshot_session_journal" }));
+        const boundary = yield* decodeJournalBoundary(
+          yield* owner.request({ type: "snapshot_session_journal" }),
+        );
         if (
           boundary.sessionFile === null ||
           !sameNeoPiJournalIdentity(
@@ -108,9 +118,7 @@ export const observeNeoPiNativeOwner = (
             ),
           );
       }
-      const state = yield* Schema.decodeUnknownEffect(NeoPiNativeRecord)(
-        yield* owner.request({ type: "get_state" }),
-      );
+      const state = yield* decodeNativeRecord(yield* owner.request({ type: "get_state" }));
       const page = yield* readNeoPiJournalPeer(
         owner,
         expected,
@@ -156,9 +164,8 @@ export const observeNeoPiNativeOwner = (
               event.type === "journal_entry" ||
               event.type === "message_persisted";
             const streamingSnapshot = event.type === "message_start" && event.snapshot === true;
-            if (journalEvent) yield* Schema.decodeUnknownEffect(NeoPiJournalNativeEvent)(event);
-            if (streamingSnapshot)
-              yield* Schema.decodeUnknownEffect(NeoPiStreamingMessageSnapshot)(event);
+            if (journalEvent) yield* decodeJournalEvent(event);
+            if (streamingSnapshot) yield* decodeStreamingSnapshot(event);
             if (journalEvent || streamingSnapshot) {
               if (
                 typeof event.sessionId !== "string" ||
@@ -179,7 +186,7 @@ export const observeNeoPiNativeOwner = (
             }
             return {
               type: "native" as const,
-              event: yield* Schema.decodeUnknownEffect(NeoPiNativeFrame)(event),
+              event: yield* decodeNativeFrame(event),
             };
           }),
         ),
@@ -225,139 +232,142 @@ type ResolveOwner = (threadId: ThreadId) => Effect.Effect<
   Scope.Scope
 >;
 
-export const makeNeoPiNativeConversationWith = (
-  resolve: ResolveOwner,
-  resolveFile: (file: string) => ReturnType<FileSystem.FileSystem["realPath"]>,
-  startStopped: (input: NeoPiNavigateTreeInput) => Effect.Effect<void, NeoPiRuntimeError> = () =>
-    Effect.void,
-  readStopped?: (threadId: ThreadId) => Effect.Effect<NeoPiSessionJournalResult>,
-) =>
-  Effect.gen(function* () {
-    const pending = new Map<ThreadId, NeoPiNativeOwner>();
-    const watch = (threadId: ThreadId) =>
-      Stream.unwrap(
-        Effect.gen(function* () {
-          const resolved = yield* resolve(threadId);
-          if (!resolved) {
-            const snapshot = readStopped ? yield* readStopped(threadId) : undefined;
-            if (snapshot?.status === "available")
-              return Stream.fromIterable<NeoPiJournalStreamEvent>([
-                {
-                  type: "connection",
-                  status: "unavailable",
-                  ownership: "unknown",
-                  canNavigate: false,
-                  reason:
-                    "Read-only native history. No live owner observer is available. Start a stopped session explicitly to navigate its tree.",
-                },
-                { type: "snapshot", page: snapshot.page },
-              ]);
-            return Stream.succeed(
-              connection(
-                "unavailable",
-                snapshot?.status === "error"
-                  ? snapshot.message
-                  : (snapshot?.reason ??
-                      "No readable native owner is connected. History remains available without starting a session."),
-              ),
-            );
-          }
-          return observeNeoPiNativeOwner(resolved.owner, resolved.expected, resolveFile);
-        }),
-      ).pipe(
-        Stream.catch((cause) =>
-          Stream.succeed(connection("disconnected", neoPiJournalError(cause).message)),
-        ),
-      );
-    const navigate = (input: NeoPiNavigateTreeInput): Effect.Effect<NeoPiTreeOperationResult> =>
-      Effect.gen(function* () {
-        if (pending.has(input.threadId))
-          return {
-            status: "error" as const,
-            code: "session_busy",
-            message: "A native tree navigation is already pending.",
-          };
-        let resolved = yield* resolve(input.threadId);
-        if (!resolved && input.startIfStopped) {
-          yield* startStopped(input);
-          resolved = yield* resolve(input.threadId);
-        }
-        if (!resolved)
-          return unavailable(
-            "Start or resume this native session explicitly before navigating its tree.",
-          );
-        if (!resolved.owner.capabilities.has("session_tree_navigation"))
-          return unavailable("The existing native owner does not support session_tree_navigation.");
-        const { threadId, startIfStopped: _, ...options } = input;
-        if (
-          options.expectedSessionId !== resolved.expected.sessionId ||
-          options.expectedSessionFile !== resolved.expected.sessionFile
-        )
-          return {
-            status: "error" as const,
-            code: "session_changed",
-            message: "Navigation does not match the thread's canonical native binding.",
-          };
-        if (pending.has(threadId))
-          return {
-            status: "error" as const,
-            code: "session_busy",
-            message: "A native tree navigation is already pending.",
-          };
-        pending.set(threadId, resolved.owner);
-        return yield* Effect.gen(function* () {
-          const result = yield* Schema.decodeUnknownEffect(NeoPiNavigateTreeResult)(
-            yield* resolved.owner.request({ type: "navigate_tree", ...options }),
-          );
-          return { status: "available" as const, result };
-        }).pipe(
-          Effect.onInterrupt(() => resolved.owner.request({ type: "abort" }).pipe(Effect.ignore)),
-          Effect.ensuring(
-            Effect.sync(() => {
-              pending.delete(threadId);
-            }),
+export const makeNeoPiNativeConversationWith = Effect.fn("NeoPiNativeConversation.makeWith")(
+  (
+    resolve: ResolveOwner,
+    resolveFile: (file: string) => ReturnType<FileSystem.FileSystem["realPath"]>,
+    startStopped: (input: NeoPiNavigateTreeInput) => Effect.Effect<void, NeoPiRuntimeError> = () =>
+      Effect.void,
+    readStopped?: (threadId: ThreadId) => Effect.Effect<NeoPiSessionJournalResult>,
+  ) =>
+    Effect.sync(() => {
+      const pending = new Map<ThreadId, NeoPiNativeOwner | undefined>();
+      const watch = (threadId: ThreadId) =>
+        Stream.unwrap(
+          Effect.gen(function* () {
+            const resolved = yield* resolve(threadId);
+            if (!resolved) {
+              const snapshot = readStopped ? yield* readStopped(threadId) : undefined;
+              if (snapshot?.status === "available")
+                return Stream.fromIterable<NeoPiJournalStreamEvent>([
+                  {
+                    type: "connection",
+                    status: "unavailable",
+                    ownership: "unknown",
+                    canNavigate: false,
+                    reason:
+                      "Read-only native history. No live owner observer is available. Start a stopped session explicitly to navigate its tree.",
+                  },
+                  { type: "snapshot", page: snapshot.page },
+                ]);
+              return Stream.succeed(
+                connection(
+                  "unavailable",
+                  snapshot?.status === "error"
+                    ? snapshot.message
+                    : (snapshot?.reason ??
+                        "No readable native owner is connected. History remains available without starting a session."),
+                ),
+              );
+            }
+            return observeNeoPiNativeOwner(resolved.owner, resolved.expected, resolveFile);
+          }),
+        ).pipe(
+          Stream.catch((cause) =>
+            Stream.succeed(connection("disconnected", neoPiJournalError(cause).message)),
           ),
         );
-      }).pipe(
-        Effect.scoped,
-        Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))),
-      );
-    const resume = (input: NeoPiResumeTreeInput): Effect.Effect<NeoPiTreeResumeResult> =>
-      Effect.gen(function* () {
-        const resolved = yield* resolve(input.threadId);
-        if (!resolved)
-          return unavailable("The native owner is disconnected. No ask continuation was started.");
-        if (!resolved.owner.capabilities.has("session_tree_navigation"))
-          return unavailable("The native owner does not support session_tree_navigation.");
-        const { threadId: _, ...options } = input;
-        if (
-          options.expectedSessionId !== resolved.expected.sessionId ||
-          options.expectedSessionFile !== resolved.expected.sessionFile
-        )
-          return {
-            status: "error" as const,
-            code: "session_changed",
-            message: "Resume does not match the thread's canonical native binding.",
-          };
-        const result = yield* Schema.decodeUnknownEffect(
-          Schema.Struct({ resumed: Schema.Literal(true) }),
-        )(yield* resolved.owner.request({ type: "resume_tree", ...options }));
-        return { status: "available" as const, result };
-      }).pipe(
-        Effect.scoped,
-        Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))),
-      );
-    const cancel = (threadId: ThreadId): Effect.Effect<NeoPiTreeCancelResult> =>
-      Effect.gen(function* () {
-        const owner = pending.get(threadId);
-        if (!owner)
-          return unavailable(
-            "There is no NeoCode navigation to cancel. No native turn was interrupted.",
+      const navigate = (input: NeoPiNavigateTreeInput): Effect.Effect<NeoPiTreeOperationResult> =>
+        Effect.suspend(() => {
+          if (pending.has(input.threadId))
+            return Effect.succeed({
+              status: "error" as const,
+              code: "session_busy",
+              message: "A native tree navigation is already pending.",
+            });
+          pending.set(input.threadId, undefined);
+          return Effect.gen(function* () {
+            let resolved = yield* resolve(input.threadId);
+            if (!resolved && input.startIfStopped) {
+              yield* startStopped(input);
+              resolved = yield* resolve(input.threadId);
+            }
+            if (!resolved)
+              return unavailable(
+                "Start or resume this native session explicitly before navigating its tree.",
+              );
+            if (!resolved.owner.capabilities.has("session_tree_navigation"))
+              return unavailable(
+                "The existing native owner does not support session_tree_navigation.",
+              );
+            const { threadId, startIfStopped: _, ...options } = input;
+            if (
+              options.expectedSessionId !== resolved.expected.sessionId ||
+              options.expectedSessionFile !== resolved.expected.sessionFile
+            )
+              return {
+                status: "error" as const,
+                code: "session_changed",
+                message: "Navigation does not match the thread's canonical native binding.",
+              };
+            pending.set(threadId, resolved.owner);
+            return yield* Effect.gen(function* () {
+              const result = yield* decodeNavigateResult(
+                yield* resolved.owner.request({ type: "navigate_tree", ...options }),
+              );
+              return { status: "available" as const, result };
+            }).pipe(
+              Effect.onInterrupt(() =>
+                resolved.owner.request({ type: "abort" }).pipe(Effect.ignore),
+              ),
+            );
+          }).pipe(
+            Effect.scoped,
+            Effect.ensuring(Effect.sync(() => pending.delete(input.threadId))),
+            Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))),
           );
-        return { status: "available" as const, result: yield* owner.request({ type: "abort" }) };
-      }).pipe(Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))));
-    return { watch, navigate, resume, cancel };
-  });
+        });
+      const resume = Effect.fn("NeoPiNativeConversation.resume")(
+        function* (input: NeoPiResumeTreeInput) {
+          const resolved = yield* resolve(input.threadId);
+          if (!resolved)
+            return unavailable(
+              "The native owner is disconnected. No ask continuation was started.",
+            );
+          if (!resolved.owner.capabilities.has("session_tree_navigation"))
+            return unavailable("The native owner does not support session_tree_navigation.");
+          const { threadId: _, ...options } = input;
+          if (
+            options.expectedSessionId !== resolved.expected.sessionId ||
+            options.expectedSessionFile !== resolved.expected.sessionFile
+          )
+            return {
+              status: "error" as const,
+              code: "session_changed" as const,
+              message: "Resume does not match the thread's canonical native binding.",
+            };
+          const result = yield* decodeResumeResult(
+            yield* resolved.owner.request({ type: "resume_tree", ...options }),
+          );
+          return { status: "available" as const, result };
+        },
+        Effect.scoped,
+        Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))),
+      );
+      const cancel = Effect.fn("NeoPiNativeConversation.cancel")(
+        function* (threadId: ThreadId) {
+          const owner = pending.get(threadId);
+          if (!owner)
+            return unavailable(
+              "There is no NeoCode navigation to cancel. No native turn was interrupted.",
+            );
+          return { status: "available" as const, result: yield* owner.request({ type: "abort" }) };
+        },
+        Effect.catch((cause) => Effect.succeed(neoPiJournalError(cause))),
+      );
+      return { watch, navigate, resume, cancel };
+    }),
+);
 
 export const makeNeoPiNativeConversation = Effect.fn("NeoPiNativeConversation.make")(function* () {
   const resolve = yield* makeNeoPiNativeOwnerResolver();

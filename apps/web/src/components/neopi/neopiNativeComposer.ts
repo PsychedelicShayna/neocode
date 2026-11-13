@@ -1,6 +1,9 @@
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
 import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
-import { collectComposerContextReferences } from "@t3tools/shared/composerContextReferences";
+import {
+  collectComposerContextReferences,
+  toKindScopedComposerContextId,
+} from "@t3tools/shared/composerContextReferences";
 import * as Schema from "effect/Schema";
 import { flushSync } from "react-dom";
 import {
@@ -18,7 +21,6 @@ import {
   releaseDraftAttachments,
   startAttachmentUpload,
 } from "../../lib/attachmentUploadQueue";
-import { toKindScopedComposerContextId } from "../../lib/composerContextReferences";
 import {
   buildMessageContext,
   previewAnnotationContextId,
@@ -100,6 +102,8 @@ export async function prepareNativePrompt(
     terminalContexts: snapshot.terminalContexts,
     reviewComments: snapshot.reviewComments,
     previewAnnotations: snapshot.previewAnnotations,
+    threadContexts: snapshot.threadContexts,
+    environmentContexts: snapshot.environmentContexts,
     attachments: media.map((attachment, index) => ({
       attachment,
       attachmentId: attachments[index]!.id,
@@ -114,12 +118,9 @@ export async function prepareNativePrompt(
   };
 }
 
-function hasRevisedRecord<T extends { id: string }>(
-  submitted: readonly T[],
-  current: readonly T[],
-) {
+function hasRevisedRecord<T>(submitted: readonly T[], current: readonly T[], key: keyof T) {
   return submitted.some((sent) =>
-    current.some((record) => record.id === sent.id && !sameRecord(record, sent)),
+    current.some((record) => record[key] === sent[key] && !sameRecord(record, sent)),
   );
 }
 
@@ -130,9 +131,11 @@ export function remainingNativeDraft(
 ): ComposerThreadDraftState {
   if (
     !current.prompt.startsWith(submitted.prompt) ||
-    hasRevisedRecord(submitted.terminalContexts, current.terminalContexts) ||
-    hasRevisedRecord(submitted.previewAnnotations, current.previewAnnotations) ||
-    hasRevisedRecord(submitted.reviewComments, current.reviewComments) ||
+    hasRevisedRecord(submitted.terminalContexts, current.terminalContexts, "id") ||
+    hasRevisedRecord(submitted.previewAnnotations, current.previewAnnotations, "id") ||
+    hasRevisedRecord(submitted.reviewComments, current.reviewComments, "id") ||
+    hasRevisedRecord(submitted.threadContexts, current.threadContexts, "contextId") ||
+    hasRevisedRecord(submitted.environmentContexts, current.environmentContexts, "contextId") ||
     submitted.images.some((sent) =>
       current.images.some((image) => image.id === sent.id && image.file !== sent.file),
     ) ||
@@ -170,6 +173,16 @@ export function remainingNativeDraft(
       !submitted.reviewComments.some((sent) => sameRecord(sent, comment)) ||
       referenced.has(reviewCommentContextId(comment.id)),
   );
+  const threadContexts = current.threadContexts.filter(
+    (record) =>
+      !submitted.threadContexts.some((sent) => sameRecord(sent, record)) ||
+      referenced.has(record.contextId),
+  );
+  const environmentContexts = current.environmentContexts.filter(
+    (record) =>
+      !submitted.environmentContexts.some((sent) => sameRecord(sent, record)) ||
+      referenced.has(record.contextId),
+  );
   const imageIds = new Set(images.map((image) => image.id));
   return {
     ...current,
@@ -179,6 +192,8 @@ export function remainingNativeDraft(
     terminalContexts,
     previewAnnotations,
     reviewComments,
+    threadContexts,
+    environmentContexts,
     persistedAttachments: current.persistedAttachments.filter((image) => imageIds.has(image.id)),
     nonPersistedImageIds: current.nonPersistedImageIds.filter((id) => imageIds.has(id)),
   };
@@ -252,6 +267,8 @@ export function remainingNativePersistedDraft(
     })),
     previewAnnotations: [...(submitted.previewAnnotations ?? [])],
     reviewComments: [...(submitted.reviewComments ?? [])],
+    threadContexts: [...(submitted.threadContexts ?? [])],
+    environmentContexts: [...(submitted.environmentContexts ?? [])],
   });
 }
 
@@ -329,6 +346,7 @@ export function consumeNativeDraft(
         sizeBytes,
         file,
       })),
+      // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel is same-origin and has no target-origin argument
     });
   } catch (cause) {
     // Native acceptance is durable even if another window cannot be notified.

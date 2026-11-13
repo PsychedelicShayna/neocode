@@ -1,14 +1,7 @@
 import type { NeoPiJournalEntry } from "@t3tools/contracts";
 import { journalRecord } from "./neopiJournal.ts";
 
-/**
- * Projection of a native NeoPi journal branch into transcript rows: user
- * prompts, assistant prose, thought, one row per tool call joined with its
- * result, and quiet system notes. The web client maps these rows onto the
- * stock T3 timeline rather than drawing them itself.
- * Native records stay attached to every row (`entry`) so a debug affordance
- * can reveal the canonical JSON without the projection losing anything.
- */
+// Keep canonical records on projected rows so debug views stay lossless.
 
 export interface TranscriptImage {
   readonly src: string;
@@ -137,7 +130,7 @@ export interface TranscriptOptions {
   readonly commandOutputs?: ReadonlyMap<string | null, ReadonlyArray<CommandRow>>;
 }
 
-export function blockText(content: unknown): string {
+function blockText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -233,7 +226,7 @@ const TOOL_VERB: Record<string, string> = {
   new_context: "Requested a new context window",
 };
 
-export function toolDetail(name: string, args: Record<string, unknown>): string | null {
+function toolDetail(name: string, args: Record<string, unknown>): string | null {
   for (const key of TOOL_DETAIL_KEYS[name] ?? []) {
     const value = args[key];
     if (typeof value === "string" && value.trim().length > 0) {
@@ -248,7 +241,7 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   return null;
 }
 
-export function toolLabel(call: ToolCall, detail: string | null): string {
+function toolLabel(call: ToolCall, detail: string | null): string {
   if (call.intent) return call.intent;
   const verb = TOOL_VERB[call.name];
   if (verb && detail) return `${verb} ${detail}`;
@@ -846,13 +839,7 @@ const rowsById = (rows: ReadonlyArray<TranscriptRow>, from = 0) => {
   return byId;
 };
 
-/**
- * `projectTranscript` for one conversation across its updates. Streaming only
- * replaces live messages, so persisted entries project once and a delta
- * re-projects just the live tail; an appended entry resumes from the last
- * entry. Rows equal to the previous projection's keep their identity, so
- * memoized consumers see only what changed.
- */
+// Project persisted entries once and replace only the live tail, retaining unchanged row identities.
 export function createTranscriptProjector() {
   let cached: PersistedProjection | null = null;
   let last: { rows: ReadonlyArray<TranscriptRow>; tail: Map<string, TranscriptRow> } | null = null;

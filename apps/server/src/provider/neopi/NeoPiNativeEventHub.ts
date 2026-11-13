@@ -1,5 +1,4 @@
 import type { SessionEventFrame } from "effect-neopi-rpc/client";
-import type { OrchestrationGetSnapshotError } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
@@ -8,7 +7,8 @@ import * as Stream from "effect/Stream";
 import {
   makeLiveStreamBudget,
   type RetainedLiveItem,
-} from "../../orchestration/LiveStreamBudget.ts";
+  type LiveStreamBufferError,
+} from "../../orchestration-v2/LiveStreamBudget.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
 /** Each window has one bounded queue. A slow window cannot stop the native owner. */
@@ -22,7 +22,7 @@ export const makeNeoPiNativeEventHub = () => {
     });
     const queue = yield* Queue.unbounded<
       RetainedLiveItem<SessionEventFrame>,
-      OrchestrationGetSnapshotError | Cause.Done<void>
+      LiveStreamBufferError | Cause.Done<void>
     >();
     const accept = (frame: SessionEventFrame) =>
       budget.retain(frame).pipe(

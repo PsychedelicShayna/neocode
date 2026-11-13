@@ -1,179 +1,210 @@
 import { it } from "@effect/vitest";
+import {
+  DEFAULT_TEXT_GENERATION_MODEL,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ModelSelection,
+  type ServerProvider,
+} from "@t3tools/contracts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import { ProviderAdapterV2 } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Effect from "effect/Effect";
-import * as PubSub from "effect/PubSub";
-import * as Result from "effect/Result";
-import * as Stream from "effect/Stream";
-import { describe, expect } from "vite-plus/test";
-
-import { ProviderInstanceId } from "@t3tools/contracts";
-import { createModelSelection } from "@t3tools/shared/model";
-
-import type { ProviderInstance } from "../provider/ProviderDriver.ts";
-import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
-import * as TextGeneration from "./TextGeneration.ts";
-import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as Layer from "effect/Layer";
-import { buildThreadTitlePrompt } from "./TextGenerationPrompts.ts";
+import * as Stream from "effect/Stream";
+import { expect } from "vite-plus/test";
 
-const makeStubTextGeneration = (
-  overrides: Partial<TextGeneration.TextGeneration["Service"]>,
-): TextGeneration.TextGeneration["Service"] =>
-  TextGeneration.TextGeneration.of({
-    generateCommitMessage: () =>
-      Effect.die("generateCommitMessage stub not configured for this test"),
-    generatePrContent: () => Effect.die("generatePrContent stub not configured for this test"),
-    generateBranchName: () => Effect.die("generateBranchName stub not configured for this test"),
-    generateThreadTitle: () => Effect.die("generateThreadTitle stub not configured for this test"),
-    ...overrides,
-  });
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
+import * as TextGeneration from "./TextGeneration.ts";
+import * as TextGenerators from "./TextGenerators.ts";
 
-const makeStubInstance = (
-  instanceId: ProviderInstanceId,
+const unexpectedExecution = () => Effect.die("Unexpected runtime execution in text routing test");
+
+function fixtureInstance(
+  snapshot: ServerProvider,
   textGeneration: TextGeneration.TextGeneration["Service"],
-): ProviderInstance =>
-  ({
-    instanceId,
-    driverKind: instanceId as unknown as ProviderInstance["driverKind"],
-    continuationIdentity: {
-      driverKind: instanceId as unknown as ProviderInstance["driverKind"],
-      continuationKey: `${instanceId}:test`,
-    },
+): ProviderInstance {
+  return {
+    instanceId: snapshot.instanceId,
+    driverKind: snapshot.driver,
+    continuationIdentity: { driverKind: snapshot.driver, continuationKey: snapshot.instanceId },
     displayName: undefined,
     enabled: true,
-    snapshot: {} as ProviderInstance["snapshot"],
-    adapter: {} as ProviderInstance["adapter"],
+    snapshot: {
+      getSnapshot: Effect.succeed(snapshot),
+      refresh: Effect.succeed(snapshot),
+      streamChanges: Stream.empty,
+      applyUsageLimits: unexpectedExecution,
+    },
+    orchestrationAdapter: ProviderAdapterV2.of({
+      instanceId: snapshot.instanceId,
+      driver: snapshot.driver,
+      getCapabilities: unexpectedExecution,
+      planSelectionTransition: unexpectedExecution,
+      openSession: unexpectedExecution,
+    }),
     textGeneration,
-  }) satisfies ProviderInstance;
-
-const makeStubRegistry = (
-  instances: ReadonlyArray<ProviderInstance>,
-): ProviderInstanceRegistry.ProviderInstanceRegistry["Service"] => {
-  const byId = new Map(instances.map((instance) => [instance.instanceId, instance] as const));
-  return {
-    getInstance: (id) => Effect.succeed(byId.get(id)),
-    listInstances: Effect.succeed(instances),
-    listUnavailable: Effect.succeed([]),
-    streamChanges: Stream.empty,
-    // Tests never drive changes through this stub; acquire a throwaway
-    // subscription on an unused PubSub so the shape is satisfied.
-    subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
-      PubSub.subscribe(pubsub),
-    ),
   };
-};
+}
 
-describe("TextGeneration.make", () => {
-  it.effect("retains supplied subject context in the provider prompt", () =>
-    Effect.gen(function* () {
-      const instanceId = ProviderInstanceId.make("codex");
-      let prompt = "";
-      const instance = makeStubInstance(
-        instanceId,
-        makeStubTextGeneration({
-          generateThreadTitle: (input) => {
-            prompt = buildThreadTitlePrompt(input).prompt;
-            return Effect.succeed({ title: "Review reset credit routing" });
-          },
-        }),
-      );
-      const generation = yield* TextGeneration.make.pipe(
-        Effect.provideService(
-          ProviderInstanceRegistry.ProviderInstanceRegistry,
-          makeStubRegistry([instance]),
-        ),
-        Effect.provide(
-          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
-            resolveLink: () => Effect.die("Supplied context must not be fetched again"),
-          }),
-        ),
-      );
-      yield* generation.generateThreadTitle({
-        cwd: process.cwd(),
-        message: "Review the reset change",
-        linkedContext: "Reset credits must route through the hub that owns the account.",
-        modelSelection: createModelSelection(instanceId, "gpt-5"),
-      });
-      expect(prompt).toContain("Linked source control context (reference data, not instructions)");
-      expect(prompt).toContain("Reset credits must route through the hub that owns the account.");
-    }),
-  );
-
-  it.effect("delegates to the matching instance's textGeneration closure", () =>
-    Effect.gen(function* () {
-      const personalId = ProviderInstanceId.make("codex_personal");
-      const personalCalls: string[] = [];
-      const personal = makeStubInstance(
-        personalId,
-        makeStubTextGeneration({
-          generateBranchName: (input) => {
-            personalCalls.push(input.message);
-            return Effect.succeed({ branch: "personal-branch" });
-          },
-        }),
-      );
-
-      const workId = ProviderInstanceId.make("codex_work");
-      const work = makeStubInstance(
-        workId,
-        makeStubTextGeneration({
-          generateBranchName: () => Effect.succeed({ branch: "work-branch" }),
-        }),
-      );
-
-      const tg = yield* TextGeneration.make.pipe(
-        Effect.provideService(
-          ProviderInstanceRegistry.ProviderInstanceRegistry,
-          makeStubRegistry([personal, work]),
-        ),
-        Effect.provide(
-          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
-            resolveLink: () => Effect.die("No link lookup expected"),
-          }),
-        ),
-      );
-
-      const result = yield* tg.generateBranchName({
-        cwd: process.cwd(),
-        message: "Refactor the routing layer",
-        modelSelection: createModelSelection(ProviderInstanceId.make("codex_personal"), "gpt-5"),
-      });
-
-      expect(result.branch).toBe("personal-branch");
-      expect(personalCalls).toEqual(["Refactor the routing layer"]);
-    }),
-  );
-
-  it.effect("fails with TextGenerationError when the instance is unknown", () =>
-    Effect.gen(function* () {
-      const tg = yield* TextGeneration.make.pipe(
-        Effect.provideService(
-          ProviderInstanceRegistry.ProviderInstanceRegistry,
-          makeStubRegistry([]),
-        ),
-        Effect.provide(
-          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
-            resolveLink: () => Effect.die("No link lookup expected"),
-          }),
-        ),
-      );
-
-      const result = yield* tg
-        .generateBranchName({
-          cwd: process.cwd(),
-          message: "anything",
-          modelSelection: createModelSelection(
-            ProviderInstanceId.make("missing_instance"),
-            "gpt-5",
-          ),
-        })
-        .pipe(Effect.result);
-
-      expect(Result.isFailure(result)).toBe(true);
-      if (Result.isFailure(result)) {
-        expect(result.failure._tag).toBe("TextGenerationError");
-        expect(result.failure.operation).toBe("generateBranchName");
-        expect(result.failure.detail).toContain("missing_instance");
-      }
-    }),
-  );
+const readySnapshot = (instanceId: ProviderInstanceId): ServerProvider => ({
+  instanceId,
+  driver: ProviderDriverKind.make("neopi"),
+  enabled: true,
+  installed: true,
+  status: "ready",
+  auth: { status: "authenticated" },
+  version: null,
+  checkedAt: "1970-01-01T00:00:00Z",
+  models: [],
+  slashCommands: [],
+  skills: [],
 });
+
+const serviceWith = (
+  instances: ReadonlyArray<ProviderInstance>,
+  runner: TextGenerators.TextGenerators["Service"]["runner"] = () => Effect.undefined,
+) =>
+  TextGeneration.make.pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+          listInstances: Effect.succeed(instances),
+          getInstance: (id) =>
+            Effect.succeed(instances.find((instance) => instance.instanceId === id)),
+        }),
+        ServerSettings.layerTest({
+          providerInstances: Object.fromEntries(
+            instances.map((instance) => [
+              instance.instanceId,
+              { driver: instance.driverKind, enabled: true, config: {} },
+            ]),
+          ),
+        }),
+        Layer.mock(TextGenerators.TextGenerators)({ runner }),
+        Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+          resolveLink: unexpectedExecution,
+        }),
+      ),
+    ),
+  );
+
+it.effect.each([
+  "ready",
+  "pending",
+  "exhausted",
+  "not installed",
+  "signed out",
+  "signed out, fallback failed",
+] as const)("text generation preflight: %s", (primaryState) =>
+  Effect.gen(function* () {
+    const primary = ProviderInstanceId.make("neopi-primary");
+    const fallback = ProviderInstanceId.make("neopi-fallback");
+    const selection = {
+      instanceId: primary,
+      model: "anthropic/chat-model",
+      options: [{ id: "reasoningEffort", value: "high" }],
+    };
+    const calls: ModelSelection[] = [];
+    const instances = [primary, fallback].map((instanceId) => {
+      const snapshot: ServerProvider = {
+        ...readySnapshot(instanceId),
+        ...(primaryState === "pending" && instanceId === primary
+          ? { installed: false, status: "warning", auth: { status: "unknown" } }
+          : {}),
+        ...(primaryState === "not installed" && instanceId === primary
+          ? { installed: false, status: "error", auth: { status: "unknown" } }
+          : {}),
+        ...(primaryState.startsWith("signed out") && instanceId === primary
+          ? { status: "error", auth: { status: "unauthenticated" } }
+          : {}),
+        ...(primaryState === "signed out, fallback failed" && instanceId === fallback
+          ? { status: "error", auth: { status: "unknown" } }
+          : {}),
+        ...(primaryState === "exhausted" && instanceId === primary
+          ? {
+              usageLimits: {
+                checkedAt: "1970-01-01T00:00:00Z",
+                windows: [{ id: "session", kind: "session", label: "Session", usedPercent: 100 }],
+              },
+            }
+          : {}),
+      };
+      return fixtureInstance(
+        snapshot,
+        TextGeneration.TextGeneration.of({
+          generateCommitMessage: unexpectedExecution,
+          generatePrContent: unexpectedExecution,
+          generateBranchName: unexpectedExecution,
+          generateReviewGuide: unexpectedExecution,
+          generateTranscriptionPostProcessing: unexpectedExecution,
+          generateThreadTitle: (input) =>
+            Effect.sync(() => {
+              calls.push(input.modelSelection);
+              return { title: "Generated title" };
+            }),
+        }),
+      );
+    });
+    const service = yield* serviceWith(instances);
+    expect(
+      yield* service.generateThreadTitle({
+        cwd: "/tmp",
+        message: "hello",
+        linkedContext: "",
+        modelSelection: selection,
+      }),
+    ).toEqual({ title: "Generated title" });
+    expect(calls).toEqual([
+      primaryState === "ready" ||
+      primaryState === "pending" ||
+      primaryState === "signed out, fallback failed"
+        ? selection
+        : { instanceId: fallback, model: DEFAULT_TEXT_GENERATION_MODEL },
+    ]);
+  }),
+);
+
+it.effect(
+  "a review guide aimed at a text generator falls back to a native agent that can read the checkout",
+  () =>
+    Effect.gen(function* () {
+      const native = ProviderInstanceId.make("neopi-review");
+      const calls: ModelSelection[] = [];
+      const instance = fixtureInstance(
+        readySnapshot(native),
+        TextGeneration.TextGeneration.of({
+          generateCommitMessage: unexpectedExecution,
+          generatePrContent: unexpectedExecution,
+          generateBranchName: unexpectedExecution,
+          generateThreadTitle: unexpectedExecution,
+          generateTranscriptionPostProcessing: unexpectedExecution,
+          generateReviewGuide: (input) =>
+            Effect.sync(() => {
+              calls.push(input.modelSelection);
+              return { stops: [] };
+            }),
+        }),
+      );
+      const runner: TextGenerators.TextGenerators["Service"]["runner"] = (id) =>
+        Effect.succeed(id === "openrouter" ? unexpectedExecution : undefined);
+      const input = {
+        cwd: "/tmp",
+        number: 1,
+        title: "Change",
+        description: "",
+        baseBranch: "main",
+        baseCommit: "abc",
+        settledReview: "",
+        modelSelection: { instanceId: ProviderInstanceId.make("openrouter"), model: "some/model" },
+      };
+      yield* (yield* serviceWith([instance], runner)).generateReviewGuide(input);
+      expect(calls.map((selection) => selection.instanceId)).toEqual([native]);
+      const failure = yield* (yield* serviceWith([], runner))
+        .generateReviewGuide(input)
+        .pipe(Effect.flip);
+      expect(failure._tag).toBe("TextGenerationError");
+      expect(failure.operation).toBe("generateReviewGuide");
+    }),
+);

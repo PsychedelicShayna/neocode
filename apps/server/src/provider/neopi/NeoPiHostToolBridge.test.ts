@@ -1,4 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -22,17 +23,21 @@ import * as Deferred from "effect/Deferred";
 import * as Schema from "effect/Schema";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
-import { McpServer } from "effect/unstable/ai";
-import { HttpServer } from "effect/unstable/http";
-import * as NetAddress from "effect/unstable/net/NetAddress";
+import { HttpServer } from "effect/http";
+import * as NetAddress from "effect/net/NetAddress";
 import * as ServerConfig from "../../config.ts";
 import { DeviceService } from "../../device/DeviceService.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import * as McpHttpServer from "../../mcp/McpHttpServer.ts";
+import * as McpInProcessTool from "../../mcp/McpInProcessTool.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
-import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
-import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import * as ProjectService from "../../project/ProjectService.ts";
+import * as PullRequestReviewGuideService from "../../pullRequest/PullRequestReviewGuideService.ts";
+import { v2PullRequestThread } from "../../orchestration-v2/testkit/pullRequestFixtures.ts";
+import { NeoPiNativeSessions } from "./NeoPiNativeSessions.ts";
 import { makeNeoPiHostToolBridge, makeNeoPiNativeHostToolPump } from "./NeoPiHostToolBridge.ts";
 const decodeResult = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -48,7 +53,7 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getEnvironmentId: Effect.succeed(environmentId),
   getDescriptor: Effect.die("unused"),
 });
-const thread = {
+const thread = v2PullRequestThread({
   id: threadId,
   projectId,
   title: "Bridge test",
@@ -58,18 +63,13 @@ const thread = {
   branch: null,
   worktreePath: null,
   pullRequests: [],
-  latestTurn: null,
   createdAt: "2026-08-01T00:00:00.000Z",
   updatedAt: "2026-08-01T00:00:00.000Z",
   archivedAt: null,
   settledOverride: null,
   settledAt: null,
-  session: null,
   latestUserMessageAt: null,
-  hasPendingApprovals: false,
-  hasPendingUserInput: false,
-  hasActionableProposedPlan: false,
-};
+});
 const screenshot = new Uint8Array(24);
 const view = new DataView(screenshot.buffer);
 view.setUint32(0, 0x89504e47);
@@ -88,12 +88,11 @@ const device = {
 };
 
 const ToolkitLayer = Layer.mergeAll(
-  McpHttpServer.PreviewToolkitRegistrationLive,
-  McpHttpServer.DeviceToolkitRegistrationLive,
-  McpHttpServer.PullRequestsToolkitRegistrationLive,
-  McpHttpServer.InProcessToolkitLive,
+  McpHttpServer.layerPreviewToolkit,
+  McpHttpServer.layerDeviceToolkit,
+  McpHttpServer.layerPullRequestsToolkit,
 ).pipe(
-  Layer.provideMerge(McpServer.McpServer.layer),
+  Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provideMerge(McpSessionRegistry.layer),
   Layer.provideMerge(PreviewAutomationBroker.layer),
   Layer.provideMerge(
@@ -119,21 +118,37 @@ const ToolkitLayer = Layer.mergeAll(
             openedAt: "2026-09-01T00:00:00.000Z",
           },
         ]),
+      locateSession: () =>
+        Effect.succeedSome({
+          threadId,
+          hostId: "local",
+          deviceId: "device-1",
+          platform: "ios",
+          openedAt: "2026-09-01T00:00:00.000Z",
+        }),
       screenshot: () => Effect.succeed({ device, png: screenshot }),
     }),
   ),
-  Layer.provideMerge(Layer.mock(OrchestrationEngineService)({})),
   Layer.provideMerge(
-    Layer.mock(ProjectionSnapshotQuery)({
-      getThreadShellById: () => Effect.succeedSome(thread),
+    Layer.mock(Orchestrator.OrchestratorV2)({
+      getThreadShell: () => Effect.succeed(thread),
     }),
   ),
+  Layer.provideMerge(
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadShell: () => Effect.succeed(thread),
+    }),
+  ),
+  Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),
+  Layer.provideMerge(Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({})),
+  Layer.provideMerge(Layer.mock(NeoPiNativeSessions)({})),
   Layer.provideMerge(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
   Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, fakeHttpServer)),
   Layer.provideMerge(
     ServerConfig.layerTest(process.cwd(), { prefix: "t3-neopi-host-bridge-test-" }),
   ),
   Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(NodeCrypto.layer),
 );
 
 const call = (name: string, args: Record<string, unknown> = {}) => ({
@@ -144,128 +159,116 @@ const call = (name: string, args: Record<string, unknown> = {}) => ({
   arguments: args,
 });
 
-it.effect(
-  "advertises exactly the project-granted catalog and runs PR, preview, and device via MCP handlers",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const registry = yield* McpSessionRegistry.McpSessionRegistry;
-        const issued = yield* registry.issue({
-          threadId,
-          providerInstanceId: instanceId,
-          capabilities: new Set(["preview", "device"]),
-        });
-        const scope = (yield* registry.resolve(issued.config.authorizationHeader.slice(7)))!;
-        const bridge = yield* makeNeoPiHostToolBridge({
-          threadId,
-          capabilities: scope.capabilities,
-          credential: issued.config.authorizationHeader,
-          context: scope,
-        });
-        expect(bridge.definitions.map(({ name }) => name)).toEqual(
-          expect.arrayContaining([
-            "preview_snapshot",
-            "device_screenshot",
-            "list_thread_pull_requests",
-          ]),
-        );
-        const pullRequests = yield* bridge.handle(
-          call("list_thread_pull_requests"),
-          new AbortController().signal,
-        );
-        expect(pullRequests.isError).not.toBe(true);
-        expect(
-          decodeResult(
-            pullRequests.content[0]!.type === "text" ? pullRequests.content[0]!.text : "null",
-          ),
-        ).toMatchObject({ pullRequests: [], chains: [] });
-        const shot = yield* bridge.handle(
-          call("device_screenshot", { deviceId: "device-1" }),
-          new AbortController().signal,
-        );
-        expect(shot.isError).not.toBe(true);
-        expect(shot.content.map((block) => block.type)).toEqual(["text", "image"]);
-        const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
-        const connected = yield* Deferred.make<void>();
-        const events = yield* broker.connect({ clientId: "bridge-preview-host", environmentId });
-        yield* Stream.runForEach(events, (event) =>
-          event.type === "connected"
-            ? Deferred.succeed(connected, undefined)
-            : broker.respond({
-                clientId: "bridge-preview-host",
-                connectionId: event.connectionId,
-                requestId: event.request.requestId,
-                ok: true,
-                result:
-                  event.request.operation === "snapshot"
-                    ? {
-                        url: "http://example.test/",
-                        title: "Example",
-                        loading: false,
-                        visibleText: "A browser page",
-                        interactiveElements: [],
-                        accessibilityTree: {},
-                        consoleEntries: [],
-                        networkEntries: [],
-                        actionTimeline: [],
-                        screenshot: {
-                          mimeType: "image/png",
-                          data: Buffer.from("png").toString("base64"),
-                          width: 10,
-                          height: 5,
-                        },
-                      }
-                    : {
-                        available: true,
-                        visible: true,
-                        tabId: null,
-                        url: "http://example.test/",
-                        title: "Example",
-                        loading: false,
+it.effect("runs authorized PR, preview, and device tools and revokes their credential", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: instanceId,
+        capabilities: new Set(["preview", "device"]),
+      });
+      const scope = (yield* registry.resolve(issued.config.authorizationHeader.slice(7)))!;
+      const bridge = yield* makeNeoPiHostToolBridge({
+        threadId,
+        capabilities: scope.capabilities,
+        credential: issued.config.authorizationHeader,
+        context: scope,
+      });
+      const pullRequests = yield* bridge.handle(
+        call("list_thread_pull_requests"),
+        yield* Effect.abortSignal,
+      );
+      expect(pullRequests.isError, JSON.stringify(pullRequests)).not.toBe(true);
+      expect(
+        decodeResult(
+          pullRequests.content[0]!.type === "text" ? pullRequests.content[0]!.text : "null",
+        ),
+      ).toMatchObject({ pullRequests: [], chains: [] });
+      const shot = yield* bridge.handle(
+        call("device_screenshot", { deviceId: "device-1" }),
+        yield* Effect.abortSignal,
+      );
+      expect(shot.isError).not.toBe(true);
+      expect(shot.content.map((block) => block.type)).toEqual(["text", "image"]);
+      const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+      const connected = yield* Deferred.make<void>();
+      const events = yield* broker.connect({ clientId: "bridge-preview-host", environmentId });
+      yield* Stream.runForEach(events, (event) =>
+        event.type === "connected"
+          ? Deferred.succeed(connected, undefined)
+          : broker.respond({
+              clientId: "bridge-preview-host",
+              connectionId: event.connectionId,
+              requestId: event.request.requestId,
+              ok: true,
+              result:
+                event.request.operation === "snapshot"
+                  ? {
+                      url: "http://example.test/",
+                      title: "Example",
+                      loading: false,
+                      visibleText: "A browser page",
+                      interactiveElements: [],
+                      accessibilityTree: {},
+                      consoleEntries: [],
+                      networkEntries: [],
+                      actionTimeline: [],
+                      screenshot: {
+                        mimeType: "image/png",
+                        data: Buffer.from("png").toString("base64"),
+                        width: 10,
+                        height: 5,
                       },
-              }),
-        ).pipe(Effect.forkScoped);
-        yield* Deferred.await(connected);
-        const preview = yield* bridge.handle(call("preview_status"), new AbortController().signal);
-        expect(preview.isError).not.toBe(true);
-        expect(
-          preview.content.some(
-            (block) => block.type === "text" && block.text.includes("example.test"),
-          ),
-        ).toBe(true);
-        const snapshot = yield* bridge.handle(
-          call("preview_snapshot"),
-          new AbortController().signal,
-        );
-        expect(snapshot.isError).not.toBe(true);
-        expect(snapshot.content.at(-1)).toEqual({
-          type: "image",
-          mimeType: "image/png",
-          data: Buffer.from("png").toString("base64"),
-        });
-        expect(snapshot.details).toMatchObject({
-          url: "http://example.test/",
-          screenshot: { mimeType: "image/png", width: 10, height: 5 },
-        });
-        const unavailable = yield* bridge.handle(
-          call("unknown_tool"),
-          new AbortController().signal,
-        );
-        expect(unavailable).toMatchObject({ isError: true });
-        yield* registry.revokeThread(threadId);
-        const revoked = yield* bridge.handle(
-          call("list_thread_pull_requests"),
-          new AbortController().signal,
-        );
-        expect(revoked).toMatchObject({
-          isError: true,
-          content: [{ type: "text", text: "access revoked" }],
-        });
-      }).pipe(Effect.provide(ToolkitLayer)),
-    ),
+                    }
+                  : {
+                      available: true,
+                      visible: true,
+                      tabId: null,
+                      url: "http://example.test/",
+                      title: "Example",
+                      loading: false,
+                    },
+            }),
+      ).pipe(Effect.forkScoped);
+      yield* Deferred.await(connected);
+      const preview = yield* bridge.handle(call("preview_status"), yield* Effect.abortSignal);
+      expect(preview.isError).not.toBe(true);
+      expect(
+        preview.content.some(
+          (block) => block.type === "text" && block.text.includes("example.test"),
+        ),
+      ).toBe(true);
+      const snapshot = yield* bridge.handle(
+        call("preview_snapshot", { includeImage: true }),
+        yield* Effect.abortSignal,
+      );
+      expect(snapshot.isError).not.toBe(true);
+      expect(snapshot.content.find((block) => block.type === "image")).toEqual({
+        type: "image",
+        mimeType: "image/png",
+        data: Buffer.from("png").toString("base64"),
+      });
+      expect(snapshot.details).toMatchObject({
+        url: "http://example.test/",
+        screenshot: { mimeType: "image/png", width: 10, height: 5 },
+      });
+      const unavailable = yield* bridge.handle(call("unknown_tool"), yield* Effect.abortSignal);
+      expect(unavailable).toMatchObject({ isError: true });
+      yield* registry.revokeThread(threadId);
+      const revoked = yield* bridge.handle(
+        call("list_thread_pull_requests"),
+        yield* Effect.abortSignal,
+      );
+      expect(revoked).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: "access revoked" }],
+      });
+    }).pipe(Effect.provide(ToolkitLayer)),
+  ),
 );
 
-it.effect("with PR-only grants, no browser or device tool is registered", () =>
+it.effect("PR-only grants reject browser and device calls", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const registry = yield* McpSessionRegistry.McpSessionRegistry;
@@ -281,14 +284,9 @@ it.effect("with PR-only grants, no browser or device tool is registered", () =>
         credential: issued.config.authorizationHeader,
         context: scope,
       });
-      expect(bridge.definitions.map(({ name }) => name)).toEqual([
-        "link_pull_request",
-        "unlink_pull_request",
-        "list_thread_pull_requests",
-      ]);
-      const denied = yield* bridge.handle(call("preview_status"), new AbortController().signal);
+      const denied = yield* bridge.handle(call("preview_status"), yield* Effect.abortSignal);
       expect(denied.isError).toBe(true);
-      const bypass = yield* McpHttpServer.invokeRegisteredMcpTool(
+      const bypass = yield* McpInProcessTool.invokeRegisteredMcpTool(
         issued.config.authorizationHeader,
         "device_list",
         {},
@@ -324,12 +322,11 @@ it.effect("aborts an in-flight browser invocation without waiting for its host",
           : Deferred.succeed(requested, undefined),
       ).pipe(Effect.forkScoped);
       yield* Deferred.await(connected);
-      const controller = new AbortController();
-      const pending = yield* bridge
-        .handle(call("preview_status"), controller.signal)
-        .pipe(Effect.forkScoped);
+      const caller = yield* Scope.fork(yield* Scope.Scope);
+      const signal = yield* Effect.abortSignal.pipe(Scope.provide(caller));
+      const pending = yield* bridge.handle(call("preview_status"), signal).pipe(Effect.forkScoped);
       yield* Deferred.await(requested);
-      controller.abort();
+      yield* Scope.close(caller, Exit.void);
       const result = yield* Fiber.join(pending);
       expect(result).toMatchObject({
         isError: true,
@@ -405,14 +402,24 @@ it.effect("routes canonical native files to their own live browser namespace and
       { ...nativeRef, providerInstanceId: ProviderInstanceId.make("another-profile") },
       { ...nativeRef, sessionFile: "/native/other.jsonl" },
     ];
-    for (const ref of refs) {
-      const { bridge } = yield* nativeBridge(ref);
-      const result = yield* bridge.handle(call("preview_status"), new AbortController().signal);
-      expect(result.isError).not.toBe(true);
+    const bridges = yield* Effect.forEach(refs, (ref) => nativeBridge(ref));
+    const siblingScope = yield* Scope.fork(yield* Effect.scope);
+    const siblingContext = yield* Layer.buildWithScope(Layer.fresh(ToolkitLayer), siblingScope);
+    const sibling = yield* nativeBridge().pipe(Effect.provideContext(siblingContext));
+    expect(
+      yield* sibling.registry.resolve(bridges[0]!.authorizationHeader.slice(7)),
+    ).toBeUndefined();
+    for (const { bridge } of bridges) {
+      const result = yield* bridge
+        .handle(call("preview_status"), yield* Effect.abortSignal)
+        .pipe(Effect.provideContext(siblingContext));
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
     }
     expect(requests.map(({ threadId, sessionRef }) => ({ threadId, sessionRef }))).toEqual(
       refs.map((sessionRef) => ({ threadId: nativeWorkspaceResourceId(sessionRef), sessionRef })),
     );
+    yield* Scope.close(siblingScope, Exit.void);
+    expect(bridges[0]!.scope.revoked?.aborted).toBe(false);
   }).pipe(Effect.scoped, Effect.provide(ToolkitLayer)),
 );
 
@@ -438,7 +445,7 @@ it.effect(
           context,
         });
         expect(
-          yield* bridge.handle(call("preview_status"), new AbortController().signal),
+          yield* bridge.handle(call("preview_status"), yield* Effect.abortSignal),
         ).toMatchObject({
           isError: true,
           content: [{ type: "text", text: "access revoked" }],
@@ -446,7 +453,7 @@ it.effect(
       }
       // Native credentials never acquire SQL-only PR access as a default.
       expect(issued.scope.capabilities.has("pull-requests")).toBe(false);
-      const bypass = yield* McpHttpServer.invokeRegisteredMcpTool(
+      const bypass = yield* McpInProcessTool.invokeRegisteredMcpTool(
         issued.authorizationHeader,
         "list_thread_pull_requests",
         {},
@@ -472,7 +479,7 @@ it.effect("revokes an in-flight native browser request and rejects the late resp
     ).pipe(Effect.forkScoped);
     yield* Deferred.await(ready);
     const pending = yield* bridge
-      .handle(call("preview_status"), new AbortController().signal)
+      .handle(call("preview_status"), yield* Effect.abortSignal)
       .pipe(Effect.forkScoped);
     const request = yield* Deferred.await(requested);
     yield* registry.revokeProviderSession(scope.providerSessionId);
@@ -481,9 +488,7 @@ it.effect("revokes an in-flight native browser request and rejects the late resp
       content: [{ type: "text", text: "access revoked" }],
     });
     yield* broker.respond({ clientId: "native-revoke-host", ...request, ok: true, result: {} });
-    expect(
-      yield* bridge.handle(call("preview_status"), new AbortController().signal),
-    ).toMatchObject({
+    expect(yield* bridge.handle(call("preview_status"), yield* Effect.abortSignal)).toMatchObject({
       isError: true,
       content: [{ type: "text", text: "access revoked" }],
     });

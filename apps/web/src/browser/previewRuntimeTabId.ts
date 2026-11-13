@@ -3,11 +3,7 @@ import { randomUUID } from "../lib/utils";
 
 const rendererId = randomUUID();
 
-/**
- * The server only guarantees preview tab ids are unique within one process.
- * Each renderer owns its webviews, even when windows share the same environment
- * and thread. A reload gets a new identity rather than adopting dead guests.
- */
+/** IDs isolate renderers, workspaces and server restarts; server tab ids are process-local. */
 export function previewRuntimeTabId(
   threadRef: WorkspaceRef,
   serverEpoch: string | null,
@@ -20,13 +16,4 @@ export function previewRuntimeTabId(
     serverEpoch,
     tabId,
   ]);
-}
-
-export function isCurrentPreviewRuntimeTab(
-  threadRef: WorkspaceRef,
-  serverEpoch: string | null,
-  tabId: string,
-  runtimeTabId: string,
-): boolean {
-  return previewRuntimeTabId(threadRef, serverEpoch, tabId) === runtimeTabId;
 }

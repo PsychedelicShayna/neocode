@@ -1,17 +1,8 @@
 import type { NeoPiNativeSessionLive } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-/**
- * What the sidebar calls Working, Waiting and idle comes from the running
- * NeoPi process itself: the control registry that `npi ctl list --json`
- * prints, one live snapshot per process. `npi sessions list --live` folds the
- * same snapshots into a coarser `state` that is wrong for this purpose (it
- * counts a queued follow-up as busy and any open pane, such as the context
- * viewer, as a pending dialog), so NeoCode reads the snapshot fields itself.
- *
- * A process that does not answer, or that left the registry, has no live state
- * at all. Unknown is never Working and never Waiting.
- */
+// Control snapshots distinguish blocking dialogs and streaming from open panes and queued input.
+// The coarse sessions-list state does not; an unresponsive owner has no known live state.
 
 /** Dialogs that block on the user's answer. Panes the user opened (`app`, `panel`, `selector`, ...) do not. */
 const BLOCKING_DIALOG_FAMILIES: ReadonlySet<string> = new Set([
@@ -51,25 +42,19 @@ const ControlRegistry = Schema.fromJsonString(
     ),
   }),
 );
+const decodeControlRegistry = Schema.decodeOption(ControlRegistry);
 
 /** Live control snapshots by instance id; a process that did not answer maps to `null`. */
 export type NeoPiControlRegistry = ReadonlyMap<string, NeoPiControlSnapshot | null>;
 
 /** Decodes `npi ctl list --json`; `undefined` when the output is not a registry listing. */
 export const decodeNeoPiControlRegistry = (stdout: string): NeoPiControlRegistry | undefined => {
-  const decoded = Schema.decodeUnknownOption(ControlRegistry)(stdout);
+  const decoded = decodeControlRegistry(stdout);
   if (decoded._tag === "None") return undefined;
   return new Map(decoded.value.sessions.map((row) => [row.meta.instanceId, row.snapshot]));
 };
 
-/**
- * Working = the process is streaming a turn or compacting. A queued
- * steer/follow-up, pending background work or an idle prompt is not Working.
- * Waiting = a question, approval, plan review or extension prompt is open;
- * it outranks Working because the turn is parked on the user.
- * `undefined` = the snapshot says nothing about streaming (never guessed).
- */
-export const neoPiLiveFromControlSnapshot = (
+const neoPiLiveFromControlSnapshot = (
   snapshot: NeoPiControlSnapshot,
   branch: string | null,
 ): NeoPiNativeSessionLive | undefined => {
@@ -88,13 +73,8 @@ export const neoPiLiveFromControlSnapshot = (
   };
 };
 
-/**
- * The live state to show for one catalog row. `reported` is what
- * `sessions list --live` said for the row's owner, kept for its branch and as
- * the answer only when the control registry could not be read at all, in which
- * case just its streaming flag is believed: its `waiting` and `busy` states
- * cannot be told apart from an open pane or a queued prompt.
- */
+// Without the control registry, trust only the reported streaming flag.
+// Its coarse waiting/busy values include open panes and queued input.
 export const resolveNativeLive = (input: {
   readonly instanceId: string | null;
   readonly reported: NeoPiNativeSessionLive | null | undefined;

@@ -1,16 +1,22 @@
 import { useIsFocused, useNavigation } from "@react-navigation/native";
 import { workspaceResourceId } from "@t3tools/client-runtime/environment";
-import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
-  deriveAgentPanelModel,
-  formatSubagentModelLabel,
-  formatSubagentTokenCount,
+  nativeValueItems,
+  type NativeSessionTarget,
+} from "@t3tools/client-runtime/neopi-native-sessions";
+import {
+  deriveWorkflowGroups,
+  isActiveSubagentStatus,
+  isTerminalSubagentStatus,
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
+import { formatTokens } from "@t3tools/shared/usageFormat";
+import { resetRootStack } from "../../lib/root-stack-reset";
+import { settingsNavigationState } from "../settings/settings-navigation";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ScrollView, View } from "react-native";
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { deviceEnvironment } from "../../state/device";
 import { useEnvironmentQuery } from "../../state/query";
 import { threadDevicePreviews } from "../devices/threadDevicePreviews";
@@ -101,42 +107,35 @@ export function NativeSessionWorkspaceControls({
   );
   return (
     <ScrollView horizontal contentContainerClassName="items-center gap-2">
-      <MaterialButton
+      <Button
         label={creating ? "Creating…" : "New session"}
         tone="text"
         disabled={creating}
         onPress={() => void createSession()}
       />
-      <MaterialButton label="Terminal" tone="text" disabled={cwd === null} onPress={openTerminal} />
-      <MaterialButton label="Files" tone="text" disabled={cwd === null} onPress={openFiles} />
-      <MaterialButton
-        label="Review changes"
-        tone="text"
-        disabled={cwd === null}
-        onPress={openReview}
-      />
-      <MaterialButton
+      <Button label="Terminal" tone="text" disabled={cwd === null} onPress={openTerminal} />
+      <Button label="Files" tone="text" disabled={cwd === null} onPress={openFiles} />
+      <Button label="Review changes" tone="text" disabled={cwd === null} onPress={openReview} />
+      <Button
         label={`Agents${agentCount ? ` · ${agentCount}` : ""}`}
         tone="text"
         onPress={onOpenAgents}
       />
       {previews.length ? (
-        <MaterialButton
+        <Button
           label={`Devices · ${previews.length}`}
           tone="text"
           onPress={() => navigation.navigate("ThreadDevicePreview", { target })}
         />
       ) : null}
-      <MaterialButton
+      <Button
         label="Settings"
         tone="text"
-        onPress={() => navigation.navigate("SettingsSheet")}
+        onPress={() =>
+          resetRootStack(navigation, (state) => settingsNavigationState(state, undefined))
+        }
       />
-      <MaterialButton
-        label="Connections"
-        tone="text"
-        onPress={() => navigation.navigate("Connections")}
-      />
+      <Button label="Connections" tone="text" onPress={() => navigation.navigate("Connections")} />
     </ScrollView>
   );
 }
@@ -149,39 +148,42 @@ export function NativeSessionAgents({
   agents: readonly RuntimeSubagent[];
   onClose: () => void;
 }) {
-  const model = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
-  const rows = useMemo(
-    () => [
-      ...model.workflows.flatMap((group) => [
-        group.workflow,
-        ...group.phases.flatMap((phase) => phase.members),
-        ...group.unphasedMembers,
-      ]),
-      ...model.directAgents,
-    ],
-    [model],
-  );
+  const model = useMemo(() => {
+    const workflows = deriveWorkflowGroups(agents);
+    const grouped = workflows.flatMap((group) => [
+      group.workflow,
+      ...group.phases.flatMap((phase) => phase.members),
+      ...group.unphasedMembers,
+    ]);
+    const groupedIds = new Set(grouped.map((agent) => agent.id));
+    const rows = [...grouped, ...agents.filter((agent) => !groupedIds.has(agent.id))];
+    const workers = rows.filter((agent) => agent.kind !== "workflow");
+    return {
+      rows,
+      liveCount: workers.filter((agent) => isActiveSubagentStatus(agent.status)).length,
+      settledCount: workers.filter((agent) => isTerminalSubagentStatus(agent.status)).length,
+      totalTokens: workers.reduce((total, agent) => total + (agent.usage?.totalTokens ?? 0), 0),
+    };
+  }, [agents]);
   return (
     <NativeModal title="Agents" onClose={onClose}>
       <ScrollView className="flex-1" contentContainerClassName="px-4 pb-4">
         <Text className="text-sm text-foreground-muted">
           {model.liveCount} active · {model.settledCount} settled ·{" "}
-          {formatSubagentTokenCount(model.totalTokens)} tokens
+          {formatTokens(model.totalTokens)} tokens
         </Text>
-        {!model.hasAgents ? (
+        {model.rows.length === 0 ? (
           <Text className="text-foreground-muted">No agents observed in this session.</Text>
         ) : null}
-        {rows.map((agent) => (
+        {model.rows.map((agent) => (
           <View key={agent.id} className="gap-1 border-b border-border py-3">
             <Text className="font-t3-medium text-foreground">{agent.title}</Text>
             <Text className="text-xs text-foreground-muted">
-              {[agent.status, agent.role, formatSubagentModelLabel(agent.model, agent.effort)]
-                .filter(Boolean)
-                .join(" · ")}
+              {[agent.status, agent.role, agent.model, agent.effort].filter(Boolean).join(" · ")}
             </Text>
             {agent.usage ? (
               <Text className="text-xs text-foreground-muted">
-                {formatSubagentTokenCount(agent.usage.totalTokens)} tokens
+                {formatTokens(agent.usage.totalTokens)} tokens
                 {agent.usage.toolUses !== undefined ? ` · ${agent.usage.toolUses} tools` : ""}
                 {agent.usage.durationMs !== undefined
                   ? ` · ${(agent.usage.durationMs / 1000).toFixed(1)}s`
@@ -196,12 +198,8 @@ export function NativeSessionAgents({
             {agent.lastToolName ? (
               <Text className="text-xs text-foreground-muted">{agent.lastToolName}</Text>
             ) : null}
-            {agent.recentActivity.map((activity, index) => (
-              <Text
-                key={`${activity.at}:${index}`}
-                selectable
-                className="text-xs text-foreground-muted"
-              >
+            {nativeValueItems(agent.recentActivity).map(({ value: activity, key }) => (
+              <Text key={key} selectable className="text-xs text-foreground-muted">
                 {activity.summary}
               </Text>
             ))}

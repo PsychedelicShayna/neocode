@@ -1,11 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off -- launch args are constructed before any runtime Path service exists.
 import * as NodePath from "node:path";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
-import type { RuntimeMode } from "@t3tools/contracts";
+import type { NeoPiResumeCursor, RuntimeMode } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { neopiProjectSessionDir, neopiSessionRoot } from "./NeoPiPaths.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
-import type { NeoPiLaunchPlan, NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
+import type { NeoPiLaunchPlan } from "./NeoPiRuntimeTypes.ts";
 
 export interface NeoPiLaunchInput {
   readonly binary: string;
@@ -30,7 +30,7 @@ export function isSharedNeoPiCursor(cursor: NeoPiResumeCursor, t3Home: string): 
   return !NodePath.resolve(cursor.sessionDir).startsWith(root);
 }
 
-const approvalModes: Record<RuntimeMode, string> = {
+export const neoPiApprovalModes: Record<RuntimeMode, string> = {
   "approval-required": "always-ask",
   "auto-accept-edits": "write",
   auto: "yolo",
@@ -72,58 +72,57 @@ export const parseNeoPiLaunchArguments = Effect.fn("parseNeoPiLaunchArguments")(
   return extra;
 });
 
-export const buildNeoPiLaunchPlan = (
+export const buildNeoPiLaunchPlan = Effect.fn("buildNeoPiLaunchPlan")(function* (
   input: NeoPiLaunchInput,
-): Effect.Effect<NeoPiLaunchPlan, NeoPiRuntimeError> =>
-  Effect.gen(function* () {
-    const extra = yield* parseNeoPiLaunchArguments(input.launchArgs);
-    // A saved cursor always retains its original directory, even after shared
-    // sessions become available on a newer peer.
-    const sessionDir =
-      input.cursor?.sessionDir ??
-      (input.sharedSession
-        ? ""
-        : neopiProjectSessionDir({
-            baseDir: input.t3Home,
-            ...(input.profile !== undefined ? { profile: input.profile } : {}),
-            projectId: input.projectId,
-          }));
-    const args = ["--mode", "rpc-ui", "--cwd", input.cwd, "--no-title"];
-    if (input.exitWithParent) args.push("--exit-with-parent");
-    if (sessionDir) args.push("--session-dir", sessionDir);
-    else args.push("--new-session");
-    if (input.cursor) {
-      if (
-        !input.cursor.sessionFile ||
-        !input.cursor.sessionId ||
-        !NodePath.resolve(input.cursor.sessionFile).startsWith(
-          NodePath.resolve(sessionDir) + NodePath.sep,
-        )
-      ) {
-        return yield* new NeoPiRuntimeError({
-          code: "settings",
-          message: "NeoPi resume cursor is outside its session directory",
-        });
-      }
-      args.push("--session", input.cursor.sessionFile);
+): Effect.fn.Return<NeoPiLaunchPlan, NeoPiRuntimeError> {
+  const extra = yield* parseNeoPiLaunchArguments(input.launchArgs);
+  // A saved cursor always retains its original directory, even after shared
+  // sessions become available on a newer peer.
+  const sessionDir =
+    input.cursor?.sessionDir ??
+    (input.sharedSession
+      ? ""
+      : neopiProjectSessionDir({
+          baseDir: input.t3Home,
+          ...(input.profile !== undefined ? { profile: input.profile } : {}),
+          projectId: input.projectId,
+        }));
+  const args = ["--mode", "rpc-ui", "--cwd", input.cwd, "--no-title"];
+  if (input.exitWithParent) args.push("--exit-with-parent");
+  if (sessionDir) args.push("--session-dir", sessionDir);
+  else args.push("--new-session");
+  if (input.cursor) {
+    if (
+      !input.cursor.sessionFile ||
+      !input.cursor.sessionId ||
+      !NodePath.resolve(input.cursor.sessionFile).startsWith(
+        NodePath.resolve(sessionDir) + NodePath.sep,
+      )
+    ) {
+      return yield* new NeoPiRuntimeError({
+        code: "settings",
+        message: "NeoPi resume cursor is outside its session directory",
+      });
     }
-    args.push("--approval-mode", approvalModes[input.runtimeMode], ...extra);
-    return {
-      command: input.binary,
-      args,
-      cwd: input.cwd,
-      sessionDir,
-      env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(
-            (entry): entry is [string, string] => typeof entry[1] === "string",
-          ),
+    args.push("--session", input.cursor.sessionFile);
+  }
+  args.push("--approval-mode", neoPiApprovalModes[input.runtimeMode], ...extra);
+  return {
+    command: input.binary,
+    args,
+    cwd: input.cwd,
+    sessionDir,
+    env: {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
         ),
-        ...input.env,
-        ...(input.profile?.trim() ? { OMP_PROFILE: input.profile.trim() } : {}),
-      },
-      identity: input.cursor
-        ? { kind: "resume" as const, cursor: input.cursor }
-        : { kind: "fresh" as const },
-    };
-  });
+      ),
+      ...input.env,
+      ...(input.profile?.trim() ? { OMP_PROFILE: input.profile.trim() } : {}),
+    },
+    identity: input.cursor
+      ? { kind: "resume" as const, cursor: input.cursor }
+      : { kind: "fresh" as const },
+  };
+});

@@ -1,3 +1,5 @@
+import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
+import { AuthSettingsWriteScope } from "@t3tools/contracts";
 import { EnvironmentId, type T3ProjectFileScript } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
@@ -6,7 +8,7 @@ import {
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { resolveProjectScripts } from "@t3tools/shared/projectScripts";
 import { ChevronDownIcon, PlusIcon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useState } from "react";
 import { useT3ProjectFileState } from "../../hooks/useT3ProjectFileScripts";
 import { useEnvironments } from "../../state/environments";
 import {
@@ -32,10 +34,6 @@ import { useProjectScriptSettings } from "./useProjectScriptSettings";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { useSettingsScope } from "./SettingsScopeContext";
 
-/**
- * Actions at environment or project scope. Environment actions remain inherited
- * when a project adds or overrides individual IDs. Shortcuts share those IDs.
- */
 export function ProjectActionsSettings() {
   const { scope, targets, target } = useSettingsScope();
   const { environments } = useEnvironments();
@@ -63,6 +61,7 @@ export function ProjectActionsSettings() {
   const mixed = targets.some(
     (candidate) => JSON.stringify(scriptsForTarget(candidate)) !== JSON.stringify(scripts),
   );
+  const canWriteSettings = useScopedSettingsWriteAllowed();
   const [request, setRequest] = useState<ProjectScriptEditorRequest | null>(null);
   const { saving, persist, submit, reset } = useProjectScriptSettings(
     targets.flatMap((candidate) => {
@@ -71,21 +70,14 @@ export function ProjectActionsSettings() {
       );
       if (!environment?.serverConfig) return [];
       const member = candidate.projectId ? memberById.get(candidate.projectId) : undefined;
-      // Older servers replace entire entries instead of mutating named keys.
-      // Leave them out rather than send a patch they could misinterpret.
-      if (
-        member &&
-        environment.serverConfig.environment?.capabilities.projectSettingsOverridePatches !== true
-      ) {
-        return [];
-      }
       return [
         {
           environmentId: candidate.environmentId,
-          // Writes read the raw environment settings so an override entry is
-          // extended, not derived from already-resolved values.
           settings: environment.serverConfig.settings,
           keybindings: environment.serverConfig.keybindings,
+          projectOverridesSupported:
+            environment.serverConfig.environment?.capabilities.projectSettingsOverridePatches ===
+            true,
           ...(member ? { project: member } : {}),
         },
       ];
@@ -106,49 +98,42 @@ export function ProjectActionsSettings() {
     .filter(([, action]) => action === null)
     .map(([id]) => id);
 
-  // A project's t3.json can declare actions to import. Read it from the
-  // representative checkout; the imported action still fans out.
   const representativeMember = target?.projectId ? memberById.get(target.projectId) : undefined;
   const t3File = useT3ProjectFileState(
     representativeMember?.environmentId ?? EnvironmentId.make("none"),
     representativeMember?.workspaceRoot ?? null,
   );
-  const importableScripts = useMemo(
-    () =>
-      t3File.scripts.filter(
-        (fileScript) =>
-          !scripts.some(
-            (script) =>
-              script.command === fileScript.command ||
-              script.name.toLowerCase() === fileScript.name.toLowerCase(),
-          ),
+  const importableScripts = t3File.scripts.filter(
+    (fileScript) =>
+      !scripts.some(
+        (script) =>
+          script.command === fileScript.command ||
+          script.name.toLowerCase() === fileScript.name.toLowerCase(),
       ),
-    [scripts, t3File.scripts],
   );
-  const importFileScript = useCallback(
-    async (fileScript: T3ProjectFileScript) => {
-      const payload: NewProjectScriptInput = {
-        name: fileScript.name,
-        command: fileScript.command,
-        icon: fileScript.icon ?? "play",
-        runOnWorktreeCreate: fileScript.runOnWorktreeCreate ?? false,
-        waitForSetup: fileScript.runOnWorktreeCreate === true && fileScript.async === false,
-        keybinding: null,
-        previewUrl: fileScript.previewUrl ?? null,
-        autoOpenPreview: fileScript.previewUrl ? (fileScript.autoOpenPreview ?? false) : false,
-      };
-      const result = await submit(null, payload);
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setRequest({
-          scriptId: null,
-          initial: payload,
-          error: error instanceof Error ? error.message : "Failed to import action.",
-        });
-      }
-    },
-    [submit],
-  );
+  const importFileScript = async (fileScript: T3ProjectFileScript) => {
+    const payload: NewProjectScriptInput = {
+      name: fileScript.name,
+      command: fileScript.command,
+      icon: fileScript.icon ?? "play",
+      runOnWorktreeCreate: fileScript.runOnWorktreeCreate ?? false,
+      waitForSetup: fileScript.runOnWorktreeCreate === true && fileScript.async === false,
+      runOnSettle: fileScript.runOnSettle ?? false,
+      stopOnSettle: fileScript.stopOnSettle ?? false,
+      keybinding: null,
+      previewUrl: fileScript.previewUrl ?? null,
+      autoOpenPreview: fileScript.previewUrl ? (fileScript.autoOpenPreview ?? false) : false,
+    };
+    const result = await submit(null, payload);
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      setRequest({
+        scriptId: null,
+        initial: payload,
+        error: error instanceof Error ? error.message : "Failed to import action.",
+      });
+    }
+  };
 
   return (
     <SettingsSection id="project-actions" title="Actions">
@@ -173,7 +158,7 @@ export function ProjectActionsSettings() {
                       id="import-scripts"
                       size="xs"
                       variant="ghost"
-                      disabled={saving}
+                      disabled={saving || !canWriteSettings}
                       type="button"
                     />
                   }
@@ -209,7 +194,7 @@ export function ProjectActionsSettings() {
             <Button
               size="xs"
               variant="outline"
-              disabled={saving || targets.length === 0}
+              disabled={saving || !canWriteSettings || targets.length === 0}
               onClick={() => setRequest({ scriptId: null, initial: EMPTY_PROJECT_SCRIPT_INPUT })}
             >
               <PlusIcon className="size-3.5" />
@@ -227,7 +212,7 @@ export function ProjectActionsSettings() {
         <ProjectActionsList
           scripts={scripts}
           keybindings={keybindings}
-          disabled={saving}
+          disabled={saving || !canWriteSettings}
           origin={actionOrigin}
           onReset={(id) => void reset(id)}
           canReset={(id) => isProjectScope && Object.hasOwn(localActions ?? {}, id)}
@@ -243,7 +228,12 @@ export function ProjectActionsSettings() {
               isProjectScope ? "Hidden for this project only." : "Hidden at environment scope."
             }
             control={
-              <Button size="xs" variant="ghost" disabled={saving} onClick={() => void reset(id)}>
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={saving || !canWriteSettings}
+                onClick={() => void reset(id)}
+              >
                 Restore action
               </Button>
             }
@@ -256,20 +246,24 @@ export function ProjectActionsSettings() {
           className="text-warning"
         />
       ) : null}
-      <ProjectScriptEditorDialog
-        scopeDescription={
-          isProjectScope
-            ? `${request?.scriptId ? actionOrigin(request.scriptId) + ". " : ""}Changes apply only to the selected project. Delete hides an inherited action here. Reset action returns to its inherited version.`
-            : "Changes apply to every project on the selected environments, except individual project overrides."
-        }
-        request={request}
-        scripts={scripts}
-        onSubmit={submit}
-        onDelete={(id) =>
-          void persist((current) => current.filter((script) => script.id !== id), id, null)
-        }
-        onClose={() => setRequest(null)}
-      />
+      {target && (
+        <ProjectScriptEditorDialog
+          environmentId={target.environmentId}
+          editScope={AuthSettingsWriteScope}
+          scopeDescription={
+            isProjectScope
+              ? `${request?.scriptId ? actionOrigin(request.scriptId) + ". " : ""}Changes apply only to the selected project. Delete hides an inherited action here. Reset action returns to its inherited version.`
+              : "Changes apply to every project on the selected environments, except individual project overrides."
+          }
+          request={request}
+          scripts={scripts}
+          onSubmit={submit}
+          onDelete={(id) =>
+            void persist((current) => current.filter((script) => script.id !== id), id, null)
+          }
+          onClose={() => setRequest(null)}
+        />
+      )}
     </SettingsSection>
   );
 }

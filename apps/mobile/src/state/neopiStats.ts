@@ -1,4 +1,4 @@
-import { remoteHttpClientLayer } from "@t3tools/client-runtime/rpc";
+import { layerRemoteHttpClient } from "@t3tools/client-runtime/rpc";
 import {
   requestNativeStats,
   type NativeStatsRequest,
@@ -11,7 +11,7 @@ import { connectionAtomRuntime } from "../connection/runtime";
 
 // RN's global fetch buffers responses. Scope Expo's streaming implementation to
 // native stats so SSE and trace reads retain their pull/cancel behavior.
-const statsHttpClient = remoteHttpClientLayer(streamingFetch);
+const statsHttpClient = layerRemoteHttpClient(streamingFetch);
 export const nativeStatsRequest = createEnvironmentCommand(connectionAtomRuntime, {
   label: "Mobile native stats request",
   execute: (input: NativeStatsRequest) =>

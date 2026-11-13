@@ -10,7 +10,6 @@ export type ThemePreviewColors = Readonly<{
   messageAction: string;
 }>;
 
-/** Default artwork uses the same roles as the live palette, not a separate preview palette. */
 export const STANDARD_THEME_PREVIEW_COLORS: Readonly<Record<ThemeAppearance, ThemePreviewColors>> =
   {
     light: {
@@ -43,7 +42,6 @@ export type ThemePreviewRenderSpec = Readonly<{
   blurAt56Px: number;
 }>;
 
-/** Shared geometry and falloff for the web and native theme preview orbs. */
 export const THEME_PREVIEW_RENDER_SPECS: Readonly<Record<ThemeAppearance, ThemePreviewRenderSpec>> =
   {
     light: {

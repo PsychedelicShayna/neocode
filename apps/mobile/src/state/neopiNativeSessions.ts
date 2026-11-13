@@ -7,7 +7,7 @@ import {
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { useCallback } from "react";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useAtomCommand } from "./use-atom-command";
@@ -17,12 +17,24 @@ export const nativeSessionAtoms = createNativeSessionAtoms(connectionAtomRuntime
 
 /** Reopens a detached or ownerless session; see `nativeSessionAtoms.reconnect`. */
 export function useNativeSessionReconnect(target: NativeSessionTarget) {
+  const {
+    environmentId,
+    ref: { providerInstanceId, sessionFile },
+  } = target;
   return useCallback(
-    () => nativeSessionAtoms.reconnect(appAtomRegistry, target),
-    [target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
+    () =>
+      nativeSessionAtoms.reconnect(appAtomRegistry, {
+        environmentId,
+        ref: { providerInstanceId, sessionFile },
+      }),
+    [environmentId, providerInstanceId, sessionFile],
   );
 }
 export function useNativeSession(target: NativeSessionTarget) {
+  const {
+    environmentId,
+    ref: { providerInstanceId, sessionFile },
+  } = target;
   const result = useAtomValue(
     nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
   );
@@ -33,13 +45,17 @@ export function useNativeSession(target: NativeSessionTarget) {
       attachments?: NeoPiNativeSessionsRequestInput["attachments"],
     ) => {
       const response = await send({
-        environmentId: target.environmentId,
-        input: { ref: target.ref, command, ...(attachments ? { attachments } : {}) },
+        environmentId,
+        input: {
+          ref: { providerInstanceId, sessionFile },
+          command,
+          ...(attachments ? { attachments } : {}),
+        },
       });
       if (response._tag === "Failure") throw squashAtomCommandFailure(response);
       return response.value;
     },
-    [send, target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
+    [send, environmentId, providerInstanceId, sessionFile],
   );
   const feed = AsyncResult.isSuccess(result)
     ? result.value

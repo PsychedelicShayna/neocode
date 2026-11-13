@@ -1,7 +1,23 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 
-/** Quota providers retain their existing colors in both appearance modes. */
+const USAGE_PROVIDER_KINDS: readonly UsageProviderKind[] = [
+  "codex",
+  "claude",
+  "grok",
+  "cursor",
+  "opencode",
+  "antigravity",
+  "pi",
+  "muse",
+  "neopi",
+];
+
+export function usageProviderKind(driver: string): UsageProviderKind | null {
+  if (driver === "claudeAgent") return "claude";
+  return USAGE_PROVIDER_KINDS.find((kind) => kind === driver) ?? null;
+}
+
 export function useProviderColors(): Record<UsageProviderKind, string> {
   const { themeAppearance: scheme } = useAppearancePreferences();
   return {
@@ -12,5 +28,7 @@ export function useProviderColors(): Record<UsageProviderKind, string> {
     opencode: "#5b9bbd",
     antigravity: "#8c7bd1",
     neopi: "#f97316",
+    pi: "#4d9f8a",
+    muse: "#0866ff",
   };
 }

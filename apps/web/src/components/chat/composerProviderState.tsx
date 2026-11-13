@@ -1,23 +1,26 @@
-import {
-  type ProviderDriverKind,
-  type ProviderInstanceId,
-  type ProviderOptionSelection,
-  type ScopedThreadRef,
-  type ServerProviderModel,
+import type {
+  ModelSelection,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderOptionSelection,
+  ScopedThreadRef,
+  ServerProviderModel,
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
-  getProviderOptionCurrentValue,
   getProviderOptionDescriptors,
+  resolveSelectableModel,
 } from "@t3tools/shared/model";
-import type { ReactNode } from "react";
-
+import {
+  getDescriptorStringValue,
+  getTraitSelectChange,
+  isReasoningSelect,
+  selectableProviderOptionChoices,
+} from "@t3tools/client-runtime/model-traits";
 import type { DraftId } from "../../composerDraftStore";
-import { getProviderModelCapabilities } from "../../providerModels";
-import type { ComposerControlSize } from "./ComposerControl";
-import { shouldRenderTraitsControls, TraitsMenuContent, TraitsPicker } from "./TraitsPicker";
+import { getTraitsSectionVisibility, type TraitsSelectionInput } from "./TraitsPicker";
 
-export type ComposerProviderStateInput = {
+type ComposerProviderStateInput = {
   provider: ProviderDriverKind;
   model: string;
   models: ReadonlyArray<ServerProviderModel>;
@@ -26,36 +29,40 @@ export type ComposerProviderStateInput = {
 
 export type ComposerProviderState = {
   provider: ProviderDriverKind;
-  promptEffort: string | null;
   modelOptionsForDispatch: ReadonlyArray<ProviderOptionSelection> | undefined;
 };
 
-type TraitsRenderInput = {
+type ComposerTraitsTarget = {
   provider: ProviderDriverKind;
-  instanceId?: ProviderInstanceId;
-  threadRef?: ScopedThreadRef;
-  draftId?: DraftId;
+  instanceId: ProviderInstanceId;
+  threadRef?: ScopedThreadRef | undefined;
+  draftId?: DraftId | undefined;
+  onDraftModelOptionsChange?: () => void;
   model: string;
   models: ReadonlyArray<ServerProviderModel>;
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
-  size?: ComposerControlSize;
-  hidden?: boolean;
-  triggerClassName?: string;
-  isComposerOwned?: boolean;
+  reportedModelSelection?: ModelSelection | null | undefined;
 };
 
 export function getComposerProviderState(input: ComposerProviderStateInput): ComposerProviderState {
   const { provider, model, models, modelOptions } = input;
-  const caps = getProviderModelCapabilities(models, model, provider);
-  const descriptors = getProviderOptionDescriptors({ caps, selections: modelOptions });
-  const primarySelectDescriptor = descriptors.find(
-    (descriptor): descriptor is Extract<(typeof descriptors)[number], { type: "select" }> =>
-      descriptor.type === "select",
-  );
-  const primaryValue = getProviderOptionCurrentValue(primarySelectDescriptor ?? null);
+  const slug = resolveSelectableModel(provider, model, models);
+  const selectedModel = models.find((candidate) => candidate.slug === slug);
+  if (!selectedModel) {
+    return {
+      provider,
+      modelOptionsForDispatch: modelOptions?.length ? modelOptions : undefined,
+    };
+  }
+  if (!selectedModel.capabilities) {
+    return { provider, modelOptionsForDispatch: undefined };
+  }
+  const descriptors = getProviderOptionDescriptors({
+    caps: selectedModel.capabilities,
+    selections: modelOptions,
+  });
   return {
     provider,
-    promptEffort: typeof primaryValue === "string" ? primaryValue : null,
     modelOptionsForDispatch: buildExplicitProviderOptionSelectionsFromDescriptors(
       descriptors,
       modelOptions,
@@ -63,41 +70,41 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
   };
 }
 
-function renderTraitsControl(
-  Component: typeof TraitsMenuContent | typeof TraitsPicker,
-  input: TraitsRenderInput,
-): ReactNode {
-  const {
-    provider, instanceId, threadRef, draftId, model, models, modelOptions,
-    size, hidden, triggerClassName, isComposerOwned,
-  } = input;
-  if (
-    (threadRef === undefined && draftId === undefined) ||
-    !shouldRenderTraitsControls({ provider, models, model, modelOptions })
-  ) {
-    return null;
-  }
-  return (
-    <Component
-      provider={provider}
-      {...(instanceId ? { instanceId } : {})}
-      models={models}
-      {...(threadRef ? { threadRef } : {})}
-      {...(draftId ? { draftId } : {})}
-      model={model}
-      modelOptions={modelOptions}
-      {...(size !== undefined ? { size } : {})}
-      {...(hidden !== undefined ? { hidden } : {})}
-      {...(triggerClassName !== undefined ? { triggerClassName } : {})}
-      {...(isComposerOwned ? { isComposerOwned } : {})}
-    />
+export function getComposerReasoningStep(input: {
+  provider: ProviderDriverKind;
+  instanceId: ProviderInstanceId;
+  model: string;
+  models: ReadonlyArray<ServerProviderModel>;
+  modelOptions: ReadonlyArray<ProviderOptionSelection> | null | undefined;
+  reportedModelSelection?: ModelSelection | null | undefined;
+  direction: 1 | -1;
+}): ReadonlyArray<ProviderOptionSelection> | null {
+  const selected = getTraitsSectionVisibility(input);
+  if (selected.modelIsUnavailable) return null;
+  const descriptor = selected.selectDescriptors.find(isReasoningSelect);
+  const choices = descriptor ? selectableProviderOptionChoices(descriptor) : [];
+  if (!descriptor || choices.length < 2) return null;
+  const current = getDescriptorStringValue(
+    descriptor,
+    { instanceId: input.instanceId, model: input.model, options: input.modelOptions ?? [] },
+    input.reportedModelSelection,
   );
+  const ordered = input.direction > 0 ? descriptor.options : descriptor.options.toReversed();
+  const position =
+    [current, getDescriptorStringValue(descriptor)]
+      .map((value) => ordered.findIndex((option) => option.id === value))
+      .find((index) => index >= 0) ?? -1;
+  const next = [...ordered.slice(position + 1), ...ordered.slice(0, Math.max(position, 0))].find(
+    (option) => choices.includes(option),
+  );
+  return next ? (getTraitSelectChange(selected.descriptors, descriptor, next.id) ?? null) : null;
 }
 
-export function renderProviderTraitsMenuContent(input: TraitsRenderInput): ReactNode {
-  return renderTraitsControl(TraitsMenuContent, input);
-}
-
-export function renderProviderTraitsPicker(input: TraitsRenderInput): ReactNode {
-  return renderTraitsControl(TraitsPicker, input);
+export function resolveComposerTraitsInput(
+  input: ComposerTraitsTarget,
+): TraitsSelectionInput | null {
+  const { threadRef, draftId, ...rest } = input;
+  const persistence = threadRef ? { threadRef } : draftId ? { draftId } : null;
+  if (!persistence) return null;
+  return { ...rest, ...persistence };
 }

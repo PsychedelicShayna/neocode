@@ -6,8 +6,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { WebView } from "react-native-webview";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { nativeStatsRequest } from "../../state/neopiStats";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { createMobileStatsBridge, nativeStatsDocument } from "./neopi-stats-document";
@@ -40,8 +40,9 @@ function StatsDocument({
   const request = useAtomCommand(nativeStatsRequest, { reportFailure: false });
   const [html, setHtml] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const webView = useRef<WebView>(null);
+  const webView = useRef<WebView<object>>(null);
   const session = useRef<{ receive: (raw: string) => void; stop: () => void } | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- owns the WebView's native document bridge and releases its remote view on teardown
   useEffect(() => {
     let active = true;
     let stopped = false;
@@ -82,8 +83,6 @@ function StatsDocument({
       },
     };
     session.current = current;
-    setHtml(null);
-    setError(null);
     void (async () => {
       try {
         let document: string | null = null;
@@ -132,7 +131,7 @@ function StatsDocument({
         <Text accessibilityRole="alert" selectable className="text-center text-danger-foreground">
           {error}
         </Text>
-        <MaterialButton label="Retry native stats" onPress={onRetry} />
+        <Button label="Retry native stats" onPress={onRetry} />
       </View>
     );
   if (source === null)

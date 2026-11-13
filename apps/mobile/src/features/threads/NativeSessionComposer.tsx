@@ -7,16 +7,18 @@ import {
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { useState, type ReactNode } from "react";
 import { Keyboard, ScrollView, View } from "react-native";
-import { ComposerAttachmentButton } from "../../components/ComposerAttachmentButton";
+import { ComposerAttachmentButton } from "./ComposerAttachmentButton";
 import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStrip";
 import { ComposerEditor } from "../../components/ComposerEditor";
 import { ComposerActionButton, ComposerToolbarRow } from "../../components/ComposerToolbar";
-import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
-import { VideoPreviewModal, type VideoPreviewSource } from "../../components/VideoPreviewModal";
-import { MaterialButton } from "../../components/MaterialButton";
+import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
+import { VideoPreviewModal, type VideoPreviewSource } from "../../components/ui/VideoPreviewModal";
+import { Button } from "../../components/ui/Button";
 import type { ComposerDocumentAttachment } from "../../lib/composerContext";
 import { composerStripAttachments } from "../../lib/composerImages";
 import type { useNativeComposerState } from "../../state/use-native-composer-state";
+import { appAtomRegistry } from "../../state/atom-registry";
+import { composerDraftsAtom, getComposerDraftSnapshot } from "../../state/use-composer-drafts";
 import { fileRoutePathSegments } from "../files/filePath";
 import {
   ComposerDictationCancelAction,
@@ -73,7 +75,9 @@ export function NativeSessionComposer({
   const [previewVideo, setPreviewVideo] = useState<VideoPreviewSource | null>(null);
   const voice = useVoiceInputController({
     ownerKey: composer.key,
-    draftMessage: composer.draft.text,
+    label: "NeoPi session",
+    readDraftMessage: () => getComposerDraftSnapshot(composer.key).text,
+    subscribeToDraftChanges: (onChange) => appAtomRegistry.subscribe(composerDraftsAtom, onChange),
     selection: menu.selection,
     onChangeDraftMessage: composer.setText,
     onChangeSelection: menu.onSelectionChange,
@@ -102,7 +106,7 @@ export function NativeSessionComposer({
       {!voice.isBusy && commands.length ? (
         <ScrollView horizontal>
           {commands.map((command) => (
-            <MaterialButton
+            <Button
               key={command.name}
               label={[
                 `/${command.name}`,
@@ -122,7 +126,7 @@ export function NativeSessionComposer({
       {!voice.isBusy && argumentCommand && argumentSuggestions.length ? (
         <ScrollView horizontal>
           {argumentSuggestions.map((item) => (
-            <MaterialButton
+            <Button
               key={item.value}
               label={item.label}
               tone="text"
@@ -220,7 +224,6 @@ export function NativeSessionComposer({
               elapsedSeconds={voice.elapsedSeconds}
               phase={voice.state.phase}
               presentation={voicePresentation}
-              onDismissError={voice.cancel}
             />
           ) : (
             <View className="min-w-0 flex-1">

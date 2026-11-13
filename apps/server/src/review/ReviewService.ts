@@ -8,6 +8,8 @@ import * as Path from "effect/Path";
 import {
   VcsRepositoryDetectionError,
   VcsUnsupportedOperationError,
+  type ReviewBranchCommitsInput,
+  type ReviewBranchCommitsResult,
   type ReviewDiffFileContentsInput,
   type ReviewDiffFileContentsResult,
   type ReviewDiffPreviewError,
@@ -18,6 +20,13 @@ import {
 import * as ServerConfig from "../config.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import * as KnownWorkspaces from "../workspace/KnownWorkspaces.ts";
+
+const WORKSPACE_BOUND_SUBJECTS = {
+  "ReviewService.getBranchCommits": "commit list",
+  "ReviewService.getDiffPreview": "diff preview",
+  "ReviewService.getDiffFileContents": "diff file contents",
+} as const;
 
 /** Server-resolved authority only; never populated from a generic review RPC payload. */
 export interface ReviewWorkspaceScope {
@@ -27,6 +36,10 @@ export interface ReviewWorkspaceScope {
 export class ReviewService extends Context.Service<
   ReviewService,
   {
+    readonly getBranchCommits: (
+      input: ReviewBranchCommitsInput,
+      scope?: ReviewWorkspaceScope,
+    ) => Effect.Effect<ReviewBranchCommitsResult, ReviewDiffPreviewError>;
     readonly getDiffPreview: (
       input: ReviewDiffPreviewInput,
       scope?: ReviewWorkspaceScope,
@@ -38,13 +51,14 @@ export class ReviewService extends Context.Service<
   }
 >()("t3/review/ReviewService") {}
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const vcsRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const knownWorkspaces = yield* KnownWorkspaces.KnownWorkspaces;
 
   const canonicalizePath = (value: string) => {
     const resolvedPath = path.resolve(value);
@@ -65,31 +79,44 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  const isWithinRoot = (candidate: string, root: string) => {
-    const relative = path.relative(root, candidate);
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  };
-
   const assertWorkspaceBoundCwd = Effect.fn("ReviewService.assertWorkspaceBoundCwd")(function* (
-    operation: "ReviewService.getDiffPreview" | "ReviewService.getDiffFileContents",
+    operation: keyof typeof WORKSPACE_BOUND_SUBJECTS,
     cwd: string,
     scope?: ReviewWorkspaceScope,
   ) {
-    const candidate = yield* canonicalizePath(cwd);
-    const roots = yield* Effect.all(
-      (scope ? [scope.workspaceRoot] : [config.cwd, config.worktreesDir]).map(canonicalizePath),
-    );
-
-    if (roots.some((root) => isWithinRoot(candidate, root))) return;
+    const [candidate, workspaceRoot] = yield* Effect.all([
+      canonicalizePath(cwd),
+      canonicalizePath(scope?.workspaceRoot ?? config.cwd),
+    ]);
+    if (
+      KnownWorkspaces.isWithinRoot(path, candidate, workspaceRoot) ||
+      (scope === undefined && (yield* knownWorkspaces.contains(candidate)))
+    ) {
+      return;
+    }
 
     return yield* new VcsRepositoryDetectionError({
       operation,
       cwd,
-      detail:
-        operation === "ReviewService.getDiffPreview"
-          ? "Review diff preview cwd must stay within the configured workspace root."
-          : "Review diff file contents cwd must stay within the configured workspace root.",
+      detail: `Review ${WORKSPACE_BOUND_SUBJECTS[operation]} cwd must stay within the configured workspace root.`,
     });
+  });
+
+  const getBranchCommits: ReviewService["Service"]["getBranchCommits"] = Effect.fn(
+    "ReviewService.getBranchCommits",
+  )(function* (input, scope) {
+    yield* assertWorkspaceBoundCwd("ReviewService.getBranchCommits", input.cwd, scope);
+
+    const handle = yield* vcsRegistry.detect({ cwd: input.cwd, requestedKind: "auto" });
+    if (!handle) return { commits: [], truncated: false };
+    if (handle.kind !== "git") {
+      return yield* new VcsUnsupportedOperationError({
+        operation: "ReviewService.getBranchCommits",
+        kind: handle.kind,
+        detail: "Review commit lists require a Git repository.",
+      });
+    }
+    return yield* git.getReviewBranchCommits(input);
   });
 
   const getDiffPreview: ReviewService["Service"]["getDiffPreview"] = Effect.fn(
@@ -106,19 +133,7 @@ export const make = Effect.gen(function* () {
       };
     }
 
-    const getDriverDiffPreview = handle.driver.getDiffPreview;
-    if (!getDriverDiffPreview) {
-      if (handle.kind === "git") {
-        return yield* git.getReviewDiffPreview(input);
-      }
-      return yield* new VcsUnsupportedOperationError({
-        operation: "ReviewService.getDiffPreview",
-        kind: handle.kind,
-        detail: `The ${handle.kind} VCS driver does not support review diff previews.`,
-      });
-    }
-
-    return yield* getDriverDiffPreview(input);
+    return yield* git.getReviewDiffPreview(input);
   });
 
   const getDiffFileContents: ReviewService["Service"]["getDiffFileContents"] = Effect.fn(
@@ -139,6 +154,7 @@ export const make = Effect.gen(function* () {
   });
 
   return ReviewService.of({
+    getBranchCommits,
     getDiffPreview,
     getDiffFileContents,
   });

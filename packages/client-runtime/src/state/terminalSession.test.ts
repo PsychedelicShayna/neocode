@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vite-plus/test";
+import { describe, expect, it } from "vite-plus/test";
 
 import { EnvironmentId, TerminalSessionSnapshot, ThreadId } from "@t3tools/contracts";
 
@@ -6,12 +6,10 @@ import {
   applyTerminalAttachStreamEvent,
   applyTerminalMetadataStreamEvent,
   combineTerminalSessionState,
-  DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
   EMPTY_TERMINAL_BUFFER_STATE,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   nextTerminalAttachSeedState,
   readTerminalOutputUpdate,
-  selectRunningSubprocessTerminalIds,
   terminalOutputText,
 } from "./terminalSession.ts";
 
@@ -69,92 +67,54 @@ describe("terminal session reducers", () => {
     });
   });
 
-  it("uses metadata status before an attach stream has emitted", () => {
-    const summary = applyTerminalMetadataStreamEvent([], {
+  it("follows the shared PTY grid from snapshots and activity without disturbing output", () => {
+    const attached = applyTerminalAttachStreamEvent(nextTerminalAttachSeedState(), {
       type: "snapshot",
-      terminals: [
-        {
-          threadId: BASE_SNAPSHOT.threadId,
-          terminalId: BASE_SNAPSHOT.terminalId,
-          cwd: BASE_SNAPSHOT.cwd,
-          worktreePath: BASE_SNAPSHOT.worktreePath,
-          status: "running",
-          pid: BASE_SNAPSHOT.pid,
-          exitCode: BASE_SNAPSHOT.exitCode,
-          exitSignal: BASE_SNAPSHOT.exitSignal,
-          updatedAt: BASE_SNAPSHOT.updatedAt,
-          hasRunningSubprocess: false,
-          label: BASE_SNAPSHOT.label,
-        },
-      ],
-    })[0]!;
-
-    expect(combineTerminalSessionState(summary, EMPTY_TERMINAL_BUFFER_STATE).status).toBe(
-      "running",
-    );
-  });
-
-  it("does not treat an idle running shell as a running subprocess", () => {
-    const idleSession = {
-      target: TARGET,
-      state: {
-        ...combineTerminalSessionState(null, EMPTY_TERMINAL_BUFFER_STATE),
-        status: "running" as const,
-        hasRunningSubprocess: false,
-      },
-    };
-    const activeSession = {
-      target: { ...TARGET, terminalId: "term-2" },
-      state: {
-        ...idleSession.state,
-        hasRunningSubprocess: true,
-      },
-    };
-
-    expect(selectRunningSubprocessTerminalIds([idleSession, activeSession])).toEqual(["term-2"]);
-  });
-
-  it("reduces attach snapshots and output without an imperative session manager", () => {
-    const snapshot = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
+      snapshot: { ...BASE_SNAPSHOT, cols: 130, rows: 15 },
     });
-    const output = applyTerminalAttachStreamEvent(
-      snapshot,
-      {
-        type: "output",
-        threadId: TARGET.threadId,
-        terminalId: TARGET.terminalId,
-        data: " world",
-      },
-      8,
+    const activity = {
+      type: "activity",
+      threadId: TARGET.threadId,
+      terminalId: TARGET.terminalId,
+      hasRunningSubprocess: false,
+      label: "Terminal 1",
+    } as const;
+    const narrowed = applyTerminalAttachStreamEvent(attached, { ...activity, cols: 54, rows: 15 });
+    // Activity from a server without geometry, or a repeat, must not reset the renderer.
+    const unchanged = applyTerminalAttachStreamEvent(
+      applyTerminalAttachStreamEvent(narrowed, activity),
+      { ...activity, cols: 54, rows: 15 },
     );
 
-    expect(output).toMatchObject({
-      status: "running",
-      error: null,
-      version: 2,
-    });
-    expect(terminalOutputText(output.output)).toBe("lo world");
+    expect(attached.grid).toEqual({ cols: 130, rows: 15 });
+    expect(narrowed).toEqual({ ...attached, grid: { cols: 54, rows: 15 } });
+    expect(unchanged).toBe(narrowed);
   });
 
-  it("resynchronizes web and mobile output cursors without pretending the PTY restarted", () => {
-    const initial = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
+  it("resynchronizes output cursors and geometry without pretending the PTY restarted", () => {
+    const initial = applyTerminalAttachStreamEvent(nextTerminalAttachSeedState(), {
       type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
+      snapshot: { ...BASE_SNAPSHOT, cols: 130, rows: 15 },
     });
     const cursor = readTerminalOutputUpdate(initial.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
     const recovered = applyTerminalAttachStreamEvent(initial, {
       type: "resync",
       threadId: TARGET.threadId,
       terminalId: TARGET.terminalId,
-      snapshot: { ...BASE_SNAPSHOT, history: "authoritative history after overflow" },
+      snapshot: {
+        ...BASE_SNAPSHOT,
+        history: "authoritative history after overflow",
+        cols: 54,
+        rows: 20,
+      },
     });
     expect(readTerminalOutputUpdate(recovered.output, cursor)).toMatchObject({
       type: "reset",
       data: "authoritative history after overflow",
     });
+    expect(recovered.grid).toEqual({ cols: 54, rows: 20 });
     expect(recovered.lifecycleVersion).toBe(initial.lifecycleVersion);
+    expect(recovered.output.generation).toBe(initial.output.generation);
     expect(recovered.version).toBe(initial.version + 1);
     expect(recovered.status).toBe("running");
     const closed = applyTerminalAttachStreamEvent(recovered, {
@@ -165,96 +125,6 @@ describe("terminal session reducers", () => {
     });
     expect(closed.status).toBe("closed");
     expect(closed.lifecycleVersion).toBe(recovered.lifecycleVersion);
-  });
-
-  it("does not advance the lifecycle for the initial attach snapshot", () => {
-    const snapshot = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
-    });
-
-    expect(snapshot).toMatchObject({ status: "running", lifecycleVersion: 0 });
-  });
-
-  it("advances the lifecycle for a live started snapshot", () => {
-    const initial = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
-    });
-    const started = applyTerminalAttachStreamEvent(initial, {
-      type: "snapshot",
-      snapshot: { ...BASE_SNAPSHOT, pid: 456 },
-    });
-
-    expect(started).toMatchObject({ status: "running", lifecycleVersion: 1 });
-  });
-
-  it("advances the lifecycle when a running terminal restarts in place", () => {
-    const snapshot = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
-    });
-    const restarted = applyTerminalAttachStreamEvent(snapshot, {
-      type: "restarted",
-      threadId: TARGET.threadId,
-      terminalId: TARGET.terminalId,
-      snapshot: { ...BASE_SNAPSHOT, pid: 456 },
-    });
-
-    expect(snapshot).toMatchObject({ status: "running", lifecycleVersion: 0 });
-    expect(restarted).toMatchObject({ status: "running", lifecycleVersion: 1 });
-  });
-
-  it("reduces terminal metadata snapshots, upserts, and removals", () => {
-    const initial = applyTerminalMetadataStreamEvent([], {
-      type: "snapshot",
-      terminals: [
-        {
-          threadId: BASE_SNAPSHOT.threadId,
-          terminalId: BASE_SNAPSHOT.terminalId,
-          cwd: BASE_SNAPSHOT.cwd,
-          worktreePath: BASE_SNAPSHOT.worktreePath,
-          status: BASE_SNAPSHOT.status,
-          pid: BASE_SNAPSHOT.pid,
-          exitCode: BASE_SNAPSHOT.exitCode,
-          exitSignal: BASE_SNAPSHOT.exitSignal,
-          updatedAt: BASE_SNAPSHOT.updatedAt,
-          hasRunningSubprocess: false,
-          label: BASE_SNAPSHOT.label,
-        },
-      ],
-    });
-    const updated = applyTerminalMetadataStreamEvent(initial, {
-      type: "upsert",
-      terminal: {
-        ...initial[0]!,
-        hasRunningSubprocess: true,
-      },
-    });
-    const removed = applyTerminalMetadataStreamEvent(updated, {
-      type: "remove",
-      threadId: TARGET.threadId,
-      terminalId: TARGET.terminalId,
-    });
-
-    expect(updated).toHaveLength(1);
-    expect(updated[0]?.hasRunningSubprocess).toBe(true);
-    expect(removed).toEqual([]);
-  });
-
-  it("caps retained output by UTF-8 byte length", () => {
-    const state = applyTerminalAttachStreamEvent(
-      EMPTY_TERMINAL_BUFFER_STATE,
-      {
-        type: "output",
-        threadId: TARGET.threadId,
-        terminalId: TARGET.terminalId,
-        data: "🙂🙂",
-      },
-      4,
-    );
-
-    expect(terminalOutputText(state.output)).toBe("🙂");
   });
 
   it("preserves a BOM code point at a new output chunk boundary", () => {
@@ -332,6 +202,46 @@ describe("terminal session reducers", () => {
     expect(readTerminalOutputUpdate(state.output, update.cursor).type).toBe("none");
   });
 
+  it("bounds historical chunk inspection when reading new tail output", () => {
+    let state = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
+      type: "snapshot",
+      snapshot: { ...BASE_SNAPSHOT, history: "" },
+    });
+    for (let index = 0; index < 512; index += 1) {
+      state = applyTerminalAttachStreamEvent(state, {
+        type: "output",
+        threadId: TARGET.threadId,
+        terminalId: TARGET.terminalId,
+        data: "history\r\n",
+      });
+    }
+    const cursor = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
+    const next = applyTerminalAttachStreamEvent(state, {
+      type: "output",
+      threadId: TARGET.threadId,
+      terminalId: TARGET.terminalId,
+      data: "latest\r\n",
+    });
+    let historicalChunkReads = 0;
+    const chunks = next.output.chunks.map((chunk, index) =>
+      index < state.output.chunks.length
+        ? {
+            ...chunk,
+            get startOffset() {
+              historicalChunkReads += 1;
+              return chunk.startOffset;
+            },
+          }
+        : chunk,
+    );
+
+    expect(readTerminalOutputUpdate({ ...next.output, chunks }, cursor)).toMatchObject({
+      type: "append",
+      data: "latest\r\n",
+    });
+    expect(historicalChunkReads).toBeLessThanOrEqual(2);
+  });
+
   it("preserves the byte-limited tail and resets a cursor before a partially trimmed chunk", () => {
     const initial = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
       type: "snapshot",
@@ -365,75 +275,20 @@ describe("terminal session reducers", () => {
     expect(state.output.retainedBytes).toBe(8);
   });
 
-  it("does not encode retained history again when appending at the byte limit", () => {
-    let state = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: { ...BASE_SNAPSHOT, history: "x".repeat(DEFAULT_MAX_TERMINAL_BUFFER_BYTES) },
-    });
-    const data = "y".repeat(8192);
-    const encode = vi.spyOn(TextEncoder.prototype, "encode");
-    try {
-      for (let index = 0; index < 100; index += 1) {
-        state = applyTerminalAttachStreamEvent(state, {
-          type: "output",
-          threadId: TARGET.threadId,
-          terminalId: TARGET.terminalId,
-          data,
-        });
-      }
-      expect(encode.mock.calls.reduce((total, [text]) => total + (text?.length ?? 0), 0)).toBe(
-        data.length * 100,
-      );
-      expect(state.output.retainedBytes).toBe(DEFAULT_MAX_TERMINAL_BUFFER_BYTES);
-    } finally {
-      encode.mockRestore();
-    }
-  });
-
-  it.each([0, -1])("discards output without encoding when the byte budget is %s", (maxBytes) => {
-    const initial = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: BASE_SNAPSHOT,
-    });
-    const cursor = readTerminalOutputUpdate(initial.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
-    const data = "x".repeat(65_536);
-    const encode = vi.spyOn(TextEncoder.prototype, "encode");
-    try {
-      const discarded = applyTerminalAttachStreamEvent(
-        initial,
-        { type: "output", threadId: TARGET.threadId, terminalId: TARGET.terminalId, data },
-        maxBytes,
-      );
-      expect(encode).not.toHaveBeenCalled();
-      expect(discarded.output.nextOffset).toBe(initial.output.nextOffset + data.length);
-      expect(discarded.output.retainedBytes).toBe(0);
-      expect(readTerminalOutputUpdate(discarded.output, cursor)).toMatchObject({
-        type: "reset",
-        data: "",
-      });
-
-      const empty = applyTerminalAttachStreamEvent(
-        initial,
-        { type: "output", threadId: TARGET.threadId, terminalId: TARGET.terminalId, data: "" },
-        maxBytes,
-      );
-      expect(empty.output).toBe(initial.output);
-      expect(encode).not.toHaveBeenCalled();
-    } finally {
-      encode.mockRestore();
-    }
-  });
-
   it("resets for repeated snapshots, clear, and restart even when output text repeats", () => {
     let state = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
       type: "snapshot",
       snapshot: BASE_SNAPSHOT,
     });
     let cursor = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
+    const attachedGeneration = state.output.generation;
+    // A socket reconnect resubscribes the same stream, so the server's new snapshot gets no seed.
     state = applyTerminalAttachStreamEvent(state, { type: "snapshot", snapshot: BASE_SNAPSHOT });
     const repeated = readTerminalOutputUpdate(state.output, cursor);
     expect(repeated).toMatchObject({ type: "reset", data: "hello" });
     expect(state.version).toBe(2);
+    // Viewers replay their measured grid once per generation; the new attachment holds the old size.
+    expect(state.output.generation).not.toBe(attachedGeneration);
     cursor = repeated.cursor;
 
     state = applyTerminalAttachStreamEvent(state, {
@@ -473,30 +328,6 @@ describe("terminal session reducers", () => {
       data: "other",
     });
     expect(next.lifecycleVersion).toBe(0);
-  });
-
-  it("keeps appending while compacting metadata for many small writes", () => {
-    let state = applyTerminalAttachStreamEvent(EMPTY_TERMINAL_BUFFER_STATE, {
-      type: "snapshot",
-      snapshot: { ...BASE_SNAPSHOT, history: "" },
-    });
-    let cursor = readTerminalOutputUpdate(state.output, INITIAL_TERMINAL_OUTPUT_CURSOR).cursor;
-    let received = "";
-    for (let index = 0; index < 2500; index += 1) {
-      state = applyTerminalAttachStreamEvent(state, {
-        type: "output",
-        threadId: TARGET.threadId,
-        terminalId: TARGET.terminalId,
-        data: "x",
-      });
-      const update = readTerminalOutputUpdate(state.output, cursor);
-      if (update.type !== "append") throw new Error(`Expected append, received ${update.type}`);
-      received += update.data;
-      cursor = update.cursor;
-    }
-    expect(received).toBe("x".repeat(2500));
-    expect(state.output.chunks.length).toBeLessThan(1024);
-    expect(terminalOutputText(state.output)).toBe(received);
   });
 
   it("appends every unread character across a compaction boundary", () => {

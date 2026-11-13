@@ -1,32 +1,64 @@
+import {
+  normalizeProviderAccentColor,
+  resolveProviderInstanceDisplayName,
+  shouldShowInstanceBadge,
+} from "@t3tools/client-runtime/state/provider-instance-display";
+
 import type {
   ModelCapabilities,
   ModelSelection,
+  ProjectId,
+  RuntimeMode,
   ServerConfig as T3ServerConfig,
+} from "@t3tools/contracts";
+import {
+  disallowedProviderMessage,
+  isManagedDriverAllowed,
+  isProviderDriverKind,
+  resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import {
   buildExplicitProviderOptionSelectionsFromDescriptors,
   getProviderOptionDescriptors,
 } from "@t3tools/shared/model";
+import { resolveModelShortName } from "@t3tools/client-runtime/provider-clients";
 
 export type ModelOption = {
   readonly key: string;
   readonly label: string;
+  readonly shortName?: string;
   readonly subtitle: string;
   readonly providerKey: string;
   readonly providerLabel: string;
   readonly providerDriver: string;
+  readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+  readonly providerIconUrl?: string | undefined;
+  readonly providerBadge?: {
+    readonly displayName: string;
+    readonly accentColor?: string;
+    readonly showBadge: boolean;
+  };
   readonly isDefault: boolean;
   readonly isLegacy: boolean;
   readonly isUnavailable?: boolean;
   readonly isReady?: boolean;
+  readonly isHidden?: boolean;
+  readonly canHide?: boolean;
   readonly capabilities: ModelCapabilities | null;
   readonly selection: ModelSelection;
+  readonly providerUpdateRequired?: ProviderUpdateRequired;
 };
+
+type ProviderUpdateRequired = Pick<
+  T3ServerConfig["providers"][number],
+  "driver" | "updateRequiredModels"
+>;
 
 export type ProviderGroup = {
   readonly providerKey: string;
   readonly providerLabel: string;
   readonly models: ReadonlyArray<ModelOption>;
+  readonly updateRequired?: ProviderUpdateRequired;
 };
 
 function providerDisplayLabel(provider: {
@@ -35,9 +67,73 @@ function providerDisplayLabel(provider: {
   readonly instanceId: string;
 }): string {
   if (provider.displayName) return provider.displayName;
+  if (provider.driver === "neopi") return "NeoPi";
   if (provider.driver === "codex") return "Codex";
   if (provider.driver === "claudeAgent") return "Claude";
+  if (provider.driver === "pi") return "Pi";
   return provider.instanceId;
+}
+
+function isProviderEnabledForProject(
+  config: T3ServerConfig | null | undefined,
+  provider:
+    | { readonly instanceId: ModelSelection["instanceId"]; readonly enabled: boolean }
+    | undefined,
+  projectId: ProjectId | null,
+): boolean {
+  if (!provider) {
+    return false;
+  }
+  return config?.settings
+    ? resolveProjectProviderInstanceEnabled(config.settings, projectId, provider.instanceId)
+    : provider.enabled;
+}
+
+function isProjectDisabledOverride(
+  config: T3ServerConfig | null | undefined,
+  instanceId: ModelSelection["instanceId"],
+  projectId: ProjectId | null,
+): boolean {
+  if (!projectId || !config?.settings) {
+    return false;
+  }
+  return (
+    config.settings.projectSettingsOverrides[projectId]?.providerInstances?.[instanceId]
+      ?.enabled === false
+  );
+}
+
+function isDisabledForProject(
+  config: T3ServerConfig | null | undefined,
+  provider:
+    | { readonly instanceId: ModelSelection["instanceId"]; readonly enabled: boolean }
+    | undefined,
+  instanceId: ModelSelection["instanceId"],
+  projectId: ProjectId | null,
+): boolean {
+  if (isProjectDisabledOverride(config, instanceId, projectId)) {
+    return true;
+  }
+  return provider !== undefined && !isProviderEnabledForProject(config, provider, projectId);
+}
+
+function selectionDriver(
+  config: T3ServerConfig | null | undefined,
+  instanceId: ModelSelection["instanceId"],
+): string | undefined {
+  return (
+    config?.providers.find((candidate) => candidate.instanceId === instanceId)?.driver ??
+    config?.settings?.providerInstances[instanceId]?.driver
+  );
+}
+
+/** Whether the environment's managed policy leaves this driver out; the server refuses its turns. */
+function isDriverDisallowed(config: T3ServerConfig | null | undefined, driver: string | undefined) {
+  return (
+    driver !== undefined &&
+    isProviderDriverKind(driver) &&
+    !isManagedDriverAllowed(config?.managedPolicy, driver)
+  );
 }
 
 function normalizeSelectionOptions(
@@ -46,6 +142,9 @@ function normalizeSelectionOptions(
 ): ModelSelection {
   if (!capabilities) {
     return selection;
+  }
+  if (!selection.options?.length) {
+    return { instanceId: selection.instanceId, model: selection.model };
   }
   const options = buildExplicitProviderOptionSelectionsFromDescriptors(
     getProviderOptionDescriptors({
@@ -62,10 +161,11 @@ function normalizeSelectionOptions(
       };
 }
 
-/** Whether the native runtime or selected model is unavailable. */
+/** Require explicit projectId or null so omissions cannot bypass project provider disablement. */
 export function isModelSelectionUnavailable(
   config: T3ServerConfig | null | undefined,
   selection: ModelSelection | null | undefined,
+  projectId: ProjectId | null,
 ): boolean {
   if (!config || !selection) {
     return false;
@@ -73,24 +173,63 @@ export function isModelSelectionUnavailable(
   const provider = config.providers.find(
     (candidate) => candidate.instanceId === selection.instanceId,
   );
+  if (isDisabledForProject(config, provider, selection.instanceId, projectId)) {
+    return true;
+  }
   const driver =
     provider?.driver ?? config.settings?.providerInstances[selection.instanceId]?.driver;
+  if (isDriverDisallowed(config, driver)) {
+    return true;
+  }
   return (
     driver !== "neopi" ||
-    (!provider ||
-      !provider.enabled ||
-      !provider.installed ||
-      provider.auth.status === "unauthenticated" ||
-      provider.availability === "unavailable" ||
-      provider.status === "error" || provider.status === "disabled" ||
-      !provider.models.some((model) => model.slug === selection.model))
+    !provider ||
+    !provider.installed ||
+    provider.auth.status === "unauthenticated" ||
+    provider.availability === "unavailable" ||
+    provider.status === "error" ||
+    provider.status === "disabled" ||
+    !provider.models.some((model) => model.slug === selection.model)
   );
 }
 
-/** Keep usable native selections; never reinterpret a retired runtime as NeoPi. */
+export function describeUnavailableModelSelection(
+  config: T3ServerConfig | null | undefined,
+  selection: ModelSelection,
+  projectId: ProjectId | null,
+): { readonly title: string; readonly detail: string } {
+  const provider = config?.providers.find(
+    (candidate) => candidate.instanceId === selection.instanceId,
+  );
+  const driver = selectionDriver(config, selection.instanceId);
+  if (isDriverDisallowed(config, driver)) {
+    const label = providerDisplayLabel({
+      driver: driver ?? selection.instanceId,
+      displayName:
+        provider?.displayName ??
+        config?.settings?.providerInstances[selection.instanceId]?.displayName,
+      instanceId: selection.instanceId,
+    });
+    return {
+      title: "Provider not allowed",
+      detail: `${disallowedProviderMessage(config?.managedPolicy?.organization, label)} Choose another model.`,
+    };
+  }
+  return isDisabledForProject(config, provider, selection.instanceId, projectId)
+    ? {
+        title: "Model turned off for this project",
+        detail: "Turn it back on from web or desktop, or choose another model.",
+      }
+    : {
+        title: "NeoPi model unavailable",
+        detail: "Check NeoPi in Models or choose another model.",
+      };
+}
+
 export function resolveSelectableModelSelection(
   config: T3ServerConfig | null | undefined,
   selection: ModelSelection | null,
+  projectId: ProjectId | null,
 ): ModelSelection | null {
   if (!selection || !config) {
     return selection;
@@ -101,8 +240,9 @@ export function resolveSelectableModelSelection(
   const driver =
     provider?.driver ?? config.settings?.providerInstances[selection.instanceId]?.driver;
   return driver === "neopi" &&
+    !isDriverDisallowed(config, driver) &&
     provider &&
-    provider.enabled &&
+    isProviderEnabledForProject(config, provider, projectId) &&
     provider.installed &&
     provider.availability !== "unavailable" &&
     provider.auth.status !== "unauthenticated"
@@ -110,15 +250,12 @@ export function resolveSelectableModelSelection(
     : null;
 }
 
-/**
- * Reject retired native models for implicit defaults. Explicit saved choices
- * remain visible until the user selects another model.
- */
 export function resolveDefaultableModelSelection(
   config: T3ServerConfig | null | undefined,
   selection: ModelSelection | null,
+  projectId: ProjectId | null,
 ): ModelSelection | null {
-  const usable = resolveSelectableModelSelection(config, selection);
+  const usable = resolveSelectableModelSelection(config, selection, projectId);
   if (!usable || !config) {
     return usable;
   }
@@ -134,9 +271,13 @@ export function resolveNewTaskModelSelection(input: {
   readonly modelOptions: ReadonlyArray<ModelOption>;
 }): ModelSelection | null {
   const nativeSelection = (selection: ModelSelection | null) =>
-    selection !== null && input.modelOptions.some(
-      (option) => option.providerDriver === "neopi" && option.selection.instanceId === selection.instanceId,
-    ) ? selection : null;
+    selection !== null &&
+    input.modelOptions.some(
+      (option) =>
+        option.providerDriver === "neopi" && option.selection.instanceId === selection.instanceId,
+    )
+      ? selection
+      : null;
   const explicitSelection =
     nativeSelection(input.draftSelection) ??
     nativeSelection(input.projectDefaultSelection) ??
@@ -147,7 +288,8 @@ export function resolveNewTaskModelSelection(input: {
     (option) => option.providerDriver === "neopi" && option.isReady && !option.isUnavailable,
   );
   const isUsable = (option: ModelOption) =>
-    option.providerDriver === "neopi" && !option.isUnavailable &&
+    option.providerDriver === "neopi" &&
+    !option.isUnavailable &&
     (!hasReadyOption || option.isReady === true);
   return (
     input.modelOptions.find((option) => option.isDefault && isUsable(option))?.selection ??
@@ -159,34 +301,101 @@ export function resolveNewTaskModelSelection(input: {
 export function buildModelOptions(
   config: T3ServerConfig | null | undefined,
   fallbackModelSelection: ModelSelection | null,
+  providerInstanceId: ModelSelection["instanceId"] | undefined,
+  projectId: ProjectId | null,
+  includeHidden = false,
 ): ReadonlyArray<ModelOption> {
   const options = new Map<string, ModelOption>();
+  const lockedProvider = config?.providers.find(
+    (provider) => provider.instanceId === providerInstanceId,
+  );
+  const matchesLockedProvider = (provider: T3ServerConfig["providers"][number]) => {
+    if (providerInstanceId === undefined || provider.instanceId === providerInstanceId) return true;
+    if (!lockedProvider || provider.driver !== lockedProvider.driver) return false;
+    const groupKey = lockedProvider.continuation?.groupKey;
+    if (groupKey) return provider.continuation?.groupKey === groupKey;
+    return true;
+  };
+  const badgeEntries = (config?.providers ?? []).map((provider) => ({
+    driverKind: provider.driver,
+    enabled: provider.enabled,
+  }));
+  const providerBadgeFor = (instanceId: ModelSelection["instanceId"]) => {
+    const snapshot = config?.providers.find((provider) => provider.instanceId === instanceId);
+    const instance = config?.settings?.providerInstances[instanceId];
+    const driver = snapshot?.driver ?? instance?.driver;
+    if (!driver) return undefined;
+    const accentColor = normalizeProviderAccentColor(
+      snapshot?.accentColor ?? instance?.accentColor,
+    );
+    return {
+      displayName: resolveProviderInstanceDisplayName({
+        instanceId,
+        driver,
+        displayName: snapshot?.displayName ?? instance?.displayName,
+      }),
+      ...(accentColor ? { accentColor } : {}),
+      showBadge: shouldShowInstanceBadge(
+        {
+          driverKind: driver,
+          accentColor,
+          enabled: snapshot?.enabled ?? instance?.enabled ?? false,
+        },
+        badgeEntries,
+      ),
+    };
+  };
 
   for (const provider of config?.providers ?? []) {
     if (
       provider.driver !== "neopi" ||
-      !provider.enabled ||
+      !matchesLockedProvider(provider) ||
+      isDriverDisallowed(config, provider.driver) ||
+      !isProviderEnabledForProject(config, provider, projectId) ||
       !provider.installed ||
       provider.auth.status === "unauthenticated" ||
       provider.availability === "unavailable" ||
-      provider.status === "error" || provider.status === "disabled"
+      provider.status === "error" ||
+      provider.status === "disabled"
     ) {
       continue;
     }
 
     const providerLabel = providerDisplayLabel(provider);
-    for (const model of provider.models) {
+    const providerBadge = providerBadgeFor(provider.instanceId);
+    const updateRequired = provider.updateRequiredModels?.length
+      ? { driver: provider.driver, updateRequiredModels: provider.updateRequiredModels }
+      : undefined;
+    const preferences = config?.settings?.providerModelPreferences?.[provider.instanceId];
+    const hiddenModels = new Set(preferences?.hiddenModels ?? []);
+    const order = new Map((preferences?.modelOrder ?? []).map((slug, index) => [slug, index]));
+    const models = provider.models.filter(
+      (model) => includeHidden || model.isCustom || !hiddenModels.has(model.slug),
+    );
+    if (order.size > 0)
+      models.sort((a, b) => (order.get(a.slug) ?? Infinity) - (order.get(b.slug) ?? Infinity));
+    for (const model of models) {
       const key = `${provider.instanceId}:${model.slug}`;
+      const shortName = resolveModelShortName(model, provider.driver);
       options.set(key, {
         key,
         label: model.name,
+        ...(shortName ? { shortName } : {}),
         subtitle: model.subProvider ?? "",
         providerKey: provider.instanceId,
         providerLabel,
         providerDriver: provider.driver,
+        providerBadge,
+        ...(provider.supportedRuntimeModes === undefined
+          ? {}
+          : { supportedRuntimeModes: provider.supportedRuntimeModes }),
+        ...(provider.iconUrl ? { providerIconUrl: provider.iconUrl } : {}),
+        isHidden: !model.isCustom && hiddenModels.has(model.slug),
+        canHide: !model.isCustom,
         isDefault: model.isDefault === true,
         isLegacy: model.isLegacy === true,
         isReady: provider.status === "ready",
+        ...(updateRequired ? { providerUpdateRequired: updateRequired } : {}),
         capabilities: model.capabilities,
         selection: normalizeSelectionOptions(
           {
@@ -199,7 +408,17 @@ export function buildModelOptions(
     }
   }
 
-  if (fallbackModelSelection) {
+  if (
+    fallbackModelSelection &&
+    (providerInstanceId === undefined ||
+      fallbackModelSelection.instanceId === providerInstanceId) &&
+    (!config?.settings?.providerModelPreferences?.[
+      fallbackModelSelection.instanceId
+    ]?.hiddenModels.includes(fallbackModelSelection.model) ||
+      config?.providers
+        .find((provider) => provider.instanceId === fallbackModelSelection.instanceId)
+        ?.models.find((model) => model.slug === fallbackModelSelection.model)?.isCustom)
+  ) {
     const key = `${fallbackModelSelection.instanceId}:${fallbackModelSelection.model}`;
     const existing = options.get(key);
     if (existing) {
@@ -223,17 +442,24 @@ export function buildModelOptions(
         displayName: provider?.displayName ?? instanceConfig?.displayName,
         instanceId: fallbackModelSelection.instanceId,
       });
+      const shortName = model
+        ? resolveModelShortName(model, isProviderDriverKind(providerDriver) ? providerDriver : null)
+        : undefined;
       options.set(key, {
         key,
         label: model?.name ?? fallbackModelSelection.model,
+        ...(shortName ? { shortName } : {}),
         subtitle: model?.subProvider ?? "",
         providerKey: fallbackModelSelection.instanceId,
         providerLabel,
         providerDriver,
+        providerBadge: providerBadgeFor(fallbackModelSelection.instanceId),
         isDefault: false,
         isLegacy: model?.isLegacy === true,
         isReady: provider?.status === "ready",
-        ...(isModelSelectionUnavailable(config, fallbackModelSelection)
+        ...(isModelSelectionUnavailable(config, fallbackModelSelection, projectId) ||
+        (provider !== undefined && !isProviderEnabledForProject(config, provider, projectId)) ||
+        provider?.updateRequiredModels?.some((gated) => gated.slug === fallbackModelSelection.model)
           ? { isUnavailable: true }
           : {}),
         capabilities: model?.capabilities ?? null,
@@ -246,28 +472,32 @@ export function buildModelOptions(
 }
 
 export function groupByProvider(options: ReadonlyArray<ModelOption>): ReadonlyArray<ProviderGroup> {
-  const groups = new Map<string, { providerLabel: string; models: ModelOption[] }>();
+  const groups = new Map<
+    string,
+    {
+      providerLabel: string;
+      models: ModelOption[];
+      updateRequired: ProviderUpdateRequired | undefined;
+    }
+  >();
   for (const option of options) {
     const existing = groups.get(option.providerKey);
     if (existing) {
       existing.models.push(option);
+      existing.updateRequired ??= option.providerUpdateRequired;
     } else {
       groups.set(option.providerKey, {
         providerLabel: option.providerLabel,
         models: [option],
+        updateRequired: option.providerUpdateRequired,
       });
     }
   }
 
-  return [...groups.entries()]
-    .map(([providerKey, group]) => ({
-      providerKey,
-      providerLabel: group.providerLabel,
-      models: group.models,
-    }))
-    .sort(
-      (left, right) =>
-        Number(right.models[0]?.providerDriver === "neopi") -
-        Number(left.models[0]?.providerDriver === "neopi"),
-    );
+  return [...groups.entries()].map(([providerKey, group]) => ({
+    providerKey,
+    providerLabel: group.providerLabel,
+    models: group.models,
+    ...(group.updateRequired ? { updateRequired: group.updateRequired } : {}),
+  }));
 }

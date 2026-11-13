@@ -6,10 +6,6 @@ export interface ModelSlugItem {
   readonly slug: string;
 }
 
-export interface ProviderModelItem extends ModelSlugItem {
-  readonly instanceId: ProviderInstanceId;
-}
-
 export function providerModelKey(instanceId: ProviderInstanceId, slug: string): string {
   return `${instanceId}:${slug}`;
 }
@@ -53,34 +49,4 @@ export function sortModelsForProviderInstance<T extends ModelSlugItem>(
   ];
 
   return Arr.sort(models, Order.combineAll(orders));
-}
-
-export function sortProviderModelItems<T extends ProviderModelItem>(
-  items: ReadonlyArray<T>,
-  options?: {
-    readonly favoriteModelKeys?: ReadonlySet<string> | ReadonlyArray<string>;
-    readonly groupFavorites?: boolean;
-    readonly instanceOrder?: ReadonlyArray<ProviderInstanceId>;
-  },
-): T[] {
-  const favoriteModelKeys = toSet(options?.favoriteModelKeys);
-  const instanceOrder = new Map(
-    Arr.map(options?.instanceOrder ?? [], (instanceId, index) => [instanceId, index] as const),
-  );
-  const originalOrder = rankByValue(
-    Arr.map(items, (item) => providerModelKey(item.instanceId, item.slug)),
-  );
-  const orders: Array<Order.Order<T>> = [
-    ...(options?.groupFavorites === true
-      ? [
-          byTrueFirst<T>((item) =>
-            favoriteModelKeys.has(providerModelKey(item.instanceId, item.slug)),
-          ),
-        ]
-      : []),
-    byOptionalRank((item) => instanceOrder.get(item.instanceId)),
-    byOptionalRank((item) => originalOrder.get(providerModelKey(item.instanceId, item.slug))),
-  ];
-
-  return Arr.sort(items, Order.combineAll(orders));
 }

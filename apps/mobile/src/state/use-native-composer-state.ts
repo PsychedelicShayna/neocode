@@ -8,10 +8,11 @@ import {
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
 } from "@t3tools/contracts";
 import { useRef, useState } from "react";
-import { prepareTurnAttachments, validateDraftFileAttachments } from "../lib/attachmentUpload";
+import { prepareTurnAttachments } from "../lib/attachmentUpload";
+import { canUploadComposerAttachment } from "../lib/composerAttachmentUploadQueue";
 import {
   composerContextSendBlockReason,
-  serializeComposerMessageForServer,
+  serializeNativeComposerMessage,
   uploadedComposerContext,
 } from "../lib/composerContext";
 import { retainComposerAttachmentFileForPreview } from "../lib/composerAttachmentPreviewRetention";
@@ -25,7 +26,7 @@ import {
 } from "../lib/composerImages";
 import type { ComposerTextPaste } from "../native/T3ComposerEditor.types";
 import { useServerConfigs } from "./entities";
-import type { useNativeSession } from "./neopiNativeSessions";
+import { nativeSessionAtoms, type useNativeSession } from "./neopiNativeSessions";
 import {
   appendComposerDraftAttachments,
   captureComposerDraftInsertion,
@@ -48,12 +49,10 @@ export function useNativeComposerState({
   target,
   request,
   connected,
-  busy,
 }: {
   target: NativeSessionTarget;
   request: ReturnType<typeof useNativeSession>["request"];
   connected: boolean;
-  busy: boolean;
 }) {
   const key = workspaceKey(target);
   const draft = useComposerDraft(key);
@@ -63,8 +62,6 @@ export function useNativeComposerState({
   const [pendingPastes, setPendingPastes] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const sendingRef = useRef(false);
-  const busyRef = useRef(busy);
-  busyRef.current = busy;
   const pastedNames = useRef(new Set<string>());
   const capabilities = serverConfig?.environment.capabilities;
   const blockReason =
@@ -74,7 +71,9 @@ export function useNativeComposerState({
       ? `Messages can contain at most ${PROVIDER_SEND_TURN_MAX_INPUT_CHARS} characters.`
       : null) ??
     composerContextSendBlockReason(draft.context) ??
-    validateDraftFileAttachments({ attachments: draft.attachments, serverConfig });
+    (draft.attachments.some((attachment) => !canUploadComposerAttachment(attachment, serverConfig))
+      ? "An attachment exceeds this server's upload limits or is not supported."
+      : null);
 
   const append = (
     attachments: readonly DraftComposerAttachment[],
@@ -195,7 +194,11 @@ export function useNativeComposerState({
       if (!snapshot.text.trim() && !snapshot.attachments.length) return;
       const invalid =
         composerContextSendBlockReason(snapshot.context) ??
-        validateDraftFileAttachments({ attachments: snapshot.attachments, serverConfig });
+        (snapshot.attachments.some(
+          (attachment) => !canUploadComposerAttachment(attachment, serverConfig),
+        )
+          ? "An attachment exceeds this server's upload limits or is not supported."
+          : null);
       if (invalid) throw new Error(invalid);
       if (snapshot.text.length > PROVIDER_SEND_TURN_MAX_INPUT_CHARS)
         throw new Error(
@@ -228,15 +231,18 @@ export function useNativeComposerState({
           throw new Error("The attachment was not uploaded. Reconnect and try again.");
         return attachment;
       });
-      const message = serializeComposerMessageForServer(
+      const message = serializeNativeComposerMessage(
         snapshot.text,
         uploadedComposerContext(snapshot.context, snapshot.attachments, attachments),
-        false,
-      ).text;
+      );
       // While NeoPi runs, a prompt steers in at the next tool boundary rather
       // than waiting invisibly for the whole run.
       await request(
-        { type: "prompt", message, ...(busyRef.current ? { streamingBehavior: "steer" } : {}) },
+        {
+          type: "prompt",
+          message,
+          ...(nativeSessionAtoms.cached(target)?.busy ? { streamingBehavior: "steer" } : {}),
+        },
         attachments,
       );
       clearComposerDraftContent(key, { acceptedSnapshot: snapshot });

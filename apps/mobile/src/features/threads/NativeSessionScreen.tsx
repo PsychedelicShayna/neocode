@@ -7,8 +7,8 @@ import {
   executeNativeSessionCommand,
   nativeCatalogModels,
   nativeCommandCompletions,
-  nativeCommandNeedsTerminal,
   nativeDisconnectLabel,
+  nativeValueItems,
   nativeOwnerNotice,
   nativeRecord,
   nativeSessionKey,
@@ -27,11 +27,11 @@ import {
 import { journalEntryLabel } from "@t3tools/client-runtime/neopi-journal";
 import { createNativeSubmissionFollow } from "@t3tools/client-runtime/neopi-submission-follow";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Platform, ScrollView, View } from "react-native";
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
-import { ScreenHeader } from "../../components/ScreenHeader";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
+import { AppBar } from "../../components/ui/AppBar";
 import {
   nativeSessionAtoms,
   useNativeSession,
@@ -77,51 +77,89 @@ export function NativeSessionScreen({ route }: StaticScreenProps<Params>) {
   );
   return <NativeSessionBody key={nativeSessionKey(target)} target={target} />;
 }
+function createNativeMobileTimeline() {
+  let list: FlatList<NativeTranscriptRow> | null = null;
+  let rows: readonly NativeTranscriptRow[] = [];
+  let revision = 0;
+  const layout = { height: 0, viewport: 0, offset: 0 };
+  const measuredRows = new Map<string, number>();
+  const scrollToEnd = () => list?.scrollToEnd({ animated: false });
+  const follow = createNativeSubmissionFollow({
+    scheduleFrame: (callback) => requestAnimationFrame(callback),
+    cancelFrame: (frame) => cancelAnimationFrame(frame),
+    readLayout: () => {
+      const last = rows.at(-1);
+      return {
+        measured: !!last && measuredRows.has(last.id) && layout.viewport > 0,
+        atEnd: layout.height - layout.viewport - layout.offset <= 1,
+        revision: JSON.stringify([
+          last?.id,
+          revision,
+          measuredRows.get(last?.id ?? ""),
+          layout.height,
+          layout.viewport,
+          layout.offset,
+        ]),
+      };
+    },
+    scrollToEnd,
+  });
+  return {
+    follow,
+    scrollToEnd,
+    setList: (value: FlatList<NativeTranscriptRow> | null) => {
+      list = value;
+    },
+    setEntries: (value: readonly NativeTranscriptRow[], nextRevision: number) => {
+      rows = value;
+      revision = nextRevision;
+    },
+    setViewportHeight: (height: number) => {
+      layout.viewport = height;
+      follow.changed();
+    },
+    setContentHeight: (height: number) => {
+      layout.height = height;
+      follow.changed();
+    },
+    setLayout: (height: number, viewport: number, offset: number) => {
+      layout.height = height;
+      layout.viewport = viewport;
+      layout.offset = offset;
+      follow.changed();
+    },
+    measureRow: (id: string, height: number) => {
+      measuredRows.set(id, height);
+      follow.changed();
+    },
+  };
+}
+
 function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const { feed, request, error } = useNativeSession(target);
-  const timelineRef = useRef<FlatList<NativeTranscriptRow>>(null);
   const nearEndRef = useRef(false);
-  const followRevisionRef = useRef(feed.conversation.revision);
-  followRevisionRef.current = feed.conversation.revision;
-  const followRowsRef = useRef<readonly NativeTranscriptRow[]>([]);
-  const layoutRef = useRef({ height: 0, viewport: 0, offset: 0 });
-  const measuredRowsRef = useRef(new Map<string, number>());
-  const submissionFollow = useMemo(
-    () =>
-      createNativeSubmissionFollow({
-        scheduleFrame: (callback) => requestAnimationFrame(callback),
-        cancelFrame: (frame) => cancelAnimationFrame(frame),
-        readLayout: () => {
-          const last = followRowsRef.current.at(-1);
-          const layout = layoutRef.current;
-          return {
-            measured: !!last && measuredRowsRef.current.has(last.id) && layout.viewport > 0,
-            atEnd: layout.height - layout.viewport - layout.offset <= 1,
-            revision: JSON.stringify([
-              last?.id,
-              followRevisionRef.current,
-              measuredRowsRef.current.get(last?.id ?? ""),
-              layout.height,
-              layout.viewport,
-              layout.offset,
-            ]),
-          };
-        },
-        scrollToEnd: () => timelineRef.current?.scrollToEnd({ animated: false }),
-      }),
-    [],
-  );
+  const [
+    {
+      follow: submissionFollow,
+      scrollToEnd: scrollTimelineToEnd,
+      setList: setTimelineList,
+      setEntries: setTimelineEntries,
+      setViewportHeight,
+      setContentHeight,
+      setLayout: setTimelineLayout,
+      measureRow,
+    },
+  ] = useState(createNativeMobileTimeline);
   const cancelSubmissionFollow = useCallback(() => {
     submissionFollow.cancel();
   }, [submissionFollow]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Release any scheduled native scroll frame on unmount.
   useEffect(() => cancelSubmissionFollow, [cancelSubmissionFollow]);
   const reconnect = useNativeSessionReconnect(target);
-  const ownerlessRef = useRef(false);
-  ownerlessRef.current = !feed.connected;
   const submit = useCallback<Request>(
     async (command, attachments) => {
-      // Nothing owns the session: take it over first, so the prompt lands in a live one.
-      if (command.type === "prompt" && ownerlessRef.current) await reconnect();
+      if (command.type === "prompt" && !nativeSessionAtoms.cached(target)?.connected)
+        await reconnect();
       if (command.type !== "prompt") {
         cancelSubmissionFollow();
         return request(command, attachments);
@@ -137,7 +175,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         throw cause;
       }
     },
-    [request, cancelSubmissionFollow, submissionFollow],
+    [request, cancelSubmissionFollow, submissionFollow, reconnect, target],
   );
   const composer = useNativeComposerState({
     target,
@@ -145,7 +183,6 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     // A reconnecting session holds sends on the server; an orphaned one takes them by
     // starting an owner first (see `submit`).
     connected: feed.connected || feed.ownerLoss === "orphaned",
-    busy: feed.busy,
   });
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const [paging, setPaging] = useState(false);
@@ -159,13 +196,18 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       .finally(() => setReconnecting(false));
   }, [reconnect]);
   const ownerNotice = nativeOwnerNotice(feed.ownerLoss, feed.session?.attachment);
-  const [editorNotice, setEditorNotice] = useState<string | null>(null);
+  const [editorNotice, setEditorNotice] = useState<{ id: string; text: string } | null>(null);
   const [models, setModels] = useState(false);
   const [tree, setTree] = useState(false);
   const [debug, setDebug] = useState(false);
   const [agents, setAgents] = useState(false);
-  const [state, setState] = useState<Record<string, unknown>>({});
-  const [commands, setCommands] = useState<readonly NativeSlashCommand[]>([]);
+  const state = feed.session?.state ?? {};
+  const [commandCatalog, setCommandCatalog] = useState<{
+    revision: number;
+    commands: readonly NativeSlashCommand[];
+  } | null>(null);
+  const commands =
+    commandCatalog?.revision === feed.commandsRevision ? commandCatalog.commands : [];
   const [completions, setCompletions] = useState<{
     readonly command: string;
     readonly prefix: string;
@@ -174,13 +216,12 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const key = nativeSessionKey(target);
   const [dismissed, setDismissed] = useState(() => answered.get(key) ?? new Set<string>());
   const navigation = useNavigation();
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Native navigation blur cancels the pending scroll frame.
   useEffect(
     () => navigation.addListener("blur", cancelSubmissionFollow),
     [navigation, cancelSubmissionFollow],
   );
-  useEffect(() => {
-    if (feed.session) setState(feed.session.state);
-  }, [feed.session]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Relocate the persisted draft before replacing a moved native route.
   useEffect(() => {
     const movedRef = feed.movedTo ?? feed.session?.ref;
     if (!movedRef || movedRef.sessionFile === target.ref.sessionFile) return;
@@ -225,13 +266,14 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       setPaging(false);
     }
   };
-  // NeoPi owns the command list; an announcement of a changed list re-reads it.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- NeoPi announcements invalidate this session's native command catalog.
   useEffect(() => {
     if (!feed.connected) return;
+    const revision = feed.commandsRevision;
     let active = true;
     void request({ type: "get_available_commands" })
       .then((value) => {
-        if (active) setCommands(nativeSlashCommands(value));
+        if (active) setCommandCatalog({ revision, commands: nativeSlashCommands(value) });
       })
       .catch((cause) => {
         if (active) setLocalError(String(cause));
@@ -250,6 +292,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       ? argument.command
       : null;
   const argumentPrefix = argumentCommand ? (argument?.prefix ?? "") : null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Debounce native completion requests and cancel superseded answers.
   useEffect(() => {
     if (argumentCommand === null || argumentPrefix === null) return;
     let active = true;
@@ -277,9 +320,9 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       clearTimeout(timer);
     };
   }, [argumentCommand, argumentPrefix, request]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Observe persisted draft availability before applying native editor text.
   useEffect(() => {
     const editor = feed.editor;
-    setEditorNotice(null);
     if (!editor || editors.get(key) === editor.id) return;
     let active = true;
     let cancel = () => {};
@@ -298,9 +341,10 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           },
           subscribe: (changed) => appAtomRegistry.subscribe(composerDraftsAtom, changed),
           onDeferred: () =>
-            setEditorNotice(
-              "Draft kept. NeoPi's editor text will be inserted after you clear or send your draft.",
-            ),
+            setEditorNotice({
+              id: editor.id,
+              text: "Draft kept. NeoPi's editor text will be inserted after you clear or send your draft.",
+            }),
         });
       })
       .catch((cause) => {
@@ -318,7 +362,6 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         command,
         submit: () => submit(command, attachments),
         readState: () => request({ type: "get_state" }),
-        onState: setState,
         onRefreshError: setLocalError,
       });
     },
@@ -355,11 +398,19 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       ),
     [feed.conversation, feed.commandOutputs, debug],
   );
-  followRowsRef.current = rows;
-  useEffect(() => {
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- The native scroll controller reads only committed rows and layout.
+  useLayoutEffect(() => {
+    setTimelineEntries(rows, feed.conversation.revision);
     if (!feed.connected) cancelSubmissionFollow();
     else submissionFollow.changed();
-  }, [rows, feed.connected, submissionFollow, cancelSubmissionFollow]);
+  }, [
+    rows,
+    feed.conversation.revision,
+    feed.connected,
+    setTimelineEntries,
+    submissionFollow,
+    cancelSubmissionFollow,
+  ]);
   const model = nativeRecord(state.model);
   const suggestions =
     composer.draft.text.startsWith("/") &&
@@ -383,7 +434,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       className="flex-1 bg-screen"
     >
-      <ScreenHeader
+      <AppBar
         title={String(state.sessionName ?? "Conversation")}
         onBack={() => navigation.dispatch(StackActions.popTo("Home"))}
         actions={[
@@ -400,7 +451,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             {ownerNotice.text}
           </Text>
           {ownerNotice.action ? (
-            <MaterialButton
+            <Button
               label={ownerNotice.action}
               tone="text"
               disabled={reconnecting}
@@ -416,30 +467,26 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       <View className="px-4">
         <NativeError message={localError ?? error} />
       </View>
-      {editorNotice ? (
+      {editorNotice && editorNotice.id === feed.editor?.id ? (
         <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
-          {editorNotice}
+          {editorNotice.text}
         </Text>
       ) : null}
       <FlatList
-        ref={timelineRef}
+        ref={setTimelineList}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
         onTouchStart={cancelSubmissionFollow}
-        onLayout={({ nativeEvent }) => {
-          layoutRef.current.viewport = nativeEvent.layout.height;
-          submissionFollow.changed();
-        }}
+        onLayout={({ nativeEvent }) => setViewportHeight(nativeEvent.layout.height)}
         onScrollBeginDrag={() => {
           cancelSubmissionFollow();
           nearEndRef.current = false;
         }}
         onScroll={({ nativeEvent }) => {
-          layoutRef.current = {
-            height: nativeEvent.contentSize.height,
-            viewport: nativeEvent.layoutMeasurement.height,
-            offset: nativeEvent.contentOffset.y,
-          };
-          submissionFollow.changed();
+          setTimelineLayout(
+            nativeEvent.contentSize.height,
+            nativeEvent.layoutMeasurement.height,
+            nativeEvent.contentOffset.y,
+          );
           nearEndRef.current =
             nativeEvent.contentSize.height -
               nativeEvent.layoutMeasurement.height -
@@ -448,41 +495,34 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         }}
         scrollEventThrottle={16}
         onContentSizeChange={(_, height) => {
-          layoutRef.current.height = height;
-          submissionFollow.changed();
-          if (nearEndRef.current) timelineRef.current?.scrollToEnd({ animated: false });
+          setContentHeight(height);
+          if (nearEndRef.current) scrollTimelineToEnd();
         }}
         data={rows}
         keyExtractor={(entry) => entry.id}
         ListHeaderComponent={
           feed.conversation.cursor ? (
-            <MaterialButton
+            <Button
               label="Load earlier messages"
               tone="text"
               disabled={paging}
               onPress={() => void loadOlder()}
             />
-          ) : null
+          ) : undefined
         }
         renderItem={({ item }) =>
           item.kind === "command" ? (
             <View
               className="px-4 py-3"
               accessibilityLabel="Command output"
-              onLayout={({ nativeEvent }) => {
-                measuredRowsRef.current.set(item.id, nativeEvent.layout.height);
-                submissionFollow.changed();
-              }}
+              onLayout={({ nativeEvent }) => measureRow(item.id, nativeEvent.layout.height)}
             >
               <NativeCommandOutput text={item.text} />
             </View>
           ) : (
             <View
               className="gap-2 px-4 py-3"
-              onLayout={({ nativeEvent }) => {
-                measuredRowsRef.current.set(item.id, nativeEvent.layout.height);
-                submissionFollow.changed();
-              }}
+              onLayout={({ nativeEvent }) => measureRow(item.id, nativeEvent.layout.height)}
             >
               <Text className="text-xs font-t3-medium text-foreground-muted">
                 {journalEntryLabel(item.entry)}
@@ -512,14 +552,14 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             {queued.lane === "steering" && queued.index < feed.queue.liveSteered ? (
               <Text className="text-xs text-foreground-muted">Sending</Text>
             ) : (
-              <MaterialButton label="Cancel" tone="text" onPress={() => removeQueued(queued)} />
+              <Button label="Cancel" tone="text" onPress={() => removeQueued(queued)} />
             )}
           </View>
         ))}
-        {Object.values(feed.notices)
-          .filter(Boolean)
-          .map((notice, index) => (
-            <Text key={index} className="text-xs text-foreground-muted">
+        {Object.entries(feed.notices)
+          .filter(([, notice]) => Boolean(notice))
+          .map(([id, notice]) => (
+            <Text key={id} className="text-xs text-foreground-muted">
               {notice}
             </Text>
           ))}
@@ -544,12 +584,12 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           onStop={interrupt}
         />
         <View className="flex-row flex-wrap items-center gap-2">
-          <MaterialButton
+          <Button
             label={String(model.name ?? model.id ?? "Choose model")}
             tone="text"
             onPress={() => setModels(true)}
           />
-          <MaterialButton
+          <Button
             label={debug ? "Hide debug" : "Debug"}
             tone="text"
             onPress={() => {
@@ -561,7 +601,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         </View>
         <NeoPiModelsEntry environmentId={target.environmentId} target={target.ref} />
         {feed.ownerLoss === "detached" || feed.ownerLoss === "orphaned" ? (
-          <MaterialButton
+          <Button
             label="Reconnect session"
             tone="text"
             disabled={reconnecting}
@@ -569,7 +609,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           />
         ) : (
           // Stays on this screen: the feed shows the session as detached, with a way back.
-          <MaterialButton
+          <Button
             label={nativeDisconnectLabel(feed.session?.attachment)}
             tone="text"
             onPress={() =>
@@ -622,11 +662,17 @@ export function NativeMobileModels({
   onClose: () => void;
 }) {
   const [models, setModels] = useState<ReturnType<typeof nativeCatalogModels>>([]);
-  const [roles, setRoles] = useState<readonly Record<string, unknown>[]>([]);
+  const [roleResult, setRoleResult] = useState<{
+    request: Request;
+    roles: readonly Record<string, unknown>[];
+    error: string | null;
+  } | null>(null);
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [rolesError, setRolesError] = useState<string | null>(null);
+  const roles = rolesSupported && roleResult?.request === request ? roleResult.roles : [];
+  const rolesError = rolesSupported && roleResult?.request === request ? roleResult.error : null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Query the open session's native catalog and discard replies after closing.
   useEffect(() => {
     let active = true;
     void request({ type: "get_available_models" })
@@ -640,20 +686,24 @@ export function NativeMobileModels({
       active = false;
     };
   }, [request]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Capability-gated native roles belong to this open picker request.
   useEffect(() => {
+    if (!rolesSupported) return;
     let active = true;
-    setRoles([]);
-    setRolesError(null);
-    if (rolesSupported) {
-      void request({ type: "get_roles" })
-        .then((value) => {
-          const items = nativeRecord(value).roles;
-          if (active && Array.isArray(items)) setRoles(items.map(nativeRecord));
-        })
-        .catch((cause) => {
-          if (active) setRolesError(`Could not load roles: ${String(cause)}`);
-        });
-    }
+    void request({ type: "get_roles" })
+      .then((value) => {
+        const items = nativeRecord(value).roles;
+        if (active)
+          setRoleResult({
+            request,
+            roles: Array.isArray(items) ? items.map(nativeRecord) : [],
+            error: null,
+          });
+      })
+      .catch((cause) => {
+        if (active)
+          setRoleResult({ request, roles: [], error: `Could not load roles: ${String(cause)}` });
+      });
     return () => {
       active = false;
     };
@@ -696,7 +746,7 @@ export function NativeMobileModels({
                   `${role.alias} ${role.name}`.toLowerCase().includes(query.toLowerCase()),
               )
               .map((role) => (
-                <MaterialButton
+                <Button
                   key={String(role.id)}
                   label={String(role.alias ?? role.id)}
                   disabled={pending}
@@ -708,7 +758,7 @@ export function NativeMobileModels({
         }
         renderItem={({ item }) => (
           <View className="px-4 py-1">
-            <MaterialButton
+            <Button
               label={`${item.name} · ${item.provider}`}
               disabled={pending}
               tone="text"
@@ -781,37 +831,37 @@ function NativeMobileDialog({
               {JSON.stringify(dialog.args, null, 2)}
             </Text>
             {Array.isArray(dialog.details)
-              ? dialog.details.map((detail, index) => (
-                  <Text key={index} className="text-foreground">
+              ? nativeValueItems(dialog.details).map(({ key, value: detail }) => (
+                  <Text key={key} className="text-foreground">
                     {String(detail)}
                   </Text>
                 ))
               : null}
             {Array.isArray(dialog.safetyChecks)
-              ? dialog.safetyChecks.map((item, index) => {
+              ? nativeValueItems(dialog.safetyChecks).map(({ key, value: item }) => {
                   const check = nativeRecord(item);
                   return (
-                    <Text key={index} accessibilityRole="alert" className="text-danger-foreground">
+                    <Text key={key} accessibilityRole="alert" className="text-danger-foreground">
                       {String(check.message ?? check.code ?? check.id)}
                     </Text>
                   );
                 })
               : null}
-            <MaterialButton
+            <Button
               label="Deny"
               tone="secondary"
               disabled={pending}
               onPress={() => void respond({ decision: "deny" })}
             />
             {!Array.isArray(dialog.safetyChecks) || dialog.safetyChecks.length === 0 ? (
-              <MaterialButton
+              <Button
                 label="Allow for session"
                 tone="secondary"
                 disabled={pending}
                 onPress={() => void respond({ decision: "allow_session" })}
               />
             ) : null}
-            <MaterialButton
+            <Button
               label="Allow once"
               disabled={pending}
               onPress={() => void respond({ decision: "allow_once" })}
@@ -824,13 +874,13 @@ function NativeMobileDialog({
               {String(dialog.planMarkdown ?? "")}
             </Text>
             <NativeField label="Plan feedback" multiline value={value} onChange={setValue} />
-            <MaterialButton
+            <Button
               label="Refine"
               tone="secondary"
               disabled={pending}
               onPress={() => void respond({ decision: "refine", feedback: value })}
             />
-            <MaterialButton
+            <Button
               label="Approve plan"
               disabled={pending}
               onPress={() => void respond({ decision: "approve" })}
@@ -838,9 +888,9 @@ function NativeMobileDialog({
           </>
         ) : null}
         {dialog.method === "select" && Array.isArray(dialog.options)
-          ? dialog.options.map((option, index) => (
-              <MaterialButton
-                key={index}
+          ? nativeValueItems(dialog.options).map(({ key, value: option }) => (
+              <Button
+                key={key}
                 label={String(option)}
                 disabled={pending}
                 tone="secondary"
@@ -850,12 +900,12 @@ function NativeMobileDialog({
           : null}
         {dialog.method === "confirm" ? (
           <>
-            <MaterialButton
+            <Button
               label="Yes"
               disabled={pending}
               onPress={() => void respond({ confirmed: true })}
             />
-            <MaterialButton
+            <Button
               label="No"
               disabled={pending}
               tone="secondary"
@@ -872,11 +922,7 @@ function NativeMobileDialog({
               secret={dialog.secret === true}
               multiline={dialog.method === "editor"}
             />
-            <MaterialButton
-              label="Submit"
-              disabled={pending}
-              onPress={() => void respond({ value })}
-            />
+            <Button label="Submit" disabled={pending} onPress={() => void respond({ value })} />
           </>
         ) : null}
         {questions.map((question) => {
@@ -885,37 +931,39 @@ function NativeMobileDialog({
           return (
             <View key={id} className="gap-2">
               <Text className="font-t3-medium text-foreground">{String(question.question)}</Text>
-              {(Array.isArray(question.options) ? question.options : []).map((item, index) => {
-                const option = nativeRecord(item);
-                const label = String(option.label);
-                const description =
-                  typeof option.description === "string" ? option.description.trim() : "";
-                return (
-                  <View key={index} className="gap-1">
-                    <MaterialButton
-                      label={`${answer.selectedOptions.includes(label) ? "✓ " : ""}${label}`}
-                      tone="secondary"
-                      disabled={pending}
-                      onPress={() =>
-                        setAnswers({
-                          ...answers,
-                          [id]: {
-                            ...answer,
-                            selectedOptions: question.multi
-                              ? answer.selectedOptions.includes(label)
-                                ? answer.selectedOptions.filter((value) => value !== label)
-                                : [...answer.selectedOptions, label]
-                              : [label],
-                          },
-                        })
-                      }
-                    />
-                    {description ? (
-                      <Text className="text-sm text-foreground-muted">{description}</Text>
-                    ) : null}
-                  </View>
-                );
-              })}
+              {nativeValueItems(Array.isArray(question.options) ? question.options : []).map(
+                ({ key, value: item }) => {
+                  const option = nativeRecord(item);
+                  const label = String(option.label);
+                  const description =
+                    typeof option.description === "string" ? option.description.trim() : "";
+                  return (
+                    <View key={key} className="gap-1">
+                      <Button
+                        label={`${answer.selectedOptions.includes(label) ? "✓ " : ""}${label}`}
+                        tone="secondary"
+                        disabled={pending}
+                        onPress={() =>
+                          setAnswers({
+                            ...answers,
+                            [id]: {
+                              ...answer,
+                              selectedOptions: question.multi
+                                ? answer.selectedOptions.includes(label)
+                                  ? answer.selectedOptions.filter((value) => value !== label)
+                                  : [...answer.selectedOptions, label]
+                                : [label],
+                            },
+                          })
+                        }
+                      />
+                      {description ? (
+                        <Text className="text-sm text-foreground-muted">{description}</Text>
+                      ) : null}
+                    </View>
+                  );
+                },
+              )}
               <NativeField
                 label="Other answer"
                 value={answer.customInput}
@@ -927,7 +975,7 @@ function NativeMobileDialog({
           );
         })}
         {dialog.method === "ask" ? (
-          <MaterialButton
+          <Button
             label="Submit answers"
             disabled={pending}
             onPress={() =>
@@ -940,12 +988,7 @@ function NativeMobileDialog({
             }
           />
         ) : null}
-        <MaterialButton
-          label="Cancel"
-          tone="text"
-          disabled={pending}
-          onPress={() => void cancel()}
-        />
+        <Button label="Cancel" tone="text" disabled={pending} onPress={() => void cancel()} />
       </ScrollView>
     </NativeModal>
   );

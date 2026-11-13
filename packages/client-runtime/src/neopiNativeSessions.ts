@@ -92,6 +92,17 @@ export const nativeRecord = (value: unknown): Record<string, unknown> =>
     ? (value as Record<string, unknown>)
     : {};
 
+/** Native lists without item IDs can contain repeated values. */
+export function nativeValueItems<A>(items: readonly A[], identityOf?: (value: A) => string) {
+  const occurrences = new Map<string, number>();
+  return items.map((value) => {
+    const identity = identityOf ? identityOf(value) : (JSON.stringify(value) ?? "undefined");
+    const occurrence = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, occurrence + 1);
+    return { key: `${identity}:${occurrence}`, value };
+  });
+}
+
 /** Keep an editor handoff pending until it can be applied without replacing a draft. */
 export function deferNativeEditorText(input: {
   readonly hasDraft: () => boolean;
@@ -131,23 +142,20 @@ export async function executeNativeSessionCommand<Result>(input: {
   readonly command: { readonly type: string };
   readonly submit: () => Promise<Result>;
   readonly readState: () => Promise<unknown>;
-  readonly onState: (state: Record<string, unknown>) => void;
   readonly onRefreshError: (message: string) => void;
 }): Promise<Result> {
   const result = await input.submit();
   if (input.command.type === "prompt" || input.command.type === "extension_ui_response") {
     return result;
   }
-  let state: unknown;
   try {
-    state = await input.readState();
+    await input.readState();
   } catch {
     input.onRefreshError(
       "Command accepted, but the state refresh failed. Reconnect to refresh session details.",
     );
     return result;
   }
-  input.onState(nativeRecord(state));
   return result;
 }
 interface NativeCommandOutput {
@@ -251,13 +259,7 @@ export interface NativeSessionFeed {
    * observation of the old ref ends here; the web layer repoints to this ref.
    */
   readonly movedTo: NeoPiNativeSessionRef | null;
-  /**
-   * Why the session has no live owner, when that is expected rather than a failure.
-   * `reconnecting`: the terminal that owned it exited and a successor is awaited (the
-   * session still accepts sends, which wait). `orphaned`: it exited and nothing
-   * replaced it. `detached`: NeoCode let go on request. The last two end with
-   * `connected: false`; any snapshot clears them.
-   */
+  /** Reconnecting owners still accept queued sends; orphaned/detached owners are disconnected. */
   readonly ownerLoss: NativeOwnerLoss | null;
   readonly error: string | null;
   readonly reconciliationError: {

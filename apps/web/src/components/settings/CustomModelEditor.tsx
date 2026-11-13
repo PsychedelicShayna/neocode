@@ -1,7 +1,5 @@
-"use client";
-
 import { PlusIcon, XIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { ServerProviderModel } from "@t3tools/contracts";
 import type { CustomModelDefinition } from "@t3tools/shared/model";
 
@@ -26,17 +24,11 @@ const START_FROM_NONE = "__none__";
 interface CustomModelEditorProps {
   readonly instanceId: string;
   readonly entry: CustomModelDefinition;
-  /** Built-in models whose descriptors can be copied as a starting point. */
   readonly builtInModels: ReadonlyArray<ServerProviderModel>;
   readonly onSave: (next: CustomModelDefinition) => void;
   readonly onCancel: () => void;
 }
 
-/**
- * Inline editor for one custom model: display name plus the option
- * descriptors the composer should offer for it (Reasoning effort, Fast
- * mode, ...). Draft state is local; nothing is persisted until Save.
- */
 export function CustomModelEditor({
   instanceId,
   entry,
@@ -46,9 +38,8 @@ export function CustomModelEditor({
 }: CustomModelEditorProps) {
   const [draft, setDraft] = useState<CustomModelDraft>(() => draftFromDefinition(entry));
   const [error, setError] = useState<string | null>(null);
-  const startFromCandidates = useMemo(
-    () => builtInModels.filter((model) => (model.capabilities?.optionDescriptors?.length ?? 0) > 0),
-    [builtInModels],
+  const startFromCandidates = builtInModels.filter(
+    (model) => (model.capabilities?.optionDescriptors?.length ?? 0) > 0,
   );
   const domId = (suffix: string) => `provider-instance-${instanceId}-custom-model-${suffix}`;
 
@@ -72,7 +63,6 @@ export function CustomModelEditor({
           ...descriptor,
           choices: descriptor.choices.map((choice) => {
             if (choice.key === choiceKey) return { ...choice, ...patch };
-            // Only one choice can be the default.
             return patch.isDefault ? { ...choice, isDefault: false } : choice;
           }),
         };

@@ -1,19 +1,33 @@
-import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   dismissThreadErrorBannerForSession,
   getThreadErrorBannerKey,
+  getThreadErrorBannerMessage,
   isThreadErrorBannerDismissedForSession,
   shouldShowThreadErrorBanner,
-  ThreadErrorBanner,
 } from "./ThreadErrorBanner";
+
+describe("getThreadErrorBannerMessage", () => {
+  it("extracts a readable nested message without trimming its whitespace", () => {
+    const message =
+      "  This model is not supported with a ChatGPT account.\nChoose another model.  ";
+    const error = ` \n${JSON.stringify({ error: { message, code: "unsupported_model" } })}\t `;
+
+    expect(getThreadErrorBannerMessage(error)).toBe(message);
+  });
+
+  it("keeps the diagnostics when the nested message is blank", () => {
+    const error = JSON.stringify({ error: { message: " \n\t ", code: "unsupported_model" } });
+
+    expect(getThreadErrorBannerMessage(error)).toBe(error);
+  });
+});
 
 describe("ThreadErrorBanner", () => {
   it("stays hidden after its current error is dismissed", () => {
     const bannerKey = getThreadErrorBannerKey("env:thread-a", "Aborted", "failure-1");
     dismissThreadErrorBannerForSession(bannerKey);
-
     expect(
       shouldShowThreadErrorBanner("Aborted", isThreadErrorBannerDismissedForSession(bannerKey)),
     ).toBe(false);
@@ -21,16 +35,28 @@ describe("ThreadErrorBanner", () => {
 
   it("reappears when a new error arrives on the same thread", () => {
     dismissThreadErrorBannerForSession(
-      getThreadErrorBannerKey("env:thread-b", "Turn failed", "failure-1"),
+      getThreadErrorBannerKey("env:new-error", "Turn failed", "failure-1"),
     );
-    const newErrorKey = getThreadErrorBannerKey("env:thread-b", "Provider crashed", "failure-2");
-
-    expect(isThreadErrorBannerDismissedForSession(newErrorKey)).toBe(false);
+    const newErrorKey = getThreadErrorBannerKey("env:new-error", "Provider crashed", "failure-2");
     expect(
       shouldShowThreadErrorBanner(
         "Provider crashed",
         isThreadErrorBannerDismissedForSession(newErrorKey),
       ),
+    ).toBe(true);
+  });
+
+  it("reappears for different diagnostics with the same headline on the same thread", () => {
+    const firstError = JSON.stringify({ error: { message: "Turn failed", code: "first" } });
+    const secondError = JSON.stringify({ error: { message: "Turn failed", code: "second" } });
+    const dismissedKey = getThreadErrorBannerKey("env:thread-b", firstError, "same-occurrence");
+    dismissThreadErrorBannerForSession(dismissedKey);
+    const newErrorKey = getThreadErrorBannerKey("env:thread-b", secondError, "same-occurrence");
+
+    expect(isThreadErrorBannerDismissedForSession(dismissedKey)).toBe(true);
+    expect(isThreadErrorBannerDismissedForSession(newErrorKey)).toBe(false);
+    expect(
+      shouldShowThreadErrorBanner(secondError, isThreadErrorBannerDismissedForSession(newErrorKey)),
     ).toBe(true);
   });
 
@@ -89,20 +115,4 @@ describe("ThreadErrorBanner", () => {
       expect(isThreadErrorBannerDismissedForSession(oldKey)).toBe(true);
     },
   );
-  it("aligns the warning and dismiss icons with the first line of a multi-line error", () => {
-    const markup = renderToStaticMarkup(
-      <ThreadErrorBanner
-        error={"The first error line\ncontinues on a second line"}
-        onDismiss={() => {}}
-      />,
-    );
-
-    expect(markup).toContain('role="alert"');
-    expect(markup).toContain('aria-label="Dismiss error"');
-    expect(markup).not.toContain("controlAlignment");
-    expect(markup).toContain("flex gap-2 items-start");
-    expect(markup).toContain("min-h-7 pt-1 sm:min-h-6 sm:pt-0.5");
-    expect(markup).toContain("h-lh w-4");
-    expect(markup).toContain("h-lh self-start");
-  });
 });

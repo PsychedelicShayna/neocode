@@ -2,8 +2,7 @@ import {
   summarizeAgentHub,
   type AgentHubAgent,
 } from "@t3tools/client-runtime/neopi-native-agent-hub";
-import { formatSubagentTokenCount } from "@t3tools/client-runtime/state/subagentRuntime";
-import { useMemo } from "react";
+import { formatTokens } from "@t3tools/shared/usageFormat";
 
 import { cn } from "~/lib/utils";
 import { formatCost } from "./agentFormat";
@@ -16,7 +15,7 @@ export function AgentSummary({
   agents: readonly AgentHubAgent[];
   className?: string;
 }) {
-  const summary = useMemo(() => summarizeAgentHub(agents), [agents]);
+  const summary = summarizeAgentHub(agents);
   const counts = [
     { label: "working", value: summary.working, className: "text-info-foreground" },
     { label: "idle", value: summary.idle, className: "" },
@@ -39,7 +38,7 @@ export function AgentSummary({
           {count.value} {count.label}
         </span>
       ))}
-      <span className="tabular-nums">Σ {formatSubagentTokenCount(summary.tokens)} tok</span>
+      <span className="tabular-nums">Σ {formatTokens(summary.tokens)} tok</span>
       {summary.toolUses > 0 ? <span className="tabular-nums">{summary.toolUses} tools</span> : null}
       {summary.requests > 0 ? <span className="tabular-nums">{summary.requests} req</span> : null}
       {summary.cost !== null ? (

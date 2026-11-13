@@ -42,8 +42,6 @@ function getProviderSnapshot(
   return providers.find((candidate) => candidate.instanceId === defaultInstanceId);
 }
 
-// Resolve an instance selection to the correlated live driver, sharing the
-// readiness-aware NeoPi fallback used by instance-scoped selections.
 export function resolveSelectableProvider(
   providers: ReadonlyArray<ServerProvider>,
   provider: ProviderDriverKind | ProviderInstanceId | null | undefined,
@@ -67,7 +65,6 @@ export function getProviderModelCapabilities(
   return caps;
 }
 
-
 export function getDefaultServerModel(
   providers: ReadonlyArray<ServerProvider>,
   provider: ProviderDriverKind,
@@ -77,7 +74,6 @@ export function getDefaultServerModel(
     models.find((model) => model.isDefault && !model.isCustom)?.slug ??
     models.find((model) => !model.isCustom)?.slug ??
     models[0]?.slug ??
-    DEFAULT_MODEL_BY_PROVIDER[provider] ??
-    DEFAULT_MODEL
+    (provider === "neopi" ? "" : (DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL))
   );
 }

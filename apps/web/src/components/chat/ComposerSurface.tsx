@@ -2,22 +2,17 @@ import type { ComponentProps } from "react";
 
 import { cn } from "~/lib/utils";
 
-/**
- * The dock stays on the chat frame edge with an opaque background, so the
- * conversation never scrolls behind the prompt. Inside it the prompt is a card
- * centered on the conversation column, as in the floating composer.
- */
 function Shell({
-  contextStrip = false,
+  contextRow = false,
   className,
   ...props
-}: ComponentProps<"div"> & { contextStrip?: boolean }) {
+}: ComponentProps<"div"> & { contextRow?: boolean }) {
   return (
     <div
       data-slot="composer-shell"
-      data-with-context={contextStrip || undefined}
+      data-context-row={contextRow || undefined}
       className={cn(
-        "@container/composer-surface group/composer-surface relative isolate w-full bg-background px-3 pt-2.5 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4",
+        "@container/composer-surface group/composer-surface relative isolate w-full bg-background px-3 pt-2.5 sm:px-4",
         "[--chat-composer-drawer-inset:1.375rem] [--chat-composer-glass-surface:var(--chat-composer-surface)] [--chat-composer-outline:var(--border)]",
         className,
       )}
@@ -31,7 +26,7 @@ function Host({ className, ...props }: ComponentProps<"div">) {
     <div
       data-slot="composer-host"
       className={cn(
-        "relative z-10 mx-auto w-full max-w-(--chat-max-width) rounded-2xl border border-(--chat-composer-outline) bg-(--chat-composer-glass-surface) shadow-composer dark:shadow-none",
+        "relative z-10 mx-auto w-full max-w-(--chat-content-max-width) rounded-2xl border border-(--chat-composer-outline) bg-(--chat-composer-glass-surface) shadow-composer dark:shadow-none",
         // Card-relative gutters for the prompt, attachments and footer.
         "[--workspace-gutter-start:0.875rem] [--workspace-gutter-end:0.875rem]",
         className,
@@ -45,7 +40,11 @@ function Main({ className, ...props }: ComponentProps<"div">) {
   return (
     <div
       data-chat-composer-main-surface="true"
-      className={cn("group relative z-10 rounded-2xl", className)}
+      className={cn(
+        "group relative z-10 rounded-2xl",
+        "group-has-data-[composer-banner-surface=attached]/composer-surface:**:data-[chat-composer-mobile-collapsed=true]:min-h-[calc(1rem+1px)]",
+        className,
+      )}
       {...props}
     />
   );
@@ -57,7 +56,7 @@ function ContextStrip({ className, ...props }: ComponentProps<"div">) {
     <div
       data-slot="composer-context-strip"
       className={cn(
-        "group/composer-context relative mx-auto flex w-full max-w-(--chat-max-width) items-center gap-2 overflow-x-clip overflow-y-visible px-2 pt-1.5 text-muted-foreground",
+        "group/composer-context relative mx-auto flex w-full max-w-(--chat-content-max-width) items-center gap-2 overflow-x-clip overflow-y-visible px-2 pt-2 text-muted-foreground",
         className,
       )}
       {...props}

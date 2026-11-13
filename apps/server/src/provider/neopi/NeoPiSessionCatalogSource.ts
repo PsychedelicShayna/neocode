@@ -1,5 +1,5 @@
-import type { ProviderInstance } from "../ProviderDriver.ts";
-import type { NeoPiAdapterShape } from "../Services/NeoPiAdapter.ts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import type { NeoPiAdapterShape } from "./NeoPiAdapter.ts";
 
 /** Last completed handshake, retained while refresh is in flight or fails. */
 export interface NeoPiCapabilityProbe {

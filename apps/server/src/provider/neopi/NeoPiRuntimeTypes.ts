@@ -1,4 +1,10 @@
-import type { ModelSelection, RuntimeMode, ThreadId, TurnId } from "@t3tools/contracts";
+import type {
+  ModelSelection,
+  NeoPiResumeCursor,
+  RuntimeMode,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import type {
   NeoPiRpcClient,
   SessionEventFrame,
@@ -24,22 +30,6 @@ export interface NeoPiLaunchPlan {
     | { readonly kind: "fresh" }
     | { readonly kind: "resume"; readonly cursor: NeoPiResumeCursor };
 }
-
-export type NeoPiResumeCursor = {
-  readonly v: 1;
-  readonly sessionFile: string;
-  readonly sessionId: string;
-  readonly sessionDir: string;
-  /** Shared native storage requires a cooperating session lease on every reopen. */
-  readonly sharedSession?: boolean;
-  /** Last native leaf whose visible history is already represented in NeoCode. */
-  readonly historyLeafId?: string | null;
-  readonly turnBoundaries: ReadonlyArray<
-    | { readonly turnId: TurnId; readonly userEntryId: string }
-    | { readonly turnId: TurnId; readonly kind: "local" | "unknown" }
-    | { readonly turnId: TurnId; readonly kind: "continuation"; readonly afterEntryId: string }
-  >;
-};
 
 export type NeoPiRuntimeState =
   | "starting"

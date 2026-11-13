@@ -1,4 +1,9 @@
-import { ComposerContextId, type ComposerContextRecord } from "@t3tools/contracts";
+import {
+  ComposerContextId,
+  EnvironmentId,
+  ThreadId,
+  type ComposerContextRecord,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -89,10 +94,28 @@ describe("serializeLegacyContextMessage", () => {
       sizeBytes: 5,
     };
     const screenshotAnnotation = { ...annotation, screenshotContextId: image.contextId };
-    const text = [image, file, screenshotAnnotation].map(formatComposerContextReference).join(" ");
+    const thread = {
+      version: 1,
+      kind: "thread",
+      contextId: ComposerContextId.make("thread_reference"),
+      label: "Reference",
+      title: "Reference",
+      environmentId: EnvironmentId.make("linked-computer"),
+      threadId: ThreadId.make("linked-thread"),
+    } satisfies ComposerContextRecord;
+    const environment = {
+      version: 1,
+      kind: "environment",
+      contextId: ComposerContextId.make("environment_lab"),
+      label: "Lab",
+      environmentId: EnvironmentId.make("linked-computer"),
+    } satisfies ComposerContextRecord;
+    const text = [image, file, screenshotAnnotation, thread, environment]
+      .map(formatComposerContextReference)
+      .join(" ");
     const encoded = serializeLegacyContextMessage({
       text,
-      records: [image, file, screenshotAnnotation],
+      records: [image, file, screenshotAnnotation, thread, environment],
     });
     const restored = upgradeLegacyContextMessage(encoded);
     expect(
@@ -102,6 +125,13 @@ describe("serializeLegacyContextMessage", () => {
       "screenshotContextId",
       image.contextId,
     );
+    expect(
+      restored.records.filter(
+        (record) => record.kind === "thread" || record.kind === "environment",
+      ),
+    ).toEqual([thread, environment]);
+    expect(restored.text).toContain(formatComposerContextReference(thread));
+    expect(restored.text).toContain(formatComposerContextReference(environment));
     expect(restored.text).toContain(formatComposerContextReference(image));
     expect(restored.text).toContain(formatComposerContextReference(file));
     expect(stripLegacyAttachmentMetadata(encoded)).not.toContain("<attachment_context>");
@@ -127,7 +157,7 @@ describe("serializeLegacyContextMessage", () => {
 
   it("leaves malformed attachment metadata visible and does not partly convert the message", () => {
     const text =
-      'Keep this\n\n<attachment_context>\n{\"attachments\":[{\"kind\":\"file\"}]}\n</attachment_context>';
+      'Keep this\n\n<attachment_context>\n{"attachments":[{"kind":"file"}]}\n</attachment_context>';
     expect(upgradeLegacyContextMessage(text)).toEqual({ text, records: [] });
     expect(stripLegacyAttachmentMetadata(text)).toBe(text);
   });

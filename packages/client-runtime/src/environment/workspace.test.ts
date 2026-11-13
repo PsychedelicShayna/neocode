@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
-import * as Encoding from "effect/Encoding";
+import * as Base64Url from "effect/encoding/Base64Url";
 import { parseWorkspaceKey, workspaceKey, workspaceResourceId } from "./workspace.ts";
 import { scopedThreadKey } from "./scoped.ts";
 
@@ -19,7 +19,7 @@ describe("workspace identity", () => {
     expect(restored && "threadId" in restored).toBe(false);
     expect(restored && workspaceResourceId(restored)).toBe(workspaceResourceId(native));
     // Terminal history base64-encodes this namespace in one filesystem component.
-    expect(Encoding.encodeBase64Url(workspaceResourceId(native)).length).toBeLessThan(80);
+    expect(Base64Url.encode(workspaceResourceId(native)).length).toBeLessThan(80);
     expect(workspaceResourceId(native)).not.toContain("conversation.jsonl");
   });
 

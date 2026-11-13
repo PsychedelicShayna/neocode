@@ -1,7 +1,7 @@
-import type { NeoPiJournalEntry } from "@t3tools/contracts";
+import { RunId, type NeoPiJournalEntry } from "@t3tools/contracts";
 import type { TranscriptRow } from "@t3tools/client-runtime/neopi-transcript";
 import { describe, expect, it } from "vite-plus/test";
-import { deriveMessagesTimelineRows } from "../chat/MessagesTimeline.logic";
+import { deriveMessagesTimelineRows, turnToolDisclosureKeys } from "../chat/MessagesTimeline.logic";
 import { projectNativeTimeline } from "./nativeTimeline";
 
 const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
@@ -49,18 +49,21 @@ const divider = (id: string, second: number): Row<"divider"> => ({
   text: "Other model",
 });
 
-function foldLabels(rows: readonly TranscriptRow[]) {
+function renderedRows(rows: readonly TranscriptRow[]) {
   const timeline = projectNativeTimeline(rows, false);
-  const derived = deriveMessagesTimelineRows({
+  return deriveMessagesTimelineRows({
     timelineEntries: timeline.entries,
-    latestTurn: timeline.latestTurn,
-    runningTurnId: timeline.runningTurnId,
+    latestRun: timeline.latestRun,
+    runningRunId: timeline.runningRunId,
     isWorking: false,
     activeTurnStartedAt: null,
     turnDiffSummaries: [],
     supportsConversationRollback: false,
   });
-  return derived.flatMap((row) => (row.kind === "turn-fold" ? [row.label] : []));
+}
+
+function foldLabels(rows: readonly TranscriptRow[]) {
+  return renderedRows(rows).flatMap((row) => (row.kind === "turn-fold" ? [row.label] : []));
 }
 
 describe("native turn duration", () => {
@@ -147,6 +150,39 @@ describe("native timeline entry identity", () => {
     expect(running.entries[2]).toMatchObject({ entry: { toolLifecycleStatus: "inProgress" } });
   });
 
+  it("expands only the current native run's work and keeps steering in that run", () => {
+    const thought: Row<"thinking"> = {
+      kind: "thinking",
+      id: "thought",
+      entry: entry("thought", "message"),
+      timestamp: at(31),
+      live: false,
+      text: "Check the second result.",
+      summary: false,
+    };
+    const rows = [
+      user("u1", 0),
+      tool("old-tool", 10),
+      assistant("a1", 20),
+      user("u2", 30),
+      thought,
+      tool("new-tool", 40),
+      { ...user("steer", 50), steering: true },
+      tool("steered-tool", 60),
+      assistant("a2", 70),
+    ];
+    const timeline = projectNativeTimeline(rows, false);
+    expect(turnToolDisclosureKeys(timeline.entries, RunId.make("native:u2")).workEntryIds).toEqual([
+      "thought",
+      "new-tool",
+      "steered-tool",
+    ]);
+    expect(timeline.entries.find((item) => item.id === "steer")).toMatchObject({
+      kind: "message",
+      message: { runId: RunId.make("native:u2"), inputIntent: "steer" },
+    });
+  });
+
   it("re-derives rows when a prompt starts a new turn above them", () => {
     const rows = [assistant("a0", 0), user("u1", 5)];
     const first = projectNativeTimeline(rows, false);
@@ -170,8 +206,8 @@ describe("native compaction row", () => {
     const timeline = projectNativeTimeline([user("u1", 0), assistant("a1", 10), compaction], false);
     const rows = deriveMessagesTimelineRows({
       timelineEntries: timeline.entries,
-      latestTurn: timeline.latestTurn,
-      runningTurnId: timeline.runningTurnId,
+      latestRun: timeline.latestRun,
+      runningRunId: timeline.runningRunId,
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaries: [],

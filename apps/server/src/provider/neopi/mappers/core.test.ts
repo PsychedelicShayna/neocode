@@ -1,31 +1,39 @@
-import { ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
+import { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { coreTurnTokenUsage, emptyCoreState, mapCoreFrame } from "./core.ts";
-import type { MapCtx } from "./MapCtx.ts";
-import { scopedItemId } from "./MapCtx.ts";
+import { mapperTestContext } from "./mapperTestContext.ts";
 
+const decodeEvent = Schema.decodeSync(ProviderAdapterV2Event);
 function harness(child = false) {
-  let nextId = 0;
-  const ctx: MapCtx = {
-    provider: ProviderDriverKind.make("neopi"),
-    providerInstanceId: ProviderInstanceId.make("neopi-test"),
-    threadId: ThreadId.make("thread-test"),
-    turnId: TurnId.make("turn-test"),
-    ...(child ? { agentId: "child-1", parentToolUseId: "tool-1" } : {}),
-    now: () => "2026-09-27T00:00:00.000Z",
-    newEventId: () => `event-${++nextId}`,
-  };
+  const ctx = mapperTestContext(child);
   let state = emptyCoreState();
-  const events: ReturnType<typeof mapCoreFrame>["events"] = [];
+  const events: ProviderAdapterV2Event[] = [];
   return {
     events,
     feed(frame: unknown) {
       const result = mapCoreFrame(ctx, frame, state);
       state = result.state;
+      for (const event of result.events) {
+        decodeEvent(event);
+        if (event.type === "provider_session.updated")
+          Object.assign(ctx, { providerSession: event.providerSession });
+        if (event.type === "provider_thread.updated")
+          Object.assign(ctx, { providerThread: event.providerThread });
+        if (event.type === "provider_turn.updated")
+          Object.assign(ctx, { providerTurn: event.providerTurn });
+      }
       events.push(...result.events);
       return result.events;
     },
+    items() {
+      const items = events.flatMap((event) =>
+        event.type === "turn_item.updated" ? [event.turnItem] : [],
+      );
+      return [...new Map(items.map((item) => [item.id, item])).values()];
+    },
+    current: () => ctx,
     usage: () => coreTurnTokenUsage(state),
   };
 }
@@ -39,25 +47,12 @@ const assistant = (text: string, usage?: object) => ({
   ...(usage ? { usage } : {}),
 });
 
-function payloads(events: ReturnType<typeof harness>["events"], type: string) {
-  return events.filter((event) => event.type === type).map((event) => event.payload);
+function terminalEvents(events: ProviderAdapterV2Event[]) {
+  return events.filter((event) => event.type === "turn.terminal");
 }
 
-const itemId = (nativeId: string) =>
-  scopedItemId(
-    {
-      provider: ProviderDriverKind.make("neopi"),
-      providerInstanceId: ProviderInstanceId.make("neopi-test"),
-      threadId: ThreadId.make("thread-test"),
-      turnId: TurnId.make("turn-test"),
-      now: () => "",
-      newEventId: () => "",
-    },
-    nativeId,
-  );
-
 describe("NeoPi core mapper", () => {
-  it("keeps interleaved reasoning and assistant text items distinct with ordered deltas and completions", () => {
+  it("keeps interleaved reasoning and assistant text distinct and completes reasoning first", () => {
     const h = harness();
     h.feed({ type: "agent_start" });
     h.feed({ type: "message_start", message: assistant("") });
@@ -73,54 +68,53 @@ describe("NeoPi core mapper", () => {
       type: "message_update",
       assistantMessageEvent: { type: "text_end", contentIndex: 1, content: "hello world" },
     });
+    expect(h.items().map((item) => item.status)).toEqual(["running", "running"]);
+    const completed = h
+      .feed({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "first thought" },
+      })
+      .flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
+    expect(completed).toMatchObject([
+      { type: "reasoning", text: "first thought", streaming: false, status: "completed" },
+      { type: "assistant_message", text: "hello world", streaming: false, status: "completed" },
+    ]);
+    expect(completed[0]?.id).not.toBe(completed[1]?.id);
+    const messages = h.events.filter((event) => event.type === "message.updated");
+    expect(messages.at(-1)?.message).toMatchObject({
+      text: "hello world",
+      streaming: false,
+      nodeId: "root-node",
+      threadId: "thread-test",
+    });
+    expect(new Set(messages.map((event) => event.message.id)).size).toBe(1);
+    const assistantItem = completed.find((item) => item.type === "assistant_message");
+    expect(assistantItem?.messageId).toBe(messages.at(-1)?.message.id);
+  });
+
+  it("uses an explicitly empty final body instead of retaining a stale partial", () => {
+    const h = harness();
     h.feed({
       type: "message_update",
-      assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "first thought" },
+      assistantMessageEvent: { type: "text_delta", delta: "partial" },
     });
-    h.feed({ type: "message_end", message: assistant("hello world") });
-    const deltas = h.events.filter((event) => event.type === "content.delta");
-    expect(deltas.map((event) => [event.itemId, event.payload])).toEqual([
-      [
-        itemId("neopi:m1:thinking:0"),
-        { streamKind: "reasoning_text", delta: "first ", contentIndex: 0 },
-      ],
-      [
-        itemId("neopi:m1:text:1"),
-        { streamKind: "assistant_text", delta: "hello ", contentIndex: 1 },
-      ],
-      [
-        itemId("neopi:m1:thinking:0"),
-        { streamKind: "reasoning_text", delta: "thought", contentIndex: 0 },
-      ],
-      [
-        itemId("neopi:m1:text:1"),
-        { streamKind: "assistant_text", delta: "world", contentIndex: 1 },
-      ],
-    ]);
-    const starts = h.events.filter((event) => event.type === "item.started");
-    const completed = h.events.filter((event) => event.type === "item.completed");
-    expect(starts.map((event) => event.itemId)).toEqual([
-      itemId("neopi:m1:thinking:0"),
-      itemId("neopi:m1:text:1"),
-    ]);
-    expect(completed.map((event) => [event.itemId, event.payload.detail])).toEqual([
-      [itemId("neopi:m1:thinking:0"), "first thought"],
-      [itemId("neopi:m1:text:1"), "hello world"],
-    ]);
-    expect(h.events.every((event) => event.raw?.source === "neopi.rpc")).toBe(true);
+    h.feed({ type: "message_update", assistantMessageEvent: { type: "text_end", content: "" } });
+    expect(h.items()).toMatchObject([{ type: "assistant_message", text: "", streaming: false }]);
+    expect(h.events.filter((event) => event.type === "message.updated").at(-1)?.message.text).toBe(
+      "",
+    );
   });
 
   it("sums typed usage once per assistant message, counts cache, and distinguishes partial turns", () => {
     const h = harness();
-    const usage = {
+    const first = assistant("first", {
       input: 100,
       cacheRead: 900,
       cacheWrite: 50,
       output: 40,
       reasoningTokens: 10,
       cost: { total: 0.023 },
-    };
-    const first = assistant("first", usage);
+    });
     const second = { ...assistant("second"), timestamp: 124 };
     h.feed({ type: "agent_start" });
     h.feed({ type: "message_start", message: first });
@@ -128,9 +122,8 @@ describe("NeoPi core mapper", () => {
     h.feed({ type: "message_start", message: second });
     h.feed({ type: "message_end", message: second });
     h.feed({ type: "subagent_lifecycle", id: "sub-1", status: "started" });
-    // Both messages are repeated by agent_end; signatures and fallback ordinals must never re-add first.
     h.feed({ type: "agent_end", messages: [first, second] });
-    expect(h.usage()).toEqual({
+    const usage = {
       usageScope: "main_agent",
       hasSubagents: true,
       usageStatus: "partial",
@@ -139,25 +132,11 @@ describe("NeoPi core mapper", () => {
       cacheCreationTokens: 50,
       outputTokens: 40,
       reasoningTokens: 10,
-    });
-    expect(
-      payloads(h.feed({ type: "t3.turn.outcome", state: "completed" }), "turn.completed"),
-    ).toEqual([
-      {
-        state: "completed",
-        tokenUsage: {
-          usageScope: "main_agent",
-          hasSubagents: true,
-          usageStatus: "partial",
-          inputTokens: 1050,
-          cachedInputTokens: 900,
-          cacheCreationTokens: 50,
-          outputTokens: 40,
-          reasoningTokens: 10,
-        },
-        totalCostUsd: 0.023,
-      },
-    ]);
+    };
+    expect(h.usage()).toEqual(usage);
+    h.feed({ type: "t3.turn.outcome", state: "completed" });
+    expect(h.current().providerTurn?.turnTokenUsage).toEqual(usage);
+    expect(h.current().providerTurn?.status).toBe("completed");
   });
 
   it("pairs compacted suffix messages and a message_end arriving after turn_end", () => {
@@ -174,74 +153,66 @@ describe("NeoPi core mapper", () => {
     expect(h.usage()).toMatchObject({ inputTokens: 3, outputTokens: 2, usageStatus: "partial" });
   });
 
-  it("reports context occupancy from contextUsage instead of lifetime token totals", () => {
+  it("reports context occupancy rather than lifetime totals without losing model options", () => {
     const h = harness();
-    h.feed({ type: "agent_start" });
     h.feed({
-      type: "message_end",
-      message: assistant("hi", { input: 999, output: 777, cacheRead: 10 }),
+      type: "t3.state",
+      state: {
+        model: { provider: "openai", id: "gpt" },
+        contextUsage: { tokens: 742, contextWindow: 200000, percent: 0.37 },
+        tokenUsage: { input: 99999, output: 77777 },
+      },
     });
-    expect(
-      payloads(
-        h.feed({
-          type: "t3.state",
-          state: {
-            model: { provider: "openai", id: "gpt" },
-            contextUsage: { tokens: 742, contextWindow: 200000, percent: 0.37 },
-            tokenUsage: { input: 99999, output: 77777 },
-          },
-        }),
-        "thread.token-usage.updated",
-      ),
-    ).toEqual([{ usage: { usedTokens: 742, maxTokens: 200000 } }]);
-    expect(
-      payloads(
-        h.feed({ type: "t3.state", state: { contextUsage: { tokens: 0, contextWindow: 0 } } }),
-        "thread.token-usage.updated",
-      ),
-    ).toEqual([{ usage: { usedTokens: 0 } }]);
+    expect(h.current().providerThread.contextUsage).toMatchObject({
+      usedTokens: 742,
+      maxTokens: 200000,
+    });
+    expect(h.current().providerThread.nativeMetadata?.modelSelection).toEqual({
+      instanceId: "neopi-test",
+      model: "openai/gpt",
+      options: [{ id: "fastMode", value: true }],
+    });
+    h.feed({ type: "t3.state", state: { contextUsage: { tokens: 0, contextWindow: 0 } } });
+    expect(h.current().providerThread.contextUsage).toEqual({
+      usedTokens: 0,
+    });
   });
 
-  it("warns on retries without ending the turn; only the injected outcome decides failure", () => {
+  it("keeps retry failures nonterminal until the authoritative native outcome and ignores duplicate terminals", () => {
     const h = harness();
     h.feed({ type: "agent_start" });
     h.feed({ type: "auto_retry_start", attempt: 1, errorMessage: "temporary" });
     h.feed({ type: "auto_retry_end", success: false, finalError: "retry exhausted" });
     h.feed({ type: "agent_end", messages: [] });
-    expect(payloads(h.events, "runtime.warning")).toHaveLength(2);
-    expect(payloads(h.events, "turn.completed")).toHaveLength(0);
-    expect(
-      payloads(
-        h.feed({
-          type: "t3.turn.outcome",
-          state: "failed",
-          errorMessage: "provider rejected request",
-        }),
-        "turn.completed",
-      ),
-    ).toMatchObject([
+    expect(h.items()).toMatchObject([
+      { type: "system_notice", message: "temporary", providerMetadata: { attempt: 1 } },
+      { type: "system_notice", message: "retry exhausted" },
+    ]);
+    expect(terminalEvents(h.events)).toEqual([]);
+    h.feed({ type: "t3.turn.outcome", state: "failed", errorMessage: "provider rejected request" });
+    expect(terminalEvents(h.events)).toMatchObject([
       {
-        state: "failed",
-        errorMessage: "provider rejected request",
-        tokenUsage: { usageStatus: "unavailable" },
+        status: "failed",
+        failure: { class: "provider_error", message: "provider rejected request" },
       },
     ]);
+    expect(h.current().providerTurn?.turnTokenUsage).toMatchObject({ usageStatus: "unavailable" });
+    expect(terminalEvents(h.feed({ type: "t3.turn.outcome", state: "failed" }))).toEqual([]);
   });
 
-  it("refreshes metadata, announces reroutes, and translates notices and extension errors", () => {
+  it("refreshes native model and effort without replacing unrelated options and preserves diagnostic metadata", () => {
     const h = harness();
     h.feed({
       type: "config_update",
       model: { provider: "openai", id: "gpt-5" },
       thinkingLevel: "high",
     });
-    expect(payloads(h.feed({ type: "agent_start" }), "turn.started")).toEqual([
-      { model: "openai/gpt-5", effort: "high" },
-    ]);
+    h.feed({ type: "agent_start" });
+    expect(h.current().providerTurn?.model).toBe("openai/gpt-5");
     h.feed({ type: "thinking_level_changed", thinkingLevel: "medium" });
-    expect(payloads(h.events, "thread.metadata.updated")).toEqual([
-      { metadata: { model: "openai/gpt-5", thinkingLevel: "high" } },
-      { metadata: { model: "openai/gpt-5", thinkingLevel: "medium" } },
+    expect(h.current().providerThread.nativeMetadata?.modelSelection?.options).toEqual([
+      { id: "fastMode", value: true },
+      { id: "reasoningEffort", value: "medium" },
     ]);
     h.feed({
       type: "retry_fallback_applied",
@@ -249,52 +220,62 @@ describe("NeoPi core mapper", () => {
       to: "openai/gpt-4",
       role: "default",
     });
-    expect(payloads(h.events, "model.rerouted")).toEqual([
-      { fromModel: "openai/gpt-5", toModel: "openai/gpt-4", reason: "Retry fallback (default)" },
+    expect(h.current().providerThread.nativeMetadata?.modelSelection?.model).toBe("openai/gpt-4");
+    h.feed({ type: "thinking_level_changed", configured: null });
+    expect(h.current().providerThread.nativeMetadata?.modelSelection?.options).toEqual([
+      { id: "fastMode", value: true },
     ]);
-    h.feed({ type: "notice", level: "warning", message: "heads up" });
-    h.feed({ type: "notice", level: "error", message: "bad" });
+    h.feed({ type: "notice", level: "error", source: "extension", message: "bad" });
     h.feed({
       type: "extension_error",
       extensionPath: "/x",
       event: "session_start",
       error: "broken extension",
     });
-    expect(payloads(h.events, "runtime.warning")).toMatchObject([
-      { message: "heads up" },
-      { message: "broken extension" },
+    expect(h.items()).toMatchObject([
+      {
+        type: "system_notice",
+        providerMetadata: { fromModel: "openai/gpt-5", toModel: "openai/gpt-4" },
+      },
+      {
+        type: "system_notice",
+        message: "bad",
+        providerMetadata: { level: "error", source: "extension" },
+      },
+      {
+        type: "system_notice",
+        message: "broken extension",
+        providerMetadata: { extensionPath: "/x", event: "session_start" },
+      },
     ]);
-    expect(payloads(h.events, "runtime.error")).toMatchObject([
-      { message: "bad", class: "provider_error" },
-    ]);
+    expect(terminalEvents(h.events)).toEqual([]);
   });
 
-  it("completes compaction once and never announces aborted or skipped compaction", () => {
+  it("updates one compaction with late counts while keeping aborted and skipped attempts distinct", () => {
     const h = harness();
     h.feed({ type: "auto_compaction_start" });
     h.feed({ type: "auto_compaction_end", result: { tokensBefore: 8100, summary: "summary" } });
     h.feed({ type: "t3.compaction", beforeTokens: 8100, afterTokens: 3200, summary: "summary" });
-    expect(payloads(h.events, "thread.state.changed")).toEqual([
-      { state: "compacted", beforeTokens: 8100, detail: "summary" },
-      { state: "compacted", beforeTokens: 8100, afterTokens: 3200, detail: "summary" },
-    ]);
     h.feed({ type: "auto_compaction_start" });
     h.feed({ type: "auto_compaction_end", aborted: true, errorMessage: "cancelled" });
     h.feed({ type: "auto_compaction_start" });
     h.feed({ type: "auto_compaction_end", skipped: true });
-    expect(payloads(h.events, "thread.state.changed")).toHaveLength(2);
-    expect(payloads(h.events, "item.completed")).toMatchObject([
-      { itemType: "context_compaction", status: "completed" },
-      { itemType: "context_compaction", status: "failed" },
-      { itemType: "context_compaction", status: "declined" },
+    expect(h.items()).toMatchObject([
+      {
+        type: "compaction",
+        status: "completed",
+        beforeTokenCount: 8100,
+        afterTokenCount: 3200,
+        summary: "summary",
+      },
+      { type: "compaction", status: "failed" },
+      { type: "compaction", status: "cancelled" },
     ]);
   });
 
   it("keeps one turn and sums both phases when a nonterminal agent run continues", () => {
     const h = harness();
-    expect(
-      h.feed({ type: "agent_start" }).filter((event) => event.type === "turn.started"),
-    ).toHaveLength(1);
+    h.feed({ type: "agent_start" });
     h.feed({ type: "message_start", message: assistant("") });
     h.feed({
       type: "message_update",
@@ -302,9 +283,7 @@ describe("NeoPi core mapper", () => {
     });
     h.feed({ type: "message_end", message: assistant("first", { input: 8, output: 3 }) });
     h.feed({ type: "agent_end", isTerminal: false });
-    expect(
-      h.feed({ type: "agent_start" }).filter((event) => event.type === "turn.started"),
-    ).toHaveLength(0);
+    expect(h.feed({ type: "agent_start" })).toEqual([]);
     h.feed({ type: "message_start", message: assistant("") });
     h.feed({
       type: "message_update",
@@ -313,30 +292,55 @@ describe("NeoPi core mapper", () => {
     h.feed({ type: "message_end", message: assistant("second", { input: 12, output: 4 }) });
     h.feed({ type: "agent_end", isTerminal: true });
     h.feed({ type: "t3.turn.outcome", state: "completed" });
-    expect(payloads(h.events, "turn.completed")).toMatchObject([
-      {
-        state: "completed",
-        tokenUsage: { usageStatus: "complete", inputTokens: 20, outputTokens: 7 },
-      },
+    expect(terminalEvents(h.events)).toMatchObject([{ status: "completed" }]);
+    expect(h.current().providerTurn?.turnTokenUsage).toMatchObject({
+      usageStatus: "complete",
+      inputTokens: 20,
+      outputTokens: 7,
+    });
+    expect(h.items()).toMatchObject([
+      { type: "assistant_message", text: "first", status: "completed" },
+      { type: "assistant_message", text: "second", status: "completed" },
     ]);
-    const started = h.events.filter((event) => event.type === "item.started");
-    expect(new Set(started.map((event) => event.itemId)).size).toBe(2);
   });
 
-  it("attributes nested content to the child without producing parent turn events", () => {
+  it("attributes nested content to its child node and parent item without settling the root", () => {
     const h = harness(true);
     h.feed({ type: "agent_start" });
     h.feed({
       type: "message_update",
-      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "child" },
+      assistantMessageEvent: { type: "text_delta", delta: "child" },
     });
     h.feed({ type: "message_end", message: assistant("child", { input: 2, output: 1 }) });
     h.feed({ type: "agent_end", messages: [] });
     h.feed({ type: "t3.turn.outcome", state: "completed" });
-    expect(payloads(h.events, "turn.started")).toHaveLength(0);
-    expect(payloads(h.events, "turn.completed")).toHaveLength(0);
-    expect(payloads(h.events, "item.completed")).toMatchObject([
-      { agentId: "child-1", parentToolUseId: "tool-1" },
+    expect(terminalEvents(h.events)).toEqual([]);
+    expect(h.items()).toMatchObject([
+      {
+        nodeId: "child-node",
+        providerThreadId: "child-thread",
+        providerTurnId: "child-turn",
+        parentItemId: "parent-tool",
+        text: "child",
+        status: "completed",
+      },
     ]);
+  });
+
+  it("preserves process-exit details and distinguishes recoverable failure from graceful stop", () => {
+    const h = harness();
+    h.feed({
+      type: "t3.session.exited",
+      recoverable: true,
+      code: 7,
+      signal: "SIGTERM",
+      stderrTail: " detail ",
+    });
+    expect(h.current().providerSession).toMatchObject({
+      status: "error",
+      lastError: "NeoPi process exited (code 7, signal SIGTERM): detail",
+    });
+    h.feed({ type: "t3.session.exited", recoverable: false, code: 0 });
+    expect(h.current().providerSession).toMatchObject({ status: "stopped", lastError: null });
   });
 });

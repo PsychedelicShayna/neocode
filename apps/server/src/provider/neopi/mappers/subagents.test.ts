@@ -1,48 +1,20 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import {
-  CommandId,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  ProjectId,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  ThreadId,
-  TurnId,
-  type ProviderRuntimeEvent,
-} from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
+import { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
 import { assert, it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import * as Queue from "effect/Queue";
-import * as Stream from "effect/Stream";
-import * as SubscriptionRef from "effect/SubscriptionRef";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { makeOrchestrationIntegrationHarness } from "../../../../integration/OrchestrationEngineHarness.integration.ts";
-import { makeNeoPiAdapter } from "../../Layers/NeoPiAdapter.ts";
-import { makeNeoPiDiscoveryHub } from "../NeoPiDiscovery.ts";
-import type { NeoPiRuntimeInput } from "../NeoPiSessionRuntime.ts";
-import type { NeoPiResumeCursor } from "../NeoPiRuntimeTypes.ts";
-import type {
-  NeoPiRuntimeFrame,
-  NeoPiRuntimeState,
-  NeoPiSessionRuntimeShape,
-} from "../NeoPiRuntimeTypes.ts";
+import { makeNativeOrchestratorHarness } from "../../../orchestration-v2/testkit/NativeOrchestratorTestHarness.ts";
 import { emptyCoreState, mapCoreFrame } from "./core.ts";
-import { scopedItemId, type MapCtx } from "./MapCtx.ts";
+import { scopedItemId } from "./MapCtx.ts";
+import { mapperTestContext } from "./mapperTestContext.ts";
 import { emptySubagentState, mapSubagentFrame } from "./subagents.ts";
 
-function ctx(): MapCtx {
-  let nextId = 0;
-  return {
-    provider: ProviderDriverKind.make("neopi"),
-    providerInstanceId: ProviderInstanceId.make("neopi-test"),
-    sessionKey: "session-1",
-    threadId: ThreadId.make("thread-1"),
-    turnId: TurnId.make("turn-1"),
-    now: () => "2026-09-27T00:00:00.000Z",
-    newEventId: () => `event-${++nextId}`,
-  };
-}
+const decodeEvent = Schema.decodeSync(ProviderAdapterV2Event);
+
+const ctx = mapperTestContext;
 const childTaskId = (id: string, generation = 1) => scopedItemId(ctx(), `task:${id}#${generation}`);
 
 function assistant(text: string, usage?: object) {
@@ -60,19 +32,33 @@ function feed(frames: readonly unknown[]) {
   const context = ctx();
   let core = emptyCoreState();
   let subagents = emptySubagentState();
-  const events: ProviderRuntimeEvent[] = [];
+  const events: ProviderAdapterV2Event[] = [];
   for (const frame of frames) {
     const mappedCore = mapCoreFrame(context, frame, core);
     const mapped = mapSubagentFrame(context, frame, subagents);
     core = mappedCore.state;
     subagents = mapped.state;
-    events.push(...mappedCore.events, ...mapped.events);
+    for (const event of [...mappedCore.events, ...mapped.events]) {
+      decodeEvent(event);
+      if (event.type === "provider_turn.updated")
+        Object.assign(context, { providerTurn: event.providerTurn });
+      if (event.type === "provider_thread.updated")
+        Object.assign(context, { providerThread: event.providerThread });
+      if (event.type === "provider_session.updated")
+        Object.assign(context, { providerSession: event.providerSession });
+      events.push(event);
+    }
   }
   return { events, core, subagents };
 }
 
-function ofType(events: readonly ProviderRuntimeEvent[], type: ProviderRuntimeEvent["type"]) {
-  return events.filter((event) => event.type === type);
+function ofType<T extends ProviderAdapterV2Event["type"]>(
+  events: readonly ProviderAdapterV2Event[],
+  type: T,
+): Extract<ProviderAdapterV2Event, { type: T }>[] {
+  return events.filter(
+    (event): event is Extract<ProviderAdapterV2Event, { type: T }> => event.type === type,
+  );
 }
 
 const usage = (input: number, output: number, cacheRead = 0) => ({
@@ -84,7 +70,7 @@ const usage = (input: number, output: number, cacheRead = 0) => ({
 });
 
 describe("NeoPi subagent mapper", () => {
-  it("maps lifecycle, two progress rows, and summed child usage onto task events", () => {
+  it("projects lifecycle, progress and isolated child usage onto V2 subagents", () => {
     const first = assistant("one", usage(10, 4, 1));
     const second = { ...assistant("two", usage(3, 5)), timestamp: 101 };
     const { events, core } = feed([
@@ -139,44 +125,39 @@ describe("NeoPi subagent mapper", () => {
       { type: "t3.turn.outcome", state: "completed" },
     ]);
 
-    expect(ofType(events, "task.started").map((event) => event.payload)).toEqual([
-      expect.objectContaining({
-        taskId: childTaskId("child-1"),
-        agentId: childTaskId("child-1"),
-        description: "Inspect the mapper",
-        parentToolUseId: scopedItemId(ctx(), "tool-parent"),
-        taskType: "subagent",
-      }),
-    ]);
-    expect(ofType(events, "task.progress").map((event) => event.payload)).toEqual([
-      expect.objectContaining({
-        taskId: childTaskId("child-1"),
-        summary: "reading core",
-        status: "running",
-      }),
-      expect.objectContaining({
-        taskId: childTaskId("child-1"),
-        summary: "summing usage",
-        status: "running",
-      }),
-    ]);
-    expect(ofType(events, "task.completed").map((event) => event.payload)).toEqual([
-      expect.objectContaining({
-        taskId: childTaskId("child-1"),
-        status: "completed",
-        typedUsage: {
-          totalTokens: 23,
-          inputTokens: 14,
-          outputTokens: 9,
-          cachedInputTokens: 1,
-        },
-      }),
-    ]);
-    expect(ofType(events, "turn.completed")).toHaveLength(1);
+    const updates = ofType(events, "subagent.updated").map((event) => event.subagent);
+    expect(updates[0]).toMatchObject({
+      id: childTaskId("child-1"),
+      prompt: "Inspect the mapper",
+      origin: "provider_native",
+      parentNodeId: ctx().nodeId,
+      providerThreadId: null,
+      childThreadId: null,
+    });
+    expect(updates.filter((entry) => entry.progress).map((entry) => entry.progress)).toContain(
+      "reading core",
+    );
+    expect(updates.filter((entry) => entry.progress).map((entry) => entry.progress)).toContain(
+      "summing usage",
+    );
+    expect(updates.at(-1)).toMatchObject({
+      id: childTaskId("child-1"),
+      status: "completed",
+      turnTokenUsage: {
+        usageStatus: "complete",
+        inputTokens: 14,
+        outputTokens: 9,
+        cachedInputTokens: 1,
+      },
+    });
+    const item = ofType(events, "turn_item.updated").find(
+      (event) => event.turnItem.type === "subagent",
+    );
+    expect(item?.turnItem).toMatchObject({ parentItemId: scopedItemId(ctx(), "tool-parent") });
+    expect(ofType(events, "turn.terminal")).toHaveLength(1);
     expect(core.hasSubagents).toBe(false);
-    const completed = ofType(events, "turn.completed")[0];
-    if (completed?.type !== "turn.completed") throw new Error("missing parent completion");
-    expect(completed.payload.tokenUsage).toEqual({
+    const completed = ofType(events, "provider_turn.updated").at(-1);
+    expect(completed?.providerTurn.turnTokenUsage).toEqual({
       usageScope: "main_agent",
       hasSubagents: true,
       usageStatus: "unavailable",
@@ -236,32 +217,28 @@ describe("NeoPi subagent mapper", () => {
       },
     ]);
 
-    expect(events.some((event) => event.type === "turn.completed")).toBe(false);
+    expect(ofType(events, "turn.terminal")).toEqual([]);
+    expect(ofType(events, "message.updated")).toEqual([]);
     expect(
-      events.some(
+      ofType(events, "turn_item.updated").some(
         (event) =>
-          event.type === "content.delta" &&
-          (event.payload.streamKind === "assistant_text" ||
-            event.payload.streamKind === "reasoning_text"),
+          event.turnItem.type === "assistant_message" || event.turnItem.type === "reasoning",
       ),
     ).toBe(false);
-    expect(ofType(events, "task.progress").map((event) => event.payload)).toEqual([
-      expect.objectContaining({
-        taskId: childTaskId("child-1"),
-        agentId: childTaskId("child-1"),
-        summary: "CHILD-SECRET",
-      }),
-    ]);
-    const tool = events.find(
-      (event) => event.type === "item.completed" && event.payload.itemType === "command_execution",
-    );
-    expect(tool?.payload).toEqual(
-      expect.objectContaining({
-        agentId: childTaskId("child-1"),
-        parentToolUseId: scopedItemId(ctx(), "tool-parent"),
-      }),
-    );
-    expect(tool && "itemId" in tool ? tool.itemId : undefined).toContain("child-1");
+    expect(ofType(events, "subagent.updated").at(-1)?.subagent).toMatchObject({
+      id: childTaskId("child-1"),
+      progress: "CHILD-SECRET",
+    });
+    const tool = ofType(events, "turn_item.updated").find(
+      (event) =>
+        event.turnItem.type === "command_execution" && event.turnItem.status === "completed",
+    )?.turnItem;
+    expect(tool).toMatchObject({
+      nodeId: childTaskId("child-1"),
+      parentItemId: childTaskId("child-1"),
+      output: "workspace",
+    });
+    expect(tool?.id).toContain("child-1");
   });
 
   it("starts a distinct task when a completed child id is reused", () => {
@@ -274,11 +251,13 @@ describe("NeoPi subagent mapper", () => {
       { type: "subagent_lifecycle", payload: { id: "child-1", status: "completed", index: 0 } },
       started("child-1"),
     ]);
-    expect(
-      ofType(events, "task.started").map((event) =>
-        "taskId" in event.payload ? event.payload.taskId : undefined,
-      ),
-    ).toEqual([childTaskId("child-1"), childTaskId("child-1", 2)]);
+    const starts = ofType(events, "subagent.updated").filter(
+      (event) => event.subagent.status === "running",
+    );
+    expect(starts.map((event) => event.subagent.id)).toEqual([
+      childTaskId("child-1"),
+      childTaskId("child-1", 2),
+    ]);
   });
 
   it("separates a reused child name across runtime restarts and keeps its error off the parent", () => {
@@ -286,15 +265,13 @@ describe("NeoPi subagent mapper", () => {
     const a = mapSubagentFrame(ctx(), frame, emptySubagentState());
     const restarted = { ...ctx(), sessionKey: "restarted-session" };
     const b = mapSubagentFrame(restarted, frame, emptySubagentState());
-    expect(a.events[0]?.payload).toEqual(
-      expect.objectContaining({ taskId: childTaskId("named-child") }),
+    expect(ofType(a.events, "subagent.updated")[0]?.subagent.id).toBe(childTaskId("named-child"));
+    expect(ofType(b.events, "subagent.updated")[0]?.subagent.id).toBe(
+      scopedItemId(restarted, "task:named-child#1"),
     );
-    expect(b.events[0]?.payload).toEqual(
-      expect.objectContaining({
-        taskId: scopedItemId(restarted, "task:named-child#1"),
-      }),
+    expect(ofType(a.events, "subagent.updated")[0]?.subagent.id).not.toBe(
+      ofType(b.events, "subagent.updated")[0]?.subagent.id,
     );
-    expect(a.events[0]?.payload).not.toEqual(b.events[0]?.payload);
     const error = mapSubagentFrame(
       ctx(),
       {
@@ -306,216 +283,188 @@ describe("NeoPi subagent mapper", () => {
       },
       a.state,
     );
-    expect(error.events.some((event) => event.type === "runtime.error")).toBe(false);
-    expect(ofType(error.events, "task.progress")[0]?.payload).toEqual(
-      expect.objectContaining({ taskId: childTaskId("named-child"), error: "Child failed" }),
-    );
+    expect(ofType(error.events, "message.updated")).toEqual([]);
+    expect(ofType(error.events, "turn.terminal")).toEqual([]);
+    expect(ofType(error.events, "subagent.updated")[0]?.subagent).toMatchObject({
+      id: childTaskId("named-child"),
+      progress: "Child failed",
+    });
+  });
+  it("enriches a completed snapshot without reopening it or accepting progress after settlement", () => {
+    const { events, subagents } = feed([
+      {
+        type: "subagent_progress",
+        payload: {
+          task: "Inspect",
+          progress: { id: "child", status: "completed", recentOutput: ["done"] },
+        },
+      },
+      {
+        type: "subagent_event",
+        payload: {
+          id: "child",
+          event: { type: "message_end", message: assistant("final", usage(8, 2)) },
+        },
+      },
+      { type: "subagent_progress", payload: { progress: { id: "child", status: "running" } } },
+      { type: "subagent_lifecycle", payload: { id: "child", status: "completed" } },
+      {
+        type: "subagent_progress",
+        payload: {
+          progress: { id: "child", status: "running", recentOutput: ["stale"] },
+        },
+      },
+    ]);
+    const updates = ofType(events, "subagent.updated").map((event) => event.subagent);
+    expect(updates.every((entry) => entry.status === "completed")).toBe(true);
+    expect(updates.at(-1)).toMatchObject({
+      result: "final",
+      turnTokenUsage: { inputTokens: 8, outputTokens: 2 },
+    });
+    expect(subagents.generations.child).toBe(1);
+  });
+
+  it("links nested children to the tool owner and counts each completed tool once", () => {
+    const toolStart = {
+      type: "tool_execution_start",
+      toolCallId: "spawn",
+      toolName: "bash",
+      args: { command: "pwd" },
+    };
+    const toolEnd = {
+      type: "tool_execution_end",
+      toolCallId: "spawn",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "root" }] },
+    };
+    const { events } = feed([
+      { type: "subagent_lifecycle", payload: { id: "parent", status: "started", agent: "scout" } },
+      {
+        type: "subagent_event",
+        payload: {
+          id: "parent",
+          event: {
+            type: "agent_start",
+            model: { provider: "openai", id: "native" },
+            thinkingLevel: "high",
+          },
+        },
+      },
+      { type: "subagent_event", payload: { id: "parent", event: toolStart } },
+      {
+        type: "subagent_lifecycle",
+        payload: { id: "nested", status: "started", parentToolCallId: "spawn" },
+      },
+      { type: "subagent_event", payload: { id: "parent", event: toolEnd } },
+      { type: "subagent_event", payload: { id: "parent", event: toolEnd } },
+      { type: "subagent_lifecycle", payload: { id: "parent", status: "completed" } },
+    ]);
+    const updates = ofType(events, "subagent.updated").map((event) => event.subagent);
+    expect(updates.find((entry) => entry.id === childTaskId("nested"))).toMatchObject({
+      parentNodeId: childTaskId("parent"),
+      childThreadId: null,
+      providerThreadId: null,
+    });
+    expect(updates.at(-1)).toMatchObject({
+      role: "scout",
+      toolUses: 1,
+      modelSelection: {
+        model: "openai/native",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+    });
+    expect(
+      ofType(events, "turn_item.updated").find(
+        (event) =>
+          event.turnItem.type === "subagent" && event.turnItem.subagentId === childTaskId("nested"),
+      )?.turnItem.parentItemId,
+    ).toBe(scopedItemId({ ...ctx(), agentId: childTaskId("parent") }, "spawn"));
+    expect(ofType(events, "app_thread.created")).toEqual([]);
   });
 });
 
 effectIt.live("child subagent text does not enter the parent message through ingestion", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const provider = ProviderDriverKind.make("neopi");
-      const instanceId = ProviderInstanceId.make("neopi");
-      const threadId = ThreadId.make("neopi-subagent-ingestion");
-      const createdAt = "2026-09-27T00:00:00.000Z";
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const makeRuntime = (input: NeoPiRuntimeInput) =>
-        Effect.gen(function* () {
-          const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
-          const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
-          const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
-            v: 1 as const,
-            sessionDir: "/tmp",
-            sessionId: "native",
-            sessionFile: "/tmp/session.jsonl",
-            turnBoundaries: [],
-          });
-          return {
-            threadId: input.threadId,
-            state,
-            cursor,
-            capabilities: new Set(["v2"]),
-            start: SubscriptionRef.set(state, "ready"),
-            startTurn: (turn) =>
-              Effect.gen(function* () {
-                yield* SubscriptionRef.set(state, "running");
-                const childUsage = { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 };
-                for (const frame of [
-                  { type: "agent_start", turnId: turn.turnId },
-                  {
-                    type: "message_update",
-                    assistantMessageEvent: { type: "text_delta", delta: "parent answer" },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "message_end",
-                    message: {
-                      role: "assistant",
-                      content: [{ type: "text", text: "parent answer" }],
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_lifecycle",
-                    payload: {
-                      id: "child-1",
-                      status: "started",
-                      description: "Look around",
-                      parentToolCallId: "tool-parent",
-                      agent: "scout",
-                      index: 0,
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_event",
-                    payload: {
-                      id: "child-1",
-                      event: {
-                        type: "message_update",
-                        assistantMessageEvent: {
-                          type: "text_delta",
-                          delta: "CHILD-SECRET",
-                          contentIndex: 0,
-                        },
-                      },
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_event",
-                    payload: {
-                      id: "child-1",
-                      event: {
-                        type: "message_end",
-                        message: {
-                          role: "assistant",
-                          content: [{ type: "text", text: "CHILD-SECRET" }],
-                          usage: childUsage,
-                        },
-                      },
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_event",
-                    payload: {
-                      id: "child-1",
-                      event: { type: "notice", level: "error", message: "child-only error" },
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_event",
-                    payload: {
-                      id: "child-1",
-                      event: { type: "agent_end", messages: [] },
-                    },
-                    turnId: turn.turnId,
-                  },
-                  {
-                    type: "subagent_lifecycle",
-                    payload: { id: "child-1", status: "completed", agent: "scout", index: 0 },
-                    turnId: turn.turnId,
-                  },
-                  { type: "t3.turn.outcome", state: "completed", turnId: turn.turnId },
-                ])
-                  yield* Queue.offer(frames, frame);
-                yield* SubscriptionRef.set(state, "ready");
-                return { turnId: turn.turnId };
-              }),
-            steer: () => Effect.void,
-            interrupt: SubscriptionRef.set(state, "ready"),
-            compact: () => Effect.void,
-            resolvePlanProposal: () => Effect.void,
-            respondUi: () => Effect.void,
-            writeFrame: () => Effect.void,
-            request: () => Effect.succeed({ messages: [] }),
-            frames: Stream.fromQueue(frames),
-            restart: () => Effect.void,
-            stop: SubscriptionRef.set(state, "stopped").pipe(
-              Effect.andThen(Queue.shutdown(frames)),
-            ),
-            setRuntimeMode: () => Effect.void,
-            onSessionIdentityMayHaveChanged: Effect.void,
-            applyModelSelection: () => Effect.void,
-          } satisfies NeoPiSessionRuntimeShape;
-        });
-      const adapter = yield* makeNeoPiAdapter({
-        settings: {
-          enabled: true,
-          binaryPath: "npi",
-          profile: "",
-          launchArgs: "",
-          customModels: [],
-        },
-        instanceId,
-        binary: "npi",
-        cwd: "/tmp",
-        t3Home: "/tmp",
-        attachmentsDir: "/tmp",
-        environment: {},
-        spawn: spawner.spawn,
-        discovery: yield* makeNeoPiDiscoveryHub(),
-        makeRuntime,
-      });
-      const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
-      yield* Effect.addFinalizer(() => harness.dispose);
-      yield* harness.engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("neopi-subagent-project"),
-        projectId: ProjectId.make("neopi-subagent-project"),
-        title: "NeoPi subagents",
-        workspaceRoot: harness.workspaceDir,
-        defaultModelSelection: { instanceId, model: "neopi-current" },
-        createdAt,
-      });
-      yield* harness.engine.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make("neopi-subagent-thread"),
-        threadId,
-        projectId: ProjectId.make("neopi-subagent-project"),
-        title: "Subagent thread",
-        modelSelection: { instanceId, model: "neopi-current" },
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        branch: null,
-        worktreePath: harness.workspaceDir,
-        createdAt,
-      });
-      yield* harness.providerService.startSession(threadId, {
-        threadId,
-        provider,
-        providerInstanceId: instanceId,
-        cwd: harness.workspaceDir,
-        runtimeMode: "approval-required",
-      });
-      yield* harness.providerService.sendTurn({ threadId, input: "delegate" });
-      const thread = yield* harness.waitForThread(
-        threadId,
-        (entry) =>
-          entry.session?.status === "ready" &&
-          entry.messages.some(
-            (message) => message.role === "assistant" && message.text === "parent answer",
-          ) &&
-          entry.activities.some((activity) => activity.kind === "task.completed"),
-      );
-      const assistantText = thread.messages
-        .filter((message) => message.role === "assistant" || message.role === "reasoning")
-        .map((message) => message.text)
-        .join("\n");
-      assert.equal(assistantText.includes("CHILD-SECRET"), false);
-      assert.equal(assistantText, "parent answer");
-      const completed = thread.activities.find((activity) => activity.kind === "task.completed");
-      const payload =
-        completed?.payload && typeof completed.payload === "object"
-          ? (completed.payload as { typedUsage?: { inputTokens?: number }; agentId?: string })
-          : undefined;
-      assert.equal(payload?.agentId?.includes("child-1"), true);
-      assert.equal(payload?.typedUsage?.inputTokens, 8);
-      assert.equal(thread.session?.status, "ready");
-    }).pipe(Effect.provide(NodeServices.layer)),
-  ),
+      const h = yield* makeNativeOrchestratorHarness("neopi-subagent-ingestion");
+      yield* Effect.gen(function* () {
+        const threadId = ThreadId.make("neopi-subagent-ingestion");
+        yield* h.create(threadId);
+        const pending = yield* h.start(threadId, "delegate");
+        for (const frame of [
+          {
+            type: "subagent_lifecycle",
+            payload: {
+              id: "child-1",
+              status: "started",
+              description: "Look around",
+              parentToolCallId: "tool-parent",
+              agent: "scout",
+              index: 0,
+            },
+          },
+          {
+            type: "subagent_event",
+            payload: {
+              id: "child-1",
+              event: {
+                type: "message_update",
+                assistantMessageEvent: {
+                  type: "text_delta",
+                  delta: "CHILD-SECRET",
+                  contentIndex: 0,
+                },
+              },
+            },
+          },
+          {
+            type: "subagent_event",
+            payload: {
+              id: "child-1",
+              event: {
+                type: "message_end",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "CHILD-SECRET" }],
+                  usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 },
+                },
+              },
+            },
+          },
+          {
+            type: "subagent_event",
+            payload: {
+              id: "child-1",
+              event: { type: "notice", level: "error", message: "child-only error" },
+            },
+          },
+          {
+            type: "subagent_event",
+            payload: { id: "child-1", event: { type: "agent_end", messages: [] } },
+          },
+          {
+            type: "subagent_lifecycle",
+            payload: { id: "child-1", status: "completed", agent: "scout", index: 0 },
+          },
+        ])
+          yield* h.native.emit(frame, pending.cursor.sessionFile);
+        const { projection } = yield* pending.complete("parent answer");
+        assert.deepEqual(
+          projection.messages
+            .filter((message) => message.role === "assistant")
+            .map((message) => message.text),
+          ["parent answer"],
+        );
+        assert.isFalse(
+          projection.messages.some((message) => message.text.includes("CHILD-SECRET")),
+        );
+        const child = projection.subagents.find((entry) => entry.id.includes("child-1"));
+        assert.equal(child?.status, "completed");
+        assert.equal(child?.result, "CHILD-SECRET");
+        assert.equal(child?.turnTokenUsage?.inputTokens, 8);
+        assert.equal(projection.runs[0]?.status, "completed");
+        assert.equal(projection.providerSessions.at(-1)?.status, "ready");
+      }).pipe(Effect.provide(h.services()));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );

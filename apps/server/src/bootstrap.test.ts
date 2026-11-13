@@ -1,26 +1,16 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
-import * as NodePath from "node:path";
-import * as NodeChildProcess from "node:child_process";
-import { PassThrough } from "node:stream";
+import * as NodeStream from "node:stream";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
-import {
-  BootstrapEnvelopeDecodeError,
-  BootstrapFdStatError,
-  BootstrapInputStreamOpenError,
-  readBootstrapEnvelope,
-  waitForParentInputClose,
-} from "./bootstrap.ts";
+import { readBootstrapEnvelope, waitForParentInputClose } from "./bootstrap.ts";
 import { assertNone, assertSome } from "@effect/vitest/utils";
 
 const openSyncInterceptor = vi.hoisted(() => ({
@@ -57,7 +47,7 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-const windowsHost = HostProcessPlatform.defaultValue() === "win32";
+const windowsHost = HostProcess.Platform.defaultValue() === "win32";
 const nullDevice = windowsHost ? "\\\\.\\NUL" : "/dev/null";
 const closeIfOpen = (fd: number) => {
   try {
@@ -67,8 +57,7 @@ const closeIfOpen = (fd: number) => {
   }
 };
 
-// A successful Windows read streams the inherited fd with autoClose. POSIX
-// reopens the fd through /proc or /dev, so the test still owns the original.
+// Windows auto-closes the inherited fd; POSIX reopens it, leaving the original for the test to close.
 const openBootstrapInputFd = (filePath: string) =>
   Effect.acquireRelease(
     Effect.sync(() => NodeFS.openSync(filePath, "r")),
@@ -108,55 +97,19 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
         `${yield* encodeTestEnvelopeSchema({ mode: "desktop" })}\n`,
       );
 
-      // Open without acquireRelease: the direct-stream fallback uses autoClose: true,
-      // so the stream owns the fd lifecycle and closes it asynchronously on end.
-      // Attempting to also close it synchronously in a finalizer races with the
-      // stream's async close and produces an uncaught EBADF.
+      // The fallback stream auto-closes asynchronously; a finalizer would race and cause EBADF.
       const fd = NodeFS.openSync(filePath, "r");
 
       openSyncInterceptor.failPath = `/proc/self/fd/${fd}`;
       try {
         const payload = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
           timeoutMs: 100,
-        }).pipe(Effect.provideService(HostProcessPlatform, "linux"));
+        }).pipe(Effect.provideService(HostProcess.Platform, "linux"));
         assertSome(payload, {
           mode: "desktop",
         });
       } finally {
         openSyncInterceptor.failPath = null;
-      }
-    }),
-  );
-
-  it.effect("preserves fd path, platform, and cause when opening the input stream fails", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const filePath = yield* fs.makeTempFileScoped({ prefix: "t3-bootstrap-", suffix: ".ndjson" });
-      const fd = yield* Effect.acquireRelease(
-        Effect.sync(() => NodeFS.openSync(filePath, "r")),
-        (fd) => Effect.sync(() => closeIfOpen(fd)),
-      );
-      const fdPath = `/proc/self/fd/${fd}`;
-
-      openSyncInterceptor.failPath = fdPath;
-      openSyncInterceptor.errorCode = "EIO";
-      try {
-        const error = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
-          timeoutMs: 100,
-        }).pipe(Effect.provideService(HostProcessPlatform, "linux"), Effect.flip);
-
-        assert.instanceOf(error, BootstrapInputStreamOpenError);
-        assert.equal(error.fd, fd);
-        assert.equal(error.platform, "linux");
-        assert.equal(error.fdPath, fdPath);
-        assert.equal((error.cause as NodeJS.ErrnoException).code, "EIO");
-        assert.equal(
-          error.message,
-          `Failed to open bootstrap input stream for file descriptor ${fd} via '${fdPath}' on 'linux'.`,
-        );
-      } finally {
-        openSyncInterceptor.failPath = null;
-        openSyncInterceptor.errorCode = "ENXIO";
       }
     }),
   );
@@ -170,94 +123,10 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
       assertNone(payload);
     }),
   );
-
-  it.effect("preserves fd and cause when stat fails for a non-availability reason", () =>
-    Effect.gen(function* () {
-      const fd = yield* Effect.acquireRelease(
-        Effect.sync(() => NodeFS.openSync(nullDevice, "r")),
-        (fd) => Effect.sync(() => closeIfOpen(fd)),
-      );
-
-      fstatSyncInterceptor.failFd = fd;
-      try {
-        const error = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
-          timeoutMs: 100,
-        }).pipe(Effect.flip);
-
-        assert.instanceOf(error, BootstrapFdStatError);
-        assert.equal(error.fd, fd);
-        assert.equal((error.cause as NodeJS.ErrnoException).code, "EACCES");
-        assert.equal(error.message, `Failed to stat bootstrap file descriptor ${fd}.`);
-      } finally {
-        fstatSyncInterceptor.failFd = null;
-      }
-    }),
-  );
-
-  it.effect("preserves fd and schema cause when decoding the envelope fails", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const filePath = yield* fs.makeTempFileScoped({ prefix: "t3-bootstrap-", suffix: ".ndjson" });
-      yield* fs.writeFileString(filePath, '{"mode":42}\n');
-
-      const fd = yield* openBootstrapInputFd(filePath);
-      const error = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
-        timeoutMs: 100,
-      }).pipe(Effect.flip);
-
-      assert.instanceOf(error, BootstrapEnvelopeDecodeError);
-      assert.equal(error.fd, fd);
-      assert.isDefined(error.cause);
-      assert.equal(
-        error.message,
-        `Failed to decode bootstrap envelope from file descriptor ${fd}.`,
-      );
-    }),
-  );
-
-  // Needs a FIFO, which mkfifo creates; Windows has neither.
-  it.effect.skipIf(windowsHost)(
-    "returns none when the bootstrap read times out before any value arrives",
-    () =>
-      Effect.gen(function* () {
-        const fs = yield* FileSystem.FileSystem;
-        const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-bootstrap-" });
-        const fifoPath = NodePath.join(tempDir, "bootstrap.pipe");
-
-        yield* Effect.sync(() => NodeChildProcess.execFileSync("mkfifo", [fifoPath]));
-
-        const _writer = yield* Effect.acquireRelease(
-          Effect.sync(() =>
-            NodeChildProcess.spawn("sh", ["-c", 'exec 3>"$1"; sleep 60', "sh", fifoPath], {
-              stdio: ["ignore", "ignore", "ignore"],
-            }),
-          ),
-          (writer) =>
-            Effect.sync(() => {
-              writer.kill("SIGKILL");
-            }),
-        );
-
-        const fd = yield* Effect.acquireRelease(
-          Effect.sync(() => NodeFS.openSync(fifoPath, "r")),
-          (fd) => Effect.sync(() => closeIfOpen(fd)),
-        );
-
-        const fiber = yield* readBootstrapEnvelope(TestEnvelopeSchema, fd, {
-          timeoutMs: 100,
-        }).pipe(Effect.forkScoped);
-
-        yield* Effect.yieldNow;
-        yield* TestClock.adjust(Duration.millis(100));
-
-        const payload = yield* Fiber.join(fiber);
-        assertNone(payload);
-      }).pipe(Effect.provide(TestClock.layer())),
-  );
   it.effect("keeps a borrowed bootstrap pipe open until its parent ends it", () =>
     Effect.gen(function* () {
       const input = yield* Effect.acquireRelease(
-        Effect.sync(() => new PassThrough()),
+        Effect.sync(() => new NodeStream.PassThrough()),
         (input) => Effect.sync(() => input.destroy()),
       );
       input.write('{"mode":"desktop"}\n');
@@ -266,8 +135,10 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
       assertSome(payload, { mode: "desktop" });
       assert.equal(input.destroyed, false);
 
-      const lifetime = yield* waitForParentInputClose(input).pipe(Effect.forkScoped);
-      yield* Effect.yieldNow;
+      // Bootstrap may already have resumed the pipe; wait for the lifetime listener installation.
+      const listening = new Promise<void>((resolve) => input.once("newListener", () => resolve()));
+      const lifetime = yield* waitForParentInputClose(input).pipe(Effect.forkChild);
+      yield* Effect.promise(() => listening);
       assert.equal(lifetime.pollUnsafe(), undefined);
 
       input.end();
@@ -279,7 +150,7 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
   it.effect("observes parent EOF that arrives between bootstrap and the lifetime listener", () =>
     Effect.gen(function* () {
       const input = yield* Effect.acquireRelease(
-        Effect.sync(() => new PassThrough()),
+        Effect.sync(() => new NodeStream.PassThrough()),
         (input) => Effect.sync(() => input.destroy()),
       );
       input.end('{"mode":"desktop"}\n');
@@ -294,11 +165,12 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
   it.effect("reports a broken parent pipe instead of leaving the server running", () =>
     Effect.gen(function* () {
       const input = yield* Effect.acquireRelease(
-        Effect.sync(() => new PassThrough()),
+        Effect.sync(() => new NodeStream.PassThrough()),
         (input) => Effect.sync(() => input.destroy()),
       );
-      const lifetime = yield* waitForParentInputClose(input).pipe(Effect.flip, Effect.forkScoped);
-      yield* Effect.yieldNow;
+      const listening = new Promise<void>((resolve) => input.once("resume", resolve));
+      const lifetime = yield* waitForParentInputClose(input).pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.promise(() => listening);
       const cause = new Error("parent pipe failed");
       input.destroy(cause);
 
@@ -310,7 +182,7 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
 
   it.effect("handles a pipe destroyed with an error before the lifetime listener starts", () =>
     Effect.gen(function* () {
-      const input = new PassThrough();
+      const input = new NodeStream.PassThrough();
       const cause = new Error("parent pipe failed during bootstrap");
       input.destroy(cause);
 

@@ -32,12 +32,7 @@ export function currentComposerArgumentCompletions(
   return result.items;
 }
 
-/**
- * A provider expands a slash command only when it opens the whole message;
- * anywhere else it reaches the agent as literal text, so it is not offered
- * there. Native command owners also exclude local commands, so a GUI action
- * cannot shadow their advertised command or consume it while unavailable.
- */
+/** Native command ownership prevents local GUI actions from consuming runtime commands. */
 export function slashCommandItemsForPromptPosition(
   items: ReadonlyArray<SlashSearchItem>,
   isAtPromptStart: boolean,
@@ -46,7 +41,12 @@ export function slashCommandItemsForPromptPosition(
   return items.filter(
     (item) =>
       (!providerOwnsCommands || item.type !== "slash-command") &&
-      (isAtPromptStart || item.type !== "provider-slash-command"),
+      (isAtPromptStart ||
+        item.type === "skill" ||
+        (item.type === "slash-command" &&
+          item.command !== "side" &&
+          item.command !== "btw" &&
+          item.command !== "clear")),
   );
 }
 

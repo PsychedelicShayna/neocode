@@ -1,8 +1,8 @@
-import * as Data from "effect/Data";
+import * as Schema from "effect/Schema";
 
 /** Transport failure for the NeoPi/OMP JSONL stdio client. */
-export class NeoPiRpcError extends Data.TaggedError("NeoPiRpcError")<{
-  readonly code?: string;
-  readonly message: string;
-  readonly command?: string;
-}> {}
+export class NeoPiRpcError extends Schema.TaggedError<NeoPiRpcError>()("NeoPiRpcError", {
+  code: Schema.optional(Schema.String),
+  message: Schema.String,
+  command: Schema.optional(Schema.String),
+}) {}

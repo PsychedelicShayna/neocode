@@ -7,7 +7,8 @@ import { TerminalIcon } from "lucide-react";
 import { useState } from "react";
 
 import { writeTextToClipboard } from "../../hooks/useCopyToClipboard";
-import { useServerConfigs, useThreadShell } from "../../state/entities";
+import { useThreadShell } from "../../state/entities";
+import { useEnvironmentProviders } from "../../state/environments";
 import { neopiSessionHandoff } from "../../state/neopiSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
@@ -16,17 +17,17 @@ import { toastManager } from "../ui/toast";
 
 export function NeoPiTerminalHandoff({ threadRef }: { threadRef: ScopedThreadRef | null }) {
   const thread = useThreadShell(threadRef);
-  const configs = useServerConfigs();
+  const providersByEnvironment = useEnvironmentProviders();
   const handoff = useAtomCommand(neopiSessionHandoff, { reportFailure: false });
   const [pending, setPending] = useState(false);
   const provider =
     threadRef && thread
-      ? configs
+      ? providersByEnvironment
           .get(threadRef.environmentId)
-          ?.providers.find(
+          ?.find(
             (entry) =>
               entry.instanceId ===
-              (thread.session?.providerInstanceId ?? thread.modelSelection.instanceId),
+              (thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId),
           )
       : null;
   if (!threadRef || !thread || provider?.driver !== "neopi") return null;
@@ -52,7 +53,7 @@ export function NeoPiTerminalHandoff({ threadRef }: { threadRef: ScopedThreadRef
       }
       toastManager.add({
         type: copied ? "success" : "warning",
-        title: copied ? "Terminal command copied" : "Session released — copy this terminal command",
+        title: copied ? "Terminal command copied" : "Session released: copy this terminal command",
         description: command,
         timeout: 0,
       });

@@ -21,7 +21,8 @@ function moveEntry<T>(
 ): Record<string, T> {
   const source = entries[from];
   if (from === to || source === undefined) return entries;
-  const { [from]: _source, ...next } = entries;
+  const next: Record<string, T> = { ...entries };
+  delete next[from];
   const destination = entries[to];
   next[to] = destination !== undefined && merge ? merge(source, destination) : source;
   return next;
@@ -34,7 +35,7 @@ function mergeById<T extends { readonly id: string }>(
   return [...new Map([...destination, ...source].map((entry) => [entry.id, entry])).values()];
 }
 
-export function mergeRelocatedComposerDraft(
+function mergeRelocatedComposerDraft(
   source: ComposerThreadDraftState,
   destination: ComposerThreadDraftState,
 ): ComposerThreadDraftState {
@@ -78,7 +79,7 @@ export function relocateNativeWorkspace(from: NativeSessionTarget, to: NativeSes
   const preview = readThreadPreviewState(from);
   for (const url of preview.recentlySeenUrls) rememberPreviewUrl(to, url);
   for (const snapshot of Object.values(preview.sessions)) {
-    if (snapshot.navStatus.kind !== "Idle") rememberPreviewUrl(to, snapshot.navStatus.url);
+    if (snapshot.navStatus._tag !== "Idle") rememberPreviewUrl(to, snapshot.navStatus.url);
     beginPreviewSessionClose(from, snapshot.tabId);
   }
   usePreviewMiniPlayerStore.getState().removeThread(from);
@@ -115,6 +116,5 @@ export function relocateNativeWorkspace(from: NativeSessionTarget, to: NativeSes
     ),
     projectKeyByThreadKey: moveEntry(state.projectKeyByThreadKey, fromKey, toKey),
     pendingVisitsByThreadKey: moveEntry(state.pendingVisitsByThreadKey, fromKey, toKey),
-    pendingTitlesByThreadKey: moveEntry(state.pendingTitlesByThreadKey, fromKey, toKey),
   }));
 }

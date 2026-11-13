@@ -5,6 +5,7 @@ import type {
   NeoPiEffortRule,
   NeoPiEffortSelection,
   NeoPiModelsConfiguration,
+  NeoPiModelsAuthState,
   NeoPiModelsTarget,
   NeoPiModelsUpdate,
   ProviderInstanceId,
@@ -13,15 +14,16 @@ import type {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { formatNeoPiModelTokenLimit } from "@t3tools/client-runtime/neopi-models";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import * as Linking from "expo-linking";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { FlatList, ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { useProjects, useServerConfigs } from "../../state/entities";
 import { neopiModels } from "../../state/neopiModels";
+import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
@@ -42,13 +44,7 @@ export function NeoPiModelsEntry(props: {
   target?: NeoPiModelsTarget;
 }) {
   const navigation = useNavigation();
-  return (
-    <MaterialButton
-      label="Models"
-      tone="text"
-      onPress={() => navigation.navigate("Models", props)}
-    />
-  );
+  return <Button label="Models" tone="text" onPress={() => navigation.navigate("Models", props)} />;
 }
 
 export function NeoPiModelsScreen({ route }: StaticScreenProps<NeoPiModelsScreenParams>) {
@@ -164,7 +160,7 @@ function ModelsSnapshot({
     return (
       <View className="gap-3 p-4">
         <NativeError message={errorMessage(Cause.squash(result.cause))} />
-        <MaterialButton label="Retry native connection" onPress={refresh} />
+        <Button label="Retry native connection" onPress={refresh} />
       </View>
     );
   if (!AsyncResult.isSuccess(result) || result.value === null)
@@ -198,7 +194,7 @@ function EffortChoices({
   return (
     <View className="flex-row flex-wrap gap-2">
       {choices.map((choice) => (
-        <MaterialButton
+        <Button
           key={choice}
           label={choice}
           tone={selected.includes(choice) ? "primary" : "secondary"}
@@ -240,6 +236,7 @@ function ModelsContent({
   const [rulesRevision, setRulesRevision] = useState(0);
   const active = useRef(true);
   const inFlight = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Ignore native mutation replies after this scoped Models view unmounts.
   useEffect(() => {
     active.current = true;
     return () => {
@@ -304,7 +301,7 @@ function ModelsContent({
           onChange={setSection}
         />
         <NativeError message={error} />
-        <MaterialButton label="Refresh native state" disabled={pending} onPress={refresh} />
+        <Button label="Refresh native state" disabled={pending} onPress={refresh} />
       </View>
       {assignment ? (
         <NativeModal title="Assign a native role" onClose={() => setAssignment(null)}>
@@ -351,7 +348,7 @@ function ModelsContent({
                   void save({ operation: "storage", value, expected: configuration.roleStorage })
                 }
               />
-              <MaterialButton
+              <Button
                 label="Create role"
                 disabled={pending}
                 onPress={() => setAssignment({ role: null, selector: "" })}
@@ -372,7 +369,7 @@ function ModelsContent({
                   ? ` · ${role.resolved.provider}/${role.resolved.modelId} · ${role.resolved.thinkingLevel ?? "Native effort"}`
                   : " · Unresolved"}
               </Text>
-              <MaterialButton
+              <Button
                 label={`Configure ${role.alias}`}
                 disabled={pending}
                 onPress={() => setAssignment({ role, selector: role.configured ?? "" })}
@@ -391,7 +388,7 @@ function ModelsContent({
             <View className="gap-4 pb-3">
               {provider ? (
                 <ProviderAccounts
-                  key={provider.id}
+                  key={JSON.stringify([environmentId, target, provider.id])}
                   environmentId={environmentId}
                   target={target}
                   provider={provider}
@@ -425,7 +422,7 @@ function ModelsContent({
                 {"\n"}Input/output per million: ${model.cost.input} / ${model.cost.output}
                 {"\n"}Efforts: {model.permittedEfforts.join(", ") || "No controllable effort"}
               </Text>
-              <MaterialButton
+              <Button
                 label={`Assign role to ${model.name}`}
                 disabled={pending}
                 onPress={() =>
@@ -571,7 +568,7 @@ function RoleEditor({
         />
       ) : null}
       <View className="flex-row flex-wrap gap-2">
-        <MaterialButton
+        <Button
           label="Save role"
           disabled={
             pending || !roleId.trim() || !selector.trim() || (mode === "auto" && !allowed.length)
@@ -587,12 +584,12 @@ function RoleEditor({
             })
           }
         />
-        <MaterialButton
+        <Button
           label="Clear this scope"
           disabled={pending || !roleId.trim()}
           onPress={() => void save({ operation: "role", role: roleId, scope, expected })}
         />
-        <MaterialButton label="Cancel" tone="text" onPress={close} />
+        <Button label="Cancel" tone="text" onPress={close} />
       </View>
     </View>
   );
@@ -609,16 +606,21 @@ function RulesEditor({
 }) {
   const [scope, setScope] = useState<Scope>("global");
   const [expected, setExpected] = useState(configuration.effortRuleScopes.global);
-  const [rules, setRules] = useState<ReadonlyArray<NeoPiEffortRule>>(
-    configuration.effortRuleScopes.global ?? [],
-  );
+  const [draft, setDraft] = useState(() => {
+    const rules = configuration.effortRuleScopes.global ?? [];
+    return { rows: rules.map((rule, id) => ({ id, rule })), nextId: rules.length };
+  });
+  const rules = draft.rows.map(({ rule }) => rule);
   const replace = (index: number, rule: NeoPiEffortRule) =>
-    setRules((values) => values.map((value, at) => (at === index ? rule : value)));
+    setDraft((value) => ({
+      ...value,
+      rows: value.rows.map((row, at) => (at === index ? { ...row, rule } : row)),
+    }));
   const move = (index: number, delta: number) =>
-    setRules((values) => {
-      const next = [...values];
-      [next[index], next[index + delta]] = [next[index + delta]!, next[index]!];
-      return next;
+    setDraft((value) => {
+      const rows = [...value.rows];
+      [rows[index], rows[index + delta]] = [rows[index + delta]!, rows[index]!];
+      return { ...value, rows };
     });
   return (
     <View className="gap-4">
@@ -638,11 +640,15 @@ function RulesEditor({
         onChange={(value) => {
           setScope(value);
           setExpected(configuration.effortRuleScopes[value]);
-          setRules(configuration.effortRuleScopes[value] ?? []);
+          const rules = configuration.effortRuleScopes[value] ?? [];
+          setDraft(({ nextId }) => ({
+            rows: rules.map((rule, index) => ({ id: nextId + index, rule })),
+            nextId: nextId + rules.length,
+          }));
         }}
       />
-      {rules.map((rule, index) => (
-        <View key={index} className="gap-3 border-b border-border-subtle pb-4">
+      {draft.rows.map(({ id, rule }, index) => (
+        <View key={id} className="gap-3 border-b border-border-subtle pb-4">
           <NativeField
             label={`Rule ${index + 1} selector`}
             value={rule.selector}
@@ -656,41 +662,52 @@ function RulesEditor({
             onChange={(allowed) => replace(index, { ...rule, allowed })}
           />
           <View className="flex-row flex-wrap gap-2">
-            <MaterialButton
+            <Button
               label="Move up"
               disabled={pending || index === 0}
               onPress={() => move(index, -1)}
             />
-            <MaterialButton
+            <Button
               label="Move down"
               disabled={pending || index === rules.length - 1}
               onPress={() => move(index, 1)}
             />
-            <MaterialButton
+            <Button
               label="Remove rule"
               disabled={pending}
-              onPress={() => setRules((values) => values.filter((_, at) => at !== index))}
+              onPress={() =>
+                setDraft((value) => ({
+                  ...value,
+                  rows: value.rows.filter((row) => row.id !== id),
+                }))
+              }
             />
           </View>
         </View>
       ))}
       <View className="flex-row flex-wrap gap-2">
-        <MaterialButton
+        <Button
           label="Add rule"
           disabled={pending}
           onPress={() =>
-            setRules((values) => [
-              ...values,
-              { selector: "", allowed: [...configuration.effortChoices] },
-            ])
+            setDraft((value) => ({
+              rows: [
+                ...value.rows,
+                {
+                  id: value.nextId,
+                  rule: { selector: "", allowed: [...configuration.effortChoices] },
+                },
+              ],
+              nextId: value.nextId + 1,
+            }))
           }
         />
-        <MaterialButton
+        <Button
           label="Save rules"
           disabled={pending || rules.some((rule) => !rule.selector.trim() || !rule.allowed.length)}
           onPress={() => void save({ operation: "rules", scope, rules, expected })}
         />
-        <MaterialButton
+        <Button
           label="Clear this scope"
           disabled={pending}
           onPress={() => void save({ operation: "rules", scope, expected })}
@@ -720,40 +737,27 @@ function ProviderAccounts({
   save: (change: Change) => Promise<boolean>;
 }) {
   const isNeoProxy = provider.id === "neoproxy";
-  const accountsCommand = useAtomCommand(neopiModels.accounts, { reportFailure: false });
+  const accountsQuery = useEnvironmentQuery(
+    neopiModels.accountsQuery({ environmentId, input: { target, providerId: provider.id } }),
+  );
+  const accounts = accountsQuery.data?.accounts ?? [];
+  const accountsReady = accountsQuery.isSuccess && !accountsQuery.isPending && !accountsQuery.error;
+  const loadAccounts = accountsQuery.refresh;
   const start = useAtomCommand(neopiModels.startAuth, { reportFailure: false });
   const cancel = useAtomCommand(neopiModels.cancelAuth, { reportFailure: false });
-  const [accounts, setAccounts] = useState<
-    ReadonlyArray<{ credentialId: number; label: string; detail: string; active: boolean }>
-  >([]);
-  const [accountsReady, setAccountsReady] = useState(false);
   const [key, setKey] = useState("");
   const [flowId, setFlowId] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const active = useRef(true);
   const startingRef = useRef(false);
-  const loadAccounts = useCallback(async () => {
-    setAccountsReady(false);
-    const result = await accountsCommand({
-      environmentId,
-      input: { target, providerId: provider.id },
-    });
-    if (!active.current) return;
-    if (result._tag === "Failure") setError(errorMessage(squashAtomCommandFailure(result)));
-    else {
-      setAccounts(result.value.accounts);
-      setAccountsReady(true);
-      setError(null);
-    }
-  }, [accountsCommand, environmentId, target, provider.id]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Cancel a late native login start if its scoped account view has closed.
   useEffect(() => {
     active.current = true;
-    void loadAccounts();
     return () => {
       active.current = false;
     };
-  }, [loadAccounts]);
+  }, []);
   async function login(providerId: string) {
     if (startingRef.current || flowId !== null) return;
     startingRef.current = true;
@@ -805,17 +809,17 @@ function ProviderAccounts({
           Native environment keys: {provider.envVars.join(", ")}
         </Text>
       ) : null}
-      <NativeError message={error} />
+      <NativeError message={error ?? accountsQuery.error} />
       <View className="flex-row flex-wrap gap-2">
         {provider.loginProviders.map((value) => (
-          <MaterialButton
+          <Button
             key={value.id}
             label={isNeoProxy ? "Connect to NeoProxy" : `Log in to ${value.name}`}
             disabled={!value.available || pending || starting || flowId !== null}
             onPress={() => void login(value.id)}
           />
         ))}
-        <MaterialButton
+        <Button
           label="Show native accounts"
           disabled={pending}
           onPress={() => void loadAccounts()}
@@ -827,7 +831,10 @@ function ProviderAccounts({
           environmentId={environmentId}
           flowId={flowId}
           providerId={provider.id}
-          refresh={refresh}
+          refresh={() => {
+            refresh();
+            loadAccounts();
+          }}
           close={() => {
             setFlowId(null);
             void loadAccounts();
@@ -861,7 +868,7 @@ function ProviderAccounts({
             secret
             disabled={pending}
           />
-          <MaterialButton
+          <Button
             label="Save native key"
             disabled={pending || !key.trim()}
             onPress={() => {
@@ -879,7 +886,7 @@ function ProviderAccounts({
             {account.active ? " · Active in native session" : ""}
           </Text>
           <Text className="text-xs text-foreground-muted">{account.detail}</Text>
-          <MaterialButton
+          <Button
             label={isNeoProxy ? "Disconnect" : "Remove this account"}
             disabled={pending}
             onPress={() =>
@@ -914,49 +921,35 @@ function NativeLogin({
   const state = useAtomValue(neopiModels.authChanges({ environmentId, input: { flowId } }));
   const respond = useAtomCommand(neopiModels.respondAuth, { reportFailure: false });
   const cancel = useAtomCommand(neopiModels.cancelAuth, { reportFailure: false });
-  const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
-  const pendingRequest = useRef<string | null>(null);
   const active = useRef(false);
   const result = AsyncResult.isSuccess(state) ? state.value : null;
-  const promptId = useRef(result?.prompt?.id);
-  promptId.current = result?.prompt?.id;
+  const completed = useRef(false);
+  const refreshCompleted = useEffectEvent(refresh);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Ignore cancellation replies after this native authentication flow closes.
   useEffect(() => {
     active.current = true;
     return () => {
       active.current = false;
     };
   }, []);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Refresh native catalog and accounts once the authentication stream reports completion.
   useEffect(() => {
-    setValue("");
-    setError(null);
-    setSubmitting(false);
-    pendingRequest.current = null;
-  }, [result?.prompt?.id]);
-  useEffect(() => {
-    if (result?.status === "complete") refresh();
-  }, [result?.status, refresh]);
-  const send = (requestId: string, answer: { value: string } | { confirmed: boolean }) => {
-    if (pendingRequest.current !== null || cancelling || result?.status !== "running") return;
-    pendingRequest.current = requestId;
-    setSubmitting(true);
-    setError(null);
-    void respond({ environmentId, input: { flowId, requestId, ...answer } }).then((response) => {
-      if (!active.current || promptId.current !== requestId) return;
-      if (response._tag === "Failure") {
-        setError(errorMessage(squashAtomCommandFailure(response)));
-        pendingRequest.current = null;
-        setSubmitting(false);
-      } else setValue("");
-    });
+    if (result?.status === "complete" && !completed.current) {
+      completed.current = true;
+      refreshCompleted();
+    }
+  }, [result?.status]);
+  const send = async (requestId: string, answer: { value: string } | { confirmed: boolean }) => {
+    const response = await respond({ environmentId, input: { flowId, requestId, ...answer } });
+    if (response._tag === "Failure") throw squashAtomCommandFailure(response);
   };
   if (AsyncResult.isFailure(state))
     return (
       <View className="gap-3">
         <NativeError message={errorMessage(Cause.squash(state.cause))} />
-        <MaterialButton label="Close login" onPress={close} />
+        <Button label="Close login" onPress={close} />
       </View>
     );
   const url = result?.url && /^https?:\/\//i.test(result.url) ? result.url : null;
@@ -971,7 +964,7 @@ function NativeLogin({
         </Text>
       ) : null}
       {url ? (
-        <MaterialButton
+        <Button
           label="Open native authorization page"
           onPress={() => void Linking.openURL(url).catch((cause) => setError(errorMessage(cause)))}
         />
@@ -987,52 +980,16 @@ function NativeLogin({
         </Text>
       ) : null}
       <NativeError message={error} />
-      {result?.prompt?.kind === "input" ? (
-        <View className="gap-2">
-          <NativeField
-            label={result.prompt.title}
-            value={value}
-            onChange={setValue}
-            secret={result.prompt.secret}
-            placeholder={result.prompt.placeholder ?? undefined}
-            disabled={submitting || cancelling}
-          />
-          <MaterialButton
-            label="Send to native login"
-            disabled={!value.trim() || submitting || cancelling}
-            onPress={() => {
-              if (result.prompt?.kind === "input") send(result.prompt.id, { value });
-            }}
-          />
-        </View>
-      ) : result?.prompt?.kind === "confirm" ? (
-        <View className="gap-3 rounded-lg border border-border-subtle p-3">
-          <Text accessibilityRole="header" className="font-t3-medium text-foreground">
-            {result.prompt.title}
-          </Text>
-          <Text selectable className="text-sm text-foreground-muted">
-            {result.prompt.message}
-          </Text>
-          <View className="flex-row flex-wrap gap-2">
-            <MaterialButton
-              label={providerId === "neoproxy" ? "Don't trust" : "Decline"}
-              disabled={submitting || cancelling}
-              onPress={() => {
-                if (result.prompt?.kind === "confirm") send(result.prompt.id, { confirmed: false });
-              }}
-            />
-            <MaterialButton
-              label={providerId === "neoproxy" ? "Trust this server" : "Confirm"}
-              tone="primary"
-              disabled={submitting || cancelling}
-              onPress={() => {
-                if (result.prompt?.kind === "confirm") send(result.prompt.id, { confirmed: true });
-              }}
-            />
-          </View>
-        </View>
+      {result?.prompt ? (
+        <NativeLoginPrompt
+          key={JSON.stringify([result.prompt.id, result.prompt.kind])}
+          prompt={result.prompt}
+          providerId={providerId}
+          disabled={cancelling || result.status !== "running"}
+          send={send}
+        />
       ) : null}
-      <MaterialButton
+      <Button
         label={!result || result.status === "running" ? "Cancel login" : "Close login"}
         disabled={(!result || result.status === "running") && cancelling}
         onPress={() => {
@@ -1049,6 +1006,92 @@ function NativeLogin({
           } else close();
         }}
       />
+    </View>
+  );
+}
+
+function NativeLoginPrompt({
+  prompt,
+  providerId,
+  disabled,
+  send,
+}: {
+  prompt: NonNullable<NeoPiModelsAuthState["prompt"]>;
+  providerId: string;
+  disabled: boolean;
+  send: (requestId: string, answer: { value: string } | { confirmed: boolean }) => Promise<void>;
+}) {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const pending = useRef(false);
+  const active = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Ignore answer replies after the native prompt ID or kind changes.
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+  const answer = (response: { value: string } | { confirmed: boolean }) => {
+    if (pending.current || disabled) return;
+    pending.current = true;
+    setSubmitting(true);
+    setError(null);
+    void send(prompt.id, response).then(
+      () => {
+        if (active.current) setValue("");
+      },
+      (cause) => {
+        if (!active.current) return;
+        setError(errorMessage(cause));
+        pending.current = false;
+        setSubmitting(false);
+      },
+    );
+  };
+  return (
+    <View className="gap-3">
+      <NativeError message={error} />
+      {prompt.kind === "input" ? (
+        <View className="gap-2">
+          <NativeField
+            label={prompt.title}
+            value={value}
+            onChange={setValue}
+            secret={prompt.secret}
+            placeholder={prompt.placeholder ?? undefined}
+            disabled={submitting || disabled}
+          />
+          <Button
+            label="Send to native login"
+            disabled={!value.trim() || submitting || disabled}
+            onPress={() => answer({ value })}
+          />
+        </View>
+      ) : (
+        <View className="gap-3 rounded-lg border border-border-subtle p-3">
+          <Text accessibilityRole="header" className="font-t3-medium text-foreground">
+            {prompt.title}
+          </Text>
+          <Text selectable className="text-sm text-foreground-muted">
+            {prompt.message}
+          </Text>
+          <View className="flex-row flex-wrap gap-2">
+            <Button
+              label={providerId === "neoproxy" ? "Don't trust" : "Decline"}
+              disabled={submitting || disabled}
+              onPress={() => answer({ confirmed: false })}
+            />
+            <Button
+              label={providerId === "neoproxy" ? "Trust this server" : "Confirm"}
+              tone="primary"
+              disabled={submitting || disabled}
+              onPress={() => answer({ confirmed: true })}
+            />
+          </View>
+        </View>
+      )}
     </View>
   );
 }

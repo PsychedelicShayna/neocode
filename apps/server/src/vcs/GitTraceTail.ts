@@ -8,16 +8,9 @@ import * as Stream from "effect/Stream";
 const NEWLINE = 0x0a;
 const decoder = new TextDecoder();
 
-/**
- * Incremental line reader for a file that another process keeps appending to
- * (Git's `GIT_TRACE2_EVENT` target).
- *
- * Each `readLines` reads only the bytes past the last consumed offset, so the
- * total I/O is linear in the file size. Lines are split on the raw 0x0A byte,
- * which never occurs inside a multi-byte UTF-8 sequence, so a character split
- * across two reads is decoded whole. Bytes after the last newline are held back
- * until their line completes or `takeRemainder` drains them.
- */
+// Git appends trace events; read only bytes past the consumed offset.
+// Split on raw 0x0A, which cannot occur inside a UTF-8 sequence, before decoding.
+// Keep incomplete lines until their newline arrives or takeRemainder drains them.
 export interface TraceTail {
   /** Complete lines appended since the previous call, without `\r`/`\n`. */
   readonly readLines: Effect.Effect<ReadonlyArray<string>, PlatformError.PlatformError>;
@@ -53,7 +46,7 @@ export const makeTraceTail = Effect.fnUntraced(function* (
 
   // Only touched while holding `mutex`, in the uninterruptible commit step.
   let offset = 0;
-  let inode: number | null = null;
+  let inode: bigint | null = null;
   let pending: Uint8Array[] = [];
 
   const readLines = mutex.withPermit(

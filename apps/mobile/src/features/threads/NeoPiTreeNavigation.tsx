@@ -1,8 +1,9 @@
 import {
-  nativeIdentityKey,
   nativeNavigationGuards,
+  nativeNavigationStillCurrent,
 } from "@t3tools/client-runtime/neopi-conversation";
 import { nativeAskQuestions, nativeAskReanswer } from "@t3tools/client-runtime/neopi-tree";
+import { nativeValueItems } from "@t3tools/client-runtime/neopi-native-sessions";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
   NeoPiNavigateTreeInput,
@@ -10,10 +11,12 @@ import type {
   ScopedThreadRef,
 } from "@t3tools/contracts";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AsyncResult } from "effect/reactivity";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { Image, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { MaterialButton } from "../../components/MaterialButton";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { estimateBase64ByteSize } from "../../lib/base64";
 import { pickComposerImages, type DraftComposerImageAttachment } from "../../lib/composerImages";
 import { uuidv4 } from "../../lib/uuid";
@@ -35,6 +38,17 @@ import {
 } from "../../state/use-composer-drafts";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { NativeError, NativeField, NativeJson } from "./NativeNeoPiControls";
+
+// Keep row identities without hashing or copying the retained base64 payloads.
+const answerImageKeys = new WeakMap<NativeAnswerImage, string>();
+let nextAnswerImageKey = 0;
+function answerImageKey(image: NativeAnswerImage): string {
+  const existing = answerImageKeys.get(image);
+  if (existing !== undefined) return existing;
+  const key = String(nextAnswerImageKey++);
+  answerImageKeys.set(image, key);
+  return key;
+}
 
 export function nativeEditorImages(
   result: Pick<NeoPiNavigateTreeResult, "editorImages">,
@@ -76,8 +90,7 @@ export function NeoPiTreeNavigation({
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const active = useRef(true);
-  const currentIdentity = useRef(identity);
-  currentIdentity.current = identity;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Ignore native navigation completions after this screen closes.
   useEffect(() => {
     active.current = true;
     return () => {
@@ -94,19 +107,30 @@ export function NeoPiTreeNavigation({
         },
       }));
   };
+  const leafId = identity?.leafId ?? null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Invalidate a persisted reopened answer when its native branch moves.
   useEffect(() => {
-    if (
-      target.result?.outcome === "ask_reopen" &&
-      identity &&
-      target.result.leafId !== identity.leafId
-    )
-      patch({
-        result: null,
-        answers: {},
-        images: [],
-        message: "The native branch changed. Reopen the question from its current tree.",
-      });
-  }, [identity?.leafId, target.result]);
+    const result = target.result;
+    if (!nativeKey || !leafId || result?.outcome !== "ask_reopen" || result.leafId === leafId)
+      return;
+    updateNativeTreeDraft(nativeKey, (current) => {
+      const currentTarget = current.targets[targetId];
+      if (!currentTarget || currentTarget.result !== result) return current;
+      return {
+        ...current,
+        targets: {
+          ...current.targets,
+          [targetId]: {
+            ...currentTarget,
+            result: null,
+            answers: {},
+            images: [],
+            message: "The native branch changed. Reopen the question from its current tree.",
+          },
+        },
+      };
+    });
+  }, [leafId, nativeKey, targetId, target.result]);
   const ask = useMemo(() => {
     if (!target.result?.reopenAsk) return null;
     try {
@@ -164,11 +188,14 @@ export function NeoPiTreeNavigation({
             : response.value.reason,
         );
       const result = response.value.result;
-      const latest = currentIdentity.current;
-      const changedAgain =
-        latest &&
-        (nativeIdentityKey(latest) !== nativeIdentityKey(capturedIdentity) ||
-          (latest.leafId !== capturedIdentity.leafId && latest.leafId !== result.leafId));
+      const current = appAtomRegistry.get(
+        nativeConversationAtoms.watch({
+          environmentId: threadRef.environmentId,
+          input: { threadId: threadRef.threadId },
+        }),
+      );
+      const latest = AsyncResult.isSuccess(current) ? current.value.conversation.identity : null;
+      const changedAgain = !nativeNavigationStillCurrent(latest, capturedIdentity, result.leafId);
       setCaptured(
         {
           result,
@@ -317,7 +344,7 @@ export function NeoPiTreeNavigation({
         Navigate inside this native file. Selecting a user entry restores its draft; its future is
         not deleted.
       </Text>
-      <MaterialButton
+      <Button
         label={target.summarize ? "Carry native summary: on" : "Carry native summary: off"}
         disabled={pending}
         onPress={() => patch({ summarize: !target.summarize })}
@@ -332,20 +359,20 @@ export function NeoPiTreeNavigation({
         />
       ) : null}
       <View className="flex-row flex-wrap gap-2">
-        <MaterialButton
+        <Button
           label="Navigate here"
           disabled={!canNavigate || pending}
           onPress={() => void perform()}
         />
         {connection?.ownership === "stopped" && !conversation.needsSnapshot ? (
-          <MaterialButton
+          <Button
             label="Start stopped native session and navigate"
             disabled={pending}
             onPress={() => void perform(undefined, true)}
           />
         ) : null}
         {pending ? (
-          <MaterialButton
+          <Button
             label="Cancel navigation"
             onPress={() =>
               void cancel({
@@ -384,7 +411,7 @@ export function NeoPiTreeNavigation({
                 <Text className="font-t3-medium text-foreground">{question.question}</Text>
                 {question.options.map((option) => (
                   <View key={option.label} className="gap-1">
-                    <MaterialButton
+                    <Button
                       label={option.label}
                       tone={answer.selectedOptions.includes(option.label) ? "primary" : "secondary"}
                       disabled={pending}
@@ -426,20 +453,16 @@ export function NeoPiTreeNavigation({
               </View>
             );
           })}
-          <MaterialButton
-            label="Add answer images"
-            disabled={pending}
-            onPress={() => void addImages()}
-          />
-          {target.images.map((image, index) => (
-            <View key={index} className="gap-2">
+          <Button label="Add answer images" disabled={pending} onPress={() => void addImages()} />
+          {nativeValueItems(target.images, answerImageKey).map(({ key, value: image }, index) => (
+            <View key={key} className="gap-2">
               <Image
                 source={{ uri: `data:${image.mimeType};base64,${image.data}` }}
                 style={{ height: 100, width: 140 }}
                 resizeMode="contain"
                 accessibilityLabel={`Answer image ${index + 1}`}
               />
-              <MaterialButton
+              <Button
                 label={`Remove image ${index + 1}`}
                 disabled={pending}
                 onPress={() => patch({ images: target.images.filter((_, at) => at !== index) })}
@@ -447,7 +470,7 @@ export function NeoPiTreeNavigation({
             </View>
           ))}
           <NativeJson value={target.result?.reopenAsk} label="Native ask record" />
-          <MaterialButton
+          <Button
             label="Save new answer on this branch"
             disabled={pending || !canNavigate || !!ask.error}
             onPress={() => {
@@ -462,7 +485,7 @@ export function NeoPiTreeNavigation({
               }
             }}
           />
-          <MaterialButton
+          <Button
             label="Cancel re-answer"
             disabled={pending}
             onPress={() =>
@@ -483,12 +506,12 @@ export function NeoPiTreeNavigation({
               ? "The transcript matches the saved answer's native leaf. Resume requires your acknowledgement."
               : "Waiting for the rebuilt matching native leaf. An intervening branch change or owner restart can invalidate this continuation."}
           </Text>
-          <MaterialButton
+          <Button
             label="Resume after rebuilt transcript"
             disabled={!rebuilt || pending || connection?.status !== "connected"}
             onPress={() => void acknowledge()}
           />
-          <MaterialButton
+          <Button
             label="Keep answer without resuming"
             disabled={pending}
             onPress={() => {

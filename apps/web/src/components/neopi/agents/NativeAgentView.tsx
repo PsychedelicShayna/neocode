@@ -1,16 +1,13 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { AgentHubAgent, AgentHubSource } from "@t3tools/client-runtime/neopi-native-agent-hub";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
-import { formatSubagentModelLabel } from "@t3tools/client-runtime/state/subagentRuntime";
+import { formatModelSlugName } from "@t3tools/shared/model";
 import { ArrowLeftIcon, ZapIcon } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 import { useEnvironmentSettings } from "~/hooks/useSettings";
-import {
-  EMPTY_SERVER_PROVIDERS,
-  primaryServerKeybindingsAtom,
-  serverEnvironment,
-} from "~/state/server";
+import { EMPTY_SERVER_PROVIDERS, primaryServerKeybindingsAtom } from "~/state/server";
+import { useEnvironmentProviders } from "~/state/environments";
 import { Button } from "~/components/ui/button";
 import { Kbd } from "~/components/ui/kbd";
 import {
@@ -48,7 +45,7 @@ function AgentControls({
 }) {
   const settings = useEnvironmentSettings(target.environmentId);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
-  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(target.environmentId));
+  const providers = useEnvironmentProviders().get(target.environmentId) ?? EMPTY_SERVER_PROVIDERS;
   const [modelOpen, setModelOpen] = useState(false);
   const run = (action: Promise<void>) => {
     onError(null);
@@ -74,10 +71,10 @@ function AgentControls({
     <div className="flex flex-wrap items-center gap-1.5">
       <NativeSessionModelPicker
         target={target}
-        providers={serverConfig?.providers ?? EMPTY_SERVER_PROVIDERS}
+        providers={providers}
         settings={settings}
         keybindings={keybindings}
-        modelLabel={formatSubagentModelLabel(agent.model, null) ?? "Model"}
+        modelLabel={agent.model ? formatModelSlugName(agent.model) : "Model"}
         modelSelector={agent.model ?? ""}
         displayState={null}
         open={modelOpen}
@@ -148,6 +145,7 @@ function AgentComposer({
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { id, live } = agent;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- focuses the DOM composer when the selected agent becomes steerable
   useEffect(() => {
     if (live) inputRef.current?.focus({ preventScroll: true });
   }, [live]);
@@ -239,11 +237,12 @@ export function NativeAgentView({
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const missing = agent === null;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- restores keyboard ownership when the external agent no longer has a live composer
   useEffect(() => {
-    // The composer takes focus itself while the agent runs; otherwise the view owns the keyboard.
+    if (!missing && agent?.live) return;
     const root = rootRef.current;
     if (root && !root.contains(document.activeElement)) root.focus({ preventScroll: true });
-  }, [missing]);
+  }, [missing, agent?.live]);
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Escape" || event.defaultPrevented) return;
     // Portaled popups bubble through React; only keys typed inside this view count.

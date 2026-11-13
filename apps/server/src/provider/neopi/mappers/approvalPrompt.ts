@@ -1,18 +1,18 @@
-import type { CanonicalRequestType } from "@t3tools/contracts";
+import type { ProviderRequestKind } from "@t3tools/contracts";
 
 export interface ApprovalPrompt {
   readonly toolName: string;
   readonly detail: string;
-  readonly requestType: CanonicalRequestType;
+  readonly requestType: ProviderRequestKind;
 }
 
-export function approvalRequestType(toolName: string): CanonicalRequestType {
-  if (toolName === "bash") return "exec_command_approval";
+export function approvalRequestType(toolName: string): ProviderRequestKind {
+  if (toolName === "bash") return "command";
   if (toolName === "edit" || toolName === "write" || toolName === "delete" || toolName === "move")
-    return "file_change_approval";
-  if (toolName === "read") return "file_read_approval";
-  if (toolName.startsWith("mcp__")) return "mcp_elicitation_approval";
-  return "permission_approval";
+    return "file-change";
+  if (toolName === "read") return "file-read";
+  if (toolName.startsWith("mcp__")) return "mcp-elicitation";
+  return "permission";
 }
 
 /** The legacy RPC UI sends approvals as a select, not as a typed permission request. */

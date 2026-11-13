@@ -1,0 +1,221 @@
+import type { OrchestrationV2ProviderCapabilities } from "@t3tools/contracts";
+
+// Capability scenarios for fake adapters; no execution driver or vendor SDK is loaded.
+export const pooledProviderCapabilities = {
+  sessions: {
+    supportsMultipleProviderThreadsPerSession: true,
+    supportsModelSwitchInSession: true,
+    supportsProviderSwitchingViaHandoff: true,
+    supportsRuntimeModeSwitchInSession: true,
+    pendingRequestsSurviveRestart: false,
+  },
+  threads: {
+    canCreateEmptyThread: true,
+    canReadThreadSnapshot: true,
+    canRollbackThread: true,
+    canForkThread: true,
+    canForkFromTurn: true,
+    canForkFromSubagentThread: true,
+    exposesNativeThreadId: true,
+  },
+  turns: {
+    exposesNativeTurnId: true,
+    emitsTurnStarted: true,
+    emitsTurnCompleted: true,
+    supportsInterrupt: true,
+    supportsActiveSteering: true,
+    supportsSteeringByInterruptRestart: true,
+    supportsQueuedMessages: true,
+    terminalStatusQuality: "strong",
+  },
+  streaming: {
+    streamsAssistantText: true,
+    streamsReasoning: true,
+    streamsToolOutput: true,
+    streamsPlanText: true,
+    emitsMessageCompleted: true,
+  },
+  tools: {
+    exposesToolItemIds: true,
+    emitsToolStarted: true,
+    emitsToolCompleted: true,
+    emitsToolOutput: true,
+    supportsMcpTools: true,
+    supportsDynamicToolCallbacks: true,
+  },
+  approvals: {
+    supportsCommandApproval: true,
+    supportsFileReadApproval: true,
+    supportsFileChangeApproval: true,
+    supportsApplyPatchApproval: true,
+    approvalsHaveNativeRequestIds: true,
+    approvalCallbacksAreLiveOnly: true,
+    approvalsCanOriginateFromSubagents: true,
+  },
+  planning: {
+    emitsPlanUpdated: true,
+    emitsTodoList: true,
+    emitsProposedPlan: true,
+    supportsStructuredQuestions: true,
+    planDeltasHaveItemIds: true,
+  },
+  subagents: {
+    supportsSubagents: true,
+    exposesSubagentThreadIds: true,
+    emitsSubagentLifecycle: true,
+    canWaitForSubagents: true,
+    canCloseSubagents: true,
+    canForkSubagentThread: true,
+  },
+  context: {
+    acceptsSystemContext: true,
+    acceptsDeveloperContext: true,
+    acceptsSyntheticUserContext: true,
+    canGenerateSummaries: true,
+    canConsumeHandoffSummaries: true,
+    supportsDeltaHandoff: true,
+    supportsFullThreadHandoff: true,
+    maxRecommendedHandoffChars: null,
+  },
+  checkpointing: {
+    appCanCheckpointFilesystem: true,
+    supportsNestedCheckpointScopes: true,
+    providerCanRollbackConversation: true,
+    providerRollbackReturnsSnapshot: true,
+    providerCanReadConversationSnapshot: true,
+  },
+  identity: {
+    nativeThreadIds: "strong",
+    nativeTurnIds: "strong",
+    nativeItemIds: "strong",
+    nativeRequestIds: "strong",
+  },
+  runtimePolicy: { enforcement: "native" },
+} satisfies OrchestrationV2ProviderCapabilities;
+
+export const exclusiveProviderCapabilities = {
+  ...pooledProviderCapabilities,
+  sessions: {
+    ...pooledProviderCapabilities.sessions,
+    supportsMultipleProviderThreadsPerSession: false,
+    supportsRuntimeModeSwitchInSession: false,
+  },
+  threads: {
+    ...pooledProviderCapabilities.threads,
+    canReadThreadSnapshot: false,
+    canForkFromSubagentThread: false,
+  },
+  turns: {
+    ...pooledProviderCapabilities.turns,
+    exposesNativeTurnId: false,
+    activeSteeringInterruptsTools: true,
+    supportsSteeringByInterruptRestart: false,
+  },
+  streaming: {
+    ...pooledProviderCapabilities.streaming,
+    streamsToolOutput: false,
+    streamsPlanText: false,
+  },
+  approvals: {
+    ...pooledProviderCapabilities.approvals,
+    supportsApplyPatchApproval: false,
+    approvalsCanOriginateFromSubagents: false,
+  },
+  planning: { ...pooledProviderCapabilities.planning, planDeltasHaveItemIds: false },
+  subagents: {
+    ...pooledProviderCapabilities.subagents,
+    exposesSubagentThreadIds: false,
+    canWaitForSubagents: false,
+    canCloseSubagents: false,
+    canForkSubagentThread: false,
+  },
+  checkpointing: {
+    ...pooledProviderCapabilities.checkpointing,
+    providerCanReadConversationSnapshot: false,
+  },
+  identity: { ...pooledProviderCapabilities.identity, nativeTurnIds: "weak" },
+} satisfies OrchestrationV2ProviderCapabilities;
+
+export const restartSteeringProviderCapabilities = {
+  ...pooledProviderCapabilities,
+  sessions: { ...exclusiveProviderCapabilities.sessions, supportsModelSwitchInSession: false },
+  threads: {
+    ...exclusiveProviderCapabilities.threads,
+    canForkThread: false,
+    canForkFromTurn: false,
+  },
+  turns: {
+    ...pooledProviderCapabilities.turns,
+    exposesNativeTurnId: false,
+    supportsActiveSteering: false,
+  },
+  streaming: { ...pooledProviderCapabilities.streaming, streamsPlanText: false },
+  tools: {
+    ...pooledProviderCapabilities.tools,
+    supportsMcpTools: false,
+    supportsDynamicToolCallbacks: false,
+  },
+  approvals: { ...exclusiveProviderCapabilities.approvals, approvalsHaveNativeRequestIds: false },
+  planning: { ...exclusiveProviderCapabilities.planning, emitsProposedPlan: false },
+  subagents: {
+    supportsSubagents: false,
+    exposesSubagentThreadIds: false,
+    emitsSubagentLifecycle: false,
+    canWaitForSubagents: false,
+    canCloseSubagents: false,
+    canForkSubagentThread: false,
+  },
+  context: {
+    ...pooledProviderCapabilities.context,
+    acceptsSystemContext: false,
+    acceptsDeveloperContext: false,
+  },
+  checkpointing: exclusiveProviderCapabilities.checkpointing,
+  identity: {
+    ...exclusiveProviderCapabilities.identity,
+    nativeItemIds: "weak",
+    nativeRequestIds: "weak",
+  },
+  runtimePolicy: { enforcement: "client-boundary" },
+} satisfies OrchestrationV2ProviderCapabilities;
+
+export const noApprovalProviderCapabilities = {
+  ...pooledProviderCapabilities,
+  sessions: exclusiveProviderCapabilities.sessions,
+  threads: {
+    ...pooledProviderCapabilities.threads,
+    canRollbackThread: false,
+    canForkThread: false,
+    canForkFromTurn: false,
+    canForkFromSubagentThread: false,
+  },
+  turns: { ...pooledProviderCapabilities.turns, supportsActiveSteering: false },
+  tools: { ...pooledProviderCapabilities.tools, supportsDynamicToolCallbacks: false },
+  approvals: {
+    supportsCommandApproval: false,
+    supportsFileReadApproval: false,
+    supportsFileChangeApproval: false,
+    supportsApplyPatchApproval: false,
+    approvalsHaveNativeRequestIds: false,
+    approvalCallbacksAreLiveOnly: false,
+    approvalsCanOriginateFromSubagents: false,
+  },
+  planning: { ...pooledProviderCapabilities.planning, supportsStructuredQuestions: false },
+  subagents: {
+    ...pooledProviderCapabilities.subagents,
+    exposesSubagentThreadIds: false,
+    canCloseSubagents: false,
+    canForkSubagentThread: false,
+  },
+  context: restartSteeringProviderCapabilities.context,
+  checkpointing: {
+    ...pooledProviderCapabilities.checkpointing,
+    providerCanRollbackConversation: false,
+    providerRollbackReturnsSnapshot: false,
+  },
+  identity: {
+    ...pooledProviderCapabilities.identity,
+    nativeItemIds: "weak",
+    nativeRequestIds: "none",
+  },
+} satisfies OrchestrationV2ProviderCapabilities;

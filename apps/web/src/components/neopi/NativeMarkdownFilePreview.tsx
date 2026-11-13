@@ -2,7 +2,7 @@ import type { EnvironmentId, NeoPiNativeSessionRef } from "@t3tools/contracts";
 import { hostPreviewMimeTypeFromExtension } from "@t3tools/shared/filePreview";
 import { mediaFileReference } from "@t3tools/client-runtime/media-reference";
 import { useState } from "react";
-import { resolvePathLinkTarget } from "../../terminal-links";
+import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 import { useAssetUrlState } from "../../assets/assetUrls";
 import { useProjectFileQuery } from "../files/projectFilesQueryState";
 import ReadOnlySourcePreview from "../files/ReadOnlySourcePreview";

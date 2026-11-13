@@ -17,6 +17,9 @@ Its name may differ from the device running your browser.
 Saved computers and computers discovered through T3 Connect are selected by
 default. Unchecking one does not disconnect it.
 
+When a setup link resumes a known computer, setup keeps that computer selected
+instead of adding every other saved computer to the selection.
+
 If NeoCode cannot confirm the workspace, setup shows **Still connecting**. Reload
 to try again. If saved settings cannot be read, choose **Retry** when storage is
 available. Setup does not replace unreadable settings with defaults.
@@ -33,7 +36,7 @@ profile with **Enable NeoPi**. Existing launch settings are preserved.
 Choose **Connect to NeoProxy** to connect with your server address and member key.
 If you selected several computers, first choose which one should save the
 connection. Setup names that computer before sign-in and does not copy credentials
-to the others. Connect additional computers later from **Models** on each computer.
+to the others. Connect additional computers later from **NeoCore** on each computer.
 If asked to verify a certificate, compare the complete fingerprints with your
 administrator before accepting. Your administrator controls which models your
 member can use; an upstream-provider login is not needed.
@@ -49,3 +52,6 @@ project folder, or use **Resume NeoPi session** to open native history. Setup do
 Code or Codex directories, and does not import projects or conversations on its
 own. Existing conversations are not deleted. Conversations saved from other
 runtimes remain read-only.
+
+Setup also offers phone connection guidance and installation of the desktop's
+`t3` command. Both are optional; they do not install another execution runtime.

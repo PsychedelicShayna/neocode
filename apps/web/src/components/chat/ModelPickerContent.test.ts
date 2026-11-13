@@ -15,7 +15,6 @@ import {
   nativeSelectorTarget,
   filterNativeSwitcherModels,
   nativeSwitcherFactCells,
-  nativeSwitcherFactSummary,
   nativeSwitcherModels,
   pinNativeSwitcherModel,
 } from "./neopiModelSwitcher";
@@ -167,16 +166,6 @@ describe("native model selector consumers", () => {
       "$0",
       "$15",
     ]);
-    expect(nativeSwitcherFactCells({ slug: "local/unknown", name: "Unknown" })).toEqual(
-      Array(6).fill("Unknown"),
-    );
-    expect(
-      nativeSwitcherFactCells({
-        slug: "local/catalog-only",
-        name: "Catalog",
-        selectorFacts: { ...facts, contextWindow: 200000 },
-      })[3],
-    ).toBe("Unknown");
   });
 
   it("routes a role through set_role and a model through its own provider and id, never a slash split", () => {
@@ -260,30 +249,6 @@ describe("native model selector consumers", () => {
     ]);
   });
 
-  it("summarises only the facts NeoPi reported in a compact line", () => {
-    expect(
-      nativeSwitcherFactSummary({
-        slug: "custom-route/model",
-        name: "Model",
-        selectorFacts: {
-          ...facts,
-          intelligence: 43,
-          effectiveContextWindow: 120000,
-          inputCostPerMillion: 0,
-          outputCostPerMillion: 15,
-        },
-      }),
-    ).toBe("120K ctx · $0 / $15 per M · intelligence 43");
-    expect(
-      nativeSwitcherFactSummary({
-        slug: "custom-route/model",
-        name: "Model",
-        selectorFacts: { ...facts, outputCostPerMillion: 2 },
-      }),
-    ).toBe("? / $2 per M");
-    expect(nativeSwitcherFactSummary({ slug: "local/unknown", name: "Unknown" })).toBe("");
-  });
-
   it("does not substitute catalog models after native errors or an empty enabled scope", () => {
     const models = rows(
       new Map([
@@ -297,7 +262,6 @@ describe("native model selector consumers", () => {
     ]);
     expect(rows(new Map())).toEqual([]);
     expect(rows(new Map(), "saved/model", false)).toEqual([]);
-    expect(nativeSwitcherFactCells(models[0]!)).toEqual(Array(6).fill("Unknown"));
   });
 
   it("queries only the matching connected instance with the thread, and others with project context", () => {

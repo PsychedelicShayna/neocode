@@ -55,6 +55,8 @@ const State = Schema.Struct({
   approvalMode: Schema.optional(Schema.Literals(["always-ask", "write", "yolo"])),
 });
 const decodeState = Schema.decodeUnknownEffect(State);
+const isRuntimeError = Schema.is(NeoPiRuntimeError);
+const isRpcError = Schema.is(NeoPiRpcError);
 const sameIdentity = (left: NeoPiConfigurationIdentity, right: NeoPiConfigurationIdentity) =>
   left.sessionId !== "" &&
   left.sessionFile !== "" &&
@@ -85,7 +87,7 @@ export const readNeoPiSessionConfiguration = Effect.fn("NeoPiSessionRuntime.conf
       runtime.request({ type: "get_state", includeDump: false }).pipe(
         Effect.flatMap(decodeState),
         Effect.mapError((cause) =>
-          cause instanceof NeoPiRpcError
+          isRpcError(cause)
             ? cause
             : new NeoPiRuntimeError({
                 code: "rpc",
@@ -167,10 +169,10 @@ export const readNeoPiSessionConfiguration = Effect.fn("NeoPiSessionRuntime.conf
     };
   },
   Effect.catch((cause) =>
-    cause instanceof NeoPiRpcError && (cause.code === "closed" || cause.code === "exited")
+    isRpcError(cause) && (cause.code === "closed" || cause.code === "exited")
       ? Effect.succeed(unavailable("The NeoPi session disconnected during the snapshot."))
       : Effect.fail(
-          cause instanceof NeoPiRuntimeError
+          isRuntimeError(cause)
             ? cause
             : new NeoPiRuntimeError({
                 code: "rpc",

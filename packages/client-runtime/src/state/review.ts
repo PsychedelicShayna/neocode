@@ -1,44 +1,151 @@
 import {
+  type NeoPiNativeSessionsGetBranchCommitsInput,
   type NeoPiNativeSessionsGetDiffPreviewInput,
   type ReviewDiffPreviewInput,
+  type ReviewDiffPreviewResult,
   VcsUnsupportedOperationError,
   WS_METHODS,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
-import { request } from "../rpc/client.ts";
-import { Atom } from "effect/unstable/reactivity";
+import { requestGuarded as request } from "../rpc/client.ts";
+import { AsyncResult, Atom } from "effect/reactivity";
 
 import {
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
   createEnvironmentQueryAtomFamily,
   createEnvironmentRpcQueryAtomFamily,
+  type QueryAnswerHandler,
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 
 export function createReviewEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
+  options: {
+    readonly onDiffPreviewAnswer?: QueryAnswerHandler<
+      ReviewDiffPreviewInput,
+      ReviewDiffPreviewResult
+    >;
+    readonly onNativeDiffPreviewAnswer?: QueryAnswerHandler<
+      NeoPiNativeSessionsGetDiffPreviewInput,
+      ReviewDiffPreviewResult
+    >;
+  } = {},
 ) {
   const patchReads = Semaphore.makeUnsafe(4);
   const diffFileScheduler = createAtomCommandScheduler();
+  const diffPreview = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:review:diff-preview",
+    tag: WS_METHODS.reviewGetDiffPreview,
+    staleTimeMs: 5_000,
+    execute: Effect.fn("review.diffPreview")(function* (
+      input: ReviewDiffPreviewInput,
+      emit: (value: ReviewDiffPreviewResult) => Effect.Effect<void>,
+      previous: Option.Option<ReviewDiffPreviewResult>,
+    ) {
+      const hasCompletePreview = Option.exists(previous, (preview) => !preview.incomplete);
+      if (
+        !hasCompletePreview &&
+        input.sourceKind &&
+        !input.file &&
+        !input.commitSha &&
+        !input.trackedOnly
+      ) {
+        const tracked = yield* request(WS_METHODS.reviewGetDiffPreview, {
+          ...input,
+          trackedOnly: true,
+        });
+        // Older servers ignore trackedOnly and already return the complete preview.
+        if (!tracked.incomplete) return tracked;
+        yield* emit(tracked);
+      }
+      return yield* request(WS_METHODS.reviewGetDiffPreview, input);
+    }),
+    ...(options.onDiffPreviewAnswer === undefined ? {} : { onAnswer: options.onDiffPreviewAnswer }),
+  });
+  const nativeDiffPreview = createEnvironmentQueryAtomFamily(runtime, {
+    label: "environment-data:review:native-diff-preview",
+    staleTimeMs: 5_000,
+    execute: Effect.fn("review.nativeDiffPreview")(function* (
+      input: NeoPiNativeSessionsGetDiffPreviewInput,
+      emit: (value: ReviewDiffPreviewResult) => Effect.Effect<void>,
+      previous: Option.Option<ReviewDiffPreviewResult>,
+    ) {
+      const hasCompletePreview = Option.exists(previous, (preview) => !preview.incomplete);
+      if (
+        !hasCompletePreview &&
+        input.sourceKind &&
+        !input.file &&
+        !input.commitSha &&
+        !input.trackedOnly
+      ) {
+        const tracked = yield* request(WS_METHODS.neopiNativeSessionsGetDiffPreview, {
+          ...input,
+          trackedOnly: true,
+        });
+        if (!tracked.incomplete) return tracked;
+        yield* emit(tracked);
+      }
+      return yield* request(WS_METHODS.neopiNativeSessionsGetDiffPreview, input);
+    }),
+    ...(options.onNativeDiffPreviewAnswer === undefined
+      ? {}
+      : { onAnswer: options.onNativeDiffPreviewAnswer }),
+  });
+  type PreviewTarget =
+    | { kind: "workspace"; target: Parameters<typeof diffPreview>[0] }
+    | { kind: "native"; target: Parameters<typeof nativeDiffPreview>[0] };
+  // A file patch is a slice of the comparison its preview generated, so a newer preview
+  // revision makes every patch read under the old one stale.
+  const previewRevisionFamily = Atom.family((key: string) => {
+    const target = JSON.parse(key) as PreviewTarget;
+    return Atom.make((get) => {
+      // A failed refresh keeps the last revision, so an error does not refresh every patch.
+      // Reading the preview here keeps its query mounted while any of its patches is read.
+      const preview =
+        target.kind === "native"
+          ? get(nativeDiffPreview(target.target))
+          : get(diffPreview(target.target));
+      return Option.match(AsyncResult.value(preview), {
+        onNone: () => null,
+        onSome: (preview) => DateTime.formatIso(preview.generatedAt),
+      });
+    });
+  });
   return {
-    diffPreview: createEnvironmentRpcQueryAtomFamily(runtime, {
-      label: "environment-data:review:diff-preview",
-      tag: WS_METHODS.reviewGetDiffPreview,
+    nativeBranchCommits: createEnvironmentQueryAtomFamily(runtime, {
+      label: "environment-data:review:native-branch-commits",
+      staleTimeMs: 5_000,
+      execute: (input: NeoPiNativeSessionsGetBranchCommitsInput) =>
+        request(WS_METHODS.neopiNativeSessionsGetBranchCommits, input),
+    }),
+    branchCommits: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:review:branch-commits",
+      tag: WS_METHODS.reviewGetBranchCommits,
       staleTimeMs: 5_000,
     }),
-    nativeDiffPreview: createEnvironmentRpcQueryAtomFamily(runtime, {
-      label: "environment-data:review:native-diff-preview",
-      tag: WS_METHODS.neopiNativeSessionsGetDiffPreview,
-      staleTimeMs: 5_000,
-    }),
+    nativeDiffPreview,
+    diffPreview,
     diffFilePatch: createEnvironmentQueryAtomFamily(runtime, {
       label: "environment-data:review:diff-file-patch",
       staleTimeMs: 5 * 60_000,
+      refreshTrigger: ({ environmentId, input }) =>
+        input.preview === undefined
+          ? undefined
+          : previewRevisionFamily(
+              JSON.stringify({
+                kind: "workspace",
+                target: { environmentId, input: input.preview },
+              }),
+            ),
       execute: (input: {
         request: ReviewDiffPreviewInput & { file: NonNullable<ReviewDiffPreviewInput["file"]> };
         cacheKey: string;
+        /** The preview this patch belongs to; its revisions refresh the patch. */
+        preview?: ReviewDiffPreviewInput;
       }) =>
         request(WS_METHODS.reviewGetDiffPreview, input.request).pipe(
           patchReads.withPermit,
@@ -61,11 +168,18 @@ export function createReviewEnvironmentAtoms<R, E>(
     nativeDiffFilePatch: createEnvironmentQueryAtomFamily(runtime, {
       label: "environment-data:review:native-diff-file-patch",
       staleTimeMs: 5 * 60_000,
+      refreshTrigger: ({ environmentId, input }) =>
+        input.preview === undefined
+          ? undefined
+          : previewRevisionFamily(
+              JSON.stringify({ kind: "native", target: { environmentId, input: input.preview } }),
+            ),
       execute: (input: {
         request: NeoPiNativeSessionsGetDiffPreviewInput & {
           file: NonNullable<NeoPiNativeSessionsGetDiffPreviewInput["file"]>;
         };
         cacheKey: string;
+        preview?: NeoPiNativeSessionsGetDiffPreviewInput;
       }) =>
         request(WS_METHODS.neopiNativeSessionsGetDiffPreview, input.request).pipe(
           patchReads.withPermit,

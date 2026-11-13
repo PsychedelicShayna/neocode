@@ -6,7 +6,7 @@ import type * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
-import { writeFileStringAtomically } from "../../atomicWrite.ts";
+import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
@@ -39,13 +39,8 @@ export interface NeoPiNativeSettlementInput {
   readonly now: number;
 }
 
-/**
- * When a session counts as settled, and whether its stored decision still
- * holds. A manual decision wakes (is dropped) when the owner is working or
- * blocked, or the file saw activity after the decision. Without a decision,
- * a session idle longer than the auto-settle window is settled as of the day
- * that window elapsed; "unsettled" is the manual hold against that rule.
- */
+// Working, blocked or modified sessions invalidate a manual settlement decision.
+// Otherwise "unsettled" holds against auto-settling, whose timestamp is the elapsed threshold.
 export function resolveNativeSettlement(input: NeoPiNativeSettlementInput): {
   readonly settledAt: string | null;
   readonly retain: boolean;

@@ -4,11 +4,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { PrimaryConnectionTarget, type PreparedConnection } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
-import { remoteHttpClientLayer } from "../rpc/http.ts";
+import { layerRemoteHttpClient } from "../rpc/http.ts";
 import { requestNativeStats, type NativeStatsResponse } from "./neopiStats.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -84,7 +84,7 @@ const fixture = Effect.gen(function* () {
       consume,
     }).pipe(
       Effect.provideService(EnvironmentSupervisor, supervisor),
-      Effect.provide(remoteHttpClientLayer(fetchFn)),
+      Effect.provide(layerRemoteHttpClient(fetchFn)),
     );
 });
 

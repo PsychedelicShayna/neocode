@@ -909,5 +909,33 @@ describe("NeoPiNativeCursor", () => {
       );
       assert.equal(reply.type === "pass" ? reply.journal?.entries[0]?.id : undefined, "big");
     });
+
+    it("one scan step is shared by every lane: a journal entry takes it, the inbox waits", () => {
+      const { sessionId, projection } = built();
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: { id: "e1", parentId: null, type: "custom", timestamp: "t" },
+      });
+      projection.fold({ type: "notice", level: "info", message: "pending" });
+      const reply = mirror.read(projection, { scanSteps: 1, replyBytes: 100_000 });
+      assert.deepEqual([reply.journal?.entries.length, reply.inbox.length], [1, 0]);
+      const next = mirror.read(projection, { scanSteps: 1, replyBytes: 100_000 });
+      assert.equal(next.inbox.length, 1, "the inbox gets the next step");
+    });
+
+    it("record only: one inbox record larger than the reply budget is sent whole", () => {
+      const { projection } = built();
+      projection.fold({ type: "notice", level: "info", message: "x".repeat(100_000) });
+      const reply = readNeoPiNativeObservation(
+        projection,
+        null,
+        { scanSteps: 100, replyBytes: 65_536 },
+        "reader",
+      );
+      assert.equal(reply.type === "pass" ? reply.inbox.length : 0, 1);
+    });
   });
 });

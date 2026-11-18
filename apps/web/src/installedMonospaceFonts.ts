@@ -57,6 +57,12 @@ export function knownMonospaceFonts(families: readonly string[], saved: string):
   return families.filter((family) => family === saved || known.get(family) === true);
 }
 
+/** Whether a scan of these families would still measure something. */
+export function hasUnclassifiedFonts(families: readonly string[]): boolean {
+  const known = knownClassifications();
+  return families.some((family) => !known.has(family));
+}
+
 /**
  * Classify installed families for an opened picker without monopolizing the
  * UI thread. The list starts with every family already known to be monospace

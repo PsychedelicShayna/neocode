@@ -173,4 +173,27 @@ describe("installed monospace font discovery", () => {
     await result;
     expect(isMonospaceFamily).not.toHaveBeenCalled();
   });
+
+  it("reports fonts left to measure until a scan completes, across launches", async () => {
+    const families = ["Alpha Mono", "Beta Mono", "Proportional Sans"];
+    let module = await import("./installedMonospaceFonts");
+    expect(module.hasUnclassifiedFonts(families)).toBe(true);
+
+    await (
+      await launch()
+    )(families, { abortAfter: 2 });
+    module = await import("./installedMonospaceFonts");
+    expect(module.hasUnclassifiedFonts(families)).toBe(true);
+
+    await (
+      await launch()
+    )(families);
+    module = await import("./installedMonospaceFonts");
+    expect(module.hasUnclassifiedFonts(families)).toBe(false);
+    expect(module.hasUnclassifiedFonts([...families, "New Mono"])).toBe(true);
+
+    vi.resetModules();
+    const relaunched = await import("./installedMonospaceFonts");
+    expect(relaunched.hasUnclassifiedFonts(families)).toBe(false);
+  });
 });

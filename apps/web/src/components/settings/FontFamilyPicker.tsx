@@ -2,7 +2,12 @@ import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { CheckIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { queryInstalledFontFamilies } from "../../appearanceFonts";
-import { knownMonospaceFonts, scanInstalledMonospaceFonts } from "../../installedMonospaceFonts";
+import {
+  hasUnclassifiedFonts,
+  knownMonospaceFonts,
+  scanInstalledMonospaceFonts,
+} from "../../installedMonospaceFonts";
+import { cn } from "../../lib/utils";
 import {
   Combobox,
   ComboboxEmpty,
@@ -129,6 +134,11 @@ export function FontFamilyPicker({
     families: readonly string[];
     done: boolean;
   } | null>(null);
+  // Decided once per open: whether this open starts with fonts left to
+  // measure. Such an open keeps the list at its full height and reserves the
+  // status line for its whole duration, so arriving rows and the end of the
+  // scan never resize the popup, flip it to the other side, or move rows.
+  const [scanningOpen, setScanningOpen] = useState(false);
   const listRef = useRef<LegendListRef | null>(null);
   const enumeration = useFontEnumeration();
   // Opening sets the starting list in the same update as the popup, so its
@@ -138,11 +148,15 @@ export function FontFamilyPicker({
     setOpen(true);
     if (requireMonospace && enumeration.status === "granted") {
       const source = enumeration.families;
+      const scanning = hasUnclassifiedFonts(source);
+      setScanningOpen(scanning);
       setMonospaceScan({
         source,
         families: knownMonospaceFonts(source, selectedFamily),
-        done: false,
+        done: !scanning,
       });
+    } else {
+      setScanningOpen(false);
     }
   };
   // Open after mount rather than mounting open: a popup that first renders in
@@ -265,13 +279,18 @@ export function FontFamilyPicker({
           onChange={(event) => setQuery(event.target.value)}
         />
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {loadingMonospace ? (
-            <div role="status" className="px-3 py-2 text-sm text-muted-foreground">
+          {scanningOpen ? (
+            <div
+              role="status"
+              className={cn(
+                "px-3 py-2 text-sm text-muted-foreground",
+                !loadingMonospace && "invisible",
+              )}
+            >
               Finding monospace fonts…
             </div>
-          ) : (
-            <ComboboxEmpty>No fonts found.</ComboboxEmpty>
-          )}
+          ) : null}
+          <ComboboxEmpty>No fonts found.</ComboboxEmpty>
           <div className="relative min-h-0 max-h-72 w-full flex-1 overflow-hidden">
             <ComboboxListVirtualized>
               <LegendList<string>
@@ -281,7 +300,7 @@ export function FontFamilyPicker({
                 renderItem={({ item, index }) => renderItem(item, index)}
                 estimatedItemSize={30}
                 drawDistance={360}
-                style={{ height: Math.min(items.length * 30, 288) }}
+                style={{ height: scanningOpen ? 288 : Math.min(items.length * 30, 288) }}
               />
             </ComboboxListVirtualized>
           </div>

@@ -50,6 +50,12 @@ export interface ThreadPreviewState {
   serverEpoch: string | null;
   /** Latest ordered server revision applied from a list response or event. */
   serverRevision: number;
+  /**
+   * Whether an authoritative session list (preview.list or a resync) has been
+   * applied. Until then `sessions` may hold only tabs seen in stray events or
+   * local snapshots, so nothing may treat it as the complete set.
+   */
+  listed: boolean;
 }
 
 const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
@@ -62,6 +68,7 @@ const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
   recentlySeenUrls: [] as string[],
   serverEpoch: null,
   serverRevision: 0,
+  listed: false,
 });
 
 const emptyPreviewStateAtom = Atom.make<ThreadPreviewState>(EMPTY_THREAD_PREVIEW_STATE).pipe(
@@ -336,12 +343,20 @@ export function updatePreviewServerSnapshot(
 /**
  * Replace the local session index from an authoritative preview.list result.
  * Missing tabs are removed while the current active tab is preserved whenever
- * it still exists in the server result.
+ * it still exists in the server result. Returns false when the result was
+ * discarded as older than state already applied from events.
  */
-export function reconcilePreviewServerSessions(ref: WorkspaceRef, result: PreviewListResult): void {
+export function reconcilePreviewServerSessions(
+  ref: WorkspaceRef,
+  result: PreviewListResult,
+): boolean {
+  let applied = true;
   updateThreadPreviewState(ref, (current) => {
     const sameServer = current.serverEpoch === result.serverEpoch;
-    if (sameServer && result.revision < current.serverRevision) return current;
+    if (sameServer && result.revision < current.serverRevision) {
+      applied = false;
+      return current;
+    }
     const resourceId = workspaceResourceId(ref);
     const snapshots = result.sessions.filter((snapshot) => snapshot.threadId === resourceId);
     const sessions: Record<string, PreviewSessionSnapshot> = {};
@@ -382,8 +397,10 @@ export function reconcilePreviewServerSessions(ref: WorkspaceRef, result: Previe
       recentlySeenUrls,
       serverEpoch: result.serverEpoch,
       serverRevision: result.revision,
+      listed: true,
     };
   });
+  return applied;
 }
 
 function isPreviewStateEqual(

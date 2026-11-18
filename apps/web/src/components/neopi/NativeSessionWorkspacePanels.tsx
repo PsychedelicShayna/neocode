@@ -325,9 +325,10 @@ export function NativeSessionWorkspacePanels({
   );
 
   useEffect(() => {
-    if (preview.serverEpoch !== null)
-      useRightPanelStore.getState().reconcileBrowserSurfaces(target, Object.keys(preview.sessions));
-  }, [target, preview.serverEpoch, preview.sessions]);
+    useRightPanelStore
+      .getState()
+      .reconcileBrowserSurfaces(target, { listed: preview.listed, sessions: preview.sessions });
+  }, [target, preview.listed, preview.sessions]);
   useEffect(
     () =>
       subscribePreviewAction((action) => {

@@ -1970,10 +1970,11 @@ export default function ChatView(props: ChatViewProps) {
 
   useEffect(() => {
     if (!activeThreadRef) return;
-    useRightPanelStore
-      .getState()
-      .reconcileBrowserSurfaces(activeThreadRef, Object.keys(activePreviewState.sessions));
-  }, [activePreviewState.sessions, activeThreadRef]);
+    useRightPanelStore.getState().reconcileBrowserSurfaces(activeThreadRef, {
+      listed: activePreviewState.listed,
+      sessions: activePreviewState.sessions,
+    });
+  }, [activePreviewState.listed, activePreviewState.sessions, activeThreadRef]);
 
   useEffect(() => {
     if (!activeThreadRef || activePreviewMiniPlayer?.source.kind !== "browser") return;

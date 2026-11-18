@@ -1,6 +1,22 @@
-import { scopeThreadRef, workspaceKey } from "@t3tools/client-runtime/environment";
-import { type EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  scopeThreadRef,
+  workspaceKey,
+  workspaceResourceId,
+} from "@t3tools/client-runtime/environment";
+import {
+  type EnvironmentId,
+  type PreviewSessionSnapshot,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
+
+import {
+  applyPreviewServerEvent,
+  readThreadPreviewState,
+  reconcilePreviewServerSessions,
+  resetPreviewStateForTests,
+} from "./previewStateStore";
 
 import {
   migratePersistedRightPanelState,
@@ -15,6 +31,23 @@ import {
 
 const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"));
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
+
+const previewSnapshot = (threadId: string, tabId: string): PreviewSessionSnapshot => ({
+  threadId,
+  tabId,
+  navStatus: { _tag: "Loading", url: "http://localhost:1800/", title: "" },
+  canGoBack: false,
+  canGoForward: false,
+  updatedAt: "2026-01-01T00:00:00.000Z",
+});
+
+/** An authoritative preview session list holding these tabs for refA. */
+const listedTabs = (...tabIds: string[]) => ({
+  listed: true,
+  sessions: Object.fromEntries(
+    tabIds.map((tabId) => [tabId, previewSnapshot(workspaceResourceId(refA), tabId)]),
+  ),
+});
 
 beforeEach(() => {
   useRightPanelStore.setState({ byThreadKey: {}, userActionRevisionByThreadKey: {} });
@@ -125,7 +158,7 @@ describe("rightPanelStore", () => {
       const revision = store.getUserActionRevision(refA);
       const requests = order === "diff-first" ? [completedDiff, surface] : [surface, completedDiff];
       for (const surface of requests) store.openProactive(refA, surface, revision);
-      store.reconcileBrowserSurfaces(refA, ["existing-browser", "agent-browser"]);
+      store.reconcileBrowserSurfaces(refA, listedTabs("existing-browser", "agent-browser"));
 
       expect(
         selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
@@ -209,7 +242,7 @@ describe("rightPanelStore", () => {
     const store = useRightPanelStore.getState();
     store.openFile(refA, "src/app.ts");
     const revision = store.getUserActionRevision(refA);
-    store.reconcileBrowserSurfaces(refA, ["agent-browser"]);
+    store.reconcileBrowserSurfaces(refA, listedTabs("agent-browser"));
     store.reconcileFileSurfaces(refA, false);
 
     expect(store.openProactive(refA, completedDiff, revision)).toBe(true);
@@ -947,7 +980,7 @@ describe("rightPanelStore", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
     useRightPanelStore.getState().openBrowser(refA, "tab-b");
-    useRightPanelStore.getState().reconcileBrowserSurfaces(refA, ["tab-b", "tab-c"]);
+    useRightPanelStore.getState().reconcileBrowserSurfaces(refA, listedTabs("tab-b", "tab-c"));
 
     expect(
       selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
@@ -955,6 +988,107 @@ describe("rightPanelStore", () => {
       ),
     ).toEqual(["terminal:term-1", "browser:tab-b", "browser:tab-c"]);
   });
+
+  it("keeps a dragged tab order through preview updates and later opens and closes", () => {
+    const ids = () =>
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      );
+    const store = useRightPanelStore.getState();
+    store.openTerminal(refA, "fish");
+    store.openBrowser(refA, "localhost");
+
+    store.moveSurface(refA, "browser:localhost", 0);
+    // The panel reconciles browser tabs on every preview session update.
+    store.reconcileBrowserSurfaces(refA, listedTabs("localhost"));
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish"]);
+
+    store.openTerminal(refA, "zsh");
+    store.reconcileBrowserSurfaces(refA, listedTabs("localhost", "docs"));
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish", "terminal:zsh", "browser:docs"]);
+
+    store.moveSurface(refA, "browser:docs", 1);
+    store.closeSurface(refA, "terminal:fish");
+    store.reconcileBrowserSurfaces(refA, listedTabs("docs"));
+    expect(ids()).toEqual(["browser:docs", "terminal:zsh"]);
+  });
+
+  it("keeps a persisted tab order across a restart and prunes only once the preview list loads", () => {
+    const session = {
+      environmentId: refA.environmentId,
+      ref: {
+        providerInstanceId: ProviderInstanceId.make("profile-a"),
+        sessionFile: "/sessions/a.jsonl",
+      },
+    };
+    const ids = () =>
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, session).surfaces.map(
+        (surface) => surface.id,
+      );
+    const syncFromPreview = () =>
+      useRightPanelStore
+        .getState()
+        .reconcileBrowserSurfaces(session, readThreadPreviewState(session));
+    const store = useRightPanelStore.getState();
+    store.openTerminal(session, "fish");
+    store.openBrowser(session, "tab-a");
+    store.openBrowser(session, "tab-b");
+    store.openBrowser(session, "tab-c");
+    store.moveSurface(session, "browser:tab-b", 0);
+    const persistedOrder = ["browser:tab-b", "terminal:fish", "browser:tab-a", "browser:tab-c"];
+    expect(ids()).toEqual(persistedOrder);
+
+    // Restart: the panel comes back from storage and the preview state is empty.
+    const { partialize } = useRightPanelStore.persist.getOptions();
+    const persisted = JSON.parse(JSON.stringify(partialize!(useRightPanelStore.getState())));
+    useRightPanelStore.setState(migratePersistedRightPanelState(persisted));
+    resetPreviewStateForTests();
+    syncFromPreview();
+    expect(ids()).toEqual(persistedOrder);
+
+    // An event for a new tab lands before the list: it shows at once, and the
+    // tabs the partial session map does not mention stay.
+    const threadId = workspaceResourceId(session);
+    applyPreviewServerEvent(session, {
+      type: "opened",
+      threadId,
+      tabId: "tab-d",
+      createdAt: "2026-01-01T00:00:01.000Z",
+      snapshot: previewSnapshot(threadId, "tab-d"),
+      serverEpoch: "server-a",
+      revision: 1,
+    });
+    syncFromPreview();
+    expect(ids()).toEqual([...persistedOrder, "browser:tab-d"]);
+
+    // The list arrives; tab-c was closed while the app was down.
+    reconcilePreviewServerSessions(session, {
+      sessions: ["tab-a", "tab-b", "tab-d"].map((tabId) => previewSnapshot(threadId, tabId)),
+      serverEpoch: "server-a",
+      revision: 2,
+    });
+    syncFromPreview();
+    expect(ids()).toEqual(["browser:tab-b", "terminal:fish", "browser:tab-a", "browser:tab-d"]);
+  });
+
+  it.each([true, false])(
+    "puts the browser tab a blank tab navigates to in the blank tab's dragged slot (listed: %s)",
+    (listed) => {
+      const ids = () =>
+        selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+          (surface) => surface.id,
+        );
+      const store = useRightPanelStore.getState();
+      store.openTerminal(refA, "fish");
+      store.openBrowser(refA, null);
+      store.openFile(refA, "README.md");
+      store.moveSurface(refA, "browser:new", 0);
+
+      store.reconcileBrowserSurfaces(refA, { ...listedTabs("tab-a"), listed });
+
+      expect(ids()).toEqual(["browser:tab-a", "terminal:fish", "file:README.md"]);
+    },
+  );
 });
 
 describe("native browser panel persistence", () => {

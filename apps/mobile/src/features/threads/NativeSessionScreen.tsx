@@ -1,6 +1,7 @@
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import { workspaceKey } from "@t3tools/client-runtime/environment";
+import { NATIVE_ROSTER_UNAVAILABLE_NOTE } from "@t3tools/client-runtime/neopi-native-agent-hub";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
   deferNativeEditorText,
@@ -9,6 +10,8 @@ import {
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
   nativeDisconnectLabel,
+  nativeInboxLossWarnings,
+  nativeObservationNotice,
   nativeOwnerNotice,
   nativeRecord,
   nativeSessionKey,
@@ -159,6 +162,8 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       .finally(() => setReconnecting(false));
   }, [reconnect]);
   const ownerNotice = nativeOwnerNotice(feed.ownerLoss, feed.session?.attachment);
+  const observationNotice = nativeObservationNotice(feed);
+  const rosterWarning = feed.agentsNote ? NATIVE_ROSTER_UNAVAILABLE_NOTE : null;
   const [editorNotice, setEditorNotice] = useState<string | null>(null);
   const [models, setModels] = useState(false);
   const [tree, setTree] = useState(false);
@@ -355,6 +360,27 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       ),
     [feed.conversation, feed.commandOutputs, debug],
   );
+  const callIdsByRow = useMemo(
+    () =>
+      new Map(
+        rows.map((row) => {
+          const content = row.kind === "entry" ? nativeRecord(row.entry.message).content : null;
+          const calls = Array.isArray(content)
+            ? content.flatMap((value) => {
+                const block = nativeRecord(value);
+                return block.type === "toolCall" && typeof block.id === "string" ? [block.id] : [];
+              })
+            : [];
+          return [row.id, calls];
+        }),
+      ),
+    [rows],
+  );
+  const losses = useMemo(
+    () =>
+      nativeInboxLossWarnings(feed.observation.inbox, new Set([...callIdsByRow.values()].flat())),
+    [feed.observation.inbox, callIdsByRow],
+  );
   followRowsRef.current = rows;
   useEffect(() => {
     if (!feed.connected) cancelSubmissionFollow();
@@ -408,10 +434,22 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             />
           ) : null}
         </View>
-      ) : !feed.connected || feed.busy ? (
+      ) : observationNotice || feed.busy ? (
         <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
-          {feed.connected ? "Working" : "Reconnecting · showing cached conversation"}
+          {observationNotice?.text ?? "Working"}
         </Text>
+      ) : null}
+      {losses.general.length > 0 ? (
+        <ScrollView
+          className="max-h-24 shrink-0 px-4 py-1"
+          accessibilityLabel="Live records not kept"
+        >
+          {losses.general.map((warning) => (
+            <Text key={warning.key} className="text-xs text-warning-foreground">
+              {warning.text}
+            </Text>
+          ))}
+        </ScrollView>
       ) : null}
       <View className="px-4">
         <NativeError message={localError ?? error} />
@@ -493,6 +531,13 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
                 nativeRef={feed.session?.ref ?? target.ref}
                 cwd={feed.session?.cwd ?? null}
               />
+              {(callIdsByRow.get(item.id) ?? []).flatMap((callId) =>
+                (losses.byToolCall.get(callId) ?? []).map((warning) => (
+                  <Text key={warning.key} className="text-xs text-warning-foreground">
+                    {warning.text}
+                  </Text>
+                )),
+              )}
             </View>
           )
         }
@@ -584,7 +629,13 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         )}
       </View>
       {agents ? (
-        <NativeSessionAgents agents={feed.agents} onClose={() => setAgents(false)} />
+        <NativeSessionAgents
+          agents={feed.agents}
+          rosterWarning={rosterWarning}
+          observationNotice={observationNotice?.text}
+          lossWarnings={losses.general}
+          onClose={() => setAgents(false)}
+        />
       ) : null}
       {models ? (
         <NativeMobileModels

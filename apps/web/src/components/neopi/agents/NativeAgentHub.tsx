@@ -49,6 +49,11 @@ export function NativeAgentHub({ viewKey, onClose }: { viewKey: string; onClose:
           <Kbd>Esc</Kbd>
         </Button>
       </header>
+      {source.rosterWarning ? (
+        <p role="status" className="shrink-0 px-4 py-2 text-xs text-muted-foreground">
+          {source.rosterWarning}
+        </p>
+      ) : null}
       {source.agents.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
           <p className="text-sm font-medium">No agents in this session</p>

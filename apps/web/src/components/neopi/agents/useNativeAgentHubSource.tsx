@@ -1,6 +1,7 @@
 import { nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import {
   nativeAgentHubAgents,
+  NATIVE_ROSTER_UNAVAILABLE_NOTE,
   SUBAGENT_MODEL_CAPABILITY,
   type AgentHubModelSelector,
   type AgentHubSource,
@@ -12,9 +13,8 @@ import {
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { createContext, use, useCallback, useEffect, useMemo, type ReactNode } from "react";
 
-import type { useNativeSession } from "../../../state/neopiNativeSessions";
+import { nativeSessionAtoms, type useNativeSession } from "../../../state/neopiNativeSessions";
 import { selectAgentView, useAgentViewStore } from "./agentViewStore";
-
 type Request = ReturnType<typeof useNativeSession>["request"];
 
 const AgentHubSourceContext = createContext<AgentHubSource | null>(null);
@@ -57,6 +57,7 @@ export function useNativeAgentHubSource({
       ),
     [feed.agents, feed.agentTicks, sessionId, sessionFile],
   );
+  const rosterWarning = feed.agentsNote ? NATIVE_ROSTER_UNAVAILABLE_NOTE : null;
   const modelControlUnavailable = feed.session?.capabilities.includes(SUBAGENT_MODEL_CAPABILITY)
     ? null
     : "This NeoPi cannot change a running agent's model yet.";
@@ -107,20 +108,29 @@ export function useNativeAgentHubSource({
     [request],
   );
 
-  // Streaming child events only flow while someone is reading a child.
-  const childOpen = useAgentViewStore((store) => selectAgentView(key)(store).mode === "agent");
+  // An open child view adds that child to the session's demand; the server
+  // raises NeoPi's subscription for it. Without its run token it cannot be named.
+  const openChild = useAgentViewStore((store) => {
+    const view = selectAgentView(key)(store);
+    return view.mode === "agent" ? view.selectedId : null;
+  });
+  const rosterEntry = openChild
+    ? feed.observation.entities.get(`roster:${openChild}`)?.value
+    : undefined;
+  const childRunToken = rosterEntry?.class === "roster" ? rosterEntry.value.runToken : undefined;
   useEffect(() => {
-    if (!childOpen || !feed.connected) return;
-    void request({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
-    return () => {
-      void request({ type: "set_subagent_subscription", level: "progress" }).catch(() => {});
-    };
-  }, [childOpen, feed.connected, feed.agentsEpoch, request]);
+    if (openChild === null || typeof childRunToken !== "string") return;
+    return nativeSessionAtoms.holdDemand(target, [
+      { kind: "child", childId: openChild, runToken: childRunToken },
+    ]);
+    // `target` is read for the key it is part of.
+  }, [key, openChild, childRunToken]);
 
   return useMemo(
     () => ({
       key,
       agents,
+      rosterWarning,
       modelControlUnavailable,
       readTranscript,
       steer,
@@ -132,6 +142,7 @@ export function useNativeAgentHubSource({
     [
       key,
       agents,
+      rosterWarning,
       modelControlUnavailable,
       readTranscript,
       steer,

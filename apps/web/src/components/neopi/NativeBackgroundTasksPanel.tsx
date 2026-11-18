@@ -224,12 +224,18 @@ function JobDetail(props: {
   );
 }
 
-export function NativeBackgroundTasksPanel({ target }: { target: NativeSessionTarget }) {
-  const capabilities = useNativeSessionSlice(target, selectCapabilities);
-  const connected = useNativeSessionSlice(target, selectConnected);
-  const jobs = useNativeSessionSlice(target, selectJobs);
-  const feedError = useNativeSessionSlice(target, selectFeedError);
-  const reconciliationError = useNativeSessionSlice(target, selectJobsError);
+export function NativeBackgroundTasksPanel({
+  target,
+  visible = true,
+}: {
+  target: NativeSessionTarget;
+  visible?: boolean;
+}) {
+  const capabilities = useNativeSessionSlice(target, selectCapabilities, visible);
+  const connected = useNativeSessionSlice(target, selectConnected, visible);
+  const jobs = useNativeSessionSlice(target, selectJobs, visible);
+  const feedError = useNativeSessionSlice(target, selectFeedError, visible);
+  const reconciliationError = useNativeSessionSlice(target, selectJobsError, visible);
   const request = useNativeSessionRequest(target);
   const supported = capabilities?.includes(NATIVE_JOBS_CAPABILITY) === true;
   const ordered = useMemo(() => orderNativeJobs(jobs.entries), [jobs.entries]);

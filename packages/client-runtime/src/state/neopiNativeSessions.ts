@@ -15,7 +15,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import type { Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { request as rpcRequest } from "../rpc/client.ts";
@@ -53,7 +53,11 @@ export const DEFAULT_NATIVE_DEMAND: readonly NeoPiNativeDemandItem[] = [
   { kind: "transcript" },
   { kind: "roster" },
 ];
-/** How long a released view's cached feed stays for a warm switch back; it holds no lease. */
+/**
+ * How long a released view's cached feed stays for a warm switch back; it holds
+ * no lease. A view that is still mounted but concealed holds the feed (`view`),
+ * so it is never evicted under that view.
+ */
 export const NATIVE_WARM_CACHE_MS = 5 * 60_000;
 /** Re-attach and re-read backoff: 250 ms doubling to 5 s, reset by any lease or reply. */
 const retryDelayMs = (failures: number) => Math.min(250 * 2 ** failures, 5_000);
@@ -85,6 +89,31 @@ export function createNativeSessionAtoms<R, E>(
   const demandSignals = new Map<string, Queue.Queue<void>>();
   /** Wakes an observation that stopped on a terminal lifecycle, after an explicit open. */
   const restarts = new Map<string, Queue.Queue<void>>();
+  /** Concealed views per session: no lease, but their feed stays cached. */
+  const holds = new Map<string, number>();
+  /** Drops cached feeds that no lease and no concealed view holds, after the warm period. */
+  const evictLater = (keys: readonly string[]) =>
+    Effect.sleep(NATIVE_WARM_CACHE_MS).pipe(
+      Effect.andThen(
+        Effect.sync(() => {
+          for (const key of keys) if (!updates.has(key) && !holds.has(key)) cache.delete(key);
+        }),
+      ),
+    );
+  const concealed = Atom.family((key: string) =>
+    Atom.make((get) => {
+      holds.set(key, (holds.get(key) ?? 0) + 1);
+      get.addFinalizer(() => {
+        const count = (holds.get(key) ?? 1) - 1;
+        if (count > 0) holds.set(key, count);
+        else {
+          holds.delete(key);
+          if (!updates.has(key)) Effect.runFork(evictLater([key]));
+        }
+      });
+      return AsyncResult.success(cache.get(key) ?? emptyNativeSessionFeed());
+    }).pipe(Atom.setIdleTTL(0)),
+  );
   const publish = (key: string, update: NativeSessionUpdate) =>
     Effect.sync(() => {
       const queue = updates.get(key);
@@ -153,17 +182,8 @@ export function createNativeSessionAtoms<R, E>(
                 updates.delete(key);
                 demandSignals.delete(key);
                 restarts.delete(key);
-                const evict = () => {
-                  if (!updates.has(key)) cache.delete(key);
-                  // Unobserved move handoffs live only as long as their source.
-                  for (const movedKey of handedOffKeys)
-                    if (!updates.has(movedKey)) cache.delete(movedKey);
-                };
-                return Effect.sleep(NATIVE_WARM_CACHE_MS).pipe(
-                  Effect.andThen(Effect.sync(evict)),
-                  Effect.forkDetach,
-                  Effect.asVoid,
-                );
+                // Unobserved move handoffs live only as long as their source.
+                return evictLater([key, ...handedOffKeys]).pipe(Effect.forkDetach, Effect.asVoid);
               }),
           );
 
@@ -400,6 +420,15 @@ export function createNativeSessionAtoms<R, E>(
     }),
     watch: observation,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
+    /**
+     * The feed a view reads. Visible: subscribes to the observation (its lease).
+     * Concealed: holds only the cached feed, so the place stays, with no lease,
+     * read or demand. Returning to visible resumes from that feed.
+     */
+    view: (target: NativeSessionTarget, visible: boolean) =>
+      visible
+        ? observation({ environmentId: target.environmentId, input: { ref: target.ref } })
+        : concealed(nativeSessionKey(target)),
     /**
      * Adds `items` to what the session's views need (C4 demand) until the
      * returned release runs: a child view holds `child(id, runToken)` while open.

@@ -972,6 +972,160 @@ export function nativeObservationStatus(feed: NativeSessionFeed): {
   return { phase, catchingUp: false };
 }
 
+/**
+ * The view's observation state as the client shows it, outside the conversation
+ * stream and never as a modal. `catching-up`: the view is loading or rebuilding
+ * to the session's current state; the conversation already shown stays and input
+ * keeps working. `reconnecting`: the transport is being restored automatically.
+ * Null while observing normally, and while the owner itself is gone
+ * (`nativeOwnerNotice` says that) or the observation ended for good (the feed's
+ * `error` says why).
+ */
+export interface NativeObservationNotice {
+  readonly kind: "catching-up" | "reconnecting";
+  readonly text: string;
+}
+export function nativeObservationNotice(feed: NativeSessionFeed): NativeObservationNotice | null {
+  if (feed.ownerLoss !== null) return null;
+  const { phase, catchingUp } = nativeObservationStatus(feed);
+  if (phase === "transport-lost" || (phase === "attaching" && feed.session && !feed.connected))
+    return {
+      kind: "reconnecting",
+      text: "Reconnecting to the session. The conversation shown is kept.",
+    };
+  if (phase === "authority-unresolved")
+    return {
+      kind: "reconnecting",
+      text: "Looking for the process running this session. The conversation shown is kept, and nothing is started.",
+    };
+  if (!catchingUp) return null;
+  if (phase === "building")
+    return { kind: "catching-up", text: "Rebuilding this view from the session…" };
+  return {
+    kind: "catching-up",
+    text: feed.session ? "Catching up with the session…" : "Loading the session…",
+  };
+}
+
+type NativeServerInboxGap = Extract<NeoPiNativeInboxRecord, { type: "gap" }>;
+type NativeInboxGap = NativeServerInboxGap | NativeInboxTrimmedGap;
+export type NativeInboxLoss = NativeServerInboxGap["reason"] | "trimmed";
+/** Facts from one inbox gap, never invented content for what is missing. */
+export interface NativeInboxRecordLossWarning {
+  readonly key: string;
+  readonly loss: NativeInboxLoss;
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  readonly firstReceivedAt: number;
+  readonly lastReceivedAt: number;
+  readonly notices: number;
+  readonly toolStreams: NativeInboxGap["toolStreams"];
+  /** Output of further tool calls is missing too; which ones is not known. */
+  readonly moreToolCalls: boolean;
+  readonly text: string;
+}
+export type NativeInboxLossWarning =
+  | NativeInboxRecordLossWarning
+  | { readonly key: string; readonly loss: "older-details-trimmed"; readonly text: string };
+
+const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+const clock = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+const LOSS_REASON: Record<NativeInboxLoss, string> = {
+  evicted: "NeoCode's server discarded them because this view fell behind.",
+  "not-observed": "No view was attached while they happened, so they were not kept.",
+  mixed:
+    "Records were missed in this interval. Whether a view fell behind or none was attached is no longer known.",
+  trimmed: "This view received them, then dropped them to stay within its own limit.",
+};
+
+function lossWarning(
+  gap: NativeInboxGap,
+  key: string,
+  content: Pick<NativeInboxRecordLossWarning, "notices" | "toolStreams" | "moreToolCalls">,
+  what: string,
+): NativeInboxRecordLossWarning {
+  const loss = gap.type === "trimmed" ? "trimmed" : gap.reason;
+  const span = Math.max(0, gap.lastReceivedAt - gap.firstReceivedAt);
+  const when = `received between ${clock(gap.firstReceivedAt)} and ${clock(gap.lastReceivedAt)} (${span / 1000} s)`;
+  const interval =
+    gap.fromSeq === gap.toSeq ? `record ${gap.fromSeq}` : `records ${gap.fromSeq}–${gap.toSeq}`;
+  return {
+    key,
+    loss,
+    fromSeq: gap.fromSeq,
+    toSeq: gap.toSeq,
+    firstReceivedAt: gap.firstReceivedAt,
+    lastReceivedAt: gap.lastReceivedAt,
+    ...content,
+    text: `Missing from this view: ${what} (live ${interval}, ${when}). ${LOSS_REASON[loss]}`,
+  };
+}
+
+/**
+ * Persistent warnings outside the conversation, plus a marker at each shown
+ * tool call whose output is missing. The outside warning stays visible even
+ * when that call is folded. A trimmed warning never describes unreceived output;
+ * a summary whose details were cut never claims causes, intervals or counts.
+ */
+export function nativeInboxLossWarnings(
+  inbox: readonly NativeInboxItem[],
+  shownToolCalls: ReadonlySet<string>,
+): {
+  readonly general: readonly NativeInboxLossWarning[];
+  readonly byToolCall: ReadonlyMap<string, readonly NativeInboxRecordLossWarning[]>;
+} {
+  const general: NativeInboxLossWarning[] = [];
+  const byToolCall = new Map<string, NativeInboxRecordLossWarning[]>();
+  for (const [index, gap] of inbox.entries()) {
+    if (gap.type === "older-details-trimmed") {
+      general.push({
+        key: "older-details-trimmed",
+        loss: "older-details-trimmed",
+        text: "Older loss-warning details were trimmed by this client. Their record kinds, intervals, times and causes are no longer available.",
+      });
+      continue;
+    }
+    if (gap.type !== "gap" && gap.type !== "trimmed") continue;
+    // A server gap is kept exactly as received, with no added projection field.
+    // The arrival position disambiguates equal sequence numbers across projections.
+    const key = `${index}:${gap.fromSeq}`;
+    for (const stream of gap.toolStreams) {
+      if (!shownToolCalls.has(stream.toolCallId)) continue;
+      const warning = lossWarning(
+        gap,
+        `${key}:${stream.toolCallId}`,
+        { notices: 0, toolStreams: [stream], moreToolCalls: false },
+        `${plural(stream.updates, "live stream update", "live stream updates")} of this call`,
+      );
+      const held = byToolCall.get(stream.toolCallId);
+      if (held) held.push(warning);
+      else byToolCall.set(stream.toolCallId, [warning]);
+    }
+    const what =
+      [
+        ...gap.toolStreams.map(
+          (stream) =>
+            `${plural(stream.updates, "live stream update", "live stream updates")} of ${stream.toolName} (${stream.toolCallId})`,
+        ),
+        ...(gap.toolStreamsTruncated ? ["live streams of further tool calls"] : []),
+        ...(gap.notices > 0 ? [plural(gap.notices, "notice", "notices")] : []),
+      ].join(", ") || "live records whose kind is not known";
+    general.push(
+      lossWarning(
+        gap,
+        `${key}:general`,
+        {
+          notices: gap.notices,
+          toolStreams: gap.toolStreams,
+          moreToolCalls: gap.toolStreamsTruncated,
+        },
+        what,
+      ),
+    );
+  }
+  return { general, byToolCall };
+}
+
 /** One child's roster key (`roster:<id>`) replayed in its authority order: history, live inventory, lifecycle, progress. */
 function projectNativeChild(
   agents: readonly NativeSubagent[],
@@ -1550,12 +1704,18 @@ export type NativeTranscriptRow =
   | { readonly kind: "entry"; readonly id: string; readonly entry: NeoPiJournalEntry }
   | { readonly kind: "command"; readonly id: string; readonly text: string };
 
-/** Command results are local display history, not entries in the native journal. */
+/**
+ * Command results are local display history, not entries in the native journal.
+ * A message with tool calls is keyed by its first call id rather than its entry,
+ * so its row (and what the reader expanded in it) survives the live row becoming
+ * durable and any rebase; a repeated call id falls back to the entry.
+ */
 export function nativeTranscriptRows(
   feed: Pick<NativeSessionFeed, "conversation" | "commandOutputs">,
   debug: boolean,
 ): readonly NativeTranscriptRow[] {
   const outputs = new Map<string | null, NativeCommandOutput[]>();
+  const toolKeys = new Set<string>();
   // Output follows its live row until that row retires onto its durable entry.
   const live = new Set(feed.conversation.pending.map((message) => message.messageId));
   for (const output of feed.commandOutputs) {
@@ -1581,8 +1741,19 @@ export function nativeTranscriptRows(
       debug ||
       entry.type === "message" ||
       (entry.type === "custom_message" && entry.display !== false)
-    )
-      rows.push({ kind: "entry", id: `entry:${entry.id}`, entry });
+    ) {
+      const content = nativeRecord(entry.message).content;
+      const call = Array.isArray(content)
+        ? content.map(nativeRecord).find((block) => block.type === "toolCall")
+        : undefined;
+      const key = typeof call?.id === "string" && call.id ? `tool:${call.id}` : null;
+      rows.push({
+        kind: "entry",
+        id: key && !toolKeys.has(key) ? key : `entry:${entry.id}`,
+        entry,
+      });
+      if (key) toolKeys.add(key);
+    }
     // A command after hidden bookkeeping still appears in the right place.
     // Results on another branch stay hidden until its anchor is visible again.
     appendOutputs(entry.id);

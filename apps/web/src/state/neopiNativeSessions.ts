@@ -9,7 +9,7 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import type { NeoPiNativeSessionsRequestInput } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { useCallback } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -52,19 +52,11 @@ export function beginNativeSessionOpen(): () => boolean {
     generation === nativeOpenGeneration && selection === useNativeSessionSelection.getState();
 }
 /** Selecting opens the session's tab when it has none. */
-export const selectNativeSession = (target: NativeSessionTarget) => {
+export const selectNativeSession = (target: NativeSessionTarget) =>
   useNativeSessionSelection.setState((state) => ({
     target,
     tabs: openNativeSessionTab(state.tabs, target),
   }));
-  // Selecting a session whose feed went dead (an exited owner, a failed open) retries it.
-  // A detach stays until Reconnect, and a reconnecting session is already being retried.
-  const feed = nativeSessionAtoms.cached(target);
-  if (feed && !feed.connected && feed.ownerLoss !== "detached")
-    appAtomRegistry.refresh(
-      nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
-    );
-};
 export const closeNativeSession = (target: NativeSessionTarget) =>
   useNativeSessionSelection.setState((state) => {
     const next = closeNativeSessionTab(state.tabs, state.target, target);
@@ -110,20 +102,38 @@ export function useNativeSessionReconnect(target: NativeSessionTarget) {
   );
 }
 
-export function useNativeSession(target: NativeSessionTarget) {
-  const result = useAtomValue(
-    nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
-  );
+const subscribeVisibility = (changed: () => void) => {
+  document.addEventListener("visibilitychange", changed);
+  return () => document.removeEventListener("visibilitychange", changed);
+};
+/** A visible but unfocused tiled window stays shown; only actual document concealment stops it. */
+export function usePageVisible() {
+  return useSyncExternalStore(subscribeVisibility, () => document.visibilityState === "visible");
+}
+
+/**
+ * The feed atom a view reads: the session's lease while the page is visible,
+ * nothing while it is hidden. A hidden view holds the cached feed instead, so it
+ * keeps its place and resumes from it when shown. Panels of the visible session
+ * share its one lease, so a collapsed panel never holds one of its own.
+ */
+function useNativeSessionFeedAtom(target: NativeSessionTarget, shown: boolean) {
+  const pageVisible = usePageVisible();
+  return nativeSessionAtoms.view(target, shown && pageVisible);
+}
+
+export function useNativeSession(target: NativeSessionTarget, shown = true) {
+  const result = useAtomValue(useNativeSessionFeedAtom(target, shown));
   const request = useNativeSessionRequest(target);
-  const feed = AsyncResult.isSuccess(result)
-    ? result.value
-    : (nativeSessionAtoms.cached(target) ?? emptyNativeSessionFeed());
+  const cached = nativeSessionAtoms.cached(target);
+  const feed = AsyncResult.isSuccess(result) ? result.value : (cached ?? emptyNativeSessionFeed());
   return {
     feed,
     session: feed.session,
     conversation: feed.conversation,
     request,
-    loading: AsyncResult.isInitial(result),
+    // Only a view with nothing to show is loading; a resumed one shows what it held.
+    loading: AsyncResult.isInitial(result) && cached === undefined,
     error: AsyncResult.isFailure(result) ? String(Cause.squash(result.cause)) : feed.error,
   };
 }
@@ -138,6 +148,7 @@ const EMPTY_FEED = emptyNativeSessionFeed();
 export function useNativeSessionSlice<A>(
   target: NativeSessionTarget,
   select: (feed: NativeSessionFeed) => A,
+  shown = true,
 ): A {
   const project = useCallback(
     (result: AsyncResult.AsyncResult<NativeSessionFeed, unknown>) =>
@@ -148,8 +159,5 @@ export function useNativeSessionSlice<A>(
       ),
     [select, target],
   );
-  return useAtomValue(
-    nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
-    project,
-  );
+  return useAtomValue(useNativeSessionFeedAtom(target, shown), project);
 }

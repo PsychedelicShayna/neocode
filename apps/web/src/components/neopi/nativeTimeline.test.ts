@@ -1,7 +1,21 @@
-import type { NeoPiJournalEntry } from "@t3tools/contracts";
-import type { TranscriptRow } from "@t3tools/client-runtime/neopi-transcript";
+import type { NeoPiJournalEntry, NeoPiNativeObservationDomain } from "@t3tools/contracts";
+import {
+  createTranscriptProjector,
+  type TranscriptRow,
+} from "@t3tools/client-runtime/neopi-transcript";
 import { describe, expect, it } from "vite-plus/test";
-import { deriveMessagesTimelineRows } from "../chat/MessagesTimeline.logic";
+import {
+  computeStableMessagesTimelineRows,
+  deriveMessagesTimelineRows,
+  deriveMessagesTimelineRowsWithState,
+  type MessagesTimelineRowsProjection,
+  type StableMessagesTimelineRowsState,
+} from "../chat/MessagesTimeline.logic";
+import {
+  emptyNativeSessionFeed,
+  reduceNativeSessionFeed,
+  type NativeSessionFeed,
+} from "@t3tools/client-runtime/neopi-native-sessions";
 import { projectNativeTimeline } from "./nativeTimeline";
 
 const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
@@ -156,6 +170,88 @@ describe("native timeline entry identity", () => {
   });
 });
 
+describe("native tool disclosure across persistence", () => {
+  it("keeps an expanded call's identity from a live message through its durable join and rebase", () => {
+    const projectRows = createTranscriptProjector();
+    const call = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call", name: "bash", arguments: { command: "pwd" } }],
+    };
+    const prompt: NeoPiJournalEntry = {
+      id: "u1",
+      parentId: null,
+      type: "message",
+      timestamp: at(0),
+      message: { role: "user", content: "Go" },
+    };
+    const options = { debug: false };
+    const live = projectNativeTimeline(
+      projectRows(
+        {
+          entries: [prompt],
+          pending: [{ messageId: "m1", message: call }],
+          leafId: prompt.id,
+        },
+        options,
+      ),
+      true,
+    );
+    const liveCall = live.entries.find(
+      (item) => item.kind === "work" && item.entry.toolCallId === "call",
+    )!;
+    // This is the key MessagesTimeline uses to remember expanded tool entries.
+    const expanded = new Set([liveCall.id]);
+    const durable: NeoPiJournalEntry = {
+      id: "a1",
+      parentId: prompt.id,
+      type: "message",
+      timestamp: at(1),
+      message: call,
+    };
+    const result: NeoPiJournalEntry = {
+      id: "r1",
+      parentId: durable.id,
+      type: "message",
+      timestamp: at(2),
+      message: { role: "toolResult", toolCallId: "call", content: "/workspace" },
+    };
+    const shown = () =>
+      projectNativeTimeline(
+        projectRows(
+          {
+            entries: [prompt, { ...durable }, { ...result }],
+            pending: [],
+            leafId: result.id,
+          },
+          options,
+        ),
+        false,
+      );
+    for (const timeline of [shown(), shown()]) {
+      const joined = timeline.entries.filter(
+        (item) => item.kind === "work" && item.entry.toolCallId === "call",
+      );
+      expect(joined).toHaveLength(1);
+      expect(expanded.has(joined[0]!.id)).toBe(true);
+      expect(joined[0]).toMatchObject({ entry: { toolLifecycleStatus: "completed" } });
+    }
+  });
+
+  it("places a missing-output marker immediately at the call, not at another tool", () => {
+    const first = tool("call-a", 10);
+    const second = tool("call-b", 11);
+    const losses = new Map([["call-a", [{ text: "missing output facts" }]]]);
+    const timeline = projectNativeTimeline([user("u1", 0), first, second], true, losses);
+    expect(timeline.entries).toHaveLength(4);
+    expect(timeline.entries[2]).toMatchObject({
+      kind: "work",
+      entry: { sourceActivityKind: "runtime.warning", detail: "missing output facts" },
+    });
+    expect(timeline.entries[1]).toMatchObject({ entry: { toolCallId: "call-a" } });
+    expect(timeline.entries[3]).toMatchObject({ entry: { toolCallId: "call-b" } });
+  });
+});
+
 describe("native compaction row", () => {
   it("expands to the compaction summary through the context-compaction row", () => {
     const compaction: TranscriptRow = {
@@ -181,5 +277,116 @@ describe("native compaction row", () => {
       label: "Context compacted · 31k → 29k tokens",
       detail: "Kept the plan.",
     });
+  });
+});
+
+describe("projection reads through the incremental timeline window", () => {
+  it("shows every current message revision at a fixed row count without a reload", () => {
+    const epoch: NeoPiNativeObservationDomain = {
+      serverIncarnation: "server",
+      ownerEpoch: 1,
+      projectionIncarnation: 1,
+      buildAttempt: 1,
+      branchGeneration: 1,
+    };
+    const empty = emptyNativeSessionFeed();
+    let feed: NativeSessionFeed = {
+      ...empty,
+      busy: true,
+      conversation: {
+        ...empty.conversation,
+        identity: { sessionId: "session", sessionFile: "/session", leafId: "u1" },
+        entries: [
+          {
+            id: "u1",
+            parentId: null,
+            type: "message",
+            timestamp: at(0),
+            message: { role: "user", content: "Go" },
+          },
+        ],
+      },
+    };
+    const projectRows = createTranscriptProjector();
+    let previous: MessagesTimelineRowsProjection | null = null;
+    let stable: StableMessagesTimelineRowsState = {
+      byId: new Map(),
+      result: [],
+    };
+    let count = 0;
+    for (const [index, text] of ["a", "ab", "abc", "final body"].entries()) {
+      const revision = index + 1;
+      feed = reduceNativeSessionFeed(feed, { type: "read-issued" });
+      feed = reduceNativeSessionFeed(feed, {
+        type: "read",
+        readId: feed.observation.outstanding!.readId,
+        result: {
+          type: "pass",
+          kind: index === 0 ? "full" : "incremental",
+          promoted: false,
+          passId: `pass-${revision}`,
+          baseCursor: feed.observation.outstanding!.cursor ?? {
+            epoch,
+            base: 0,
+            pass: null,
+            inboxSeq: 0,
+            journalAt: null,
+          },
+          complete: true,
+          coveredThrough: revision,
+          continuation: { epoch, base: revision, pass: null, inboxSeq: 0, journalAt: null },
+          entities: [
+            {
+              key: "message:m1",
+              ordinal: 1,
+              revision,
+              value: {
+                class: "message",
+                messageId: "m1",
+                phase: "open",
+                entryId: null,
+                message: { role: "assistant", content: [{ type: "text", text }] },
+              },
+            },
+          ],
+          tombstones: [],
+          segments: [],
+          inbox: [],
+          journal: null,
+        },
+      });
+      const timeline = projectNativeTimeline(
+        projectRows(
+          {
+            entries: feed.conversation.entries,
+            pending: feed.conversation.pending,
+            leafId: null,
+          },
+          { debug: false },
+        ),
+        feed.busy,
+      );
+      previous = deriveMessagesTimelineRowsWithState(
+        {
+          timelineEntries: timeline.entries,
+          latestTurn: timeline.latestTurn,
+          runningTurnId: timeline.runningTurnId,
+          isWorking: true,
+          activeTurnStartedAt: null,
+          turnDiffSummaries: [],
+          supportsConversationRollback: false,
+        },
+        previous,
+      );
+      const next = computeStableMessagesTimelineRows(previous.rows, stable);
+      const shown = next.result.find(
+        (row) => row.kind === "message" && row.message.role === "assistant",
+      );
+      expect(shown?.kind === "message" && shown.message.text).toBe(text);
+      expect(next).not.toBe(stable);
+      if (index === 0) count = next.result.length;
+      else expect(next.result).toHaveLength(count);
+      stable = next;
+    }
   });
 });

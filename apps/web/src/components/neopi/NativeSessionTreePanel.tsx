@@ -81,18 +81,20 @@ const asFilter = (value: unknown): SessionTreeFilter =>
  */
 export function NativeSessionTreePanel({
   target,
+  visible = true,
   request,
   execute,
   onNavigated,
 }: {
   target: NativeSessionTarget;
+  visible?: boolean;
   /** Plain reads. */
   request: Request;
   /** Commands that change the session; refreshes the workspace state afterwards. */
   execute: Request;
   onNavigated: (result: Record<string, unknown>) => void;
 }) {
-  const { feed, conversation, session } = useNativeSession(target);
+  const { feed, conversation, session } = useNativeSession(target, visible);
   const identity = conversation.identity;
   return (
     <TreeBody

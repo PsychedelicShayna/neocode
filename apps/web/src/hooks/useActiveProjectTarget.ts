@@ -1,15 +1,12 @@
 import { scopeThreadRef, type WorkspaceRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId } from "@t3tools/contracts";
-import { useAtomValue } from "@effect/atom-react";
 import { useLocation } from "@tanstack/react-router";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { nativeSessionAtoms, useNativeSessionSelection } from "~/state/neopiNativeSessions";
 
 import { useProjects } from "~/state/entities";
+import { useEnvironmentQuery } from "~/state/query";
 
 import { useHandleNewThread } from "./useHandleNewThread";
-
-const noNativeWorkspaceAtom = Atom.make(null);
 
 export interface ActiveProjectTarget {
   readonly environmentId: EnvironmentId;
@@ -25,20 +22,20 @@ export function useActiveProjectTarget(): ActiveProjectTarget | null {
   const pathname = useLocation({ select: (location) => location.pathname });
   const selection = useNativeSessionSelection((state) => state.target);
   const nativeTarget = pathname === "/" ? selection : null;
-  const nativeResult = useAtomValue(
+  // The session view holds the lease; this reads what it cached, else the inventory.
+  const listed = useEnvironmentQuery(
     nativeTarget
-      ? nativeSessionAtoms.watch({
-          environmentId: nativeTarget.environmentId,
-          input: { ref: nativeTarget.ref },
-        })
-      : noNativeWorkspaceAtom,
-  );
+      ? nativeSessionAtoms.list({ environmentId: nativeTarget.environmentId, input: {} })
+      : null,
+  ).data?.sessions;
   if (nativeTarget) {
-    const feed =
-      nativeResult && AsyncResult.isSuccess(nativeResult)
-        ? nativeResult.value
-        : nativeSessionAtoms.cached(nativeTarget);
-    const cwd = feed?.session?.cwd;
+    const cwd =
+      nativeSessionAtoms.cached(nativeTarget)?.session?.cwd ??
+      listed?.find(
+        (entry) =>
+          entry.ref.sessionFile === nativeTarget.ref.sessionFile &&
+          entry.ref.providerInstanceId === nativeTarget.ref.providerInstanceId,
+      )?.cwd;
     return cwd
       ? {
           environmentId: nativeTarget.environmentId,

@@ -31,6 +31,11 @@ import {
 import type { NeoPiNativeSettledRecord, NeoPiNativeSettledStore } from "./NeoPiNativeSettlement.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import { updateNativeModelsConfiguration } from "./NeoPiModels.ts";
+import {
+  emptyNativeSessionFeed,
+  reduceNativeSessionFeed,
+  type NativeSessionFeed,
+} from "../../../../../packages/client-runtime/src/neopiNativeSessions.ts";
 
 const instanceId = ProviderInstanceId.make("native-profile");
 /** The connection every test lease belongs to, unless a test says otherwise. */
@@ -3442,5 +3447,67 @@ describe("native session liveness and settling", () => {
       yield* service.setSettled({ ref: originalRef, settled: false });
       assert.equal(yield* settledAt(), undefined);
     }).pipe(Effect.scoped),
+  );
+});
+
+describe("join replay through the client reducer (paired)", () => {
+  it.effect(
+    "a re-attached view keeps each still-open dialog object and drops only those settled while it was away",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const dialogs = 12; // More than the credit window of 8, so the replay spans several grants.
+        const apply = (feed: NativeSessionFeed, envelopes: readonly Envelope[]) =>
+          envelopes.reduce((current, envelope) => reduceNativeSessionFeed(current, envelope), feed);
+        const first = yield* follow(service, originalRef);
+        yield* first.next("lifecycle", observing);
+        yield* Effect.forEach(
+          Array.from({ length: dialogs }, (_, index) => index),
+          (index) =>
+            native.publish({
+              type: "extension_ui_request",
+              id: `ui-${index}`,
+              method: "confirm",
+              title: `Allow ${index}?`,
+            }),
+          { discard: true },
+        );
+        yield* first.next("obligation-opened", (envelope) => envelope.id === `ui-${dialogs - 1}`);
+        let feed = apply(emptyNativeSessionFeed(), first.seen);
+        assert.equal(feed.dialogs.length, dialogs);
+        const held = feed.dialogs.find((dialog) => dialog.id === "ui-0");
+        // The view goes away; three dialogs are cancelled by the owner while nobody watches.
+        yield* Fiber.interrupt(first.fiber);
+        yield* Effect.forEach(
+          ["ui-1", "ui-5", "ui-11"],
+          (targetId) =>
+            native.publish({
+              type: "extension_ui_request",
+              id: `c-${targetId}`,
+              method: "cancel",
+              targetId,
+            }),
+          { discard: true },
+        );
+        const again = yield* follow(service, originalRef);
+        yield* again.next("lifecycle", observing);
+        const lifecycle = again.seen.findIndex((envelope) => envelope.type === "lifecycle");
+        // Before the lease's first lifecycle every held dialog is still shown, the same objects.
+        const beforeLifecycle = apply(feed, again.seen.slice(0, lifecycle));
+        assert.equal(beforeLifecycle.dialogs.length, dialogs);
+        feed = apply(beforeLifecycle, again.seen.slice(lifecycle));
+        assert.deepEqual(
+          feed.dialogs.map((dialog) => dialog.id),
+          Array.from({ length: dialogs }, (_, index) => `ui-${index}`).filter(
+            (id) => !["ui-1", "ui-5", "ui-11"].includes(id),
+          ),
+        );
+        assert.strictEqual(
+          feed.dialogs.find((dialog) => dialog.id === "ui-0"),
+          held,
+        );
+        assert.isNull(feed.unconfirmedDialogs);
+      }).pipe(Effect.scoped),
   );
 });

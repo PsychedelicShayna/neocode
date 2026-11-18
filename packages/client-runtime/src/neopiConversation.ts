@@ -270,6 +270,8 @@ export function reduceNativeConversation(
           new Set(entries.map((entry) => entry.id)),
         ),
         cursor: action.page.nextCursor,
+        // The page was read at the previous revision; a replay of it no longer applies.
+        revision: state.revision + 1,
       };
     }
     case "identity": {

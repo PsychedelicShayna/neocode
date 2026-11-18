@@ -34,6 +34,7 @@ const storeSource = (store: NeoPiNativeKeyedStore): NeoPiNativeReadSource => ({
   published: true,
   store,
   journal: new NeoPiNativeJournalTail(16),
+  deliverableJournalEnd: 0,
   horizonCursor: undefined,
   inbox: [],
 });
@@ -48,12 +49,17 @@ const passReply = (reply: NeoPiNativeSessionsReadResult): PassReply => {
 /**
  * The client side of C2, as small as the rule: keep the newest revision per
  * key, remove only by tombstone, and when a `full` pass completes remove what
- * the pass did not return unless held at a revision above its watermark.
- * Journal entry ids it has received are kept to check join coherence.
+ * the pass did not return unless held at a revision above its watermark. A
+ * tombstone with `joinEntryId` keeps the row until that entry is held.
+ * Journal entry ids it has received are kept to check join coherence;
+ * `erasedBeforeEntry` records any live row lost before its durable entry.
  */
 class Mirror {
   readonly held = new Map<string, NeoPiNativeEntity>();
   readonly entryIds = new Set<string>();
+  /** Rows retired by an entry the mirror does not hold yet: key → entry id. */
+  readonly retiring = new Map<string, string>();
+  readonly erasedBeforeEntry: string[] = [];
   cursor: NeoPiNativeCursor | null = null;
   #passId: string | null = null;
   #returned = new Set<string>();
@@ -66,6 +72,11 @@ class Mirror {
       this.#returned = new Set();
     }
     for (const entry of result.journal?.entries ?? []) this.entryIds.add(entry.id);
+    for (const [key, entryId] of this.retiring)
+      if (this.entryIds.has(entryId)) {
+        this.retiring.delete(key);
+        this.held.delete(key);
+      }
     const take = (entity: NeoPiNativeEntity) => {
       this.#returned.add(entity.key);
       const held = this.held.get(entity.key);
@@ -82,13 +93,20 @@ class Mirror {
       }
     }
     for (const tombstone of result.tombstones) {
+      this.#returned.add(tombstone.key);
       const held = this.held.get(tombstone.key);
-      if (held && held.revision < tombstone.revision) this.held.delete(tombstone.key);
+      if (!held || held.revision >= tombstone.revision) continue;
+      if (tombstone.joinEntryId !== undefined && !this.entryIds.has(tombstone.joinEntryId))
+        this.retiring.set(tombstone.key, tombstone.joinEntryId);
+      else this.held.delete(tombstone.key);
     }
     if (result.kind === "full" && result.continuation.pass === null)
       for (const [key, held] of this.held)
-        if (!this.#returned.has(key) && held.revision <= result.coveredThrough)
+        if (!this.#returned.has(key) && held.revision <= result.coveredThrough) {
+          if (held.value.class === "message" && !this.retiring.has(key))
+            this.erasedBeforeEntry.push(key);
           this.held.delete(key);
+        }
     this.cursor = result.continuation;
     return result;
   }
@@ -482,7 +500,7 @@ describe("NeoPiNativeCursor", () => {
     );
   });
 
-  it("segments a value above the reply budget and restarts on a newer revision", () => {
+  it("segments a value above the reply budget; a change mid-transfer arrives with the next pass", () => {
     const store = new NeoPiNativeKeyedStore(10);
     const source = storeSource(store);
     const mirror = new Mirror();
@@ -504,7 +522,141 @@ describe("NeoPiNativeCursor", () => {
       reads++;
       assert.isBelow(reads, 200);
     }
-    assert.deepEqual(mirror.held.get("big")?.value, big("v2"));
+    assert.deepEqual(mirror.held.get("big")?.value, big("v1"));
     assert.deepEqual(mirror.held.get("small")?.value, presentation(1));
+    mirror.drain(source, limits);
+    assert.deepEqual(mirror.held.get("big")?.value, big("v2"));
+  });
+
+  describe("B2 review", () => {
+    it("1 a hot oversized key updated before every read does not stall its pass", () => {
+      const store = new NeoPiNativeKeyedStore(10);
+      const source = storeSource(store);
+      const mirror = new Mirror();
+      const big = (n: number) => ({
+        class: "presentation" as const,
+        value: { text: `${n}:`.padEnd(2000, "x") },
+      });
+      store.put("a", big(0));
+      store.put("b", presentation(0));
+      const limits = { scanSteps: 100, replyBytes: 400 };
+      let passes = 0;
+      for (let n = 1; n <= 200 && passes < 3; n++) {
+        store.put("a", big(n));
+        const reply = mirror.read(source, limits);
+        if (reply.continuation.pass === null) passes++;
+      }
+      assert.equal(passes, 3, "every pass completes while a changes before every read");
+      assert.deepEqual(mirror.held.get("b")?.value, presentation(0));
+      assert.equal(mirror.held.get("a")?.value.class, "presentation");
+    });
+
+    const session = (capacity: { journal: number; tombstones: number; joins?: number }) => {
+      const sessionId = "session-1";
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: capacity.tombstones,
+        journalCapacity: capacity.journal,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
+      let parent: string | null = null;
+      const append = (id: string, message?: Record<string, unknown>) => {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: {
+            id,
+            parentId: parent,
+            type: message ? "message" : "custom",
+            timestamp: "t",
+            ...(message ? { message } : {}),
+          },
+        });
+        parent = id;
+      };
+      return { sessionId, projection, append };
+    };
+    const assistant = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+
+    it("2 a reader behind the ring never loses a live row before its durable replacement", () => {
+      const { sessionId, projection, append } = session({ journal: 3, tombstones: 1 });
+      const mirror = new Mirror();
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("answer") });
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      assert.isTrue(mirror.held.has("message:m"));
+      // Stalled through m's commit, enough appends to overrun its journal
+      // cursor, and enough plain churn to expire every plain tombstone.
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m", entryId: "e-m" });
+      append("e-m", assistant("answer"));
+      for (let n = 0; n < 6; n++) append(`e${n}`);
+      for (let n = 0; n < 6; n++) {
+        projection.store.put(`churn-${n}`, { class: "presentation", value: {} });
+        projection.store.remove(`churn-${n}`);
+      }
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      assert.isFalse(mirror.entryIds.has("e-m"), "the entry is behind the reader's horizon page");
+      assert.deepEqual(mirror.erasedBeforeEntry, []);
+      assert.equal(mirror.retiring.get("message:m"), "e-m", "kept until its entry is held");
+    });
+
+    it("3a an entry that arrives before its association is held until message_persisted", () => {
+      const { sessionId, projection, append } = session({ journal: 16, tombstones: 16 });
+      const mirror = new Mirror();
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("answer") });
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      append("e-m", assistant("answer"));
+      const between = mirror.apply(
+        readNeoPiNativeObservation(projection, mirror.cursor, {
+          scanSteps: 100,
+          replyBytes: 100_000,
+        }),
+      );
+      assert.notInclude(
+        (between?.journal?.entries ?? []).map((entry) => entry.id),
+        "e-m",
+        "both copies would be visible",
+      );
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m", entryId: "e-m" });
+      const joined = mirror.read(projection, { scanSteps: 100, replyBytes: 100_000 });
+      assert.include(
+        (joined.journal?.entries ?? []).map((entry) => entry.id),
+        "e-m",
+      );
+      assert.include(
+        joined.tombstones.map((tombstone) => tombstone.key),
+        "message:m",
+      );
+      assert.isFalse(mirror.held.has("message:m"));
+    });
+
+    it("3b a reply that carries the entry carries its retirement, whatever the scan reaches", () => {
+      const { sessionId, projection, append } = session({ journal: 16, tombstones: 16 });
+      const mirror = new Mirror();
+      // Many keys ahead of m in scan order, so a small reply stops before m.
+      for (let n = 0; n < 20; n++) projection.store.put(`p${n}`, presentation(n));
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("answer") });
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      for (let n = 0; n < 20; n++) projection.store.put(`p${n}`, presentation(n + 100));
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m", entryId: "e-m" });
+      append("e-m", assistant("answer"));
+      const reply = mirror.read(projection, { scanSteps: 100, replyBytes: 900 });
+      assert.include(
+        (reply.journal?.entries ?? []).map((entry) => entry.id),
+        "e-m",
+      );
+      assert.include(
+        reply.tombstones.map((tombstone) => tombstone.key),
+        "message:m",
+      );
+      assert.isFalse(mirror.held.has("message:m"));
+    });
   });
 });

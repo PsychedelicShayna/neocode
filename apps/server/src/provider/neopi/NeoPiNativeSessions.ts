@@ -216,6 +216,19 @@ const CANDIDATE_FRAME_LIMIT = 4096;
 const PENDING_LEAF_SETTLE = Duration.seconds(2);
 /** A refused lowering of the owner's subagent level is retried this many times, at the build backoff. */
 const LEVEL_LOWERING_RETRIES = 8;
+/** Re-reads of the roster for children last seen running before an unwatched interval, at the build backoff. */
+const UNOBSERVED_CHILD_REREADS = 8;
+/**
+ * Child statuses after which nothing more is owed: finished activations in lifecycle
+ * frames, and `parked`, `aborted` or `idle` (result accepted) in the owner's history.
+ */
+const SETTLED_CHILD_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "aborted",
+  "parked",
+  "idle",
+]);
 /** How long a lease may hold a closed session without taking its terminal envelope. */
 const CLOSED_LEASE_GRACE = Duration.seconds(5);
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
@@ -366,6 +379,8 @@ interface NativeSession {
   busyEpoch: number;
   /** Bulk frames were skipped while no lease was held; the first lease rebuilds first. */
   bulkStale: boolean;
+  /** When the last lease left, while some view was following children; null while watched. */
+  unwatchedSince: number | null;
   readonly pendingUi: Map<string, SessionEventFrame>;
   readonly modelChanges: PubSub.PubSub<void>;
   readonly modelUi: PubSub.PubSub<UiRequestFrame>;
@@ -1063,6 +1078,77 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       ),
     );
   };
+  /**
+   * A child the view showed must not vanish because nobody watched it finish. On the
+   * first lease after an unwatched interval, each held child not known to have
+   * finished keeps its row with only `unobserved` (its last live parts and when
+   * watching stopped), so a stale "started" never replays over what the owner says
+   * now. The rebuild's inventory or history then tells it running or finished; one in
+   * neither stays as finished with its outcome unknown until the history lists it.
+   */
+  const markUnobservedChildren = (session: NativeSession) => {
+    const { store } = session.projection;
+    const since = session.unwatchedSince ?? clock.currentTimeMillisUnsafe();
+    let marked = false;
+    for (const record of Array.from(store.values())) {
+      if (record.value?.class !== "roster") continue;
+      const row = record.value.value;
+      if (row.unobserved !== undefined) continue;
+      const lifecycle = isNativeRecord(row.lifecycle) ? row.lifecycle : undefined;
+      const history = isNativeRecord(row.history) ? row.history : undefined;
+      const inventory = isNativeRecord(row.inventory) ? row.inventory : undefined;
+      const status = lifecycle?.status ?? history?.status ?? inventory?.status;
+      if (typeof status === "string" && SETTLED_CHILD_STATUSES.has(status)) continue;
+      const last: Record<string, unknown> = { since };
+      for (const field of ["lifecycle", "progress", "history", "inventory"] as const)
+        if (isNativeRecord(row[field])) last[field] = row[field];
+      store.put(record.key, {
+        class: "roster",
+        value: {
+          id: row.id,
+          ...(row.runToken === undefined ? {} : { runToken: row.runToken }),
+          ticks: row.ticks ?? 0,
+          unobserved: last,
+        },
+      });
+      marked = true;
+    }
+    if (marked) confirmUnobservedChildren(session);
+  };
+  /** A held child the owner's latest roster reads list neither as live nor in its history. */
+  const hasUnconfirmedChild = (session: NativeSession) => {
+    for (const record of session.projection.store.values())
+      if (
+        record.value?.class === "roster" &&
+        record.value.value.unobserved !== undefined &&
+        record.value.value.history === undefined &&
+        !record.value.value.inventory
+      )
+        return true;
+    return false;
+  };
+  /**
+   * A child that just finished may not be in the owner's history yet: while one is
+   * unconfirmed the roster is read again at the build backoff, a bounded number of
+   * times. Its row stays either way; absence from one reply proves nothing.
+   */
+  const confirmUnobservedChildren = (session: NativeSession) =>
+    spawnIn(
+      session,
+      Effect.gen(function* () {
+        let delayMs = BUILD_RETRY_MIN_MS;
+        for (let attempt = 0; attempt < UNOBSERVED_CHILD_REREADS;) {
+          yield* Effect.sleep(Duration.millis(delayMs));
+          delayMs = Math.min(delayMs * 2, BUILD_RETRY_MAX_MS);
+          if (session.closed || session.observations.size === 0 || !hasUnconfirmedChild(session))
+            return;
+          if (!session.native.client.capabilities.has(SUBAGENT_HISTORY_CAPABILITY)) return;
+          if (!session.projection.published) continue;
+          attempt++;
+          requestRefresh(session, "roster");
+        }
+      }),
+    );
   const create = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
     input: NeoPiNativeSessionsOpenInput,
@@ -1468,6 +1554,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           busyEpoch: 0,
           leafWatch: null,
           bulkStale: false,
+          unwatchedSince: null,
           recovery: null,
           takeoverRequested: false,
         };
@@ -1887,6 +1974,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         session.projection.setInboxObserved(false);
         // With the subagent level about to drop, the owner stops reporting children: any
         // that finish unseen would stay "running". The next lease rereads them.
+        session.unwatchedSince = clock.currentTimeMillisUnsafe();
         if (session.subagentLevel !== null && session.subagentLevel.level !== "off")
           session.bulkStale = true;
       } else pruneAcknowledged(session);
@@ -1992,16 +2080,15 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               // A message that was open when watching stopped may have gone on streaming,
               // ended or been persisted unseen, so its held body cannot be served. It is
               // dropped; if the owner is still streaming it, the build's snapshot message
-              // brings back its current body before the projection publishes.
-              // Children and jobs that finished unseen are the same: they would otherwise
-              // stay "running". The build rereads the live inventory, history and jobs.
+              // brings back its current body before the projection publishes. Jobs that
+              // finished unseen are the same; the jobs inventory lists recent ones again.
               for (const record of Array.from(projection.store.values()))
                 if (
                   (record.value?.class === "message" && record.value.phase === "open") ||
-                  record.key.startsWith("roster:") ||
                   record.key.startsWith("job:")
                 )
                   projection.store.remove(record.key);
+              markUnobservedChildren(session);
               const obsolete = session.attempt;
               session.attempt = null;
               if (obsolete) spawnIn(session, Fiber.interrupt(obsolete));

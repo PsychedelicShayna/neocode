@@ -146,11 +146,17 @@ export const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(func
   });
 });
 
-/** The thread's native session ref for attach-only observation. Never opens a connection. */
+/**
+ * The native session ref of an active thread, for attach-only observation. A deleted thread's
+ * retained binding is never disclosed. Never opens a connection.
+ */
 export const makeNeoPiThreadNativeRef = Effect.fn("NeoPiNativeOwner.nativeRef")(function* () {
   const readBinding = yield* makeNeoPiThreadBinding();
+  const snapshots = yield* ProjectionSnapshotQuery;
   return (threadId: ThreadId): Effect.Effect<NeoPiThreadNativeRef> =>
     Effect.gen(function* () {
+      if (Option.isNone(yield* snapshots.getThreadShellById(threadId)))
+        return { status: "unavailable" as const, reason: "This thread does not exist." };
       const binding = yield* readBinding(threadId);
       if (binding.status !== "available") return binding;
       return {
@@ -160,9 +166,9 @@ export const makeNeoPiThreadNativeRef = Effect.fn("NeoPiNativeOwner.nativeRef")(
           sessionFile: binding.expected.sessionFile,
         },
         sessionId: binding.expected.sessionId,
-        ownedRuntime: binding.source.hasSession
-          ? yield* binding.source.hasSession(threadId)
-          : false,
+        runtime: binding.source.nativeOwner
+          ? ((yield* Effect.scoped(binding.source.nativeOwner(threadId)))?.ownership ?? "none")
+          : "none",
       };
     }).pipe(
       Effect.catch((cause) =>

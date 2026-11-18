@@ -87,16 +87,18 @@ export const NeoPiTreeCancelResult = Schema.Union([
 ]);
 export type NeoPiTreeCancelResult = typeof NeoPiTreeCancelResult.Type;
 /**
- * A thread's canonical native session, from its saved binding. `ownedRuntime` is true while
- * NeoCode's own runtime for the thread is running, so a view that finds no attachable owner
- * can tell a stopped session from one whose control plane is off or unsupported.
+ * A thread's canonical native session, from its saved binding, for an active thread only.
+ * `runtime` is what NeoCode's own runtime for the thread is right now: `gui` when it owns the
+ * session, `terminal` when it attached to a terminal owner, `none` when it is not running. A
+ * view that finds no attachable owner can then tell a stopped session from a NeoCode-owned
+ * one whose control plane is off or unsupported.
  */
 export const NeoPiThreadNativeRef = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("available"),
     ref: NeoPiNativeSessionRef,
     sessionId: Schema.String,
-    ownedRuntime: Schema.Boolean,
+    runtime: Schema.Literals(["gui", "terminal", "none"]),
   }),
   Unavailable,
 ]);

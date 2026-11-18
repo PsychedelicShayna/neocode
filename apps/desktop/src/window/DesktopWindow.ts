@@ -30,7 +30,7 @@ import * as PreviewManager from "../preview/Manager.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopClientSettings from "../settings/DesktopClientSettings.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
-import { makeQuitShortcutHandler } from "./QuitHold.ts";
+import { makeQuitShortcutHandler, type QuitHoldKeyInput } from "./QuitHold.ts";
 
 const TITLEBAR_HEIGHT = 40;
 // Windows draws its caption buttons 32 points tall at 100% scale; an overlay
@@ -318,6 +318,53 @@ export function concealPendingQuitWindow(
   // Electron implements window opacity on macOS and Windows. Linux keeps the
   // release-gated quit behavior but cannot make the pending window disappear.
   window.setOpacity(0);
+}
+
+/**
+ * Whether a focused terminal input owns every key in this window. On Linux
+ * and Windows the shell's Ctrl chords (Ctrl+Q quit, Ctrl+W close, the menu
+ * accelerators) are also the program's own keys, so the shell steps aside.
+ * macOS terminals never receive Cmd chords, so the shell keeps them there.
+ */
+export function terminalOwnsWindowKeys(
+  platform: NodeJS.Platform,
+  terminalInputFocused: boolean,
+): boolean {
+  return terminalInputFocused && platform !== "darwin";
+}
+
+/** What the shell does with a key in before-input-event, ahead of the page. */
+export function resolveShellKeyHandling(
+  input: QuitHoldKeyInput,
+  context: { readonly platform: NodeJS.Platform; readonly terminalInputFocused: boolean },
+): { readonly quitShortcut: boolean; readonly drop: boolean } {
+  if (terminalOwnsWindowKeys(context.platform, context.terminalInputFocused)) {
+    return { quitShortcut: false, drop: false };
+  }
+  // Electron's windowMenu close role owns CmdOrCtrl+W. Holding the
+  // close-terminal shortcut can outlive the terminal that handled its first
+  // press, so repeats are dropped before they reach the native accelerator.
+  const modifier = context.platform === "darwin" ? input.meta : input.control;
+  return {
+    quitShortcut: true,
+    drop:
+      input.type === "keyDown" &&
+      input.isAutoRepeat &&
+      modifier &&
+      !input.alt &&
+      !input.shift &&
+      input.key.toLowerCase() === "w",
+  };
+}
+
+const terminalInputFocusSetters = new WeakMap<Electron.WebContents, (focused: boolean) => void>();
+
+/**
+ * Records the renderer's report that a terminal input in this window gained
+ * or lost focus. Contents that are not a main window's own page are ignored.
+ */
+export function setTerminalInputFocused(contents: Electron.WebContents, focused: boolean): void {
+  terminalInputFocusSetters.get(contents)?.(focused);
 }
 
 function getWindowTitleBarOptions(
@@ -699,10 +746,23 @@ export const make = Effect.gen(function* () {
       }
     });
 
-    // Electron's windowMenu close role owns CmdOrCtrl+W. Holding the
-    // close-terminal shortcut can outlive the terminal that handled its first
-    // press, so reject repeats before they reach the native window accelerator.
-    // Deliberate presses still flow through the renderer or native menu.
+    // The renderer reports when a terminal input gains or loses focus. Every
+    // way its page can go away (reload, navigation, crash) clears the report,
+    // so the shell never stays stepped aside for a terminal that is gone.
+    let terminalInputFocused = false;
+    const setWindowTerminalInputFocused = (focused: boolean) => {
+      if (terminalInputFocused === focused || window.isDestroyed()) return;
+      terminalInputFocused = focused;
+      // The terminal consumes every key it encodes, which already keeps those
+      // from the menu. Keys it leaves unconsumed (IME composition, AltGr text)
+      // must not fall through to a menu accelerator such as Quit either.
+      window.webContents.setIgnoreMenuShortcuts(
+        terminalOwnsWindowKeys(environment.platform, focused),
+      );
+    };
+    terminalInputFocusSetters.set(window.webContents, setWindowTerminalInputFocused);
+    window.webContents.on("did-navigate", () => setWindowTerminalInputFocused(false));
+
     // Intercept the quit accelerator before the native menu sees it and apply
     // the configured direct, hold, or double-press behavior.
     const quitShortcutHandler = makeQuitShortcutHandler({
@@ -730,12 +790,12 @@ export const make = Effect.gen(function* () {
       },
     });
     window.webContents.on("before-input-event", (event, input) => {
-      quitShortcutHandler(event, input);
-      if (input.type !== "keyDown" || !input.isAutoRepeat) return;
-      const modifier = environment.platform === "darwin" ? input.meta : input.control;
-      if (modifier && !input.alt && !input.shift && input.key.toLowerCase() === "w") {
-        event.preventDefault();
-      }
+      const handling = resolveShellKeyHandling(input, {
+        platform: environment.platform,
+        terminalInputFocused,
+      });
+      if (handling.quitShortcut) quitShortcutHandler(event, input);
+      if (handling.drop) event.preventDefault();
     });
     window.webContents.on("input-event", (_event, input) => {
       if (input.type === "gestureScrollEnd") window.webContents.send(TRACKPAD_SCROLL_END_CHANNEL);
@@ -851,6 +911,7 @@ export const make = Effect.gen(function* () {
       },
     );
     window.webContents.on("render-process-gone", (_event, details) => {
+      setWindowTerminalInputFocused(false);
       const recoverable =
         details.reason === "crashed" ||
         details.reason === "oom" ||

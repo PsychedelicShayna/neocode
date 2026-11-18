@@ -85,9 +85,8 @@ import {
   resolveNativeLive,
 } from "./NeoPiNativeLiveness.ts";
 import { NeoPiNativeProjection, type NeoPiNativeRequestMark } from "./NeoPiNativeProjection.ts";
-import { readNeoPiNativeObservation } from "./NeoPiNativeCursor.ts";
+import { readNeoPiNativeObservation, sameObservationDomain } from "./NeoPiNativeCursor.ts";
 import { observeNeoPiJournalEntry, observeNeoPiMessage } from "./NeoPiStopOutcome.ts";
-import { isNeoPiNativeIdle, NEOPI_NATIVE_IDLE_DEBOUNCE_MS } from "./NeoPiNativeIdle.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import {
   neoPiSessionCatalogSource,
@@ -153,6 +152,10 @@ const TERMINAL_POLL_INTERVAL = Duration.seconds(5);
 /** Build retries are bounded in rate and never terminal (C3.5). */
 const BUILD_RETRY_MIN_MS = 250;
 const BUILD_RETRY_MAX_MS = 5_000;
+/** One attach-only discovery attempt; past it the authority is unresolved and attach is retried. */
+const DISCOVERY_TIMEOUT = Duration.seconds(10);
+const DISCOVERY_RETRY_MIN_MS = 1_000;
+const DISCOVERY_RETRY_MAX_MS = 30_000;
 /**
  * Essential envelopes outstanding per lease. The client's RPC stream queue holds
  * 16 chunks; staying below it means its socket reader never waits on this stream.
@@ -310,6 +313,10 @@ interface NativeSession {
   /** Reads owed after frames that change `get_state`, jobs or the roster. */
   readonly refreshes: Set<NativeRefresh>;
   refreshing: boolean;
+  /** The subagent level last settled on the native peer, and under which owner epoch. */
+  subagentLevel: { readonly epoch: number; readonly level: SubagentLevel } | null;
+  /** The demand actor is applying a level. */
+  demanding: boolean;
   readonly pendingUi: Map<string, SessionEventFrame>;
   readonly modelChanges: PubSub.PubSub<void>;
   readonly modelUi: PubSub.PubSub<UiRequestFrame>;
@@ -320,14 +327,8 @@ interface NativeSession {
   cwdFile: string;
   state: Record<string, unknown>;
   closed: boolean;
-  /** Open `watch` streams on this connection. */
-  observers: number;
   /** A turn is in flight, from `agent_start`/`agent_end` frames and `get_state`. */
   busy: boolean;
-  /** Open UI subscriptions and in-flight client operations share the same retention lease. */
-  leases: number;
-  activityRevision: number;
-  idleSince: number;
   /** Set while the terminal owner is gone and its successor is awaited; requests wait on it. */
   recovery: Deferred.Deferred<void, NeoPiNativeSessionsError> | null;
   /** A prompt is waiting: when the grace period ends, start an owner instead of closing. */
@@ -338,10 +339,18 @@ interface NativeMarkers {
   last: { readonly sessionId: string; readonly sessionFile: string } | null;
 }
 type NativeRefresh = "state" | "jobs" | "roster";
+/** NeoPi's per-connection subagent subscription: none, lifecycle and progress, or also every child step. */
+type SubagentLevel = "off" | "progress" | "events";
+const SUBAGENT_LEVEL_RANK: Readonly<Record<SubagentLevel, number>> = {
+  off: 0,
+  progress: 1,
+  events: 2,
+};
 /** One `watch` stream: the lease (C4) and its essential outbox (C2). */
 interface Observation {
   readonly leaseId: string;
-  readonly session: NativeSession;
+  /** Null while attach-only discovery is still looking for the session's owner. */
+  session: NativeSession | null;
   /** Unsent envelopes, coalesced by kind, so their count is bounded by open obligations. */
   readonly outbox: NeoPiNativeEssentialEnvelope[];
   sent: number;
@@ -352,10 +361,16 @@ interface Observation {
   wake: (() => void) | null;
   /** Highest `readId` admitted. */
   readId: number;
-  /** Ends the read currently waiting on this lease. */
-  interrupt: ((why: "superseded" | "released") => void) | null;
+  /** The inbox position the client acknowledged with its last read; pruning waits for every lease. */
+  inboxSeq: number;
+  /** Ends or re-checks the read currently waiting on this lease. */
+  interrupt: ((why: "changed" | "superseded" | "released") => void) | null;
   released: boolean;
-  demand: { readonly generation: number; readonly payload: string } | null;
+  demand: {
+    readonly generation: number;
+    readonly payload: string;
+    readonly level: SubagentLevel;
+  } | null;
 }
 
 /** One owner/control connection per canonical native file, never per browser subscription. */
@@ -378,23 +393,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     gates.set(file, winner);
     return winner;
   });
-  const touch = (session: NativeSession) => {
-    session.activityRevision++;
-    session.idleSince = clock.currentTimeMillisUnsafe();
-  };
+  /**
+   * Nothing retires an owner automatically in stage one (decision 4, r12 I4(4): no
+   * NeoPi offers conditional retirement), so a session needs no retention count;
+   * work against a closed one is refused.
+   */
   const retain = (session: NativeSession) =>
-    Effect.acquireRelease(
-      Effect.gen(function* () {
-        if (session.closed) return yield* fail("This native connection is closed.", "closed");
-        session.leases++;
-        touch(session);
-      }),
-      () =>
-        Effect.sync(() => {
-          session.leases--;
-          touch(session);
-        }),
-    );
+    session.closed ? Effect.fail(fail("This native connection is closed.", "closed")) : Effect.void;
   /** Every live lease on this server, by id. */
   const observations = new Map<string, Observation>();
   /** Names this server instance in every cursor it issues (C2 identity domains). */
@@ -735,6 +740,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             if (session.closed) return;
             if (!session.projection.published) return ensureBuild(session);
             broadcast(session, lifecycle(session, "observing"));
+            // Reads owed while building (a raised subagent level) run now.
+            startRefresh(session);
             notifyChanged(session);
           }),
         ),
@@ -780,9 +787,69 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     session.refreshes.add(kind);
     startRefresh(session);
   };
+  /** The child level the leases of a session ask for: the most any one of them wants. */
+  const demandedLevel = (session: NativeSession): SubagentLevel => {
+    let level: SubagentLevel = "off";
+    for (const observation of session.observations) {
+      const wanted = observation.demand?.level ?? "off";
+      if (SUBAGENT_LEVEL_RANK[wanted] > SUBAGENT_LEVEL_RANK[level]) level = wanted;
+    }
+    return level;
+  };
+  /**
+   * The demand actor (C4): one serialized applier per session that keeps NeoPi's
+   * subagent subscription at the aggregate the leases demand, fenced by owner epoch.
+   * A level is settled once per epoch and value: a peer that refuses it is not asked
+   * again until the demand or the owner changes. Raising the level re-reads the
+   * roster, because children that changed while it was lower sent nothing.
+   */
+  const applyDemand = (session: NativeSession) => {
+    if (session.demanding || session.closed || session.recovery) return;
+    // A fresh connection is at `off`, so only a different aggregate needs applying.
+    const settled = session.subagentLevel;
+    const epoch = session.projection.domain.ownerEpoch;
+    const held = settled?.epoch === epoch ? settled.level : "off";
+    if (held === demandedLevel(session)) return;
+    session.demanding = true;
+    spawnIn(
+      session,
+      Effect.gen(function* () {
+        const epoch = session.projection.domain.ownerEpoch;
+        const level = demandedLevel(session);
+        const native = session.native;
+        const before = session.subagentLevel?.epoch === epoch ? session.subagentLevel.level : "off";
+        const applied = yield* native.client
+          .request({ type: "set_subagent_subscription", level })
+          .pipe(Effect.result);
+        // A reply from a replaced connection or an earlier epoch changes nothing.
+        if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
+        session.subagentLevel = { epoch, level };
+        // A build in progress may have read the roster before the level rose: the re-read
+        // is owed and runs once the projection publishes.
+        if (
+          applied._tag === "Success" &&
+          SUBAGENT_LEVEL_RANK[level] > SUBAGENT_LEVEL_RANK[before]
+        ) {
+          session.refreshes.add("roster");
+          if (session.projection.published) startRefresh(session);
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            session.demanding = false;
+            applyDemand(session);
+          }),
+        ),
+      ),
+    );
+  };
   const create = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
     input: NeoPiNativeSessionsOpenInput,
+    /** `attach` joins a live owner only; automatic recovery never starts one (I4(1)). */
+    mode: "auto" | "attach" = "auto",
+    /** Discovery connects outside the per-file gate and installs its result under it (C5). */
+    installUnder?: Semaphore.Semaphore,
   ) {
     const scope = yield* Scope.fork(lifetime);
     const pendingUi = new Map<string, SessionEventFrame>();
@@ -820,6 +887,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         if (session) ensureBuild(session);
       },
     });
+    // Decision 8 (a): no lease yet, so live-only inbox records are not retained.
+    projection.setInboxObserved(false);
     /** Adopts a file the owner moved to; a real identity change ends every lease (I3). */
     const followIdentity = (
       current: NativeSession,
@@ -900,7 +969,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const fence = projection.fold(folded);
         const current = session;
         if (!current || current.closed) return;
-        touch(current);
         if (frame.type === "agent_start") current.busy = true;
         else if (frame.type === "agent_end") current.busy = false;
         if (identityFrame && (unseenFile || identityFrame.sessionId !== current.sessionId))
@@ -997,7 +1065,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             ? next.state
             : { ...next.state, sessionFile: next.file };
         current.busy = next.state.isStreaming === true;
-        touch(current);
         return next.native;
       }).pipe(Effect.onError(() => Scope.close(next.nativeScope, Exit.void)));
     });
@@ -1053,6 +1120,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       yield* watchExit(current, successor);
       broadcast(current, sessionEnvelope(current));
       ensureBuild(current);
+      // The new connection starts at `off`: the aggregate demand is applied to it again (C4).
+      applyDemand(current);
       notifyChanged(current);
       yield* PubSub.publish(modelChanges, undefined);
     });
@@ -1074,67 +1143,69 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         Effect.asVoid,
       );
     return yield* Effect.gen(function* () {
-      const { native, nativeScope, state, identity, file } = yield* establish(input, "auto");
-      if (sessions.has(file))
-        return yield* fail(
-          "The native file already has a canonical connection.",
-          "identity_conflict",
+      const { native, nativeScope, state, identity, file } = yield* establish(input, mode);
+      const install = Effect.gen(function* () {
+        // A late discovery never replaces an authority installed meanwhile.
+        if (sessions.has(file))
+          return yield* fail(
+            "The native file already has a canonical connection.",
+            "identity_conflict",
+          );
+        if (!files.has(identity.sessionFile)) files.set(identity.sessionFile, file);
+        session = {
+          profile,
+          native,
+          nativeScope,
+          scope,
+          projection,
+          observations,
+          changed: new Set(),
+          markers,
+          files,
+          building: false,
+          attempt: null,
+          statusKey: "",
+          refreshes: new Set(),
+          refreshing: false,
+          pendingUi,
+          modelChanges,
+          modelUi,
+          state: state.sessionFile === file ? state : { ...state, sessionFile: file },
+          openedAt: DateTime.formatIso(yield* DateTime.now),
+          ref: { providerInstanceId: profile.providerInstanceId, sessionFile: file },
+          sessionId: identity.sessionId,
+          cwd: native.cwd,
+          cwdFile: file,
+          closed: false,
+          busy: state.isStreaming === true,
+          subagentLevel: null,
+          demanding: false,
+          recovery: null,
+          takeoverRequested: false,
+        };
+        const current = session;
+        sessions.set(file, current);
+        yield* Effect.addFinalizer(() => finish(current, "The native connection was closed.")).pipe(
+          Effect.provideService(Scope.Scope, scope),
         );
-      if (!files.has(identity.sessionFile)) files.set(identity.sessionFile, file);
-      session = {
-        profile,
-        native,
-        nativeScope,
-        scope,
-        projection,
-        observations,
-        changed: new Set(),
-        markers,
-        files,
-        building: false,
-        attempt: null,
-        statusKey: "",
-        refreshes: new Set(),
-        refreshing: false,
-        pendingUi,
-        modelChanges,
-        modelUi,
-        state: state.sessionFile === file ? state : { ...state, sessionFile: file },
-        openedAt: DateTime.formatIso(yield* DateTime.now),
-        ref: { providerInstanceId: profile.providerInstanceId, sessionFile: file },
-        sessionId: identity.sessionId,
-        cwd: native.cwd,
-        cwdFile: file,
-        closed: false,
-        observers: 0,
-        busy: state.isStreaming === true,
-        leases: 0,
-        activityRevision: 0,
-        idleSince: clock.currentTimeMillisUnsafe(),
-        recovery: null,
-        takeoverRequested: false,
-      };
-      const current = session;
-      sessions.set(file, current);
-      yield* Effect.addFinalizer(() => finish(current, "The native connection was closed.")).pipe(
-        Effect.provideService(Scope.Scope, scope),
-      );
-      yield* native.hostTools?.bind(current.ref) ?? Effect.void;
-      yield* watchExit(current, native);
-      // An observed terminal owner's telemetry changes elsewhere without frames here.
-      yield* Effect.sleep(TERMINAL_POLL_INTERVAL).pipe(
-        Effect.andThen(
-          Effect.sync(() => {
-            if (current.native.attachment !== "terminal") return;
-            requestRefresh(current, "state");
-            requestRefresh(current, "jobs");
-            requestRefresh(current, "roster");
-          }),
-        ),
-        Effect.forever,
-        Effect.forkIn(scope),
-      );
-      return current;
+        yield* native.hostTools?.bind(current.ref) ?? Effect.void;
+        yield* watchExit(current, native);
+        // An observed terminal owner's telemetry changes elsewhere without frames here.
+        yield* Effect.sleep(TERMINAL_POLL_INTERVAL).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              if (current.native.attachment !== "terminal") return;
+              requestRefresh(current, "state");
+              requestRefresh(current, "jobs");
+              requestRefresh(current, "roster");
+            }),
+          ),
+          Effect.forever,
+          Effect.forkIn(scope),
+        );
+        return current;
+      });
+      return yield* installUnder ? installUnder.withPermits(1)(install) : install;
     }).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
   });
   const open = (
@@ -1397,6 +1468,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           "Native host tools are server-owned; clients cannot replace registrations or supply results.",
           "host_tools_server_owned",
         );
+      // The build is the only sender of `snapshot_session_journal` on this connection
+      // (its marker rule, C3.1), and the demand actor the only one of the child level.
+      if (
+        command.type === "snapshot_session_journal" ||
+        command.type === "set_subagent_subscription"
+      )
+        return yield* fail(
+          "This command is issued by the server's observation, not by clients.",
+          "observation_server_owned",
+        );
       yield* verifyRef(session, input.ref);
       const preparedCommand = yield* dependencies.preparePrompt(input);
       // UI and approval answers are one-way side channels, never correlated RPC requests.
@@ -1492,14 +1573,32 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       return result ?? null;
     }).pipe(Effect.scoped, Effect.mapError(nativeError));
   const request = (input: NeoPiNativeSessionsRequestInput) => requestNative(input);
-  /** Ends a lease exactly once: its read is cancelled and later calls with its id fail. */
+  /** Inbox records every live lease of a session has acknowledged are dropped (decision 8 (b)). */
+  const pruneAcknowledged = (session: NativeSession) => {
+    let through = Number.POSITIVE_INFINITY;
+    for (const observation of session.observations)
+      through = Math.min(through, observation.inboxSeq);
+    if (Number.isFinite(through)) session.projection.pruneInbox(through);
+  };
+  /**
+   * Ends a lease exactly once (C4): its read is cancelled, later calls with its id
+   * fail, its share of the demand is withdrawn, and when it was the session's last
+   * lease the live-only inbox stops retaining (decision 8 (a)).
+   */
   const release = (observation: Observation) => {
     if (observation.released) return;
     observation.released = true;
-    observation.session.observations.delete(observation);
     observations.delete(observation.leaseId);
-    observation.session.projection.store.endTransfer(observation.leaseId);
+    const session = observation.session;
+    if (session) {
+      session.observations.delete(observation);
+      session.projection.store.endTransfer(observation.leaseId);
+      if (session.observations.size === 0) session.projection.setInboxObserved(false);
+      else pruneAcknowledged(session);
+      applyDemand(session);
+    }
     observation.interrupt?.("released");
+    observation.wake?.();
   };
   /**
    * The next chunk of a lease's essential stream: as many queued envelopes as its
@@ -1540,34 +1639,176 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       ),
     );
   /**
-   * The essential stream (C2). It is the lease (C4): `leased` comes first, then what
-   * `open` would describe, identity, lifecycle, status and every open obligation;
-   * after that, changes as they happen. Bulk state is pulled through `read` with the
-   * lease id. Capacity never ends it (I3); only the lifecycle states that I3 names do.
+   * Joins a lease to a live session under the per-file gate (C4): the session is
+   * re-read and must still be the file's live authority; the lease is counted before
+   * the gate opens. Then it receives what `open` would describe, identity, lifecycle,
+   * status and every open obligation.
+   */
+  const join = (observation: Observation, session: NativeSession, file: string) =>
+    Effect.gen(function* () {
+      return yield* (yield* gate(file)).withPermits(1)(
+        Effect.sync(() => {
+          if (observation.released) return true;
+          if (session.closed || sessions.get(file) !== session) return false;
+          const { projection } = session;
+          enqueue(observation, sessionEnvelope(session));
+          const identity = projection.identity;
+          if (identity?.sessionFile)
+            enqueue(observation, {
+              type: "identity",
+              revision: projection.store.bump(),
+              domain: projection.domain,
+              sessionId: identity.sessionId,
+              sessionFile:
+                identity.sessionId === session.sessionId
+                  ? session.ref.sessionFile
+                  : identity.sessionFile,
+              leafId: identity.leafId,
+            });
+          enqueue(
+            observation,
+            lifecycle(
+              session,
+              session.recovery ? "reconnecting" : projection.published ? "observing" : "building",
+            ),
+          );
+          const live = liveState(session, undefined);
+          if (live)
+            enqueue(observation, { type: "status", revision: projection.store.bump(), live });
+          for (const [id, { revision, request }] of projection.obligations)
+            enqueue(observation, { type: "obligation-opened", revision, id, request });
+          observation.session = session;
+          session.observations.add(observation);
+          if (session.observations.size === 1) {
+            projection.setInboxObserved(true);
+            // Query-backed state went unread while no lease was held; the first lease re-reads it.
+            requestRefresh(session, "state");
+            requestRefresh(session, "jobs");
+            requestRefresh(session, "roster");
+          }
+          ensureBuild(session);
+          applyDemand(session);
+          observation.interrupt?.("changed");
+          return true;
+        }),
+      );
+    });
+  type Discovery =
+    | { readonly outcome: "found" }
+    | {
+        readonly outcome: "owner-stopped" | "incompatible" | "authority-unresolved";
+        readonly reason: string;
+      };
+  interface DiscoveryFlight {
+    readonly result: Deferred.Deferred<Discovery, NeoPiNativeSessionsError>;
+    waiters: number;
+    fiber: Fiber.Fiber<void> | null;
+  }
+  /** Attach-only discovery in flight per file, shared by every lease that waits on it. */
+  const discoveries = new Map<string, DiscoveryFlight>();
+  /**
+   * Attach-only discovery (I4(1), C5): with no session for the file, look for a live
+   * owner and attach to it; never start one. It connects outside the per-file gate
+   * and installs under it, a late result never replaces an authority installed
+   * meanwhile, and when every waiting lease has gone the candidate is closed.
+   */
+  const discover = (profile: NeoPiNativeProfile, file: string) =>
+    Effect.gen(function* () {
+      let flight = discoveries.get(file);
+      if (!flight) {
+        const started: DiscoveryFlight = {
+          result: yield* Deferred.make<Discovery, NeoPiNativeSessionsError>(),
+          waiters: 0,
+          fiber: null,
+        };
+        flight = started;
+        discoveries.set(file, started);
+        const installUnder = yield* gate(file);
+        started.fiber = yield* create(
+          profile,
+          { providerInstanceId: profile.providerInstanceId, sessionFile: file },
+          "attach",
+          installUnder,
+        ).pipe(
+          Effect.timeoutOption(DISCOVERY_TIMEOUT),
+          Effect.map((created): Discovery =>
+            created._tag === "Some"
+              ? { outcome: "found" }
+              : {
+                  outcome: "authority-unresolved",
+                  reason: "No live owner answered in time; only attaching is retried.",
+                },
+          ),
+          Effect.catch((cause) => {
+            const error = nativeError(cause);
+            switch (error.code) {
+              case "identity_conflict":
+                return Effect.succeed<Discovery>({ outcome: "found" });
+              case "no_owner":
+                return Effect.succeed<Discovery>({
+                  outcome: "owner-stopped",
+                  reason: "No NeoPi is running this session now.",
+                });
+              case "owner_outdated":
+              case "unsupported":
+              case "session_in_use":
+                return Effect.succeed<Discovery>({
+                  outcome: "incompatible",
+                  reason: error.message,
+                });
+              case "profile_changed":
+                return Effect.fail(error);
+              default:
+                return Effect.succeed<Discovery>({
+                  outcome: "authority-unresolved",
+                  reason: error.message,
+                });
+            }
+          }),
+          Effect.exit,
+          Effect.flatMap((exit) => Deferred.done(started.result, exit)),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (discoveries.get(file) === started) discoveries.delete(file);
+            }),
+          ),
+          Effect.asVoid,
+          Effect.forkIn(lifetime),
+        );
+      }
+      const joined = flight;
+      joined.waiters++;
+      return yield* Deferred.await(joined.result).pipe(
+        Effect.ensuring(
+          Effect.suspend(() => {
+            joined.waiters--;
+            // The last waiting lease leaving cancels the attempt, which closes its candidate.
+            return joined.waiters === 0 && joined.fiber
+              ? Fiber.interrupt(joined.fiber)
+              : Effect.void;
+          }),
+        ),
+      );
+    });
+  /**
+   * The essential stream (C2). It is the lease (C4): `leased` comes first. With a live
+   * session the lease joins it at once; with none, attach-only discovery finds its
+   * owner, reports that none runs it (owner-stopped) or that it cannot be attached
+   * (incompatible), or keeps retrying attach while reporting authority-unresolved.
+   * Bulk state is pulled through `read`. Capacity never ends it (I3); only the
+   * lifecycle states that I3 names do.
    */
   const watch = (input: {
     ref: NeoPiNativeSessionRef;
   }): Stream.Stream<NeoPiNativeEssentialEnvelope, NeoPiNativeSessionsError> =>
     Stream.unwrap(
       Effect.gen(function* () {
-        const session = yield* requireSession(input.ref);
-        // Watchers share one native peer, so child progress stays subscribed only while at
-        // least one is attached; the last to leave silences it.
-        session.observers += 1;
-        yield* Effect.addFinalizer(() =>
-          Effect.suspend(() => {
-            session.observers -= 1;
-            if (session.observers > 0 || session.closed) return Effect.void;
-            return session.native.client
-              .request({ type: "set_subagent_subscription", level: "off" })
-              .pipe(Effect.timeoutOption("2 seconds"), Effect.ignore);
-          }),
-        );
-        yield* retain(session);
-        const { projection } = session;
+        const file = yield* dependencies.canonicalize(input.ref.sessionFile);
+        const profile = yield* dependencies.profile(input.ref.providerInstanceId);
+        const existing = sessions.get(file);
         const observation: Observation = {
           leaseId: NodeCrypto.randomUUID(),
-          session,
+          session: null,
           outbox: [],
           sent: 0,
           applied: 0,
@@ -1575,6 +1816,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           failure: null,
           wake: null,
           readId: -1,
+          inboxSeq: 0,
           interrupt: null,
           released: false,
           demand: null,
@@ -1582,45 +1824,60 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         enqueue(observation, {
           type: "leased",
           leaseId: observation.leaseId,
-          domain: projection.domain,
+          domain: existing?.projection.domain ?? {
+            serverIncarnation,
+            ownerEpoch: 0,
+            projectionIncarnation: 0,
+            buildAttempt: 0,
+            branchGeneration: 0,
+          },
           creditWindow: CREDIT_WINDOW,
           readDeadlineMs: READ_DEADLINE_MS,
         });
-        enqueue(observation, sessionEnvelope(session));
-        const identity = projection.identity;
-        if (identity?.sessionFile)
-          enqueue(observation, {
-            type: "identity",
-            revision: projection.store.bump(),
-            domain: projection.domain,
-            sessionId: identity.sessionId,
-            sessionFile:
-              identity.sessionId === session.sessionId
-                ? session.ref.sessionFile
-                : identity.sessionFile,
-            leafId: identity.leafId,
-          });
-        enqueue(
-          observation,
-          lifecycle(
-            session,
-            session.recovery ? "reconnecting" : projection.published ? "observing" : "building",
-          ),
-        );
-        const live = liveState(session, undefined);
-        if (live) enqueue(observation, { type: "status", revision: projection.store.bump(), live });
-        for (const [id, { revision, request }] of projection.obligations)
-          enqueue(observation, { type: "obligation-opened", revision, id, request });
-        session.observations.add(observation);
         observations.set(observation.leaseId, observation);
         yield* Effect.addFinalizer(() => Effect.sync(() => release(observation)));
-        ensureBuild(session);
-        // Query-backed state went unread while no lease was held; the first lease re-reads it.
-        if (session.observations.size === 1) {
-          requestRefresh(session, "state");
-          requestRefresh(session, "jobs");
-          requestRefresh(session, "roster");
-        }
+        /** A lifecycle before any session exists carries no projection revision. */
+        const report = (state: NeoPiNativeObservationLifecycle, reason: string) =>
+          enqueue(observation, { type: "lifecycle", revision: 0, state, reason });
+        const acquire = Effect.gen(function* () {
+          let delayMs = DISCOVERY_RETRY_MIN_MS;
+          let unresolved = false;
+          while (!observation.released) {
+            const session = sessions.get(file);
+            if (session && !session.closed) {
+              if (session.profile.providerInstanceId !== input.ref.providerInstanceId)
+                return yield* fail(
+                  "This native file is already connected through a different configured instance. Use that instance or close it explicitly.",
+                  "profile_conflict",
+                );
+              yield* session.profile.validate;
+              if (yield* join(observation, session, file)) return;
+              continue;
+            }
+            const found = yield* discover(profile, file);
+            if (found.outcome === "found") continue;
+            if (found.outcome !== "authority-unresolved")
+              return report(found.outcome, found.reason);
+            if (!unresolved) report(found.outcome, found.reason);
+            unresolved = true;
+            yield* Effect.sleep(Duration.millis(delayMs));
+            delayMs = Math.min(delayMs * 2, DISCOVERY_RETRY_MAX_MS);
+          }
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.sync(() => {
+              observation.failure = nativeError(cause);
+              observation.wake?.();
+            }),
+          ),
+        );
+        // A live session is joined before the stream is returned; only discovery is deferred.
+        const live = existing && !existing.closed ? existing : undefined;
+        const joined =
+          live && live.profile.providerInstanceId === input.ref.providerInstanceId
+            ? yield* join(observation, live, file).pipe(Effect.orElseSucceed(() => false))
+            : false;
+        if (!joined) yield* Effect.forkScoped(acquire);
         return Stream.fromPull(Effect.succeed(pullEnvelopes(observation)));
       }),
     ).pipe(Stream.mapError(nativeError), Stream.scoped);
@@ -1654,27 +1911,38 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         );
       observation.readId = input.readId;
       observation.interrupt?.("superseded");
-      const { session } = observation;
       const deadline = clock.currentTimeMillisUnsafe() + READ_DEADLINE_MS;
       while (true) {
-        const result = readNeoPiNativeObservation(
-          session.projection,
-          input.cursor,
-          READ_LIMITS,
-          observation.leaseId,
-        );
+        const { session } = observation;
+        const result = session
+          ? readNeoPiNativeObservation(
+              session.projection,
+              input.cursor,
+              READ_LIMITS,
+              observation.leaseId,
+            )
+          : ({ type: "building" } as const);
+        // The cursor's inbox position is the client's acknowledgement of what it holds.
+        if (
+          session &&
+          input.cursor &&
+          sameObservationDomain(input.cursor.epoch, session.projection.domain)
+        ) {
+          observation.inboxSeq = Math.max(observation.inboxSeq, input.cursor.inboxSeq);
+          pruneAcknowledged(session);
+        }
         const remaining = deadline - clock.currentTimeMillisUnsafe();
         if (result.type === "pass" || remaining <= 0) return result;
         let wake: (() => void) | undefined;
         const woken = yield* Effect.callback<"changed" | "superseded" | "released">((resume) => {
           wake = () => resume(Effect.succeed("changed"));
-          session.changed.add(wake);
+          session?.changed.add(wake);
           observation.interrupt = (why) => resume(Effect.succeed(why));
         }).pipe(
           Effect.timeoutOption(Duration.millis(remaining)),
           Effect.ensuring(
             Effect.sync(() => {
-              if (wake) session.changed.delete(wake);
+              if (wake) session?.changed.delete(wake);
               observation.interrupt = null;
             }),
           ),
@@ -1703,9 +1971,20 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }),
     );
   /**
+   * The level of NeoPi's child subscription a demand needs: a roster view wants child
+   * lifecycle and progress; a child's own view wants its settled steps too; summary and
+   * transcript need no child traffic.
+   */
+  const levelOf = (demand: NeoPiNativeSessionsSetDemandInput["demand"]): SubagentLevel =>
+    demand.some((item) => item.kind === "child")
+      ? "events"
+      : demand.some((item) => item.kind === "roster")
+        ? "progress"
+        : "off";
+  /**
    * Records a lease's demand under C4's generation rules: lower is stale, the same
    * payload again is unchanged, a different payload at the same generation conflicts.
-   * Applying the aggregate to the native peer belongs to the demand actor (B5).
+   * The demand actor then applies the aggregate over every lease of the session.
    */
   const setDemand = (
     input: NeoPiNativeSessionsSetDemandInput,
@@ -1728,7 +2007,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           NEOPI_NATIVE_OBSERVATION_ERROR_CODES.demandConflict,
         );
       }
-      observation.demand = { generation: input.generation, payload };
+      observation.demand = { generation: input.generation, payload, level: levelOf(input.demand) };
+      if (observation.session) applyDemand(observation.session);
       return { outcome: "applied" as const };
     });
   const close = (input: {
@@ -1821,54 +2101,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         ),
       ),
     ).pipe(Effect.forkIn(lifetime));
-  // Clients retain their observation for five minutes after the last view unmounts.
-  // That is the warm-switch grace; after its final lease leaves, only this short
-  // debounce remains. Do not add a second five-minute server retention window.
-  const reapIdleOwners = Effect.gen(function* () {
-    const unobserved = (session: NativeSession) =>
-      !session.closed &&
-      session.native.attachment === "owned" &&
-      session.recovery === null &&
-      session.leases === 0 &&
-      !session.busy &&
-      session.pendingUi.size === 0;
-    yield* Effect.forEach(
-      Array.from(sessions.values()),
-      (session) =>
-        Effect.gen(function* () {
-          if (!unobserved(session)) {
-            touch(session);
-            return;
-          }
-          if (clock.currentTimeMillisUnsafe() - session.idleSince < NEOPI_NATIVE_IDLE_DEBOUNCE_MS)
-            return;
-          const native = session.native;
-          const revision = session.activityRevision;
-          if (!(yield* isNeoPiNativeIdle(native.client))) {
-            touch(session);
-            return;
-          }
-          yield* (yield* gate(session.ref.sessionFile)).withPermits(1)(
-            Effect.gen(function* () {
-              // An observer, command, event or reconnect invalidates an in-flight inventory.
-              if (
-                !unobserved(session) ||
-                session.native !== native ||
-                session.activityRevision !== revision
-              )
-                return;
-              yield* finish(session, "The unobserved native owner was idle and has been released.");
-              // Its transport closes stdin, awaits EOF exit, then escalates to TERM if needed.
-              yield* Scope.close(session.scope, Exit.void);
-            }),
-          );
-        }),
-      { concurrency: 4, discard: true },
-    );
-  });
-  yield* Effect.forever(
-    Effect.sleep(NEOPI_NATIVE_IDLE_DEBOUNCE_MS).pipe(Effect.andThen(reapIdleOwners)),
-  ).pipe(Effect.forkIn(lifetime));
   return {
     list,
     open,

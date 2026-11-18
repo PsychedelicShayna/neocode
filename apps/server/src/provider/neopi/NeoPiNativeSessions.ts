@@ -25,6 +25,7 @@ import {
   type NeoPiNativeSessionsSetDemandResult,
   type NeoPiNativeSessionsSetSettledInput,
   type NeoPiNativeSessionsSetSettledResult,
+  type NeoPiNativeSessionsWatchInput,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
@@ -398,6 +399,11 @@ interface NativeSession {
   recovery: Deferred.Deferred<void, NeoPiNativeSessionsError> | null;
   /** A prompt is waiting: when the grace period ends, start an owner instead of closing. */
   takeoverRequested: boolean;
+  /**
+   * Set by an explicit open or a session-purpose lease, never by a thread lease: host
+   * tools are registered with the owner only once something wants them.
+   */
+  hostToolsWanted: boolean;
 }
 interface NativeMarkers {
   count: number;
@@ -635,7 +641,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     session.state = { ...session.state, sessionId, sessionFile };
     session.sessionId = sessionId;
     sessions.set(sessionFile, session);
-    yield* session.native.hostTools?.bind(session.ref) ?? Effect.void;
+    if (session.hostToolsWanted) yield* session.native.hostTools?.bind(session.ref) ?? Effect.void;
     yield* PubSub.publish(session.modelChanges, undefined);
   });
   const describe = (session: NativeSession): NeoPiNativeSessionsOpenResult => ({
@@ -1417,7 +1423,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             "The native owner opened a different session file.",
             "session_changed",
           );
-        yield* next.native.hostTools?.bind(current.ref) ?? Effect.void;
+        if (current.hostToolsWanted) yield* next.native.hostTools?.bind(current.ref) ?? Effect.void;
         current.native = next.native;
         current.nativeScope = next.nativeScope;
         current.sessionId = next.identity.sessionId;
@@ -1576,13 +1582,14 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           unwatchedSince: null,
           recovery: null,
           takeoverRequested: false,
+          hostToolsWanted: mode === "auto",
         };
         const current = session;
         sessions.set(file, current);
         yield* Effect.addFinalizer(() => finish(current, "The native connection was closed.")).pipe(
           Effect.provideService(Scope.Scope, scope),
         );
-        yield* native.hostTools?.bind(current.ref) ?? Effect.void;
+        if (current.hostToolsWanted) yield* native.hostTools?.bind(current.ref) ?? Effect.void;
         yield* watchExit(current, native);
         // An observed terminal owner's telemetry changes elsewhere without frames here.
         yield* Effect.sleep(TERMINAL_POLL_INTERVAL).pipe(
@@ -1602,6 +1609,23 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       return yield* installUnder ? installUnder.withPermits(1)(install) : install;
     }).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
   });
+  /**
+   * Registers host tools with the owner the first time an explicit open or a
+   * session lease wants them. During recovery the successor's adoption binds them.
+   */
+  const wantHostTools = (session: NativeSession) =>
+    Effect.suspend(() => {
+      if (session.hostToolsWanted || session.closed) return Effect.void;
+      session.hostToolsWanted = true;
+      if (session.recovery) return Effect.void;
+      return (session.native.hostTools?.bind(session.ref) ?? Effect.void).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            session.hostToolsWanted = false;
+          }),
+        ),
+      );
+    });
   const open = (
     input: NeoPiNativeSessionsOpenInput,
   ): Effect.Effect<NeoPiNativeSessionsOpenResult, NeoPiNativeSessionsError> =>
@@ -1627,6 +1651,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               sessionFile: file,
             });
             yield* retain(current);
+            yield* wantHostTools(current);
             yield* refreshCwd(current);
             const result = current.pendingUi.size > 0 ? describe(current) : yield* refresh(current);
             yield* verifyRef(current, {
@@ -2235,7 +2260,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    * lifecycle states that I3 names do.
    */
   const watch = (
-    input: { ref: NeoPiNativeSessionRef },
+    input: NeoPiNativeSessionsWatchInput,
     /** The connection opening this watch; the lease belongs to it alone. */
     owner: string,
   ): Stream.Stream<NeoPiNativeEssentialEnvelope, NeoPiNativeSessionsError> =>
@@ -2280,6 +2305,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         /** A lifecycle before any session exists carries no projection revision. */
         const report = (state: NeoPiNativeObservationLifecycle, reason: string) =>
           enqueue(observation, { type: "lifecycle", revision: 0, state, reason });
+        // A thread view only reads; it never registers host tools with the owner.
+        const wantsHostTools = (session: NativeSession) =>
+          input.purpose === "thread" ? Effect.void : wantHostTools(session);
         const acquire = Effect.gen(function* () {
           let delayMs = DISCOVERY_RETRY_MIN_MS;
           let unresolved = false;
@@ -2292,7 +2320,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                   "profile_conflict",
                 );
               yield* session.profile.validate;
-              if (yield* join(observation, session, file)) return;
+              if (yield* join(observation, session, file)) return yield* wantsHostTools(session);
               continue;
             }
             const found = yield* discover(profile, file);
@@ -2322,7 +2350,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           live && live.profile.providerInstanceId === input.ref.providerInstanceId
             ? yield* join(observation, live, file).pipe(Effect.orElseSucceed(() => false))
             : false;
-        if (!joined) yield* Effect.forkScoped(acquire);
+        if (joined && live) yield* wantsHostTools(live);
+        else yield* Effect.forkScoped(acquire);
         return Stream.fromPull(Effect.succeed(pullEnvelopes(observation)));
       }),
     ).pipe(Stream.mapError(nativeError), Stream.scoped);

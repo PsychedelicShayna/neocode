@@ -91,6 +91,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       refuseLevels: false,
       /** `get_entries_page` requests the owner received. */
       pages: 0,
+      /** Host-tool registrations (`set_host_tools`) sent to the owner. */
+      binds: 0,
       /** Runs inside `connect` once the connection exists (and its finalizer is registered). */
       connectHook: Effect.void as Effect.Effect<void>,
       /** Makes every connect fail with this error. */
@@ -324,6 +326,13 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
             readState: Effect.suspend(() => native.stateHook).pipe(
               Effect.andThen(Effect.sync(state)),
             ),
+            hostTools: {
+              bind: () =>
+                Effect.sync(() => {
+                  native.binds++;
+                }),
+              revoke: Effect.void,
+            },
           };
         }),
     };
@@ -343,6 +352,7 @@ const follow = Effect.fnUntraced(function* (
   service: Service,
   ref: NeoPiNativeSessionRef,
   client: string = testClient,
+  purpose?: "session" | "thread",
 ) {
   // `ended` marks the watch stream finishing, so a test waiting on an envelope fails instead of hanging.
   const envelopes = yield* Queue.unbounded<Envelope | { readonly type: "ended" }>();
@@ -350,7 +360,7 @@ const follow = Effect.fnUntraced(function* (
   let applied = 0;
   /** Every envelope delivered so far, in order. */
   const seen: Envelope[] = [];
-  const fiber = yield* service.watch({ ref }, client).pipe(
+  const fiber = yield* service.watch({ ref, ...(purpose ? { purpose } : {}) }, client).pipe(
     Stream.runForEach((envelope) =>
       Effect.gen(function* () {
         if (envelope.type === "leased") yield* Deferred.succeed(leased, envelope.leaseId);
@@ -3141,6 +3151,35 @@ describe("attach-only discovery (r12 C5)", () => {
         assert.equal(native.starts, 1);
         assert.equal(native.connections, 1);
       }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a thread view registers no host tools with the owner, across a refresh; a session view or open does",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        const thread = yield* follow(service, originalRef, testClient, "thread");
+        yield* thread.next("lifecycle", observing);
+        yield* Fiber.interrupt(thread.fiber);
+        const again = yield* follow(service, originalRef, testClient, "thread");
+        yield* again.next("lifecycle", observing);
+        assert.equal(native.binds, 0);
+        assert.deepEqual(native.levels, []);
+        // A session view joining the same attached session registers them once.
+        const session = yield* follow(service, originalRef);
+        yield* session.next("lifecycle", observing);
+        assert.equal(native.binds, 1);
+        yield* service.open(originalRef);
+        assert.equal(native.binds, 1);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("an explicit open registers host tools before any view attaches", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      assert.equal(native.binds, 1);
+    }).pipe(Effect.scoped),
   );
 
   it.effect(

@@ -3127,6 +3127,43 @@ describe("children after an unwatched interval (rc3-1a)", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "a job held from before an unwatched interval is gone after the rebuild; one the owner still lists is kept",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        native.capabilities.push("background_jobs");
+        const running = (id: string) => ({ id, status: "running" });
+        native.jobs = [running("job-a"), running("job-b")];
+        yield* service.open({ ...originalRef });
+        const first = yield* follow(service, originalRef);
+        const built = yield* first.pass();
+        yield* service.setDemand(
+          { leaseId: first.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+          testClient,
+        );
+        yield* TestClock.adjust("2 seconds");
+        for (const id of ["job-a", "job-b"])
+          yield* native.publish({
+            type: "job_lifecycle",
+            event: "registered",
+            job: running(id),
+            runningCount: 2,
+          });
+        const seen = yield* first.pass(built.cursor);
+        assert.isTrue(seen.entities.has("job:job-a") && seen.entities.has("job:job-b"));
+        yield* Fiber.interrupt(first.fiber);
+        yield* settle;
+        assert.equal(native.levels.at(-1), "off");
+        // Job A finished and aged out unseen; the owner lists only B now.
+        native.jobs = [running("job-b")];
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        assert.isFalse(view.entities.has("job:job-a"));
+        assert.isTrue(view.entities.has("job:job-b"));
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("a child still running is shown from the live inventory, not unobserved", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();

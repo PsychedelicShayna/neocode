@@ -6,6 +6,7 @@ import {
   type NeoPiNativeDemandItem,
   type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
+  type NeoPiNativeSessionsWatchInput,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -53,6 +54,13 @@ export const DEFAULT_NATIVE_DEMAND: readonly NeoPiNativeDemandItem[] = [
   { kind: "transcript" },
   { kind: "roster" },
 ];
+/** A thread transcript only reads the conversation: it changes nothing in the owner. */
+const THREAD_NATIVE_DEMAND: readonly NeoPiNativeDemandItem[] = [
+  { kind: "summary" },
+  { kind: "transcript" },
+];
+/** `thread`: a thread transcript observing the session; absent means a native session view. */
+export type NativeObservationPurpose = NonNullable<NeoPiNativeSessionsWatchInput["purpose"]>;
 /** How long a released view's cached feed stays for a warm switch back; it holds no lease. */
 export const NATIVE_WARM_CACHE_MS = 5 * 60_000;
 /** Re-attach and re-read backoff: 250 ms doubling to 5 s, reset by any lease or reply. */
@@ -72,23 +80,32 @@ export function createNativeSessionAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   const cache = new Map<string, NativeSessionFeed>();
-  /** Live observations: updates published from outside the controller (commands). */
-  const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
-  /** Demand held by views beyond `DEFAULT_NATIVE_DEMAND`, per session, one entry per hold. */
+  /**
+   * Live observations per session key: updates published from outside the
+   * controller (commands) reach every one. A session view and a thread view of
+   * the same session are two observations, each its own lease.
+   */
+  const updates = new Map<string, Set<Queue.Queue<NativeSessionUpdate>>>();
+  /** Demand held by session views beyond `DEFAULT_NATIVE_DEMAND`, per session, one entry per hold. */
   const demandHolds = new Map<string, Set<readonly NeoPiNativeDemandItem[]>>();
-  const demandOf = (key: string) => {
+  const demandOf = (key: string, purpose: NativeObservationPurpose) => {
+    // A thread view only reads the conversation: no roster, so the owner's subagent level stays as it is.
+    if (purpose === "thread") return THREAD_NATIVE_DEMAND;
     const items = new Map(DEFAULT_NATIVE_DEMAND.map((item) => [JSON.stringify(item), item]));
     for (const held of demandHolds.get(key) ?? [])
       for (const item of held) items.set(JSON.stringify(item), item);
     return [...items.values()];
   };
-  const demandSignals = new Map<string, Queue.Queue<void>>();
-  /** Wakes an observation that stopped on a terminal lifecycle, after an explicit open. */
-  const restarts = new Map<string, Queue.Queue<void>>();
+  const demandSignals = new Map<string, Set<Queue.Queue<void>>>();
+  /** Wakes observations that stopped on a terminal lifecycle, after an explicit open. */
+  const restarts = new Map<string, Set<Queue.Queue<void>>>();
+  const signal = (registry: Map<string, Set<Queue.Queue<void>>>, key: string) => {
+    for (const queue of registry.get(key) ?? []) Queue.offerUnsafe(queue, undefined);
+  };
   const publish = (key: string, update: NativeSessionUpdate) =>
     Effect.sync(() => {
-      const queue = updates.get(key);
-      if (queue) Queue.offerUnsafe(queue, update);
+      const queues = updates.get(key);
+      if (queues) for (const queue of queues) Queue.offerUnsafe(queue, update);
       else {
         const feed = cache.get(key);
         if (feed) cache.set(key, reduceNativeSessionFeed(feed, update));
@@ -110,7 +127,7 @@ export function createNativeSessionAtoms<R, E>(
     label: "native-sessions:watch",
     // A concealed view releases its lease at once; the cache stays warm without one.
     idleTtlMs: 0,
-    subscribe: (input: { ref: NeoPiNativeSessionRef }) =>
+    subscribe: (input: { ref: NeoPiNativeSessionRef; purpose?: NativeObservationPurpose }) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const supervisor = yield* EnvironmentSupervisor;
@@ -141,18 +158,30 @@ export function createNativeSessionAtoms<R, E>(
               }
               Queue.offerUnsafe(out, next);
             });
+          const purpose = input.purpose ?? "session";
+          const join = <A>(registry: Map<string, Set<A>>, value: A) => {
+            const members = registry.get(key) ?? new Set<A>();
+            registry.set(key, members);
+            members.add(value);
+          };
+          const leave = <A>(registry: Map<string, Set<A>>, value: A) => {
+            const members = registry.get(key);
+            members?.delete(value);
+            if (members?.size === 0) registry.delete(key);
+          };
           yield* Effect.acquireRelease(
             Effect.sync(() => {
-              updates.set(key, external);
-              demandSignals.set(key, demandSignal);
-              restarts.set(key, restart);
+              join(updates, external);
+              // Holds change only a session view's demand; a thread lease's never changes.
+              if (purpose === "session") join(demandSignals, demandSignal);
+              join(restarts, restart);
             }),
             () =>
               Effect.suspend(() => {
-                if (updates.get(key) !== external) return Effect.void;
-                updates.delete(key);
-                demandSignals.delete(key);
-                restarts.delete(key);
+                leave(updates, external);
+                leave(demandSignals, demandSignal);
+                leave(restarts, restart);
+                if (updates.has(key)) return Effect.void;
                 const evict = () => {
                   if (!updates.has(key)) cache.delete(key);
                   // Unobserved move handoffs live only as long as their source.
@@ -203,7 +232,7 @@ export function createNativeSessionAtoms<R, E>(
                 rpcRequest(WS_METHODS.neopiNativeSessionsSetDemand, {
                   leaseId,
                   generation: ++generation,
-                  demand: demandOf(key),
+                  demand: demandOf(key, purpose),
                 }).pipe(Effect.ignore),
               );
               yield* send;
@@ -231,6 +260,7 @@ export function createNativeSessionAtoms<R, E>(
                 let leaseId: string | null = null;
                 return yield* session.client[WS_METHODS.neopiNativeSessionsWatch]({
                   ref: input.ref,
+                  ...(input.purpose ? { purpose: input.purpose } : {}),
                 }).pipe(
                   Stream.runForEach((envelope) =>
                     Effect.gen(function* () {
@@ -412,18 +442,14 @@ export function createNativeSessionAtoms<R, E>(
       // A fresh array per hold, so two holds of equal items release separately.
       const hold = [...items];
       holds.add(hold);
-      const signal = () => {
-        const queue = demandSignals.get(key);
-        if (queue) Queue.offerUnsafe(queue, undefined);
-      };
-      signal();
+      signal(demandSignals, key);
       let released = false;
       return () => {
         if (released) return;
         released = true;
         holds.delete(hold);
         if (holds.size === 0 && demandHolds.get(key) === holds) demandHolds.delete(key);
-        signal();
+        signal(demandSignals, key);
       };
     },
     /**
@@ -440,8 +466,7 @@ export function createNativeSessionAtoms<R, E>(
         input: target.ref,
       });
       if (result._tag === "Failure") throw Cause.squash(result.cause);
-      const restart = restarts.get(nativeSessionKey(target));
-      if (restart) Queue.offerUnsafe(restart, undefined);
+      signal(restarts, nativeSessionKey(target));
     },
   };
 }

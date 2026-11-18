@@ -36,6 +36,8 @@ import {
   type NativeSession,
   type NativeSessionFeed,
 } from "../neopiNativeSessions.ts";
+import { nativeAgentHubAgents, summarizeAgentHub } from "../neopiNativeAgentHub.ts";
+import { subagentFlashFor } from "../neopiNativeStatus.ts";
 import { DEFAULT_NATIVE_DEMAND, createNativeSessionAtoms } from "./neopiNativeSessions.ts";
 
 const ref = {
@@ -114,6 +116,7 @@ type Item =
   | { readonly type: "end" };
 interface FakeLease {
   readonly id: string;
+  readonly purpose: string | undefined;
   readonly items: Queue.Queue<Item>;
   readonly applied: SubscriptionRef.SubscriptionRef<number>;
   readonly released: Deferred.Deferred<void>;
@@ -154,7 +157,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
         if (input.command.type === "prompt") prompts++;
         return {};
       }),
-    [WS_METHODS.neopiNativeSessionsWatch]: () =>
+    [WS_METHODS.neopiNativeSessionsWatch]: (input: { readonly purpose?: string }) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const id = `lease-${++leaseCount}`;
@@ -163,6 +166,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
           const released = yield* Deferred.make<void>();
           const lease: FakeLease = {
             id,
+            purpose: input.purpose,
             items,
             applied,
             released,
@@ -285,6 +289,50 @@ describe("native observation controller", () => {
         );
         expect(result._tag).toBe("Success");
         expect(h.atoms.cached(h.target)).toBeUndefined();
+      }),
+    ),
+  );
+
+  it.effect("a thread view leaves the owner's subagent level alone beside a session view", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const thread = h.atoms.watch({
+          environmentId: h.target.environmentId,
+          input: { ref, purpose: "thread" },
+        });
+        const unmountThread = h.registry.mount(thread);
+        const threadLease = yield* Queue.take(h.leases);
+        expect(threadLease.purpose).toBe("thread");
+        expect(yield* Queue.take(h.demands)).toEqual({
+          leaseId: threadLease.id,
+          generation: 1,
+          demand: [{ kind: "summary" }, { kind: "transcript" }],
+        });
+        // The session view of the same session is its own lease, with the roster.
+        const unmountSession = h.registry.mount(h.watch);
+        const sessionLease = yield* Queue.take(h.leases);
+        expect(sessionLease.purpose).toBeUndefined();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: DEFAULT_NATIVE_DEMAND,
+        });
+        // A child view's hold goes to session leases only.
+        const child = { kind: "child" as const, childId: "c", runToken: "r" };
+        const release = h.atoms.holdDemand(h.target, [child]);
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: [...DEFAULT_NATIVE_DEMAND, child],
+        });
+        release();
+        yield* Queue.take(h.demands);
+        // Concealing the session view leaves the thread view's lease in place.
+        unmountSession();
+        yield* Deferred.await(sessionLease.released);
+        expect(h.counts().active).toBe(1);
+        expect(yield* Queue.size(h.demands)).toBe(0);
+        unmountThread();
+        yield* Deferred.await(threadLease.released);
       }),
     ),
   );
@@ -926,6 +974,107 @@ describe("native projection mapping", () => {
       leafId: null,
     });
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
+  });
+
+  it("counts a child that finished unseen as finished, never as interrupted", () => {
+    const lifecycle = {
+      id: "child",
+      runToken: "run",
+      status: "started",
+      agent: "scout",
+      description: "Find the bug",
+    };
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({
+        epoch,
+        watermark: 1,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 1,
+            value: {
+              class: "roster",
+              value: { id: "child", runToken: "run", lifecycle, ticks: 0 },
+            },
+          },
+        ],
+      }),
+    );
+    const running = feed.agents;
+    expect(running.map((agent) => agent.status)).toEqual(["running"]);
+    // The view left while it ran; it finished unseen and no history lists it.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ buildAttempt: 2 }),
+        watermark: 3,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 3,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                inventory: null,
+                unobserved: { since: 1_795_000_000_000, lifecycle },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    const [agent] = feed.agents;
+    expect(agent).toMatchObject({
+      id: "child",
+      native: { unobservedSince: 1_795_000_000_000, disconnected: false },
+    });
+    expect(agent?.status === "interrupted" && agent.native.unobservedSince !== null).toBe(true);
+    const hub = nativeAgentHubAgents(feed.agents, feed.agentTicks, "session");
+    expect(hub.map((row) => [row.live, row.unobservedSince])).toEqual([[false, 1_795_000_000_000]]);
+    expect(summarizeAgentHub(hub)).toMatchObject({ done: 1, stopped: 0, failed: 0, working: 0 });
+    expect(subagentFlashFor(running, feed.agents)).toBe("exit");
+
+    // A later inventory listing clears the marker.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ buildAttempt: 2 }),
+        watermark: 4,
+        kind: "incremental",
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 4,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                inventory: { id: "child", status: "completed", runToken: "run" },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(feed.agents[0]).toMatchObject({
+      status: "completed",
+      native: { unobservedSince: null },
+    });
   });
 
   it("notes a refused subagent level for the Agents view and clears it when withdrawn", () => {

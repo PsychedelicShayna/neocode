@@ -78,6 +78,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       startupDialog: false,
       jobs: [] as Record<string, unknown>[],
       agents: [] as Record<string, unknown>[],
+      /** `get_subagent_history` rows, served when `capabilities` lists `subagent_history`. */
+      history: [] as Record<string, unknown>[],
+      /** `get_subagent_history` requests the owner received. */
+      historyReads: 0,
       /** Subagent subscription levels requested of the owner, in order. */
       levels: [] as string[],
       /** `snapshot_session_journal` requests the owner received. */
@@ -212,6 +216,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                   case "get_subagents":
                     yield* native.inventoryHook;
                     return { subagents: native.agents };
+                  case "get_subagent_history":
+                    native.historyReads++;
+                    return { subagents: native.history };
                   case "set_subagent_subscription":
                     if (native.refuseLevels && Reflect.get(command, "level") !== "off")
                       return yield* new NeoPiRpcError({
@@ -2891,29 +2898,158 @@ describe("confirmation round", () => {
         );
       }).pipe(Effect.scoped),
   );
-  it.effect("hide and show: a child that finished while nobody watched is not still running", () =>
+});
+
+describe("children after an unwatched interval (rc3-1a)", () => {
+  const settle = Effect.forEach(Array.from({ length: 400 }), () => Effect.yieldNow, {
+    discard: true,
+  });
+  // The verifier's run: two children spawned, the view closed, the parent finished, the
+  // view reopened. NeoPi sent only the spawns; with the level off it sent nothing more.
+  const spawned = (id: string, runToken: string) => ({
+    type: "subagent_lifecycle",
+    payload: {
+      id,
+      runToken,
+      runKind: "spawn",
+      status: "started",
+      agent: "task",
+      agentSource: "bundled",
+      index: 0,
+      sessionFile: `/native/children/${id}.jsonl`,
+    },
+  });
+  const rowOf = (
+    view: { readonly entities: ReadonlyMap<string, NeoPiNativeEntity["value"]> },
+    id: string,
+  ) => {
+    const value = view.entities.get(`roster:${id}`);
+    return value?.class === "roster" ? value.value : undefined;
+  };
+  /** Shows the two children to a roster view, then closes it; returns when the level is off. */
+  const watchThenClose = Effect.fnUntraced(function* (
+    native: Effect.Success<ReturnType<typeof fixture>>["native"],
+    service: Service,
+  ) {
+    yield* service.open({ ...originalRef });
+    const first = yield* follow(service, originalRef);
+    const built = yield* first.pass();
+    yield* service.setDemand(
+      { leaseId: first.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+      testClient,
+    );
+    yield* TestClock.adjust("2 seconds");
+    yield* native.publish(spawned("Load0", "5f4a0d14-1cf6-4396-b217-ce24c2337edd"));
+    yield* native.publish(spawned("Load1", "eee9a31c-45cc-4000-83a7-544dd920a038"));
+    const seen = yield* first.pass(built.cursor);
+    assert.isDefined(rowOf(seen, "Load0"));
+    assert.isDefined(rowOf(seen, "Load1"));
+    yield* Fiber.interrupt(first.fiber);
+    yield* settle;
+    assert.equal(native.levels.at(-1), "off");
+    // The parent finished meanwhile: the live inventory is empty.
+    native.agents = [];
+  });
+
+  it.effect(
+    "an owner without subagent history: children that finished unseen stay, marked unobserved, never running",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* watchThenClose(native, service);
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        for (const id of ["Load0", "Load1"]) {
+          const row = rowOf(view, id);
+          assert.isDefined(row, `${id} vanished from the roster`);
+          // No live part is left to replay as "started" over what the owner says now.
+          assert.isUndefined(row?.lifecycle);
+          const unobserved = Object(row?.unobserved);
+          assert.equal(Reflect.get(Object(Reflect.get(unobserved, "lifecycle")), "id"), id);
+          assert.isNumber(Reflect.get(unobserved, "since"));
+        }
+        assert.equal(native.historyReads, 0);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a child the owner's history lists comes back finished, not unobserved", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();
-      yield* service.open({ ...originalRef });
-      const first = yield* follow(service, originalRef);
-      const built = yield* first.pass();
-      yield* service.setDemand(
-        { leaseId: first.leaseId, generation: 1, demand: [{ kind: "roster" }] },
-        testClient,
-      );
-      yield* TestClock.adjust("2 seconds");
-      yield* native.publish(child("c1", "started"));
-      const seen = yield* first.pass(built.cursor);
-      assert.isTrue([...seen.entities.keys()].some((key) => key.startsWith("roster:")));
-      yield* Fiber.interrupt(first.fiber);
-      yield* settle;
-      // The child finished with the level lowered: the owner sent nothing, and its
-      // inventory no longer lists it.
-      native.agents = [];
+      native.capabilities = ["subagent_history"];
+      yield* watchThenClose(native, service);
+      native.history = [
+        { id: "Load0", kind: "sub", status: "parked", live: false, createdAt: 1, lastActivity: 2 },
+        { id: "Load1", kind: "sub", status: "aborted", live: false, createdAt: 1, lastActivity: 2 },
+      ];
       const second = yield* follow(service, originalRef);
       const view = yield* second.pass();
-      assert.isFalse([...view.entities.keys()].some((key) => key.startsWith("roster:")));
+      assert.equal(Reflect.get(Object(rowOf(view, "Load0")?.history), "status"), "parked");
+      assert.equal(Reflect.get(Object(rowOf(view, "Load1")?.history), "status"), "aborted");
+      for (const id of ["Load0", "Load1"]) {
+        assert.isUndefined(rowOf(view, id)?.lifecycle);
+        assert.isUndefined(rowOf(view, id)?.unobserved);
+      }
     }).pipe(Effect.scoped),
+  );
+
+  it.effect("a child still running is shown from the live inventory, not unobserved", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* watchThenClose(native, service);
+      native.agents = [{ id: "Load0", status: "running", agent: "task", index: 0 }];
+      const second = yield* follow(service, originalRef);
+      const view = yield* second.pass();
+      assert.equal(Reflect.get(Object(rowOf(view, "Load0")?.inventory), "status"), "running");
+      assert.isUndefined(rowOf(view, "Load0")?.unobserved);
+      assert.isDefined(rowOf(view, "Load1")?.unobserved);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a history that does not list a child yet is read again, and the child is kept meanwhile",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        native.capabilities = ["subagent_history"];
+        yield* watchThenClose(native, service);
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        assert.isDefined(rowOf(view, "Load0")?.unobserved);
+        const reads = native.historyReads;
+        // The child's result is persisted a moment later.
+        native.history = [
+          {
+            id: "Load0",
+            kind: "sub",
+            status: "parked",
+            live: false,
+            createdAt: 1,
+            lastActivity: 2,
+          },
+        ];
+        yield* TestClock.adjust("300 millis");
+        yield* settle;
+        yield* TestClock.adjust("2 seconds");
+        yield* settle;
+        assert.isAbove(native.historyReads, reads);
+        const after = yield* second.pass(view.cursor);
+        assert.equal(Reflect.get(Object(rowOf(after, "Load0")?.history), "status"), "parked");
+        assert.isUndefined(rowOf(after, "Load0")?.unobserved);
+        // Load1 is in neither: it stays, and the re-reads stop after a bound.
+        for (let step = 0; step < 20; step++) {
+          yield* TestClock.adjust("10 seconds");
+          yield* settle;
+        }
+        const settled = native.historyReads;
+        yield* TestClock.adjust("2 minutes");
+        yield* settle;
+        assert.equal(native.historyReads, settled);
+        assert.isAtMost(settled - reads, 8);
+        const third = yield* follow(service, originalRef);
+        const latest = yield* third.pass();
+        assert.isDefined(rowOf(latest, "Load1")?.unobserved);
+        assert.equal(Reflect.get(Object(rowOf(latest, "Load0")?.history), "status"), "parked");
+      }).pipe(Effect.scoped),
   );
 });
 

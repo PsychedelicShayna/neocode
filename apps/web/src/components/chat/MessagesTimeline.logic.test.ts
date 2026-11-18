@@ -30,6 +30,7 @@ import {
   resolveWorkGroupScrollIndex,
   rowsWerePrepended,
   scrollMovedAwayFromEnd,
+  settleUpwardGesture,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   turnToolDisclosureKeys,
@@ -4032,10 +4033,57 @@ describe("older history paging", () => {
   });
 
   it("does not take the list's own scroll adjustment for the reader leaving", () => {
-    // Real trace: a row estimate briefly put the end 1.2 M px away, and the list
-    // nudged scrollTop up by 4 px. No gesture preceded it; follow must survive.
+    // Real trace: a sudden page-metric change briefly put the end 1.2 M px away,
+    // and the list nudged scrollTop up by 4 px. No gesture preceded it.
     expect(
       scrollMovedAwayFromEnd({ previousTop: 39965, top: 39961, isAtEnd: false, byUser: false }),
     ).toBe(false);
+  });
+
+  describe("settleUpwardGesture", () => {
+    it("resumes following after a nudge that stayed in the follow band", () => {
+      // A touchpad nudge of 30 px from the live edge; the view still looks at the end.
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 4970,
+          top: 4970,
+        }),
+      ).toEqual({ kind: "resume" });
+    });
+
+    it("stays where the reader put it after a real scroll up", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 3800,
+          top: 3800,
+        }),
+      ).toEqual({ kind: "stay" });
+    });
+
+    it("undoes a pin that pulled a real scroll up back down", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 4600,
+          top: 5100,
+        }),
+      ).toEqual({ kind: "restore", top: 4600 });
+    });
+
+    it("never resumes a gesture that began away from the end", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: false,
+          startTop: 2000,
+          highestTop: 1990,
+          top: 1990,
+        }),
+      ).toEqual({ kind: "stay" });
+    });
   });
 });

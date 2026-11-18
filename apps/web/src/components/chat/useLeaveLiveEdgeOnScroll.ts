@@ -1,46 +1,56 @@
 import type { LegendListRef } from "@legendapp/list/react";
-import { useEffect, type RefObject } from "react";
-import { resolveTimelineIsAtEnd, scrollMovedAwayFromEnd } from "./MessagesTimeline.logic";
+import { useEffect, useRef, type RefObject } from "react";
+import {
+  resolveTimelineIsAtEnd,
+  scrollMovedAwayFromEnd,
+  settleUpwardGesture,
+} from "./MessagesTimeline.logic";
 import { isTimelineScrollTarget } from "./timelineScrollTarget";
 
 const SCROLL_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+const SCROLL_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
 /** Finger travel that is a drag rather than a tap. */
 const TOUCH_SLOP_PX = 8;
 
 /**
- * An upward gesture (`deltaY` < 0) on `target` that moves the timeline itself.
- * A scroller nested in it (a tool output, a code block) that takes the gesture
- * keeps the timeline following.
+ * A gesture on `target` that scrolls the timeline itself in the direction of
+ * `deltaY` (negative: up). A scroller nested in it (a tool output, a code
+ * block) that takes the gesture leaves the timeline alone.
  */
-export function upwardGestureLeavesTimeline(
+export function gestureMovesTimeline(
   target: EventTarget | null,
   timeline: HTMLElement,
   deltaY: number,
 ): boolean {
   return (
-    deltaY < 0 &&
     timeline.scrollHeight > timeline.clientHeight &&
     isTimelineScrollTarget(target, timeline, deltaY)
   );
 }
 
 /**
- * Calls `onLeave` when the reader moves the timeline up and off its live edge:
- * wheel, touchpad, scrollbar, touch, keys, a composer page key, or a text
- * selection that drags the view. The list keeps re-pinning to the end while
- * follow is on, so without this a host that never hears about the gesture
- * fights every scroll up.
+ * Tells the host when the reader leaves the timeline's live edge and when they
+ * come back to it, read from the reader's own input: wheel, touchpad,
+ * scrollbar, touch, keys, a composer page key, or a selection drag. The list
+ * keeps re-pinning to the end while follow is on, so a host that never hears
+ * about the gesture fights every scroll up.
  *
- * Leaving is read from the reader's input, never from scroll positions alone:
- * the list lowers scrollTop on its own when it corrects a row estimate or the
- * window resizes. The one position check left is a selection drag, counted
- * only while the pointer is held down on the content. Following resumes when
- * the host sees the reader back at the end, never because new output arrives.
+ * Scroll positions alone never decide: the list moves scrollTop itself when it
+ * pins, corrects a row estimate or the window resizes. An upward gesture stops
+ * follow at once; when its scrolling settles, a nudge that stayed in the follow
+ * band resumes it (`settleUpwardGesture`). A downward gesture that brings the
+ * view into the band resumes it too. A pin or a layout change never does.
  */
 export function useLeaveLiveEdgeOnScroll(
   listRef: RefObject<LegendListRef | null>,
+  following: boolean,
   onLeave: () => void,
+  onReturn: () => void,
 ): void {
+  const followingRef = useRef(following);
+  useEffect(() => {
+    followingRef.current = following;
+  }, [following]);
   useEffect(() => {
     let frame: number | null = null;
     let detach: (() => void) | null = null;
@@ -54,69 +64,127 @@ export function useLeaveLiveEdgeOnScroll(
           return;
         }
         const view = node.ownerDocument.defaultView ?? window;
+        const atEnd = () => resolveTimelineIsAtEnd(listRef.current?.getState()) === true;
         let previousTop = node.scrollTop;
         let pointerHeld = false;
-        let touchStartY: number | null = null;
+        let scrollbarHeld = false;
+        let touchY: number | null = null;
+        /** The open upward gesture, until its scrolling settles. */
+        let upward: { startedFollowing: boolean; startTop: number; highestTop: number } | null =
+          null;
+        /** The reader's last input moved toward the end; reaching the band resumes. */
+        let returning = false;
+        const up = () => {
+          returning = false;
+          upward ??= {
+            startedFollowing: followingRef.current,
+            startTop: node.scrollTop,
+            highestTop: node.scrollTop,
+          };
+          onLeave();
+        };
+        const down = () => {
+          upward = null;
+          returning = true;
+          // Already in the band, a downward input scrolls nothing to report.
+          if (atEnd()) {
+            returning = false;
+            onReturn();
+          }
+        };
         const onScroll = () => {
           const top = node.scrollTop;
-          const left = scrollMovedAwayFromEnd({
-            previousTop,
-            top,
-            isAtEnd: resolveTimelineIsAtEnd(listRef.current?.getState()),
-            byUser: pointerHeld,
-          });
+          if (upward) upward.highestTop = Math.min(upward.highestTop, top);
+          if (
+            scrollMovedAwayFromEnd({
+              previousTop,
+              top,
+              isAtEnd: resolveTimelineIsAtEnd(listRef.current?.getState()),
+              byUser: pointerHeld,
+            })
+          )
+            onLeave();
           previousTop = top;
-          if (left) onLeave();
+          if (returning && atEnd()) {
+            returning = false;
+            onReturn();
+          }
+        };
+        const onScrollEnd = () => {
+          // A pin already in flight can settle before the reader's own scroll
+          // moves the view; only a settle after the reader moved it up counts.
+          if (!upward || scrollbarHeld || upward.highestTop >= upward.startTop) return;
+          const outcome = settleUpwardGesture({ ...upward, top: node.scrollTop });
+          upward = null;
+          if (outcome.kind === "resume") onReturn();
+          else if (outcome.kind === "restore") node.scrollTop = outcome.top;
         };
         const onWheel = (event: WheelEvent) => {
-          if (!event.ctrlKey && upwardGestureLeavesTimeline(event.target, node, event.deltaY))
-            onLeave();
+          if (event.ctrlKey || !gestureMovesTimeline(event.target, node, event.deltaY)) return;
+          if (event.deltaY < 0) up();
+          else down();
         };
         // Only the scrollbar puts a pointerdown on the scroll node itself.
         const onPointerDown = (event: PointerEvent) => {
-          if (event.target === node) {
-            if (node.scrollHeight > node.clientHeight) onLeave();
+          if (event.target !== node) {
+            pointerHeld = true;
             return;
           }
-          pointerHeld = true;
+          if (node.scrollHeight <= node.clientHeight) return;
+          scrollbarHeld = true;
+          returning = false;
+          upward = null;
+          onLeave();
         };
         const onPointerUp = () => {
           pointerHeld = false;
+          if (!scrollbarHeld) return;
+          scrollbarHeld = false;
+          // Releasing the thumb in the band is coming back; anywhere else stays.
+          if (atEnd()) onReturn();
         };
         const onTouchStart = (event: TouchEvent) => {
-          touchStartY = event.touches[0]?.clientY ?? null;
+          touchY = event.touches[0]?.clientY ?? null;
         };
-        // A finger moving down drags the content down, toward older rows.
+        // A finger moving down drags the content toward older rows.
         const onTouchMove = (event: TouchEvent) => {
           const y = event.touches[0]?.clientY;
-          if (touchStartY === null || y === undefined || y <= touchStartY + TOUCH_SLOP_PX) return;
-          const deltaY = touchStartY - y;
-          touchStartY = null;
-          if (upwardGestureLeavesTimeline(event.target, node, deltaY)) onLeave();
+          if (touchY === null || y === undefined || Math.abs(y - touchY) <= TOUCH_SLOP_PX) return;
+          const deltaY = touchY - y;
+          touchY = null;
+          if (!gestureMovesTimeline(event.target, node, deltaY)) return;
+          if (deltaY < 0) up();
+          else down();
         };
-        // Up keys scroll the timeline when it or the page has focus; the
-        // composer claims (prevents) a PageUp it forwards to the timeline.
+        // Page keys scroll the timeline when it or the page has focus; the
+        // composer claims (prevents) a page key it forwards to the timeline.
         const onKeyDown = (event: KeyboardEvent) => {
           if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
           const target = event.target;
           const editable =
             target instanceof Element &&
             target.closest("input, textarea, [contenteditable=true]") !== null;
-          // A composer PageUp scrolls the timeline as a whole, as does an up
-          // key with focus on the page itself.
           const onPage =
             target === node.ownerDocument.body || target === node.ownerDocument.documentElement;
-          const scrolled = editable
-            ? event.key === "PageUp" && event.defaultPrevented
-            : SCROLL_UP_KEYS.has(event.key);
-          if (scrolled && upwardGestureLeavesTimeline(editable || onPage ? node : target, node, -1))
-            onLeave();
+          const isUp = SCROLL_UP_KEYS.has(event.key);
+          const scrolls = editable
+            ? (event.key === "PageUp" || event.key === "PageDown") && event.defaultPrevented
+            : isUp || SCROLL_DOWN_KEYS.has(event.key);
+          if (
+            !scrolls ||
+            !gestureMovesTimeline(editable || onPage ? node : target, node, isUp ? -1 : 1)
+          )
+            return;
+          if (isUp) up();
+          else down();
         };
         // A release outside the window never arrives.
         const onBlur = () => {
           pointerHeld = false;
+          scrollbarHeld = false;
         };
         node.addEventListener("scroll", onScroll, { passive: true });
+        node.addEventListener("scrollend", onScrollEnd);
         node.addEventListener("wheel", onWheel, { passive: true });
         node.addEventListener("pointerdown", onPointerDown, { passive: true });
         node.addEventListener("touchstart", onTouchStart, { passive: true });
@@ -127,6 +195,7 @@ export function useLeaveLiveEdgeOnScroll(
         view.addEventListener("blur", onBlur);
         detach = () => {
           node.removeEventListener("scroll", onScroll);
+          node.removeEventListener("scrollend", onScrollEnd);
           node.removeEventListener("wheel", onWheel);
           node.removeEventListener("pointerdown", onPointerDown);
           node.removeEventListener("touchstart", onTouchStart);
@@ -143,5 +212,5 @@ export function useLeaveLiveEdgeOnScroll(
       if (frame !== null) cancelAnimationFrame(frame);
       detach?.();
     };
-  }, [listRef, onLeave]);
+  }, [listRef, onLeave, onReturn]);
 }

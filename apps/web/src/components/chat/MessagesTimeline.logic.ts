@@ -207,6 +207,34 @@ export function scrollMovedAwayFromEnd(input: {
   return input.byUser && input.isAtEnd === false && input.top < input.previousTop - 1;
 }
 
+export type UpwardGestureOutcome =
+  | { readonly kind: "resume" }
+  | { readonly kind: "stay" }
+  | { readonly kind: "restore"; readonly top: number };
+
+/**
+ * How an upward gesture that stopped follow ends once its scrolling settles.
+ * `highestTop` is the smallest scrollTop since its first input, where the
+ * reader took the view; growth below never changes scrollTop, and only the
+ * list's pin moves it back down. From the live edge, a nudge that stayed in
+ * the follow band resumes following, so the view never looks frozen at the
+ * end; a real scroll up stays where the reader put it, and a pin that was
+ * already in flight when they left is undone.
+ */
+export function settleUpwardGesture(input: {
+  readonly startedFollowing: boolean;
+  readonly startTop: number;
+  readonly highestTop: number;
+  readonly top: number;
+}): UpwardGestureOutcome {
+  if (!input.startedFollowing) return { kind: "stay" };
+  if (input.startTop - input.highestTop <= TIMELINE_FOLLOW_REARM_THRESHOLD_PX)
+    return { kind: "resume" };
+  return input.top > input.highestTop + 1
+    ? { kind: "restore", top: input.highestTop }
+    : { kind: "stay" };
+}
+
 export function shouldPreserveAssistantLineBreaks(text: string): boolean {
   return /^★ Insight(?:\s|─)/mu.test(text);
 }

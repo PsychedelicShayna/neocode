@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { upwardGestureLeavesTimeline } from "./useLeaveLiveEdgeOnScroll";
+import { gestureMovesTimeline } from "./useLeaveLiveEdgeOnScroll";
 
 class ScrollElement extends EventTarget {
   scrollTop = 0;
@@ -20,8 +20,8 @@ class ScrollElement extends EventTarget {
   }
 }
 
-function leaves(target: ScrollElement, timeline: ScrollElement, deltaY: number) {
-  return upwardGestureLeavesTimeline(target, timeline as unknown as HTMLElement, deltaY);
+function moves(target: ScrollElement, timeline: ScrollElement, deltaY: number) {
+  return gestureMovesTimeline(target, timeline as unknown as HTMLElement, deltaY);
 }
 
 /** A streaming timeline pinned at its end, holding a scrollable tool output body. */
@@ -47,29 +47,34 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllGlobals());
 
-describe("upwardGestureLeavesTimeline", () => {
+describe("gestureMovesTimeline", () => {
   it("keeps following when a tool output body with room to scroll takes a wheel-up", () => {
     const { timeline, line } = setup();
-    expect(leaves(line, timeline, -120)).toBe(false);
+    expect(moves(line, timeline, -120)).toBe(false);
   });
 
   it("keeps following when the body is at its top but contains its overscroll", () => {
     const { timeline, toolBody, line } = setup();
     toolBody.scrollTop = 0;
     toolBody.overscrollBehaviorY = "contain";
-    expect(leaves(line, timeline, -120)).toBe(false);
+    expect(moves(line, timeline, -120)).toBe(false);
   });
 
   it("leaves on a wheel-up over the timeline's own content", () => {
     const { timeline } = setup();
-    expect(leaves(new ScrollElement(timeline), timeline, -120)).toBe(true);
-    expect(leaves(timeline, timeline, -1)).toBe(true);
+    expect(moves(new ScrollElement(timeline), timeline, -120)).toBe(true);
+    expect(moves(timeline, timeline, -1)).toBe(true);
   });
 
-  it("never leaves on a downward gesture or a timeline that cannot scroll", () => {
+  it("does not return the reader on a wheel-down that a tool output body takes", () => {
+    const { timeline, line } = setup();
+    expect(moves(line, timeline, 120)).toBe(false);
+  });
+
+  it("never moves a timeline that cannot scroll", () => {
     const { timeline } = setup();
-    expect(leaves(timeline, timeline, 120)).toBe(false);
     timeline.scrollHeight = timeline.clientHeight;
-    expect(leaves(timeline, timeline, -120)).toBe(false);
+    expect(moves(timeline, timeline, -120)).toBe(false);
+    expect(moves(timeline, timeline, 120)).toBe(false);
   });
 });

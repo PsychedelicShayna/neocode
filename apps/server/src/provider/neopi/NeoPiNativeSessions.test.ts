@@ -32,6 +32,8 @@ import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import { updateNativeModelsConfiguration } from "./NeoPiModels.ts";
 
 const instanceId = ProviderInstanceId.make("native-profile");
+/** The connection every test lease belongs to, unless a test says otherwise. */
+const testClient = "client-a";
 const otherId = ProviderInstanceId.make("other-profile");
 const originalRef = { providerInstanceId: instanceId, sessionFile: "/native/session.jsonl" };
 const entry = (id: string, parentId: string | null = null): NeoPiJournalEntry => ({
@@ -82,10 +84,22 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       snapshots: 0,
       /** The owner refuses to raise the subagent level. */
       refuseLevels: false,
+      /** `get_entries_page` requests the owner received. */
+      pages: 0,
+      /** Runs inside `connect` once the connection exists (and its finalizer is registered). */
+      connectHook: Effect.void as Effect.Effect<void>,
+      /** Makes every connect fail with this error. */
+      connectError: undefined as NeoPiNativeSessionsError | undefined,
+      /** Makes every attach (not start) fail with this error. */
+      attachError: undefined as NeoPiNativeSessionsError | undefined,
+      /** After connecting, the owner reports a different file than the one asked for. */
+      mismatch: false,
+      /** Runs before a `set_subagent_subscription` is recorded. */
+      levelHook: Effect.void as Effect.Effect<void>,
       followUp: [] as string[],
       inventoryFailure: false,
       inventoryHook: Effect.void as Effect.Effect<void>,
-      pageHook: Effect.void as Effect.Effect<void>,
+      pageHook: Effect.void as Effect.Effect<void, NeoPiRpcError>,
       disposeHook: Effect.void as Effect.Effect<void>,
       afterPageHook: Effect.void as Effect.Effect<void>,
       /** Runs before a `get_state` reply is returned. */
@@ -136,6 +150,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       catalog: () => Effect.succeed([]),
       connect: (_profile, input, observer, mode) =>
         Effect.gen(function* () {
+          if (native.connectError) return yield* native.connectError;
+          if (mode === "attach" && native.attachError) return yield* native.attachError;
           if (native.connections !== 0)
             return yield* new NeoPiNativeSessionsError({
               code: "session_in_use",
@@ -150,7 +166,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
           native.starts++;
           native.connections++;
           native.running = true;
-          native.sessionFile = input.sessionFile ?? "/native/lazy-created.jsonl";
+          native.sessionFile = native.mismatch
+            ? "/native/other.jsonl"
+            : (input.sessionFile ?? "/native/lazy-created.jsonl");
           // The real transport calls the observer synchronously from its parser.
           const publish = (frame: SessionEventFrame) => Effect.sync(() => observer.frame(frame));
           native.publish = publish;
@@ -168,6 +186,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
               yield* Deferred.succeed(disconnected, undefined);
             }),
           );
+          yield* native.connectHook;
           const client: NeoPiNativeConnection["client"] = {
             capabilities: new Set([
               "session_journal",
@@ -193,6 +212,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                       return yield* new NeoPiRpcError({
                         message: "Subagent event bus is unavailable",
                       });
+                    yield* native.levelHook;
                     native.levels.push(String(Reflect.get(command, "level")));
                     return { level: native.levels.at(-1) };
                   case "get_status":
@@ -209,6 +229,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                     return identity();
                   }
                   case "get_entries_page": {
+                    native.pages++;
                     yield* native.pageHook;
                     const page = {
                       ...identity(),
@@ -301,21 +322,25 @@ type Envelope = NeoPiNativeEssentialEnvelope;
  * credit returned at once, and bulk state is read by cursor. Tests wait on
  * envelopes in order, never on time.
  */
-const follow = Effect.fnUntraced(function* (service: Service, ref: NeoPiNativeSessionRef) {
+const follow = Effect.fnUntraced(function* (
+  service: Service,
+  ref: NeoPiNativeSessionRef,
+  client: string = testClient,
+) {
   // `ended` marks the watch stream finishing, so a test waiting on an envelope fails instead of hanging.
   const envelopes = yield* Queue.unbounded<Envelope | { readonly type: "ended" }>();
   const leased = yield* Deferred.make<string>();
   let applied = 0;
   /** Every envelope delivered so far, in order. */
   const seen: Envelope[] = [];
-  const fiber = yield* service.watch({ ref }).pipe(
+  const fiber = yield* service.watch({ ref }, client).pipe(
     Stream.runForEach((envelope) =>
       Effect.gen(function* () {
         if (envelope.type === "leased") yield* Deferred.succeed(leased, envelope.leaseId);
         applied++;
         seen.push(envelope);
         yield* Queue.offer(envelopes, envelope);
-        yield* service.credit({ leaseId: yield* Deferred.await(leased), applied });
+        yield* service.credit({ leaseId: yield* Deferred.await(leased), applied }, client);
       }),
     ),
     Effect.ensuring(Queue.offer(envelopes, { type: "ended" })),
@@ -336,7 +361,7 @@ const follow = Effect.fnUntraced(function* (service: Service, ref: NeoPiNativeSe
     }
   });
   const read = (cursor: NeoPiNativeCursor | null) =>
-    service.read({ leaseId, readId: readId++, cursor });
+    service.read({ leaseId, readId: readId++, cursor }, client);
   /** Reads until one pass completes; returns what it delivered and the cursor after it. */
   const pass = Effect.fnUntraced(function* (from: NeoPiNativeCursor | null = null) {
     const entities = new Map<string, NeoPiNativeEntity["value"]>();
@@ -364,7 +389,7 @@ const follow = Effect.fnUntraced(function* (service: Service, ref: NeoPiNativeSe
         return { entities, removed, entries, inbox, cursor, unchanged: false };
     }
   });
-  return { fiber, leaseId, next, read, pass, seen };
+  return { fiber, leaseId, next, read, pass, seen, client };
 });
 
 /** A new lease's description and first complete pass, as a freshly mounted view sees them. */
@@ -1411,7 +1436,7 @@ describe("native observation (r12 §3.1)", () => {
         yield* service.open({ ...originalRef });
         // Lease A takes its envelopes but never reads and never returns credit.
         const stalled = yield* Queue.unbounded<Envelope>();
-        yield* service.watch({ ref: originalRef }).pipe(
+        yield* service.watch({ ref: originalRef }, testClient).pipe(
           Stream.runForEach((envelope) => Queue.offer(stalled, envelope)),
           Effect.forkScoped,
         );
@@ -1452,7 +1477,7 @@ describe("native observation (r12 §3.1)", () => {
         let applied = held.length;
         let more = 0;
         for (let round = 0; round < 4; round++) {
-          yield* service.credit({ leaseId, applied });
+          yield* service.credit({ leaseId, applied }, testClient);
           for (let spin = 0; spin < 20; spin++) yield* Effect.yieldNow;
           const sent = (yield* Queue.clear(stalled)).length;
           applied += sent;
@@ -1499,8 +1524,6 @@ describe("native observation (r12 §3.1)", () => {
         });
         const rebased = yield* lease.pass(behind.cursor);
         assert.equal(rebased.cursor!.epoch.branchGeneration, domain.branchGeneration + 1);
-        // Unlike an append, the navigation restarts the build and fetches a fresh page (C3.5).
-        assert.equal(rebased.cursor!.epoch.buildAttempt, domain.buildAttempt + 1);
         assert.equal(rebased.entries.at(-1)?.id, target.id);
       }).pipe(Effect.scoped),
   );
@@ -1523,14 +1546,18 @@ describe("native observation (r12 §3.1)", () => {
         }
         const { leaseId } = lease;
         const waiting = yield* service
-          .read({ leaseId, readId: 100, cursor })
+          .read({ leaseId, readId: 100, cursor }, testClient)
           .pipe(Effect.forkChild);
         for (let spin = 0; spin < 10; spin++) yield* Effect.yieldNow;
         // The same or an older read id is a second read on this lease: refused.
-        const repeated = yield* service.read({ leaseId, readId: 100, cursor }).pipe(Effect.flip);
+        const repeated = yield* service
+          .read({ leaseId, readId: 100, cursor }, testClient)
+          .pipe(Effect.flip);
         assert.equal(repeated.code, "stale_read");
         // A newer read id is a retry: it replaces the one waiting, which ends as stale.
-        const retry = yield* service.read({ leaseId, readId: 101, cursor }).pipe(Effect.forkChild);
+        const retry = yield* service
+          .read({ leaseId, readId: 101, cursor }, testClient)
+          .pipe(Effect.forkChild);
         const replaced = yield* Fiber.join(waiting).pipe(Effect.flip);
         assert.equal(replaced.code, "stale_read");
         yield* TestClock.adjust("20 seconds");
@@ -1544,20 +1571,23 @@ describe("native observation (r12 §3.1)", () => {
         );
         assert.isAbove(opened.revision, cursor!.base);
         // Catch up past the obligation's revision, then leave a read waiting.
-        const caughtUp = yield* service.read({ leaseId, readId: 102, cursor });
+        const caughtUp = yield* service.read({ leaseId, readId: 102, cursor }, testClient);
         assert.equal(caughtUp.type, "pass");
         const pending = yield* service
-          .read({
-            leaseId,
-            readId: 103,
-            cursor: caughtUp.type === "pass" ? caughtUp.continuation : cursor,
-          })
+          .read(
+            {
+              leaseId,
+              readId: 103,
+              cursor: caughtUp.type === "pass" ? caughtUp.continuation : cursor,
+            },
+            testClient,
+          )
           .pipe(Effect.forkChild);
         for (let spin = 0; spin < 10; spin++) yield* Effect.yieldNow;
         yield* Fiber.interrupt(lease.fiber);
         const cancelled = yield* Fiber.join(pending).pipe(Effect.flip);
         assert.equal(cancelled.code, "lease_unknown");
-        const late = yield* service.credit({ leaseId, applied: 1 }).pipe(Effect.flip);
+        const late = yield* service.credit({ leaseId, applied: 1 }, testClient).pipe(Effect.flip);
         assert.equal(late.code, "lease_unknown");
       }).pipe(Effect.scoped),
   );
@@ -1671,7 +1701,10 @@ describe("native observation (r12 §3.1)", () => {
         // Releasing the first lease after the succession leaves the second untouched.
         yield* Fiber.interrupt(first.fiber);
         const unknown = yield* service
-          .setDemand({ leaseId: first.leaseId, generation: 1, demand: [{ kind: "summary" }] })
+          .setDemand(
+            { leaseId: first.leaseId, generation: 1, demand: [{ kind: "summary" }] },
+            testClient,
+          )
           .pipe(Effect.flip);
         assert.equal(unknown.code, "lease_unknown");
         yield* native.publish({ type: "tool_approval_request", id: "after", toolName: "bash" });
@@ -1703,15 +1736,18 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* a.pass();
         yield* b.pass();
         const demand = (lease: typeof a, generation: number, kinds: ReadonlyArray<string>) =>
-          service.setDemand({
-            leaseId: lease.leaseId,
-            generation,
-            demand: kinds.map((kind) =>
-              kind === "child"
-                ? { kind: "child" as const, childId: "c1", runToken: "run-c1" }
-                : { kind: kind as "roster" },
-            ),
-          });
+          service.setDemand(
+            {
+              leaseId: lease.leaseId,
+              generation,
+              demand: kinds.map((kind) =>
+                kind === "child"
+                  ? { kind: "child" as const, childId: "c1", runToken: "run-c1" }
+                  : { kind: kind as "roster" },
+              ),
+            },
+            testClient,
+          );
         const settle = () => TestClock.adjust("2 seconds");
         assert.deepEqual(yield* demand(a, 2, ["roster"]), { outcome: "applied" });
         yield* settle();
@@ -1745,11 +1781,14 @@ describe("native observation leases and demand (r12 C4)", () => {
         const lease = yield* follow(service, originalRef);
         const built = yield* lease.pass();
         assert.isFalse([...built.entities.keys()].some((key) => key.startsWith("roster:")));
-        yield* service.setDemand({
-          leaseId: lease.leaseId,
-          generation: 1,
-          demand: [{ kind: "roster" }],
-        });
+        yield* service.setDemand(
+          {
+            leaseId: lease.leaseId,
+            generation: 1,
+            demand: [{ kind: "roster" }],
+          },
+          testClient,
+        );
         yield* TestClock.adjust("2 seconds");
         assert.deepEqual(native.levels, ["progress"]);
         yield* native.publish(child("c1", "started"));
@@ -1772,18 +1811,21 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* service.open({ ...originalRef });
         const lease = yield* follow(service, originalRef);
         yield* lease.pass();
-        yield* service.setDemand({
-          leaseId: lease.leaseId,
-          generation: 1,
-          demand: [{ kind: "roster" }],
-        });
+        yield* service.setDemand(
+          {
+            leaseId: lease.leaseId,
+            generation: 1,
+            demand: [{ kind: "roster" }],
+          },
+          testClient,
+        );
         yield* TestClock.adjust("2 seconds");
         assert.deepEqual(native.levels, ["progress"]);
         yield* Fiber.interrupt(lease.fiber);
         yield* TestClock.adjust("2 seconds");
         assert.deepEqual(native.levels, ["progress", "off"]);
         const gone = yield* service
-          .read({ leaseId: lease.leaseId, readId: 99, cursor: null })
+          .read({ leaseId: lease.leaseId, readId: 99, cursor: null }, testClient)
           .pipe(Effect.flip);
         assert.equal(gone.code, "lease_unknown");
         // While no lease is held, live-only records are not kept: a returning viewer is
@@ -1825,11 +1867,14 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* service.open(originalRef);
         const lease = yield* follow(service, originalRef);
         yield* lease.next("lifecycle", observing);
-        yield* service.setDemand({
-          leaseId: lease.leaseId,
-          generation: 1,
-          demand: [{ kind: "roster" }],
-        });
+        yield* service.setDemand(
+          {
+            leaseId: lease.leaseId,
+            generation: 1,
+            demand: [{ kind: "roster" }],
+          },
+          testClient,
+        );
         yield* TestClock.adjust("2 seconds");
         assert.deepEqual(native.levels, ["progress"]);
         native.ownerAlive = false;
@@ -1841,11 +1886,14 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* TestClock.adjust("2 seconds");
         // The new connection starts at `off`; the same lease's demand reaches it.
         assert.deepEqual(native.levels, ["progress", "progress"]);
-        const same = yield* service.setDemand({
-          leaseId: lease.leaseId,
-          generation: 1,
-          demand: [{ kind: "roster" }],
-        });
+        const same = yield* service.setDemand(
+          {
+            leaseId: lease.leaseId,
+            generation: 1,
+            demand: [{ kind: "roster" }],
+          },
+          testClient,
+        );
         assert.deepEqual(same, { outcome: "unchanged" });
       }).pipe(Effect.scoped),
   );
@@ -1892,11 +1940,14 @@ describe("a refused subagent level (decision 11 follow-up)", () => {
       const lease = yield* follow(service, originalRef);
       let { cursor } = yield* lease.pass();
       const ask = (generation: number, kinds: ReadonlyArray<"roster" | "summary">) =>
-        service.setDemand({
-          leaseId: lease.leaseId,
-          generation,
-          demand: kinds.map((kind) => ({ kind })),
-        });
+        service.setDemand(
+          {
+            leaseId: lease.leaseId,
+            generation,
+            demand: kinds.map((kind) => ({ kind })),
+          },
+          testClient,
+        );
       const fault = () =>
         Effect.gen(function* () {
           // A read with nothing new waits for its deadline, which the test clock supplies.
@@ -1929,8 +1980,509 @@ describe("a refused subagent level (decision 11 follow-up)", () => {
       native.refuseLevels = false;
       yield* ask(3, ["roster"]);
       yield* TestClock.adjust("2 seconds");
-      assert.deepEqual(native.levels, ["off", "progress"]);
+      assert.deepEqual(native.levels, ["progress"]);
       assert.isFalse((yield* fault()).entities.has("fault:subagent-subscription"));
+    }).pipe(Effect.scoped),
+  );
+});
+
+/** A watch that takes envelopes but returns credit only when told to. */
+const manualWatch = Effect.fnUntraced(function* (
+  service: Service,
+  ref: NeoPiNativeSessionRef,
+  client: string = testClient,
+) {
+  const received = yield* Queue.unbounded<Envelope>();
+  const fiber = yield* service.watch({ ref }, client).pipe(
+    Stream.runForEach((envelope) => Queue.offer(received, envelope)),
+    Effect.forkScoped,
+  );
+  const settle = Effect.forEach(Array.from({ length: 30 }), () => Effect.yieldNow, {
+    discard: true,
+  });
+  const take = Effect.gen(function* () {
+    yield* settle;
+    return yield* Queue.clear(received);
+  });
+  return { fiber, received, take, settle };
+});
+const leaseOf = (envelopes: ReadonlyArray<Envelope>) => {
+  const first = envelopes[0];
+  return first?.type === "leased" ? first.leaseId : "";
+};
+const openObligations = (
+  native: { publish: (frame: SessionEventFrame) => Effect.Effect<void> },
+  count: number,
+) =>
+  Effect.forEach(
+    Array.from({ length: count }, (_, index) => index),
+    (index) => native.publish({ type: "host_tool_call", id: `call-${index}`, toolName: "preview" }),
+    { discard: true },
+  );
+
+describe("server wiring review round", () => {
+  it.effect(
+    "a cursor from another projection (closed and reopened file) rebases instead of continuing",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const first = yield* follow(service, originalRef);
+        const held = yield* first.pass();
+        yield* service.close({ ref: originalRef });
+        native.connections = 0;
+        yield* service.open({ ...originalRef });
+        const second = yield* follow(service, originalRef);
+        const reply = yield* second.read(held.cursor);
+        assert.equal(reply.type, "pass");
+        if (reply.type !== "pass") return;
+        assert.equal(reply.kind, "full");
+        assert.notEqual(
+          reply.baseCursor.epoch.serverIncarnation,
+          held.cursor!.epoch.serverIncarnation,
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("read, setDemand and credit refuse a lease that belongs to another connection", () =>
+    Effect.gen(function* () {
+      const { service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef, "client-a");
+      const built = yield* lease.pass();
+      const stranger = "client-b";
+      const read = yield* service
+        .read({ leaseId: lease.leaseId, readId: 50, cursor: built.cursor }, stranger)
+        .pipe(Effect.flip);
+      const demand = yield* service
+        .setDemand(
+          { leaseId: lease.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+          stranger,
+        )
+        .pipe(Effect.flip);
+      const credit = yield* service
+        .credit({ leaseId: lease.leaseId, applied: 1 }, stranger)
+        .pipe(Effect.flip);
+      assert.deepEqual(
+        [read.code, demand.code, credit.code],
+        ["lease_unknown", "lease_unknown", "lease_unknown"],
+      );
+      // The owner's own calls still work, and the stranger changed nothing on the lease.
+      assert.deepEqual(
+        yield* service.setDemand(
+          { leaseId: lease.leaseId, generation: 1, demand: [{ kind: "summary" }] },
+          "client-a",
+        ),
+        { outcome: "applied" },
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("credit is cumulative: excess and repeated values grant nothing", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const watch = yield* manualWatch(service, originalRef);
+      yield* openObligations(native, 20);
+      const window = yield* watch.take;
+      assert.equal(window.length, 8);
+      const leaseId = leaseOf(window);
+      // More than was sent, repeated: nothing arrives, however often it is said.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        yield* service.credit({ leaseId, applied: 1000 }, testClient);
+        assert.deepEqual(yield* watch.take, []);
+      }
+      // The true count releases exactly one window's worth; repeating it releases no more.
+      yield* service.credit({ leaseId, applied: 8 }, testClient);
+      assert.equal((yield* watch.take).length, 8);
+      yield* service.credit({ leaseId, applied: 8 }, testClient);
+      assert.deepEqual(yield* watch.take, []);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("ending a session reaches a lease that returns no credit, and releases it", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const watch = yield* manualWatch(service, originalRef);
+      yield* openObligations(native, 20);
+      const window = yield* watch.take;
+      assert.equal(window.length, 8);
+      yield* service.close({ ref: originalRef });
+      const terminal = yield* watch.take;
+      assert.deepEqual(
+        terminal.map((envelope) => envelope.type === "lifecycle" && envelope.state),
+        ["detached"],
+      );
+      yield* Fiber.join(watch.fiber);
+      const gone = yield* service
+        .read({ leaseId: leaseOf(window), readId: 0, cursor: null }, testClient)
+        .pipe(Effect.flip);
+      assert.equal(gone.code, "lease_unknown");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a lease whose stream is stuck does not hold a closed session beyond the grace period",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const watch = yield* manualWatch(service, originalRef);
+        yield* openObligations(native, 20);
+        const leaseId = leaseOf(yield* watch.take);
+        yield* service.close({ ref: originalRef });
+        yield* TestClock.adjust("10 seconds");
+        const gone = yield* service
+          .setDemand({ leaseId, generation: 1, demand: [] }, testClient)
+          .pipe(Effect.flip);
+        assert.equal(gone.code, "lease_unknown");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a read woken by a change that lands between its scan and its wait still answers", () =>
+    Effect.gen(function* () {
+      const { native, dependencies } = yield* fixture();
+      let slip = false;
+      const service = yield* makeNeoPiNativeSessionsWith({
+        ...dependencies,
+        afterReadScan: Effect.suspend(() =>
+          slip
+            ? Effect.void
+            : Effect.sync(() => {
+                slip = true;
+              }).pipe(
+                Effect.andThen(
+                  native.publish({ type: "notice", level: "info", message: "slipped in" }),
+                ),
+              ),
+        ),
+      });
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      slip = false;
+      // The test clock never advances: only the change can end this read.
+      const reading = yield* lease.pass(built.cursor).pipe(Effect.forkChild);
+      yield* Effect.forEach(Array.from({ length: 50 }), () => Effect.yieldNow, { discard: true });
+      assert.isTrue(reading.pollUnsafe() !== undefined);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a build waiting on a stale page is abandoned when the branch navigates, and a new one starts",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const held = yield* Deferred.make<void>();
+        let first = true;
+        native.pageHook = Effect.suspend(() => {
+          if (!first) return Effect.void;
+          first = false;
+          return Deferred.await(held);
+        });
+        yield* follow(service, originalRef);
+        const spin = Effect.forEach(Array.from({ length: 40 }), () => Effect.yieldNow, {
+          discard: true,
+        });
+        yield* spin;
+        assert.equal(native.snapshots, 1);
+        const frame = (entry: NeoPiJournalEntry) =>
+          native.publish({
+            type: "journal_entry",
+            sessionId: native.sessionId,
+            sessionFile: native.sessionFile,
+            leafId: entry.id,
+            entry,
+          });
+        yield* frame(entry("a"));
+        yield* frame(entry("elsewhere", "not-the-head"));
+        yield* spin;
+        // The held page is still outstanding, yet a fresh attempt has already started.
+        assert.equal(native.snapshots, 2);
+        yield* Deferred.succeed(held, undefined);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a build stops retrying once the last lease has gone", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      native.pageHook = Effect.sync(() => {}).pipe(
+        Effect.andThen(Effect.fail(new NeoPiRpcError({ message: "page unavailable" }))),
+      );
+      const lease = yield* follow(service, originalRef);
+      yield* TestClock.adjust("3 seconds");
+      assert.isAbove(native.pages, 1);
+      yield* Fiber.interrupt(lease.fiber);
+      yield* TestClock.adjust("1 second");
+      const after = native.pages;
+      yield* TestClock.adjust("1 minute");
+      assert.equal(native.pages, after);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a lease that never reads pins the inbox; a forged acknowledgement prunes nothing unseen",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const idle = yield* follow(service, originalRef);
+        const reader = yield* follow(service, originalRef);
+        const readerBuilt = yield* reader.pass();
+        yield* native.publish({
+          type: "notice",
+          level: "info",
+          message: "kept for the idle lease",
+        });
+        const got = yield* reader.pass(readerBuilt.cursor);
+        assert.deepEqual(
+          got.inbox.map((record) => record.type === "notice" && record.message),
+          ["kept for the idle lease"],
+        );
+        // The reader acknowledges what it holds; the idle lease has acknowledged nothing.
+        const ack = yield* reader.pass(got.cursor).pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(ack);
+        // A forged position beyond anything sent cannot move pruning past what was delivered.
+        const forging = yield* idle
+          .read({ ...readerBuilt.cursor!, inboxSeq: 1_000_000 })
+          .pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(forging);
+        const late = yield* follow(service, originalRef);
+        const fresh = yield* late.pass();
+        assert.deepEqual(
+          fresh.inbox.map((record) => record.type === "notice" && record.message),
+          ["kept for the idle lease"],
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a stale idle state reply cannot overwrite a turn that started meanwhile", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      yield* lease.pass();
+      const held = yield* Deferred.make<void>();
+      native.stateHook = Deferred.await(held);
+      yield* native.publish({ type: "agent_end" });
+      const refreshing = yield* Effect.forkChild(
+        Effect.forEach(Array.from({ length: 30 }), () => Effect.yieldNow, { discard: true }),
+      );
+      yield* Fiber.join(refreshing);
+      native.stateHook = Effect.void;
+      yield* native.publish({ type: "agent_start" });
+      yield* Deferred.succeed(held, undefined);
+      yield* Effect.forEach(Array.from({ length: 60 }), () => Effect.yieldNow, { discard: true });
+      const statuses = lease.seen.filter((envelope) => envelope.type === "status");
+      const last = statuses.at(-1);
+      assert.equal(last?.type === "status" && last.live.isStreaming, true);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a profile invalidation fails the watch with profile_changed, not owner-stopped", () =>
+    Effect.gen(function* () {
+      const { native, service, profileChanges } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      native.profileValid = false;
+      yield* Queue.offer(profileChanges, undefined);
+      const exit = yield* Fiber.await(lease.fiber);
+      assert.isTrue(Exit.isFailure(exit));
+      assert.isFalse(
+        lease.seen.some(
+          (envelope) => envelope.type === "lifecycle" && envelope.state === "owner-stopped",
+        ),
+      );
+      if (Exit.isFailure(exit))
+        assert.match(String(exit.cause), /profile_changed|Profile replaced/);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "bulk frames are not folded with no lease; the first lease rebuilds only if some were skipped",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const first = yield* follow(service, originalRef);
+        yield* first.pass();
+        yield* Fiber.interrupt(first.fiber);
+        assert.equal(native.snapshots, 1);
+        // Only identity and interactions arrived: nothing bulk went unread.
+        const quiet = yield* follow(service, originalRef);
+        yield* quiet.pass();
+        assert.equal(native.snapshots, 1);
+        yield* Fiber.interrupt(quiet.fiber);
+        yield* native.publish({
+          type: "message_update",
+          messageId: "m",
+          message: assistant("unseen"),
+        });
+        const returning = yield* follow(service, originalRef);
+        const view = yield* returning.pass();
+        assert.equal(native.snapshots, 2);
+        assert.isFalse(view.entities.has("message:m"));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a reader the journal ring overran makes the server fetch a fresh native page", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const append = appender(native);
+      yield* append(3);
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      const pagesBefore = native.pages;
+      yield* append(600);
+      yield* lease.pass(built.cursor);
+      yield* TestClock.adjust("2 seconds");
+      assert.isAbove(native.pages, pagesBefore);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a stale demand reply from a replaced connection settles nothing for its successor",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        const held = yield* Deferred.make<void>();
+        native.levelHook = Deferred.await(held);
+        yield* service.setDemand(
+          { leaseId: lease.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+          testClient,
+        );
+        yield* Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        native.ownerAlive = true;
+        native.levelHook = Effect.void;
+        yield* TestClock.adjust("1 second");
+        yield* lease.next("lifecycle", observing);
+        yield* Deferred.succeed(held, undefined);
+        yield* TestClock.adjust("2 seconds");
+        // The old connection's reply arrived after the succession; the new connection was
+        // still asked for the demand, so the owner now holds it.
+        assert.deepEqual(native.levels, ["progress", "progress"]);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a successor that fails validation never shows its frames to the leases", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      native.ownerAlive = false;
+      yield* Deferred.succeed(native.exit!, ownerExited);
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+      // The candidate opens a dialog while connecting, then turns out to be another file.
+      native.ownerAlive = true;
+      native.startupDialog = true;
+      native.mismatch = true;
+      yield* TestClock.adjust("3 seconds");
+      assert.isFalse(lease.seen.some((envelope) => envelope.type === "obligation-opened"));
+      // A valid successor's frames reach the leases once it is accepted.
+      native.mismatch = false;
+      yield* TestClock.adjust("2 seconds");
+      const opened = yield* lease.next(
+        "obligation-opened",
+        (envelope) => envelope.id === "native-dialog",
+      );
+      assert.equal(opened.id, "native-dialog");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a live owner that cannot be attached is incompatible or unresolved, never owner-stopped",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        native.attachError = new NeoPiNativeSessionsError({
+          code: "transient",
+          message: "no answer",
+        });
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        yield* TestClock.adjust("12 seconds");
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "authority-unresolved");
+        assert.isFalse(
+          lease.seen.some(
+            (envelope) => envelope.type === "lifecycle" && envelope.state === "owner-stopped",
+          ),
+        );
+        // Attach is retried, and the same lease follows the owner when it answers.
+        native.attachError = undefined;
+        native.ownerAlive = true;
+        yield* TestClock.adjust("6 seconds");
+        yield* lease.next("lifecycle", observing);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("an owner outdated throughout the grace period ends the lease as incompatible", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      native.attachError = new NeoPiNativeSessionsError({
+        code: "owner_outdated",
+        message: "update the terminal's NeoPi",
+      });
+      native.ownerAlive = false;
+      yield* Deferred.succeed(native.exit!, ownerExited);
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+      yield* TestClock.adjust("12 seconds");
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "incompatible");
+      yield* Fiber.join(lease.fiber);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a discovery cancelled while its candidate connects closes that candidate", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      const reached = yield* Deferred.make<void>();
+      native.connectHook = Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.never));
+      const lease = yield* follow(service, originalRef);
+      yield* Deferred.await(reached);
+      assert.equal(native.connections, 1);
+      yield* Fiber.interrupt(lease.fiber);
+      yield* Effect.forEach(Array.from({ length: 30 }), () => Effect.yieldNow, { discard: true });
+      assert.equal(native.connections, 0);
+      assert.equal(native.detaches, 1);
+      // Nothing was installed: a fresh lease discovers again.
+      native.connectHook = Effect.void;
+      const again = yield* follow(service, originalRef);
+      yield* again.next("lifecycle", observing);
+      assert.equal(native.connections, 1);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("discovery keeps retrying attach while the authority is unresolved, then joins", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      native.connectError = new NeoPiNativeSessionsError({ code: "transient", message: "busy" });
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "authority-unresolved");
+      assert.equal(native.starts, 0);
+      native.connectError = undefined;
+      yield* TestClock.adjust("3 seconds");
+      yield* lease.next("lifecycle", observing);
+      assert.equal(native.starts, 1);
     }).pipe(Effect.scoped),
   );
 });

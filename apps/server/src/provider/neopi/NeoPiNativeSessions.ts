@@ -5,6 +5,7 @@ import {
   NEOPI_NATIVE_OBSERVATION_ERROR_CODES,
   NeoPiJournalPage,
   NeoPiModelsError,
+  type NeoPiNativeObservationDomain,
   NeoPiNativeSessionCommand,
   NeoPiNativeSessionLive,
   NeoPiNativeSessionRecord,
@@ -149,6 +150,24 @@ const REFRESH_MIN_GAP = Duration.seconds(1);
  * miss telemetry changed elsewhere, so an observed one is re-read on this cadence.
  */
 const TERMINAL_POLL_INTERVAL = Duration.seconds(5);
+/**
+ * Frame types still folded while no lease is held (C1): identity, pending interactions
+ * and the live-only inbox (which becomes a "not observed" gap). Everything else is bulk.
+ */
+const UNOBSERVED_FOLDED: ReadonlySet<string> = new Set([
+  "journal_state",
+  "extension_ui_request",
+  "tool_approval_request",
+  "tool_approval_cancel",
+  "plan_proposal_request",
+  "plan_proposal_cancel",
+  "host_tool_call",
+  "host_tool_cancel",
+  "host_uri_request",
+  "host_uri_cancel",
+  "tool_stream_update",
+  "notice",
+]);
 /** Build retries are bounded in rate and never terminal (C3.5). */
 /** Fault key for an owner that refused to raise its subagent subscription level (value: `{source, level: "error", requestedLevel, message}`). */
 const SUBAGENT_FAULT_KEY = "fault:subagent-subscription";
@@ -181,8 +200,20 @@ const TERMINAL_LIFECYCLE: ReadonlySet<NeoPiNativeObservationLifecycle> = new Set
  * NeoCode may start an owner of its own. Starting one earlier would take the
  * session's lease out from under a terminal that is still restarting.
  */
-const OWNER_REATTACH_GRACE = "10 seconds";
+const OWNER_REATTACH_GRACE_MS = 10_000;
 const OWNER_REATTACH_POLL = "500 millis";
+/** Past the grace period an unresolved owner is still looked for, at this rate. */
+const OWNER_UNRESOLVED_RETRY = "5 seconds";
+/** Reattach failures that mean a live owner exists that this server cannot attach to. */
+const INCOMPATIBLE_OWNER_CODES: ReadonlySet<string> = new Set([
+  "owner_outdated",
+  "unsupported",
+  "session_in_use",
+]);
+/** A candidate successor's frames held until it is accepted; more are dropped (the rebuild rereads state). */
+const CANDIDATE_FRAME_LIMIT = 4096;
+/** How long a lease may hold a closed session without taking its terminal envelope. */
+const CLOSED_LEASE_GRACE = Duration.seconds(5);
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
   if (Schema.is(NeoPiNativeSessionsError)(cause)) return cause;
   const error = new NeoPiNativeSessionsError({
@@ -272,6 +303,8 @@ export interface NeoPiNativeSessionsDependencies {
     cwd?: string,
     file?: string,
   ) => Effect.Effect<ReadonlyArray<CatalogRow>, NeoPiNativeSessionsError>;
+  /** Runs between a read's scan and its wait; tests inject a change there. */
+  readonly afterReadScan?: Effect.Effect<void>;
   /** Drops the shared listing so the next list rescans; absent in tests with a fresh catalog per call. */
   readonly invalidateCatalog?: Effect.Effect<void>;
   readonly connect: (
@@ -299,6 +332,8 @@ interface NativeSession {
   readonly observations: Set<Observation>;
   /** Woken after every projection change; idle reads wait here. */
   readonly changed: Set<() => void>;
+  /** Bumped by every change, so a read can tell one landed between its scan and its wait. */
+  changeCount: number;
   /** Snapshot markers seen on the current connection, for the build's marker rule (C3.1). */
   readonly markers: NativeMarkers;
   /**
@@ -319,6 +354,12 @@ interface NativeSession {
   subagentLevel: { readonly epoch: number; readonly level: SubagentLevel } | null;
   /** The demand actor is applying a level. */
   demanding: boolean;
+  /** The last level the owner refused to take, so the same request is not repeated. */
+  refusal: { readonly epoch: number; readonly level: SubagentLevel } | null;
+  /** Counts `agent_start`/`agent_end` frames; a `get_state` reply older than one cannot set `busy`. */
+  busyEpoch: number;
+  /** Bulk frames were skipped while no lease was held; the first lease rebuilds first. */
+  bulkStale: boolean;
   readonly pendingUi: Map<string, SessionEventFrame>;
   readonly modelChanges: PubSub.PubSub<void>;
   readonly modelUi: PubSub.PubSub<UiRequestFrame>;
@@ -340,7 +381,7 @@ interface NativeMarkers {
   count: number;
   last: { readonly sessionId: string; readonly sessionFile: string } | null;
 }
-type NativeRefresh = "state" | "jobs" | "roster";
+type NativeRefresh = "state" | "jobs" | "roster" | "page";
 /** NeoPi's per-connection subagent subscription: none, lifecycle and progress, or also every child step. */
 type SubagentLevel = "off" | "progress" | "events";
 const SUBAGENT_LEVEL_RANK: Readonly<Record<SubagentLevel, number>> = {
@@ -351,6 +392,8 @@ const SUBAGENT_LEVEL_RANK: Readonly<Record<SubagentLevel, number>> = {
 /** One `watch` stream: the lease (C4) and its essential outbox (C2). */
 interface Observation {
   readonly leaseId: string;
+  /** The connection that opened this watch: the only one that may read, set demand or return credit. */
+  readonly owner: string;
   /** Null while attach-only discovery is still looking for the session's owner. */
   session: NativeSession | null;
   /** Unsent envelopes, coalesced by kind, so their count is bounded by open obligations. */
@@ -365,6 +408,8 @@ interface Observation {
   readId: number;
   /** The inbox position the client acknowledged with its last read; pruning waits for every lease. */
   inboxSeq: number;
+  /** The inbox position of the last reply sent, under that reply's domain: what an acknowledgement may cover. */
+  delivered: { readonly epoch: NeoPiNativeObservationDomain; readonly inboxSeq: number } | null;
   /** Ends or re-checks the read currently waiting on this lease. */
   interrupt: ((why: "changed" | "superseded" | "released") => void) | null;
   released: boolean;
@@ -408,6 +453,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   const serverIncarnation = NodeCrypto.randomUUID();
   /** Wakes idle reads after a projection change; they re-check and go back to waiting if unchanged. */
   const notifyChanged = (session: NativeSession) => {
+    session.changeCount++;
     if (session.changed.size === 0) return;
     const waiting = Array.from(session.changed);
     session.changed.clear();
@@ -489,7 +535,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         ? "detached"
         : code === "identity_conflict" || code === "session_changed"
           ? "identity-changed"
-          : "owner-stopped";
+          : code === "owner_incompatible"
+            ? "incompatible"
+            : "owner-stopped";
     broadcast(session, lifecycle(session, state, reason));
   };
   const finish = (session: NativeSession, reason: string, code?: string) =>
@@ -500,8 +548,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         sessions.delete(session.ref.sessionFile);
       if (session.recovery) yield* Deferred.fail(session.recovery, fail(reason, code ?? "closed"));
       yield* session.native.hostTools?.revoke ?? Effect.void;
+      const leases = Array.from(session.observations);
       endObservations(session, reason, code);
       notifyChanged(session);
+      // Ending a session never depends on a viewer returning credit: a lease that has
+      // not taken its terminal envelope within the grace period is released anyway.
+      for (const lease of leases)
+        yield* Effect.sleep(CLOSED_LEASE_GRACE).pipe(
+          Effect.andThen(Effect.sync(() => release(lease))),
+          Effect.forkIn(lifetime),
+        );
       yield* PubSub.publish(session.modelChanges, undefined);
     });
   const adoptIdentity = Effect.fnUntraced(function* (
@@ -546,9 +602,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     // Native new_session keeps its cwd even while its new file is still lazy.
     session.cwdFile = session.ref.sessionFile;
   });
-  /** One `get_state` read, applied to the projection under the mark it was requested with (C3.3). */
+  /**
+   * One `get_state` read (C3.3). It is applied to the projection first under the mark
+   * it was requested with; a reply the projection refuses (another incarnation, branch,
+   * file, or older than newer state of the same kind) changes nothing else. Without an
+   * identity to check against yet, the reply still sets the session's own record, but
+   * a busy flag only if no turn started or ended since the request.
+   */
   const readState = Effect.fnUntraced(function* (session: NativeSession) {
     const mark = session.projection.mark();
+    const busyBefore = session.busyEpoch;
     const state = yield* Schema.decodeUnknownEffect(NeoPiNativeSessionRecord)(
       yield* (
         session.native.readState ??
@@ -556,6 +619,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       ),
     );
     const identity = yield* Schema.decodeUnknownEffect(StateIdentity)(state);
+    const applied = session.projection.applyStateReply(state, mark);
+    if (session.projection.identity !== null && !applied) return false;
     if (!session.files.has(identity.sessionFile) || identity.sessionId !== session.sessionId) {
       yield* adoptIdentity(session, identity.sessionId, identity.sessionFile);
       if (!session.files.has(identity.sessionFile))
@@ -565,8 +630,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       state.sessionFile === session.ref.sessionFile
         ? state
         : { ...state, sessionFile: session.ref.sessionFile };
-    session.busy = state.isStreaming === true;
-    const applied = session.projection.applyStateReply(state, mark);
+    if (session.busyEpoch === busyBefore) session.busy = state.isStreaming === true;
     publishStatus(session);
     notifyChanged(session);
     return applied;
@@ -651,6 +715,30 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           session.projection.applyJobsReply(reply, mark),
         )
       : Effect.succeed(true);
+  /** One backward journal page, joined to the held tail by entry id under its own mark (C3.3, C3.4). */
+  const readPage = (session: NativeSession) =>
+    Effect.gen(function* () {
+      const { projection } = session;
+      const mark = projection.mark();
+      const journal = yield* decodeJournalPage(
+        yield* session.native.client.request({
+          type: "get_entries_page",
+          scope: "branch",
+          direction: "backward",
+          limit: 128,
+        }),
+      );
+      const applied = projection.applyJournalPage(
+        {
+          sessionId: journal.sessionId,
+          entries: journal.entries,
+          ...(journal.nextCursor === undefined ? {} : { nextCursor: journal.nextCursor }),
+        },
+        mark,
+      );
+      notifyChanged(session);
+      return applied;
+    });
   /**
    * One build attempt (C3). The attempt's marker is the last snapshot marker received
    * before its own `snapshot_session_journal` reply on this connection (C3.1); the
@@ -673,29 +761,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       marker.sessionFile !== reply.sessionFile
     )
       return false;
-    const page = Effect.gen(function* () {
-      const mark = projection.mark();
-      const journal = yield* decodeJournalPage(
-        yield* session.native.client.request({
-          type: "get_entries_page",
-          scope: "branch",
-          direction: "backward",
-          limit: 128,
-        }),
-      );
-      const applied = projection.applyJournalPage(
-        {
-          sessionId: journal.sessionId,
-          entries: journal.entries,
-          ...(journal.nextCursor === undefined ? {} : { nextCursor: journal.nextCursor }),
-        },
-        mark,
-      );
-      notifyChanged(session);
-      return applied;
-    });
     const applied = yield* Effect.all(
-      [readState(session), page, readRoster(session), readJobs(session)],
+      [readState(session), readPage(session), readRoster(session), readJobs(session)],
       { concurrency: "unbounded" },
     );
     return applied.every(Boolean) && projection.published;
@@ -705,6 +772,19 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    * flight per session, retried at a bounded rate and never terminal (C3.5). A
    * fence or a new owner epoch unpublishes it and calls this again.
    */
+  /**
+   * A navigation or identity change during a build makes its attempt obsolete (C3.5):
+   * it is abandoned at once and the loop starts a fresh one, rather than waiting for
+   * stale work to finish and back off.
+   */
+  const restartBuild = (session: NativeSession) => {
+    const obsolete = session.attempt;
+    if (obsolete) {
+      session.attempt = null;
+      spawnIn(session, Fiber.interrupt(obsolete));
+    }
+    ensureBuild(session);
+  };
   const ensureBuild = (session: NativeSession) => {
     if (
       session.building ||
@@ -719,7 +799,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       session,
       Effect.gen(function* () {
         let delayMs = BUILD_RETRY_MIN_MS;
-        while (!session.closed && !session.projection.published) {
+        while (!session.closed && !session.projection.published && session.observations.size > 0) {
           const recovery = session.recovery;
           if (recovery) {
             yield* Deferred.await(recovery).pipe(Effect.ignore);
@@ -766,7 +846,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                 ? readState(session)
                 : kind === "jobs"
                   ? readJobs(session)
-                  : readRoster(session)
+                  : kind === "page"
+                    ? readPage(session)
+                    : readRoster(session)
               ).pipe(Effect.ignore),
             ),
             { concurrency: "unbounded", discard: true },
@@ -807,36 +889,41 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    */
   const applyDemand = (session: NativeSession) => {
     if (session.demanding || session.closed || session.recovery) return;
-    // A fresh connection is at `off`, so only a different aggregate needs applying.
-    const settled = session.subagentLevel;
+    const { store } = session.projection;
     const epoch = session.projection.domain.ownerEpoch;
+    const demanded = demandedLevel(session);
+    // A refusal stands only for the same request to the same owner: a different demand
+    // or a new owner clears it, and with it the fault the Agents view shows.
+    if (
+      session.refusal &&
+      (session.refusal.epoch !== epoch || session.refusal.level !== demanded)
+    ) {
+      session.refusal = null;
+      if (store.remove(SUBAGENT_FAULT_KEY)) notifyChanged(session);
+    }
+    // A fresh connection is at `off`; `subagentLevel` is what the owner actually holds.
+    const settled = session.subagentLevel;
     const held = settled?.epoch === epoch ? settled.level : "off";
-    if (held === demandedLevel(session)) return;
+    if (held === demanded || session.refusal) return;
     session.demanding = true;
     spawnIn(
       session,
       Effect.gen(function* () {
-        const epoch = session.projection.domain.ownerEpoch;
-        const level = demandedLevel(session);
+        const level = demanded;
         const native = session.native;
-        const before = session.subagentLevel?.epoch === epoch ? session.subagentLevel.level : "off";
         const applied = yield* native.client
           .request({ type: "set_subagent_subscription", level })
           .pipe(Effect.result);
         // A reply from a replaced connection or an earlier epoch changes nothing.
         if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
-        session.subagentLevel = { epoch, level };
-        // A refused raise is a visible fault, not silence: the Agents view would otherwise
-        // show a build-time roster. A success, a new owner or the demand going away clears it.
-        const { store } = session.projection;
-        if (applied._tag === "Failure" && level !== "off") {
-          const message = nativeError(applied.failure).message;
-          const held = store.get(SUBAGENT_FAULT_KEY)?.value;
-          const same =
-            held?.class === "fault" &&
-            held.value.requestedLevel === level &&
-            held.value.message === message;
-          if (!same)
+        if (applied._tag === "Failure") {
+          // The owner keeps the level it had, which is what `subagentLevel` still says;
+          // the same request is not repeated until the demand or the owner changes. A
+          // refused raise is a visible fault, not silence: the Agents view would otherwise
+          // show a build-time roster.
+          session.refusal = { epoch, level };
+          if (level !== "off") {
+            const message = nativeError(applied.failure).message;
             store.put(SUBAGENT_FAULT_KEY, {
               class: "fault",
               value: {
@@ -846,14 +933,17 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                 message,
               },
             });
-        } else store.remove(SUBAGENT_FAULT_KEY);
+            notifyChanged(session);
+          }
+          return;
+        }
+        session.subagentLevel = { epoch, level };
+        session.refusal = null;
+        store.remove(SUBAGENT_FAULT_KEY);
         notifyChanged(session);
         // A build in progress may have read the roster before the level rose: the re-read
         // is owed and runs once the projection publishes.
-        if (
-          applied._tag === "Success" &&
-          SUBAGENT_LEVEL_RANK[level] > SUBAGENT_LEVEL_RANK[before]
-        ) {
+        if (SUBAGENT_LEVEL_RANK[level] > SUBAGENT_LEVEL_RANK[held]) {
           session.refreshes.add("roster");
           if (session.projection.published) startRefresh(session);
         }
@@ -891,7 +981,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     const files = new Map<string, string>();
     const projection = new NeoPiNativeProjection({
       domain: {
-        serverIncarnation,
+        // Unique per projection instance, so a cursor from another file's projection, or
+        // from this file before it was closed and reopened, never matches (C2).
+        serverIncarnation: NodeCrypto.randomUUID(),
         ownerEpoch: 0,
         projectionIncarnation: 0,
         buildAttempt: 0,
@@ -908,7 +1000,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       },
       // A navigation or identity change, from a frame or settled by a read, restarts the build (C3.5).
       onFence: () => {
-        if (session) ensureBuild(session);
+        if (session) restartBuild(session);
       },
     });
     // Decision 8 (a): no lease yet, so live-only inbox records are not retained.
@@ -990,11 +1082,24 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           }
           if (fed !== frame.sessionFile) folded = { ...frame, sessionFile: fed };
         }
-        const fence = projection.fold(folded);
+        // With no lease held only identity, pending interactions and the live-only inbox
+        // are kept (C1): everything else is read again by the first build (`bulkStale`).
+        const unobserved = session !== undefined && observations.size === 0;
+        const skip =
+          unobserved &&
+          (!UNOBSERVED_FOLDED.has(frame.type) ||
+            (frame.type === "tool_stream_update" && frame.toolName === "edit"));
+        if (skip && session) session.bulkStale = true;
+        const fence = skip ? "none" : projection.fold(folded);
         const current = session;
         if (!current || current.closed) return;
-        if (frame.type === "agent_start") current.busy = true;
-        else if (frame.type === "agent_end") current.busy = false;
+        if (frame.type === "agent_start") {
+          current.busy = true;
+          current.busyEpoch++;
+        } else if (frame.type === "agent_end") {
+          current.busy = false;
+          current.busyEpoch++;
+        }
         if (identityFrame && (unseenFile || identityFrame.sessionId !== current.sessionId))
           spawnIn(
             current,
@@ -1027,11 +1132,31 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     const establish = Effect.fnUntraced(function* (
       connectInput: NeoPiNativeSessionsOpenInput,
       mode: "auto" | "attach",
+      /** A candidate successor's frames wait until it is accepted: it holds no authority yet (C2). */
+      candidate = false,
     ) {
       const nativeScope = yield* Scope.fork(scope);
+      let held: SessionEventFrame[] | null = candidate ? [] : null;
+      const candidateObserver: NeoPiNativeFrameObserver = candidate
+        ? {
+            frame: (frame) => {
+              if (held === null) observer.frame(frame);
+              else if (held.length < CANDIDATE_FRAME_LIMIT) held.push(frame);
+            },
+            resulted: (id) => {
+              if (held === null) observer.resulted(id);
+            },
+          }
+        : observer;
+      /** Accepts the candidate: what it sent meanwhile now reaches the leases, in order. */
+      const accept = () => {
+        const frames = held;
+        held = null;
+        if (frames) for (const frame of frames) observer.frame(frame);
+      };
       return yield* Effect.gen(function* () {
         const native = yield* dependencies
-          .connect(profile, connectInput, observer, mode)
+          .connect(profile, connectInput, candidateObserver, mode)
           .pipe(Effect.provideService(Scope.Scope, nativeScope));
         if (
           !native.client.capabilities.has("session_journal") ||
@@ -1057,7 +1182,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             "session_changed",
           );
         yield* profile.validate;
-        return { native, nativeScope, state, identity, file };
+        return { native, nativeScope, state, identity, file, accept };
       }).pipe(Effect.onError(() => Scope.close(nativeScope, Exit.void)));
     });
     const abandon = (current: NativeSession, reason: string, code?: string) =>
@@ -1071,6 +1196,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           ...(input.cwd ? { cwd: input.cwd } : {}),
         },
         mode,
+        true,
       );
       return yield* Effect.gen(function* () {
         if (current.closed) return yield* fail("This native connection is closed.", "closed");
@@ -1089,7 +1215,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             ? next.state
             : { ...next.state, sessionFile: next.file };
         current.busy = next.state.isStreaming === true;
-        return next.native;
+        return { native: next.native, accept: next.accept };
       }).pipe(Effect.onError(() => Scope.close(next.nativeScope, Exit.void)));
     });
     /**
@@ -1112,37 +1238,61 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         projection.settleObligation(id, "cancelled");
       broadcast(current, lifecycle(current, "reconnecting", reason));
       publishStatus(current);
-      const attached = yield* Effect.gen(function* () {
-        while (!current.closed) {
-          const next = yield* adopt(current, "attach").pipe(Effect.result);
-          if (next._tag === "Success") return next.success;
-          if (nativeError(next.failure).code === "profile_changed") return yield* next.failure;
-          yield* Effect.sleep(OWNER_REATTACH_POLL);
+      // Only an established absence ends the session as owner-stopped; an owner that is
+      // alive but cannot be attached, or whose state is unknown, is reported as that and
+      // never replaced (I4(1), C5).
+      const started = clock.currentTimeMillisUnsafe();
+      let announcedUnresolved = false;
+      let accepted: Effect.Success<ReturnType<typeof adopt>> | undefined;
+      while (!current.closed && accepted === undefined) {
+        const next = yield* adopt(current, "attach").pipe(Effect.result);
+        if (next._tag === "Success") {
+          accepted = next.success;
+          break;
         }
-        return undefined;
-      }).pipe(Effect.timeoutOption(OWNER_REATTACH_GRACE), Effect.result);
-      if (current.closed) return;
-      if (attached._tag === "Failure") {
-        const error = nativeError(attached.failure);
-        return yield* abandon(current, error.message, error.code);
+        const error = nativeError(next.failure);
+        if (error.code === "profile_changed")
+          return yield* abandon(current, error.message, error.code);
+        const graceOver = clock.currentTimeMillisUnsafe() - started >= OWNER_REATTACH_GRACE_MS;
+        if (graceOver) {
+          if (error.code === "no_owner") {
+            if (!current.takeoverRequested)
+              return yield* abandon(
+                current,
+                "No NeoPi is running this session now.",
+                "owner_exited",
+              );
+            const taken = yield* adopt(current, "auto").pipe(Effect.result);
+            if (taken._tag === "Failure") {
+              const failed = nativeError(taken.failure);
+              return yield* abandon(current, failed.message, failed.code);
+            }
+            accepted = taken.success;
+            break;
+          }
+          if (INCOMPATIBLE_OWNER_CODES.has(error.code ?? ""))
+            return yield* abandon(current, error.message, "owner_incompatible");
+          if (!announcedUnresolved) {
+            announcedUnresolved = true;
+            broadcast(current, lifecycle(current, "authority-unresolved", error.message));
+          }
+        }
+        yield* Effect.sleep(graceOver ? OWNER_UNRESOLVED_RETRY : OWNER_REATTACH_POLL);
       }
-      let successor = attached.success._tag === "Some" ? attached.success.value : undefined;
-      if (!successor) {
-        if (!current.takeoverRequested)
-          return yield* abandon(current, "No NeoPi is running this session now.", "owner_exited");
-        const taken = yield* adopt(current, "auto").pipe(Effect.result);
-        if (taken._tag === "Failure")
-          return yield* abandon(current, nativeError(taken.failure).message);
-        successor = taken.success;
-      }
+      if (current.closed || accepted === undefined) return;
+      const successor = accepted.native;
       const abandoned = current.attempt;
       current.attempt = null;
       if (abandoned) yield* Fiber.interrupt(abandoned);
       projection.rebuild(projection.domain.ownerEpoch + 1);
       // A refusal belongs to the owner that gave it; the successor is asked afresh.
       projection.store.remove(SUBAGENT_FAULT_KEY);
+      current.refusal = null;
+      current.subagentLevel = null;
       current.recovery = null;
       yield* Deferred.succeed(recovery, undefined);
+      // What the successor said while it was a candidate reaches the leases now, in order.
+      accepted.accept();
       yield* watchExit(current, successor);
       broadcast(current, sessionEnvelope(current));
       ensureBuild(current);
@@ -1186,6 +1336,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           projection,
           observations,
           changed: new Set(),
+          changeCount: 0,
           markers,
           files,
           building: false,
@@ -1206,6 +1357,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           busy: state.isStreaming === true,
           subagentLevel: null,
           demanding: false,
+          refusal: null,
+          busyEpoch: 0,
+          bulkStale: false,
           recovery: null,
           takeoverRequested: false,
         };
@@ -1616,6 +1770,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     observation.released = true;
     observations.delete(observation.leaseId);
     const session = observation.session;
+    observation.session = null;
+    observation.outbox.length = 0;
     if (session) {
       session.observations.delete(observation);
       session.projection.store.endTransfer(observation.leaseId);
@@ -1644,6 +1800,15 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           return resume(Effect.fail(observation.failure));
         }
         const room = CREDIT_WINDOW - (observation.sent - observation.applied);
+        // The terminal lifecycle supersedes everything unsent and needs no credit: the
+        // window plus this one envelope stays below the client's queue.
+        if (room <= 0 && observation.ending && observation.outbox.length > 0) {
+          const terminal = observation.outbox.at(-1)!;
+          observation.outbox.length = 0;
+          observation.sent += 1;
+          resumed = true;
+          return resume(Effect.succeed([terminal]));
+        }
         const [first, ...rest] = observation.outbox.splice(0, Math.max(0, room));
         if (first) {
           observation.sent += 1 + rest.length;
@@ -1707,6 +1872,15 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           session.observations.add(observation);
           if (session.observations.size === 1) {
             projection.setInboxObserved(true);
+            // Bulk frames were not folded while no lease was held, so what the projection
+            // holds is stale: the first lease starts a new incarnation and builds again.
+            if (session.bulkStale) {
+              session.bulkStale = false;
+              const obsolete = session.attempt;
+              session.attempt = null;
+              if (obsolete) spawnIn(session, Fiber.interrupt(obsolete));
+              projection.rebuild();
+            }
             // Query-backed state went unread while no lease was held; the first lease re-reads it.
             requestRefresh(session, "state");
             requestRefresh(session, "jobs");
@@ -1824,9 +1998,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    * Bulk state is pulled through `read`. Capacity never ends it (I3); only the
    * lifecycle states that I3 names do.
    */
-  const watch = (input: {
-    ref: NeoPiNativeSessionRef;
-  }): Stream.Stream<NeoPiNativeEssentialEnvelope, NeoPiNativeSessionsError> =>
+  const watch = (
+    input: { ref: NeoPiNativeSessionRef },
+    /** The connection opening this watch; the lease belongs to it alone. */
+    owner: string,
+  ): Stream.Stream<NeoPiNativeEssentialEnvelope, NeoPiNativeSessionsError> =>
     Stream.unwrap(
       Effect.gen(function* () {
         const file = yield* dependencies.canonicalize(input.ref.sessionFile);
@@ -1842,7 +2018,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           failure: null,
           wake: null,
           readId: -1,
+          owner,
           inboxSeq: 0,
+          delivered: null,
           interrupt: null,
           released: false,
           demand: null,
@@ -1882,6 +2060,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             }
             const found = yield* discover(profile, file);
             if (found.outcome === "found") continue;
+            // An outcome that arrives after a session was installed meanwhile (an explicit
+            // open) is stale: the live authority wins, never a report of absence.
+            const installed = sessions.get(file);
+            if (installed && !installed.closed) continue;
             if (found.outcome !== "authority-unresolved")
               return report(found.outcome, found.reason);
             if (!unresolved) report(found.outcome, found.reason);
@@ -1907,10 +2089,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         return Stream.fromPull(Effect.succeed(pullEnvelopes(observation)));
       }),
     ).pipe(Stream.mapError(nativeError), Stream.scoped);
-  const leaseFor = (leaseId: string) =>
+  /** A lease is found only by the connection that opened it (C4); anyone else sees it as unknown. */
+  const leaseFor = (leaseId: string, caller: string) =>
     Effect.suspend(() => {
       const observation = observations.get(leaseId);
-      return observation
+      return observation && observation.owner === caller
         ? Effect.succeed(observation)
         : Effect.fail(
             fail(
@@ -1927,19 +2110,30 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    */
   const read = (
     input: NeoPiNativeSessionsReadInput,
+    caller: string,
   ): Effect.Effect<NeoPiNativeSessionsReadResult, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
-      const observation = yield* leaseFor(input.leaseId);
-      if (input.readId <= observation.readId)
-        return yield* fail(
+      const observation = yield* leaseFor(input.leaseId, caller);
+      const superseded = () =>
+        fail(
           "A newer read was admitted on this lease.",
           NEOPI_NATIVE_OBSERVATION_ERROR_CODES.staleRead,
         );
+      if (input.readId <= observation.readId) return yield* superseded();
       observation.readId = input.readId;
       observation.interrupt?.("superseded");
       const deadline = clock.currentTimeMillisUnsafe() + READ_DEADLINE_MS;
       while (true) {
+        // Every pass of the loop is a fresh decision: a newer read or a release may have
+        // come in while this one slept, and neither may be answered over.
+        if (observation.released)
+          return yield* fail(
+            "This observation lease has ended.",
+            NEOPI_NATIVE_OBSERVATION_ERROR_CODES.leaseUnknown,
+          );
+        if (observation.readId !== input.readId) return yield* superseded();
         const { session } = observation;
+        const scanned = session?.changeCount ?? 0;
         const result = session
           ? readNeoPiNativeObservation(
               session.projection,
@@ -1948,51 +2142,74 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               observation.leaseId,
             )
           : ({ type: "building" } as const);
-        // The cursor's inbox position is the client's acknowledgement of what it holds.
+        if (session && result.type === "pass") {
+          // The inbox position a viewer may acknowledge is the one this server sent it.
+          observation.delivered = {
+            epoch: result.continuation.epoch,
+            inboxSeq: result.continuation.inboxSeq,
+          };
+          // A reader the journal ring overran got what the ring holds; the native horizon
+          // is fetched afresh so the next one starts from it (C3.4).
+          if (
+            result.journal?.continuity === "horizon" &&
+            input.cursor?.journalAt != null &&
+            sameObservationDomain(input.cursor.epoch, session.projection.domain)
+          )
+            requestRefresh(session, "page");
+        }
+        // The cursor's inbox position is the viewer's acknowledgement, capped at what was sent.
+        const acknowledged = observation.delivered;
         if (
           session &&
+          acknowledged &&
           input.cursor &&
-          sameObservationDomain(input.cursor.epoch, session.projection.domain)
+          sameObservationDomain(input.cursor.epoch, session.projection.domain) &&
+          sameObservationDomain(input.cursor.epoch, acknowledged.epoch)
         ) {
-          observation.inboxSeq = Math.max(observation.inboxSeq, input.cursor.inboxSeq);
+          observation.inboxSeq = Math.max(
+            observation.inboxSeq,
+            Math.min(input.cursor.inboxSeq, acknowledged.inboxSeq),
+          );
           pruneAcknowledged(session);
         }
         const remaining = deadline - clock.currentTimeMillisUnsafe();
         if (result.type === "pass" || remaining <= 0) return result;
+        // Test seam: a change can land exactly here, between the scan and the wait.
+        if (dependencies.afterReadScan) yield* dependencies.afterReadScan;
         let wake: (() => void) | undefined;
+        const waiting = (why: "changed" | "superseded" | "released") => {
+          if (observation.interrupt === waiting) wakeUp(why);
+        };
+        let wakeUp: (why: "changed" | "superseded" | "released") => void = () => {};
         const woken = yield* Effect.callback<"changed" | "superseded" | "released">((resume) => {
+          wakeUp = (why) => resume(Effect.succeed(why));
           wake = () => resume(Effect.succeed("changed"));
           session?.changed.add(wake);
-          observation.interrupt = (why) => resume(Effect.succeed(why));
+          observation.interrupt = waiting;
+          // A change that landed between the scan and this registration woke no one.
+          if (session && session.changeCount !== scanned) wake();
         }).pipe(
           Effect.timeoutOption(Duration.millis(remaining)),
           Effect.ensuring(
             Effect.sync(() => {
               if (wake) session?.changed.delete(wake);
-              observation.interrupt = null;
+              // Only this read's own registration is cleared, never a newer read's.
+              if (observation.interrupt === waiting) observation.interrupt = null;
             }),
           ),
         );
-        if (woken._tag === "None" || woken.value === "changed") continue;
-        return yield* woken.value === "superseded"
-          ? fail(
-              "A newer read was admitted on this lease.",
-              NEOPI_NATIVE_OBSERVATION_ERROR_CODES.staleRead,
-            )
-          : fail(
-              "This observation lease has ended.",
-              NEOPI_NATIVE_OBSERVATION_ERROR_CODES.leaseUnknown,
-            );
+        if (woken._tag === "Some" && woken.value === "superseded") return yield* superseded();
       }
     }).pipe(Effect.mapError(nativeError));
-  /** Returns essential credit; `applied` is cumulative, so a repeated call changes nothing. */
-  const credit = (input: NeoPiNativeSessionsCreditInput) =>
-    leaseFor(input.leaseId).pipe(
+  /**
+   * Returns essential credit. `applied` is cumulative and monotonic: a value at or
+   * below what is already acknowledged, or above what was sent, grants nothing.
+   */
+  const credit = (input: NeoPiNativeSessionsCreditInput, caller: string) =>
+    leaseFor(input.leaseId, caller).pipe(
       Effect.map((observation) => {
-        observation.applied = Math.min(
-          observation.sent,
-          Math.max(observation.applied, input.applied),
-        );
+        if (input.applied > observation.sent || input.applied <= observation.applied) return;
+        observation.applied = input.applied;
         observation.wake?.();
       }),
     );
@@ -2014,9 +2231,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
    */
   const setDemand = (
     input: NeoPiNativeSessionsSetDemandInput,
+    caller: string,
   ): Effect.Effect<NeoPiNativeSessionsSetDemandResult, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
-      const observation = yield* leaseFor(input.leaseId);
+      const observation = yield* leaseFor(input.leaseId, caller);
       // Demand is a set: order does not make it different.
       const payload = input.demand
         .map((item) =>
@@ -2120,7 +2338,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       Effect.forEach(Array.from(sessions.values()), (session) =>
         session.profile.validate.pipe(
           Effect.catch((cause) =>
-            finish(session, nativeError(cause).message).pipe(
+            finish(session, nativeError(cause).message, nativeError(cause).code).pipe(
               Effect.andThen(Scope.close(session.scope, Exit.void)),
             ),
           ),

@@ -492,6 +492,12 @@ export function createNativeSessionAtoms<R, E>(
       };
     },
     /**
+     * Wakes a mounted observation that stopped on a terminal lifecycle, attach
+     * only: it opens nothing and never starts an owner. If no owner is live the
+     * server answers owner-stopped again.
+     */
+    retry: (target: NativeSessionTarget) => signal(restarts, nativeSessionKey(target)),
+    /**
      * The explicit route back for an owner-stopped or detached session: opens it
      * (the server attaches to a live terminal owner when there is one and
      * otherwise starts NeoCode's own, so this is also how a quit terminal is

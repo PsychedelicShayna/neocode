@@ -508,6 +508,66 @@ describe("native observation controller", () => {
       ),
   );
 
+  it.effect(
+    "a dialog answered while the view was hidden does not come back on the next lease",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness();
+          const approval = (id: string) => ({
+            type: "obligation-opened" as const,
+            revision: h.nextRevision(),
+            id,
+            request: { type: "tool_approval_request", id },
+          });
+          let unmount = h.registry.mount(h.watch);
+          const first = yield* Queue.take(h.leases);
+          yield* first.push(approval("answered-elsewhere"));
+          yield* h.observe((feed) => feed.dialogs.length === 1);
+          // Hidden: the lease ends and the cache keeps the feed.
+          unmount();
+          yield* Deferred.await(first.released);
+          expect(h.atoms.cached(h.target)?.dialogs.map((dialog) => dialog.id)).toEqual([
+            "answered-elsewhere",
+          ]);
+          // Shown again after another client answered it: the new lease replays only
+          // what is still open, here one opened while hidden.
+          unmount = h.registry.mount(h.watch);
+          const second = yield* Queue.take(h.leases);
+          yield* second.push(approval("opened-while-hidden"));
+          const shown = yield* h.observe(
+            (feed) =>
+              feed.connected && feed.dialogs.some((dialog) => dialog.id === "opened-while-hidden"),
+          );
+          expect(shown.dialogs.map((dialog) => dialog.id)).toEqual(["opened-while-hidden"]);
+          unmount();
+        }),
+      ),
+  );
+
+  it.effect("retry re-attaches a stopped observation without opening the session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const unmount = h.registry.mount(h.watch);
+        const first = yield* Queue.take(h.leases);
+        yield* first.push({
+          type: "lifecycle",
+          revision: h.nextRevision(),
+          state: "owner-stopped",
+        });
+        yield* Queue.offer(first.items, { type: "end" });
+        yield* h.observe((feed) => feed.ownerLoss === "orphaned");
+        yield* Deferred.await(first.released);
+        h.atoms.retry(h.target);
+        yield* Queue.take(h.leases);
+        yield* h.observe((feed) => feed.connected && feed.ownerLoss === null);
+        expect(h.counts().opens).toBe(0);
+        unmount();
+      }),
+    ),
+  );
+
   it.effect("draft, attachments, terminals, layout and scroll survive every transition", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -597,6 +657,51 @@ describe("native observation controller", () => {
 });
 
 describe("native inbox bound", () => {
+  it("never re-adds applied records when a rebuild keeps the server's inbox", () => {
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    const notice = (seq: number): NeoPiNativeInboxRecord => ({
+      type: "notice",
+      seq,
+      level: "info",
+      message: `notice ${seq}`,
+    });
+    const gap: NeoPiNativeInboxRecord = {
+      type: "gap",
+      seq: 2,
+      reason: "evicted",
+      fromSeq: 2,
+      toSeq: 2,
+      firstReceivedAt: 1,
+      lastReceivedAt: 2,
+      notices: 1,
+      toolStreams: [],
+      toolStreamsTruncated: false,
+    };
+    feed = applyRead(
+      feed,
+      pass({ epoch: domain(), watermark: 3, inbox: [notice(1), gap, notice(3)] }),
+    );
+    expect(feed.observation.inbox.length).toBe(3);
+    // The view hid before the server saw its cursor; the next lease's build
+    // advanced the projection incarnation and replays the same inbox.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ projectionIncarnation: 2, branchGeneration: 1 }),
+        watermark: 2,
+        inbox: [notice(1), gap, notice(3), notice(4)],
+      }),
+    );
+    const seqs = feed.observation.inbox.map((item) =>
+      item.type === "gap" ? `gap:${item.fromSeq}` : "seq" in item ? item.seq : item.type,
+    );
+    expect(seqs).toEqual([1, "gap:2", 3, 4]);
+  });
+
   it("keeps a tool that streams forever within bounds, server gaps exact, cuts as trimmed", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
@@ -607,7 +712,11 @@ describe("native inbox bound", () => {
     const perProjection = NATIVE_INBOX_LIMIT * 3;
     // Two projections: sequence numbers restart with the second.
     for (const incarnation of [1, 2]) {
-      const epoch = domain({ projectionIncarnation: incarnation });
+      // A new projection object: its own server incarnation, sequence numbers restart.
+      const epoch = domain({
+        serverIncarnation: `server-${incarnation}`,
+        projectionIncarnation: incarnation,
+      });
       for (let seq = 1; seq <= perProjection; seq++) {
         const record: NeoPiNativeInboxRecord =
           seq % 10 === 0

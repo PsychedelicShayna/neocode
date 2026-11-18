@@ -1247,6 +1247,32 @@ describe("NeoPiNativeProjection", () => {
         assert.isTrue(projection.published);
       });
 
+      it("append by ancestry: an entry folded live after the page's mark is kept", () => {
+        const projection = pending(); // tail A, B; leaf D pending
+        const generation = projection.domain.branchGeneration;
+        const mark = projection.mark();
+        // X extends the head while the page (ending at B) is in flight.
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("X", "B") });
+        const page = {
+          sessionId,
+          leafId: "D",
+          entries: [entry("A", null), entry("B", "A"), entry("D", "B")],
+        };
+        assert.equal(
+          projection.reconcilePendingLeaf(
+            "D",
+            { ...page, leafId: "B", entries: page.entries.slice(0, 2) },
+            mark,
+          ),
+          "stale",
+        );
+        const ending = { sessionId, entries: [entry("A", null), entry("B", "A")] };
+        assert.equal(projection.reconcilePendingLeaf("D", ending, mark), "append");
+        assert.deepEqual(tail(projection), ["A", "B", "X"]);
+        assert.equal(projection.domain.branchGeneration, generation);
+        assert.isNull(projection.pendingLeafId);
+      });
+
       it("stale: another leaf since, or a mark from before a fence", () => {
         const projection = pending();
         const mark = projection.mark();

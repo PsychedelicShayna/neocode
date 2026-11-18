@@ -67,6 +67,20 @@ export const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
 /** Caps live stderr retention when a subscriber is attached. Unused sessions offer nothing. */
 export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
 
+/**
+ * Receives peer frames in-line on the stdout parser, in wire order: each call returns before the
+ * parser reads the next frame, and an event written before a reply is delivered before that
+ * reply settles its request. Calls must be synchronous and must not throw. With a sink, the
+ * `events`, `uiRequests`, `hostToolCalls` and `hostUriRequests` streams never emit, and every
+ * host URI request reaches `hostUriRequest`, whose owner must answer it.
+ */
+export interface NeoPiRpcFrameSink {
+  readonly event: (frame: SessionEventFrame) => void;
+  readonly uiRequest: (frame: UiRequestFrame) => void;
+  readonly hostToolCall: (frame: HostToolCallFrame | HostToolCancelFrame) => void;
+  readonly hostUriRequest: (frame: HostUriRequestFrame) => void;
+}
+
 export interface NeoPiRpcClientOptions {
   readonly spawn: SpawnFn;
   readonly command: string;
@@ -78,6 +92,8 @@ export interface NeoPiRpcClientOptions {
   readonly stderrTailBytes?: number;
   /** A consuming observer may bound stdout read-ahead. Full queues backpressure the pipe. */
   readonly eventQueueCapacity?: number;
+  /** Replaces the event, UI, host-tool and host-URI queues; `eventQueueCapacity` then has no effect. */
+  readonly sink?: NeoPiRpcFrameSink;
   readonly onTransportReady?: (transport: NeoPiRpcTransport) => Effect.Effect<void>;
 }
 
@@ -213,6 +229,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     Cause.Done<void>
   >();
   const hostUriRequests = yield* Queue.unbounded<HostUriRequestFrame, Cause.Done<void>>();
+  const sink = options.sink;
+  // With a sink nothing is offered to the four frame queues, so they cannot accumulate.
+  const publishEvent = (frame: SessionEventFrame): Effect.Effect<void> =>
+    sink ? Effect.sync(() => sink.event(frame)) : Queue.offer(events, frame).pipe(Effect.ignore);
   const stderr = yield* Queue.sliding<string, Cause.Done<void>>(DEFAULT_STDERR_QUEUE_CAPACITY);
   const exit = yield* Deferred.make<ProcessExit>();
   const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
@@ -243,14 +263,16 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       for (const prompt of prompts.values()) {
         // Failure must settle requests even when the bounded event consumer has
         // stopped. Prompt outcomes and process exit remain separate receipts.
-        yield* Effect.sync(() =>
-          Queue.offerUnsafe(events, {
+        yield* Effect.sync(() => {
+          const failed = {
             type: "t3.prompt.failed",
             id: prompt.id,
             error: error.message,
             code: error.code,
-          }),
-        );
+          };
+          if (sink) sink.event(failed);
+          else Queue.offerUnsafe(events, failed);
+        });
         yield* completePrompt(prompt, {
           kind: "rejected",
           error: error.message,
@@ -410,12 +432,12 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       // Proposal responses have no success ack, but a cancelled proposal gets
       // a response-only error. Surface it to the runtime instead of dropping it.
       if (frame.command === "plan_proposal_response" && !frame.success && id)
-        yield* Queue.offer(events, {
+        yield* publishEvent({
           type: "t3.plan.proposal.rejected",
           id,
           error: frame.error ?? "Plan proposal rejected",
           code: frame.code,
-        }).pipe(Effect.ignore);
+        });
     });
 
   const onPromptResponse = (record: PromptRecord, frame: ResponseFrame): Effect.Effect<void> =>
@@ -426,12 +448,12 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           error: frame.error ?? "prompt rejected",
           ...(frame.code !== undefined ? { code: frame.code } : {}),
         });
-        yield* Queue.offer(events, {
+        yield* publishEvent({
           type: "t3.prompt.failed",
           id: record.id,
           error: frame.error ?? "prompt rejected",
           code: frame.code,
-        }).pipe(Effect.ignore);
+        });
         prompts.delete(record.id);
         return;
       }
@@ -449,7 +471,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           agentInvoked: false,
           ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
         });
-        yield* Queue.offer(events, { type: "t3.prompt.local", id: record.id }).pipe(Effect.ignore);
+        yield* publishEvent({ type: "t3.prompt.local", id: record.id });
         prompts.delete(record.id);
         return;
       }
@@ -513,9 +535,6 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     return undefined;
   };
 
-  const publishEvent = (frame: SessionEventFrame): Effect.Effect<void> =>
-    Queue.offer(events, frame).pipe(Effect.ignore);
-
   const handleLogicalFrame = (frame: Frame): Effect.Effect<void> =>
     Effect.gen(function* () {
       if (!(yield* Deferred.isDone(readyDeferred))) {
@@ -570,16 +589,18 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               yield* Queue.offer(startupUiChanges, undefined);
             }
           }
+          if (sink) return sink.uiRequest(ui);
           return yield* Queue.offer(uiRequests, ui).pipe(Effect.ignore);
         }
         case "host_tool_call":
-        case "host_tool_cancel":
-          return yield* Queue.offer(
-            hostToolCalls,
-            frame as HostToolCallFrame | HostToolCancelFrame,
-          ).pipe(Effect.ignore);
+        case "host_tool_cancel": {
+          const call = frame as HostToolCallFrame | HostToolCancelFrame;
+          if (sink) return sink.hostToolCall(call);
+          return yield* Queue.offer(hostToolCalls, call).pipe(Effect.ignore);
+        }
         case "host_uri_request": {
           const uri = frame as HostUriRequestFrame;
+          if (sink) return sink.hostUriRequest(uri);
           if (uriListeners === 0) {
             yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
             return;

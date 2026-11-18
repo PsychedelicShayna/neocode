@@ -61,6 +61,15 @@ export {
   parseKeybindingShortcut,
 };
 
+/** Default commands added together with the retired-defaults migration. */
+const MIGRATION_MARKER_COMMANDS: ReadonlySet<KeybindingRule["command"]> = new Set([
+  "terminal.leaveFocus",
+  "terminal.fontSize.increase",
+  "terminal.fontSize.decrease",
+  "terminal.fontSize.reset",
+  "exLine.open",
+]);
+
 export const ResolvedKeybindingFromConfig = KeybindingRule.pipe(
   Schema.decodeTo(
     Schema.toType(ResolvedKeybindingRule),
@@ -484,13 +493,16 @@ const make = Effect.gen(function* () {
       }
       // Files written before `terminal.leaveFocus` existed still hold the
       // retired terminal-focus defaults, which can no longer fire in a terminal.
-      // Drop exact copies of them once: backfill below then adds
-      // `terminal.leaveFocus`, which marks the file as migrated, and the retired
-      // commands have no defaults left for backfill to restore. Any other rule,
-      // including the user's own rules for those commands, is kept.
+      // Drop exact copies of them once: backfill below then adds the commands
+      // introduced with that change, which mark the file as migrated, and the
+      // retired commands have no defaults left for backfill to restore. Any
+      // other rule, including the user's own rules for those commands, is kept.
+      // The marker is inferred, not stored: a file migrates again only if the
+      // user deletes every rule for all of those commands (backfill restores
+      // them on each start) and has re-added an exact copy of a retired default.
       const savedConfig = runtimeConfig.keybindings;
-      const migratesRetiredDefaults = !savedConfig.some(
-        (entry) => entry.command === "terminal.leaveFocus",
+      const migratesRetiredDefaults = !savedConfig.some((entry) =>
+        MIGRATION_MARKER_COMMANDS.has(entry.command),
       );
       const customConfig = migratesRetiredDefaults
         ? savedConfig.filter(

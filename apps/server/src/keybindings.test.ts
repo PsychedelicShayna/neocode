@@ -342,6 +342,24 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
           ...migrated,
           readded,
         ]);
+
+        // Deleting the escape rule as well does not make the file look unmigrated:
+        // the user's re-added rule survives the next start.
+        const withoutEscape = [...migrated, readded].filter(
+          (entry) => entry.command !== "terminal.leaveFocus",
+        );
+        yield* writeKeybindingsConfig(keybindingsConfigPath, withoutEscape);
+        yield* keybindings.syncDefaultKeybindingsOnStartup;
+        const restarted = yield* readKeybindingsConfig(keybindingsConfigPath);
+        assert.isTrue(
+          restarted.some(
+            (entry) =>
+              entry.key === readded.key &&
+              entry.command === readded.command &&
+              entry.when === readded.when,
+          ),
+        );
+        assert.isTrue(restarted.some((entry) => entry.command === "terminal.leaveFocus"));
       }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 

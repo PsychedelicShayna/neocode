@@ -139,6 +139,18 @@ describe("terminal focus escape", () => {
     expect(play([ctrl("a"), key()], { custom })).toEqual({ program: ["\u0001", "x"], ran: [] });
   });
 
+  it("leaves an input method's keys alone when the escape is rebound onto one", () => {
+    const custom = [
+      { key: "enter", command: "terminal.leaveFocus", when: "terminalFocus" },
+    ] satisfies ReadonlyArray<KeybindingRule>;
+    const enter = (overrides: Partial<TerminalFocusEscapeKey> = {}) =>
+      key({ key: "Enter", code: "Enter", keyCode: 13, ...overrides });
+    expect(play([enter({ isComposing: true }), enter({ keyCode: 229 })], { custom }).ran).toEqual(
+      [],
+    );
+    expect(play([enter()], { custom }).ran).toEqual(["terminal.leaveFocus"]);
+  });
+
   it("changes the font size on the size keys, repeating while held", () => {
     expect(
       play([

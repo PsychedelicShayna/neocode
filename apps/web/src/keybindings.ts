@@ -12,7 +12,8 @@ import {
 } from "@t3tools/contracts";
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
-import { isTerminalInputFocused } from "./lib/terminalFocus";
+import { isEditableFocused } from "./lib/editableFocus";
+import { getTerminalFocusOwner, isTerminalInputFocused } from "./lib/terminalFocus";
 
 export interface ShortcutEventLike {
   getModifierState?: (key: "AltGraph") => boolean;
@@ -252,26 +253,66 @@ export function isModifierKeyEvent(event: Pick<ShortcutEventLike, "key">): boole
   return MODIFIER_KEYS[event.key] === true;
 }
 
+interface PageFocus {
+  readonly activeElement: Element | null;
+  readonly editableFocus: boolean;
+  readonly terminalFocus: boolean;
+}
+
+function readPageFocus(): PageFocus {
+  if (typeof document === "undefined") {
+    return { activeElement: null, editableFocus: false, terminalFocus: false };
+  }
+  return {
+    activeElement: document.activeElement,
+    editableFocus: isEditableFocused(),
+    terminalFocus: getTerminalFocusOwner() !== null,
+  };
+}
+
 /**
  * Sequence state shared by every caller. Several listeners resolve the same
  * keydown, each with its own context, so state advances once per keydown
- * (keyed by the browser event) and every listener sees the same prefix.
+ * (keyed by the browser event): every listener sees the same prefix and the
+ * same page focus, read once from the page rather than from a caller's
+ * context, which may omit it.
  */
 let sequenceKeydown: unknown = null;
 let sequenceKeydownEvent: ShortcutEventLike | null = null;
+let sequenceKeydownFocus: PageFocus = {
+  activeElement: null,
+  editableFocus: false,
+  terminalFocus: false,
+};
 let sequenceKeydownStarts = false;
 let sequencePrefix: ShortcutEventLike | null = null;
 
-/** The previous keydown when it began a bound sequence, else null. */
-function advanceSequence(event: ShortcutEventLike): ShortcutEventLike | null {
+/**
+ * Moves the state to this keydown. The previous keydown becomes the prefix
+ * when it began a bound sequence and focus has not moved since.
+ */
+function advanceSequence(event: ShortcutEventLike): {
+  readonly prefix: ShortcutEventLike | null;
+  readonly focus: PageFocus;
+} {
   const identity = event.nativeEvent ?? event;
   if (identity !== sequenceKeydown) {
-    sequencePrefix = sequenceKeydownStarts ? sequenceKeydownEvent : null;
+    const focus = readPageFocus();
+    sequencePrefix =
+      sequenceKeydownStarts && focus.activeElement === sequenceKeydownFocus.activeElement
+        ? sequenceKeydownEvent
+        : null;
     sequenceKeydown = identity;
     sequenceKeydownEvent = event;
+    sequenceKeydownFocus = focus;
     sequenceKeydownStarts = false;
   }
-  return sequencePrefix;
+  return { prefix: sequencePrefix, focus: sequenceKeydownFocus };
+}
+
+/** A key that types a character into a focused field, which a sequence must never take. */
+function typesText(event: ShortcutEventLike): boolean {
+  return !event.ctrlKey && !event.metaKey && !event.altKey && event.key.length === 1;
 }
 
 /**
@@ -281,8 +322,10 @@ function advanceSequence(event: ShortcutEventLike): ShortcutEventLike | null {
  *
  * A keypress that begins a two-chord sequence resolves to null and is
  * prevented; the next keypress completes it if it matches the second chord.
- * Any other keypress drops the pending first chord and resolves on its own.
- * There is no timeout.
+ * Any other keypress, or a focus change in between, drops the pending first
+ * chord. There is no timeout. Sequence rules see `editableFocus` and
+ * `terminalFocus` as the page reports them, so every listener agrees, and a
+ * plain character typed into a field never begins a sequence.
  */
 export function resolveShortcutCommand(
   event: ShortcutEventLike,
@@ -291,33 +334,41 @@ export function resolveShortcutCommand(
 ): KeybindingCommand | null {
   if (event.type !== undefined && event.type !== "keydown") return null;
   if (isModifierKeyEvent(event)) return null;
-  const prefix = advanceSequence(event);
+  const { prefix, focus } = advanceSequence(event);
   if (isTerminalInputFocused()) return null;
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
+  const sequenceContext = {
+    ...context,
+    editableFocus: focus.editableFocus,
+    terminalFocus: focus.terminalFocus,
+  };
 
   if (prefix) {
     for (let index = keybindings.length - 1; index >= 0; index -= 1) {
       const binding = keybindings[index];
       if (!binding || !("sequence" in binding)) continue;
-      if (!matchesWhenClause(binding.whenAst, context)) continue;
+      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
       if (!matchesShortcut(prefix, binding.sequence[0], platform)) continue;
       if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
       return binding.command;
     }
   }
 
+  const mayBeginSequence = !(focus.editableFocus && typesText(event));
   for (let index = keybindings.length - 1; index >= 0; index -= 1) {
     const binding = keybindings[index];
     if (!binding) continue;
-    if (!matchesWhenClause(binding.whenAst, context)) continue;
-    const [first] = keybindingRuleSteps(binding);
-    if (!matchesShortcut(event, first, platform)) continue;
     if ("sequence" in binding) {
+      if (!mayBeginSequence) continue;
+      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
+      if (!matchesShortcut(event, binding.sequence[0], platform)) continue;
       sequenceKeydownStarts = true;
       event.preventDefault?.();
       return null;
     }
+    if (!matchesWhenClause(binding.whenAst, context)) continue;
+    if (!matchesShortcut(event, binding.shortcut, platform)) continue;
     return binding.command;
   }
   return null;
@@ -457,9 +508,10 @@ export function shouldShowThreadJumpHintsForModifiers(
 
   for (const command of THREAD_JUMP_KEYBINDING_COMMANDS) {
     const steps = findEffectiveStepsForCommand(keybindings, command, options);
+    const first = steps?.[0];
     // Holding a modifier previews single-chord jumps only.
-    if (steps?.length !== 1) continue;
-    if (matchesShortcutModifiers(modifiers, steps[0], platform)) {
+    if (first === undefined || steps?.length !== 1) continue;
+    if (matchesShortcutModifiers(modifiers, first, platform)) {
       return true;
     }
   }

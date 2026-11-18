@@ -522,7 +522,7 @@ export function TerminalViewport({
       // Every byte of user input leaves through focusEscape.send.
       const focusEscape = createTerminalFocusEscape<KeyboardEvent>({
         write: (data) => handleData(data),
-        encode: (event) => terminalRef.current?.encodeKey(event) ?? "",
+        encode: (event) => terminalRef.current?.encodeKeyPressAndRelease(event) ?? "",
         rules: () => readTerminalKeybindingRules(),
         run: (command) => {
           if (command !== "terminal.leaveFocus") {

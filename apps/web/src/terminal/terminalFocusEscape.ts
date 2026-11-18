@@ -32,7 +32,12 @@ export type TerminalFocusEscapeKey = Pick<
  *
  * A key that begins a two-chord rule is held until the next key, with no
  * timeout. If that key completes no rule, the held key goes to the program
- * first, as `encode` wrote it when it was pressed.
+ * first, as `encode` wrote it when it was pressed. `encode` must include the
+ * key's release for programs that asked for releases: the surface swallows
+ * the real release of a key this consumed.
+ *
+ * Keydowns that belong to an input method composition are never bound here,
+ * so a rebinding onto a key an IME uses (Enter, Space) cannot take them.
  *
  * Every byte of user input bound for the program must go through `send`, so
  * a held key goes out ahead of anything else the user enters (keys, IME
@@ -65,6 +70,7 @@ export function createTerminalFocusEscape<Key extends TerminalFocusEscapeKey>({
     return false;
   };
   const begin = (event: Key): boolean => {
+    if (isTerminalCompositionKey(event, false)) return true;
     const sequences: TerminalKeybindingRule[] = [];
     for (const rule of rules()) {
       const steps = keybindingRuleSteps(rule);

@@ -1603,6 +1603,7 @@ describe("native session defaults", () => {
 describe("focused terminal input", () => {
   class FocusedElement {
     readonly isConnected = true;
+    readonly dataset = { terminalOwner: "drawer" };
     readonly classList = {
       contains: (value: string) => this.className.split(/\s+/).includes(value),
     };
@@ -1616,13 +1617,16 @@ describe("focused terminal input", () => {
   }
 
   const originalDocument = globalThis.document;
+  const originalElement = globalThis.Element;
   const originalHTMLElement = globalThis.HTMLElement;
   afterEach(() => {
     globalThis.document = originalDocument;
+    globalThis.Element = originalElement;
     globalThis.HTMLElement = originalHTMLElement;
   });
 
   function focus(element: FocusedElement) {
+    globalThis.Element = FocusedElement as unknown as typeof Element;
     globalThis.HTMLElement = FocusedElement as unknown as typeof HTMLElement;
     globalThis.document = { activeElement: element } as unknown as Document;
   }
@@ -1755,5 +1759,108 @@ describe("two-chord sequences", () => {
 
   it("labels a sequence with both chords", () => {
     assert.strictEqual(shortcutLabelForCommand(bindings, "sidebar.toggle", "Linux"), "Ctrl+W H");
+  });
+});
+
+describe("sequences read focus from the page", () => {
+  class PageElement {
+    readonly isConnected = true;
+    readonly classList = { contains: () => false };
+    constructor(readonly editable: boolean) {}
+    closest(selector: string) {
+      return this.editable && selector.includes("textarea") ? this : null;
+    }
+  }
+  const field = new PageElement(true);
+  const body = new PageElement(false);
+
+  const originalDocument = globalThis.document;
+  const originalElement = globalThis.Element;
+  const originalHTMLElement = globalThis.HTMLElement;
+  afterEach(() => {
+    globalThis.document = originalDocument;
+    globalThis.Element = originalElement;
+    globalThis.HTMLElement = originalHTMLElement;
+  });
+  function focus(element: PageElement) {
+    globalThis.Element = PageElement as unknown as typeof Element;
+    globalThis.HTMLElement = PageElement as unknown as typeof HTMLElement;
+    globalThis.document = { activeElement: element } as unknown as Document;
+  }
+
+  // Each keydown is its own event object, as the browser delivers them.
+  function press(overrides: Partial<ShortcutEventLike>) {
+    let prevented = false;
+    const keydown = event({
+      type: "keydown",
+      ...overrides,
+      preventDefault: () => {
+        prevented = true;
+      },
+    });
+    return { keydown, prevented: () => prevented };
+  }
+  // Listeners that, like the sidebar's, pass no editableFocus of their own.
+  const options = { platform: "Linux", context: { terminalFocus: false } };
+  const bind = (rules: Parameters<typeof compileResolvedKeybindingsConfig>[0]) =>
+    mergeWithDefaultKeybindings(compileResolvedKeybindingsConfig(rules));
+
+  it("never holds or prevents a plain letter typed into a field", () => {
+    const bindings = bind([{ key: "g h", command: "sidebar.toggle", when: "!editableFocus" }]);
+    focus(field);
+    const g = press({ key: "g" });
+    assert.isNull(resolveShortcutCommand(g.keydown, bindings, options));
+    assert.isFalse(g.prevented());
+    assert.isNull(resolveShortcutCommand(press({ key: "h" }).keydown, bindings, options));
+    // Outside a field the same letter begins the sequence.
+    focus(body);
+    const held = press({ key: "g" });
+    assert.isNull(resolveShortcutCommand(held.keydown, bindings, options));
+    assert.isTrue(held.prevented());
+    assert.strictEqual(
+      resolveShortcutCommand(press({ key: "h" }).keydown, bindings, options),
+      "sidebar.toggle",
+    );
+  });
+
+  it("drops a held chord when focus moves before the second key", () => {
+    const bindings = bind([
+      { key: "ctrl+g q", command: "sidebar.toggle" },
+      { key: "ctrl+g h", command: "navigation.back", when: "editableFocus" },
+    ]);
+    focus(body);
+    resolveShortcutCommand(press({ key: "g", ctrlKey: true }).keydown, bindings, options);
+    focus(field);
+    // This listener knows the field has focus, as the navigation listener does.
+    assert.isNull(
+      resolveShortcutCommand(press({ key: "h" }).keydown, bindings, {
+        platform: "Linux",
+        context: { terminalFocus: false, editableFocus: true },
+      }),
+    );
+  });
+
+  it("gives listeners with different contexts the same sequence command", () => {
+    const bindings = bind([
+      { key: "ctrl+g ctrl+h", command: "terminal.toggle" },
+      { key: "ctrl+g ctrl+h", command: "navigation.back", when: "editableFocus" },
+    ]);
+    focus(field);
+    const first = press({ key: "g", ctrlKey: true }).keydown;
+    const second = press({ key: "h", ctrlKey: true }).keydown;
+    const contexts = [
+      { terminalFocus: false },
+      { terminalFocus: false, editableFocus: false },
+      { terminalFocus: false, editableFocus: true },
+    ];
+    for (const context of contexts) {
+      resolveShortcutCommand(first, bindings, { platform: "Linux", context });
+    }
+    for (const context of contexts) {
+      assert.strictEqual(
+        resolveShortcutCommand(second, bindings, { platform: "Linux", context }),
+        "navigation.back",
+      );
+    }
   });
 });

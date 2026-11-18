@@ -1187,6 +1187,8 @@ export class NeoPiNativeProjection {
       readonly sessionId: string;
       readonly entries: readonly unknown[];
       readonly nextCursor?: string;
+      /** The owner's leaf the page ends at. */
+      readonly leafId?: string | null;
     },
     mark: NeoPiNativeRequestMark,
   ): "append" | "navigated" | "stale" {
@@ -1201,13 +1203,26 @@ export class NeoPiNativeProjection {
       const entry = observeNeoPiJournalEntry(raw);
       return entry ? [entry] : [];
     });
+    // An owner whose page neither ends at nor contains the pending leaf has
+    // moved again since; the caller retries.
+    if (
+      page.leafId !== undefined &&
+      page.leafId !== leafId &&
+      !entries.some((entry) => entry.id === leafId)
+    )
+      return "stale";
+    const pageHead = page.leafId !== undefined ? page.leafId : (entries.at(-1)?.id ?? null);
     const head = this.journal.head?.id;
     const at = head === undefined ? -1 : entries.findIndex((entry) => entry.id === head);
-    if (head === undefined || at >= 0) {
-      // The held head is on the owner's branch: everything after it appends.
+    // By ancestry: the page's head held in the tail means the held head
+    // descends from it (entries folded live while the page was in flight are
+    // kept); the held head inside the page means the page extends it.
+    const pageHeadHeld = pageHead !== null && this.journal.positionOf(pageHead) >= 0;
+    if (head === undefined || at >= 0 || pageHeadHeld) {
       this.#pendingLeaf = null;
-      for (const entry of entries.slice(at + 1))
-        this.#fold({ type: "journal_entry", sessionId: page.sessionId, entry });
+      if (head === undefined || at >= 0)
+        for (const entry of entries.slice(at + 1))
+          this.#fold({ type: "journal_entry", sessionId: page.sessionId, entry });
       return "append";
     }
     this.#pendingLeaf = null;

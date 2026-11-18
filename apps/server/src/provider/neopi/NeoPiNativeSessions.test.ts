@@ -92,6 +92,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       connectError: undefined as NeoPiNativeSessionsError | undefined,
       /** Makes every attach (not start) fail with this error. */
       attachError: undefined as NeoPiNativeSessionsError | undefined,
+      /** Makes every start (not attach) fail with this error. */
+      autoError: undefined as NeoPiNativeSessionsError | undefined,
+      /** Refuses this many requests to lower the subagent level to `off`. */
+      rejectOff: 0,
       /** After connecting, the owner reports a different file than the one asked for. */
       mismatch: false,
       /** Runs before a `set_subagent_subscription` is recorded. */
@@ -152,6 +156,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
         Effect.gen(function* () {
           if (native.connectError) return yield* native.connectError;
           if (mode === "attach" && native.attachError) return yield* native.attachError;
+          if (mode === "auto" && native.autoError) return yield* native.autoError;
           if (native.connections !== 0)
             return yield* new NeoPiNativeSessionsError({
               code: "session_in_use",
@@ -213,6 +218,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                         message: "Subagent event bus is unavailable",
                       });
                     yield* native.levelHook;
+                    if (Reflect.get(command, "level") === "off" && native.rejectOff > 0) {
+                      native.rejectOff--;
+                      return yield* new NeoPiRpcError({ message: "Not now" });
+                    }
                     native.levels.push(String(Reflect.get(command, "level")));
                     return { level: native.levels.at(-1) };
                   case "get_status":
@@ -2656,6 +2665,250 @@ describe("leaf announcements (the live stall)", () => {
       const read = yield* lease.pass(unchanged.cursor);
       assert.deepEqual(idsOf(read.entries), ["slow-1"]);
       assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+    }).pipe(Effect.scoped),
+  );
+});
+
+describe("confirmation round", () => {
+  const settle = Effect.forEach(Array.from({ length: 400 }), () => Effect.yieldNow, {
+    discard: true,
+  });
+
+  it.effect(
+    "hide and show: an assistant message that ended unseen is not served as its old prefix",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const first = yield* follow(service, originalRef);
+        const built = yield* first.pass();
+        yield* native.publish({ type: "message_start", messageId: "m", message: assistant("pre") });
+        yield* native.publish({
+          type: "message_update",
+          messageId: "m",
+          message: assistant("prefix"),
+        });
+        const seen = yield* first.pass(built.cursor);
+        assert.deepEqual(bodyOf(seen.entities.get("message:m")), assistant("prefix").content);
+        yield* Fiber.interrupt(first.fiber);
+        yield* settle;
+        // Nobody is watching: the message goes on, ends, and the turn is over.
+        yield* native.publish({
+          type: "message_update",
+          messageId: "m",
+          message: assistant("prefix and more"),
+        });
+        yield* native.publish({
+          type: "message_end",
+          messageId: "m",
+          message: assistant("prefix and more, done"),
+        });
+        yield* native.publish({ type: "agent_end" });
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        // The old prefix is never served: the body is gone or current, never stale.
+        const held = bodyOf(view.entities.get("message:m"));
+        assert.isTrue(
+          held === undefined || String(Reflect.get(Object(held.at(-1)), "text")).includes("done"),
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("hide and show: a message still streaming is served with its current body", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const first = yield* follow(service, originalRef);
+      const built = yield* first.pass();
+      yield* native.publish({ type: "message_start", messageId: "m", message: assistant("pre") });
+      yield* first.pass(built.cursor);
+      yield* Fiber.interrupt(first.fiber);
+      yield* settle;
+      yield* native.publish({
+        type: "message_update",
+        messageId: "m",
+        message: assistant("longer by now"),
+      });
+      // The owner's snapshot carries the message as it is now.
+      native.snapshotHook = native.publish({
+        type: "message_start",
+        messageId: "m",
+        snapshot: true,
+        message: assistant("longer by now"),
+      });
+      const second = yield* follow(service, originalRef);
+      const view = yield* second.pass();
+      assert.deepEqual(bodyOf(view.entities.get("message:m")), assistant("longer by now").content);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a read scanned before its lease attached still answers when the session publishes first",
+    () =>
+      Effect.gen(function* () {
+        const { native, dependencies } = yield* fixture("terminal");
+        const gate = yield* Deferred.make<void>();
+        native.connectHook = Deferred.await(gate);
+        let first = true;
+        const service = yield* makeNeoPiNativeSessionsWith({
+          ...dependencies,
+          afterReadScan: Effect.suspend(() => {
+            if (!first) return Effect.void;
+            first = false;
+            // Attachment and publication happen after the scan and before the wait.
+            return Deferred.succeed(gate, undefined).pipe(Effect.andThen(settle));
+          }),
+        });
+        const lease = yield* follow(service, originalRef);
+        const reading = yield* lease.read(null).pipe(Effect.forkChild);
+        yield* settle;
+        yield* settle;
+        assert.isTrue(reading.pollUnsafe() !== undefined);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a newer read is not displaced by an older one resuming after its scan", () =>
+    Effect.gen(function* () {
+      const { native, dependencies } = yield* fixture();
+      const hold = yield* Deferred.make<void>();
+      // Only the two reads under test are held or counted; the build's own read is not.
+      let calls = -1;
+      const service = yield* makeNeoPiNativeSessionsWith({
+        ...dependencies,
+        afterReadScan: Effect.suspend(() =>
+          calls < 0 || calls++ > 0 ? Effect.void : Deferred.await(hold),
+        ),
+      });
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      calls = 0;
+      const older = yield* service
+        .read({ leaseId: lease.leaseId, readId: 900, cursor: built.cursor }, testClient)
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* settle;
+      const newer = yield* service
+        .read({ leaseId: lease.leaseId, readId: 901, cursor: built.cursor }, testClient)
+        .pipe(Effect.forkChild);
+      yield* settle;
+      yield* Deferred.succeed(hold, undefined);
+      yield* settle;
+      // The older read ended as superseded and did not take the newer one's place.
+      const olderExit = yield* Fiber.join(older);
+      assert.isTrue(Exit.isFailure(olderExit));
+      yield* native.publish({ type: "message_update", messageId: "x", message: assistant("go") });
+      yield* settle;
+      assert.isTrue(newer.pollUnsafe() !== undefined);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "an acknowledgement is capped at what was sent, so pruning never discards records a lease has not seen",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const a = yield* follow(service, originalRef);
+        const b = yield* follow(service, originalRef);
+        const builtA = yield* a.pass();
+        const builtB = yield* b.pass();
+        yield* native.publish({ type: "notice", level: "info", message: "only b sees this early" });
+        const gotB = yield* b.pass(builtB.cursor);
+        assert.equal(gotB.inbox.length, 1);
+        const ackB = yield* b.pass(gotB.cursor).pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(ackB);
+        // Lease a claims a position beyond anything it was sent, twice: the second read
+        // would acknowledge the echo of the first reply's position.
+        yield* native.publish({
+          type: "message_update",
+          messageId: "u",
+          message: assistant("unrelated"),
+        });
+        const forged = { ...builtA.cursor!, inboxSeq: 1_000_000 };
+        const first = yield* a.read(forged);
+        assert.equal(first.type, "pass");
+        const second = yield* a
+          .read(first.type === "pass" ? first.continuation : forged)
+          .pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(second);
+        // Its own honest position still has the record waiting.
+        const honest = yield* a.read(builtA.cursor);
+        assert.equal(honest.type === "pass" && honest.inbox.length, 1);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("a refused lowering of the subagent level is retried until the owner takes it", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      yield* lease.pass();
+      yield* service.setDemand(
+        { leaseId: lease.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+        testClient,
+      );
+      yield* TestClock.adjust("2 seconds");
+      assert.deepEqual(native.levels, ["progress"]);
+      native.rejectOff = 2;
+      yield* Fiber.interrupt(lease.fiber);
+      yield* TestClock.adjust("10 seconds");
+      assert.deepEqual(native.levels, ["progress", "off"]);
+      assert.equal(native.rejectOff, 0);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a terminal that cannot be attached when takeover is due is incompatible, not owner-stopped",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        yield* service
+          .request({ ref: originalRef, command: { type: "prompt", message: "queued" } })
+          .pipe(Effect.forkScoped);
+        yield* settle;
+        native.autoError = new NeoPiNativeSessionsError({
+          code: "owner_outdated",
+          message: "update the terminal's NeoPi",
+        });
+        yield* TestClock.adjust("12 seconds");
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "incompatible");
+        assert.isFalse(
+          lease.seen.some(
+            (envelope) => envelope.type === "lifecycle" && envelope.state === "owner-stopped",
+          ),
+        );
+      }).pipe(Effect.scoped),
+  );
+  it.effect("hide and show: a child that finished while nobody watched is not still running", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const first = yield* follow(service, originalRef);
+      const built = yield* first.pass();
+      yield* service.setDemand(
+        { leaseId: first.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+        testClient,
+      );
+      yield* TestClock.adjust("2 seconds");
+      yield* native.publish(child("c1", "started"));
+      const seen = yield* first.pass(built.cursor);
+      assert.isTrue([...seen.entities.keys()].some((key) => key.startsWith("roster:")));
+      yield* Fiber.interrupt(first.fiber);
+      yield* settle;
+      // The child finished with the level lowered: the owner sent nothing, and its
+      // inventory no longer lists it.
+      native.agents = [];
+      const second = yield* follow(service, originalRef);
+      const view = yield* second.pass();
+      assert.isFalse([...view.entities.keys()].some((key) => key.startsWith("roster:")));
     }).pipe(Effect.scoped),
   );
 });

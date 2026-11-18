@@ -1037,6 +1037,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             projection.reconcilePendingLeaf(
               pending,
               {
+                leafId: page.success.leafId,
                 sessionId: page.success.sessionId,
                 entries: page.success.entries,
                 ...(page.success.nextCursor === undefined
@@ -1882,8 +1883,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     if (session) {
       session.observations.delete(observation);
       session.projection.store.endTransfer(observation.leaseId);
-      if (session.observations.size === 0) session.projection.setInboxObserved(false);
-      else pruneAcknowledged(session);
+      if (session.observations.size === 0) {
+        session.projection.setInboxObserved(false);
+        // With the subagent level about to drop, the owner stops reporting children: any
+        // that finish unseen would stay "running". The next lease rereads them.
+        if (session.subagentLevel !== null && session.subagentLevel.level !== "off")
+          session.bulkStale = true;
+      } else pruneAcknowledged(session);
       applyDemand(session);
     }
     observation.interrupt?.("released");

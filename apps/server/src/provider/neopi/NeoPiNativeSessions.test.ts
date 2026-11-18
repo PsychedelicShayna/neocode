@@ -2708,7 +2708,9 @@ describe("confirmation round", () => {
         const view = yield* second.pass();
         // The old prefix is never served: the body is gone or current, never stale.
         const held = bodyOf(view.entities.get("message:m"));
-        assert.isTrue(held === undefined || JSON.stringify(held).includes("done"));
+        assert.isTrue(
+          held === undefined || String(Reflect.get(Object(held.at(-1)), "text")).includes("done"),
+        );
       }).pipe(Effect.scoped),
   );
 
@@ -2884,6 +2886,30 @@ describe("confirmation round", () => {
           ),
         );
       }).pipe(Effect.scoped),
+  );
+  it.effect("hide and show: a child that finished while nobody watched is not still running", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const first = yield* follow(service, originalRef);
+      const built = yield* first.pass();
+      yield* service.setDemand(
+        { leaseId: first.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+        testClient,
+      );
+      yield* TestClock.adjust("2 seconds");
+      yield* native.publish(child("c1", "started"));
+      const seen = yield* first.pass(built.cursor);
+      assert.isTrue([...seen.entities.keys()].some((key) => key.startsWith("roster:")));
+      yield* Fiber.interrupt(first.fiber);
+      yield* settle;
+      // The child finished with the level lowered: the owner sent nothing, and its
+      // inventory no longer lists it.
+      native.agents = [];
+      const second = yield* follow(service, originalRef);
+      const view = yield* second.pass();
+      assert.isFalse([...view.entities.keys()].some((key) => key.startsWith("roster:")));
+    }).pipe(Effect.scoped),
   );
 });
 

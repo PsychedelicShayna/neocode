@@ -483,11 +483,14 @@ describe("NeoPiNativeProjection", () => {
         }),
         "none",
       );
-      assert.equal(projection.fold({ type: "agent_start" }), "navigated");
+      // Other frames, such as a flush's message_persisted, never settle it.
+      assert.equal(projection.fold({ type: "agent_start" }), "none");
+      assert.isTrue(projection.pendingLeaf);
+      // The owner side's timeout settles a quiet move.
+      assert.equal(projection.settlePendingLeaf(), "navigated");
       assert.equal(projection.domain.branchGeneration, generation + 1);
       assert.deepEqual(tailIds(projection), []);
       assert.equal(projection.identity?.leafId, "e1");
-      // A caller with no further frame settles it directly.
       projection.fold({ type: "journal_entry", sessionId, entry: entry("e5", "e1") });
       projection.fold({
         type: "journal_state",
@@ -989,6 +992,281 @@ describe("NeoPiNativeProjection", () => {
       assert.deepEqual(fences, ["none", "none", "none", "none"]);
       assert.equal(projection.domain.branchGeneration, generation);
       assert.deepEqual(tail(projection), ["h", "b1", "b2"]);
+    });
+
+    it("a NeoPi flush (leaf = last, each entry followed by its message_persisted) is never a navigation", () => {
+      // The frame order of the verifier's stalled run (branchGeneration 1 → 10
+      // in a linear session): NeoPi's `committed()` announces the manager's
+      // current leaf, the LAST appended entry, then emits each committed entry,
+      // each followed at once by its `message_persisted`, with streaming frames
+      // and reads in between.
+      const projection = published();
+      const fences: string[] = [];
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("h", null) });
+      const generation = projection.domain.branchGeneration;
+      const fold = (frame: Record<string, unknown>) => fences.push(projection.fold(frame));
+      for (const id of ["e1", "e2", "last"])
+        fold({ type: "message_end", messageId: `m-${id}`, message: assistant(id) });
+      fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: "last",
+      });
+      let parent = "h";
+      for (const id of ["e1", "e2", "last"]) {
+        fold({ type: "journal_entry", sessionId, entry: entry(id, parent, assistant(id)) });
+        // A read lands inside the flush; it changes nothing.
+        const before = projection.domain;
+        readNeoPiNativeObservation(projection, null, WIDE, "reader");
+        assert.deepEqual(projection.domain, before);
+        fold({ type: "message_persisted", sessionId, messageId: `m-${id}`, entryId: id });
+        fold({ type: "message_update", messageId: "m-next", message: assistant("…") });
+        parent = id;
+      }
+      assert.isTrue(
+        fences.every((fence) => fence === "none"),
+        fences.join(","),
+      );
+      assert.isFalse(projection.pendingLeaf);
+      assert.equal(projection.domain.branchGeneration, generation);
+      assert.isTrue(projection.published);
+      assert.deepEqual(tail(projection), ["h", "e1", "e2", "last"]);
+    });
+
+    it("the real npi frame order of a full run, read after every frame, never navigates", () => {
+      // Captured from the installed npi (rpc, built-in MockModel) by the
+      // verifier: every journal_state, journal_entry and message_persisted in
+      // order, with the other frame types between them; message_update frames
+      // (thousands) are left out. A leaf is announced long before its entry,
+      // twice in a row, and each entry is followed by its message_persisted.
+      const trace: ReadonlyArray<readonly (string | null)[]> = [
+        ["agent_start"],
+        ["turn_start"],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "ddef4f16"],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "c4cdc37d"],
+        ["leaf", "acf6afb2"],
+        ["entry", "bca429dc", null, "model_change", null],
+        ["entry", "43aba11c", "bca429dc", "thinking_level_change", null],
+        ["entry", "ddef4f16", "43aba11c", "message", "user"],
+        ["persisted", "1", "ddef4f16"],
+        ["entry", "c4cdc37d", "ddef4f16", "custom", null],
+        ["entry", "acf6afb2", "c4cdc37d", "message", "assistant"],
+        ["persisted", "2", "acf6afb2"],
+        ["leaf", "0bedafd5"],
+        ["entry", "0bedafd5", "acf6afb2", "custom", null],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "2f3f99e6"],
+        ["entry", "2f3f99e6", "0bedafd5", "message", "toolResult"],
+        ["persisted", "3", "2f3f99e6"],
+        ["turn_end"],
+        ["turn_start"],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "5567c050"],
+        ["entry", "5567c050", "2f3f99e6", "message", "assistant"],
+        ["persisted", "4", "5567c050"],
+        ["leaf", "c05a7e6a"],
+        ["entry", "c05a7e6a", "5567c050", "custom", null],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "5a37f5a9"],
+        ["entry", "5a37f5a9", "c05a7e6a", "message", "toolResult"],
+        ["persisted", "5", "5a37f5a9"],
+        ["turn_end"],
+        ["turn_start"],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "2b3013bb"],
+        ["entry", "2b3013bb", "5a37f5a9", "message", "assistant"],
+        ["persisted", "6", "2b3013bb"],
+        ["leaf", "a47ab5b1"],
+        ["entry", "a47ab5b1", "2b3013bb", "custom", null],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "3c0bda21"],
+        ["entry", "3c0bda21", "a47ab5b1", "message", "toolResult"],
+        ["persisted", "7", "3c0bda21"],
+        ["turn_end"],
+        ["turn_start"],
+        ["message_start"],
+        ["message_end"],
+        ["leaf", "9abd1e76"],
+        ["entry", "9abd1e76", "3c0bda21", "message", "assistant"],
+        ["persisted", "8", "9abd1e76"],
+        ["turn_end"],
+        ["agent_end"],
+      ];
+      const projection = published();
+      const generation = projection.domain.branchGeneration;
+      const fences: string[] = [];
+      let message = 0;
+      for (const [type, a, b, entryType, role] of trace) {
+        if (type === "leaf")
+          fences.push(
+            projection.fold({
+              type: "journal_state",
+              reason: "leaf",
+              sessionId,
+              sessionFile: "/s.jsonl",
+              leafId: a ?? null,
+            }),
+          );
+        else if (type === "entry")
+          fences.push(
+            projection.fold({
+              type: "journal_entry",
+              sessionId,
+              entry: {
+                id: a,
+                parentId: b,
+                type: entryType,
+                timestamp: "t",
+                ...(role ? { message: { role, content: [] } } : {}),
+              },
+            }),
+          );
+        else if (type === "persisted")
+          fences.push(
+            projection.fold({
+              type: "message_persisted",
+              sessionId,
+              messageId: `m${a}`,
+              entryId: b,
+            }),
+          );
+        else if (type === "message_start" || type === "message_end") {
+          if (type === "message_start") message++;
+          fences.push(
+            projection.fold({
+              type: type!,
+              messageId: `m${message}`,
+              message: assistant(`m${message}`),
+            }),
+          );
+        } else fences.push(projection.fold({ type: type! }));
+        const before = projection.domain;
+        readNeoPiNativeObservation(projection, null, WIDE, "reader");
+        assert.deepEqual(projection.domain, before, "a read changes nothing");
+      }
+      assert.isTrue(
+        fences.every((fence) => fence === "none"),
+        fences.join(","),
+      );
+      assert.equal(projection.domain.branchGeneration, generation);
+      assert.isTrue(projection.published);
+      assert.equal(tail(projection).length, 14);
+      assert.equal(projection.journal.head?.id, "9abd1e76");
+      assert.deepEqual(
+        [...projection.store.values()].filter((record) => record.value?.class === "message"),
+        [],
+        "every live message joined its entry",
+      );
+    });
+
+    it("entries folded after a page's request survive that page when it is empty", () => {
+      // B4's case: the build's page is read from an empty branch, then a flush
+      // arrives before the page is applied.
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.beginBuildAttempt();
+      const mark = projection.mark();
+      projection.fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: "last",
+      });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("first", null) });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("last", "first") });
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applySubagentsReply({ subagents: [] }, mark);
+      projection.applySubagentHistoryReply(null, mark);
+      projection.applyJournalPage({ sessionId, entries: [] }, mark);
+      assert.isTrue(projection.published);
+      assert.deepEqual(tail(projection), ["first", "last"]);
+    });
+
+    describe("a leaf still pending after the owner's timeout is decided by the fetched page", () => {
+      const pending = () => {
+        const projection = published();
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("A", null) });
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("B", "A") });
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: "D",
+        });
+        assert.equal(projection.pendingLeafId, "D");
+        return projection;
+      };
+
+      it("append: the page extends the held head; live entries join by id", () => {
+        const projection = pending();
+        const generation = projection.domain.branchGeneration;
+        const mark = projection.mark();
+        // An entry arrives live while the page is in flight.
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("C", "B") });
+        const page = {
+          sessionId,
+          entries: [entry("A", null), entry("B", "A"), entry("C", "B"), entry("D", "C")],
+        };
+        assert.equal(projection.reconcilePendingLeaf("D", page, mark), "append");
+        assert.deepEqual(tail(projection), ["A", "B", "C", "D"]);
+        assert.equal(projection.domain.branchGeneration, generation);
+        assert.isNull(projection.pendingLeafId);
+      });
+
+      it("navigated: the page does not hold the head; history is rebased once", () => {
+        const projection = pending();
+        const generation = projection.domain.branchGeneration;
+        const mark = projection.mark();
+        const page = { sessionId, entries: [entry("A", null), entry("D", "A")] };
+        assert.equal(projection.reconcilePendingLeaf("D", page, mark), "navigated");
+        assert.deepEqual(tail(projection), ["A", "D"]);
+        assert.equal(projection.domain.branchGeneration, generation + 1);
+        assert.isTrue(projection.published);
+      });
+
+      it("stale: another leaf since, or a mark from before a fence", () => {
+        const projection = pending();
+        const mark = projection.mark();
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: "E",
+        });
+        assert.equal(
+          projection.reconcilePendingLeaf("D", { sessionId, entries: [] }, mark),
+          "stale",
+        );
+        projection.settlePendingLeaf();
+        assert.equal(
+          projection.reconcilePendingLeaf("E", { sessionId, entries: [] }, mark),
+          "stale",
+        );
+      });
     });
 
     it("every entry hold ends: an alias for an unheld message, the run's end, eviction from the ring", () => {

@@ -212,6 +212,8 @@ const INCOMPATIBLE_OWNER_CODES: ReadonlySet<string> = new Set([
 ]);
 /** A candidate successor's frames held until it is accepted; more are dropped (the rebuild rereads state). */
 const CANDIDATE_FRAME_LIMIT = 4096;
+/** How long a leaf announcement may wait for its journal entry before it counts as a navigation. */
+const PENDING_LEAF_SETTLE = Duration.seconds(2);
 /** How long a lease may hold a closed session without taking its terminal envelope. */
 const CLOSED_LEASE_GRACE = Duration.seconds(5);
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
@@ -356,6 +358,8 @@ interface NativeSession {
   demanding: boolean;
   /** The last level the owner refused to take, so the same request is not repeated. */
   refusal: { readonly epoch: number; readonly level: SubagentLevel } | null;
+  /** The timer that resolves a leaf announcement no entry followed, with the leaf it belongs to. */
+  leafWatch: { readonly leafId: string; cancelled: boolean } | null;
   /** Counts `agent_start`/`agent_end` frames; a `get_state` reply older than one cannot set `busy`. */
   busyEpoch: number;
   /** Bulk frames were skipped while no lease was held; the first lease rebuilds first. */
@@ -957,6 +961,74 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       ),
     );
   };
+  /**
+   * A leaf announced before its entry is settled by that entry. One no entry follows
+   * is either a flush whose entries are late or a move to an entry the tail does not
+   * hold, and elapsed time cannot tell them apart. After a pause the owner is asked
+   * (its leaf and the page leading to it, as the build does, under the same marks) and
+   * the projection decides by parent identity: entries extending the held head are
+   * appended, anything else is a navigation. A timer belongs to one pending leaf: it is
+   * cancelled when that leaf resolves, and acts only if that leaf is still pending.
+   */
+  const watchLeaf = (session: NativeSession) => {
+    const { projection } = session;
+    const pending = projection.pendingLeafId;
+    const held = session.leafWatch;
+    if (held && held.leafId !== pending) {
+      held.cancelled = true;
+      session.leafWatch = null;
+    }
+    if (pending === null || session.leafWatch !== null) return;
+    const watch = { leafId: pending, cancelled: false };
+    session.leafWatch = watch;
+    spawnIn(
+      session,
+      Effect.gen(function* () {
+        yield* Effect.sleep(PENDING_LEAF_SETTLE);
+        let delayMs = BUILD_RETRY_MIN_MS;
+        while (!session.closed && !watch.cancelled && projection.pendingLeafId === pending) {
+          if (session.recovery) {
+            yield* Deferred.await(session.recovery).pipe(Effect.ignore);
+            continue;
+          }
+          const mark = projection.mark();
+          const page = yield* session.native.client
+            .request({
+              type: "get_entries_page",
+              scope: "branch",
+              direction: "backward",
+              limit: 128,
+            })
+            .pipe(Effect.flatMap(decodeJournalPage), Effect.result);
+          if (page._tag === "Success") {
+            projection.reconcilePendingLeaf(
+              pending,
+              {
+                sessionId: page.success.sessionId,
+                entries: page.success.entries,
+                ...(page.success.nextCursor === undefined
+                  ? {}
+                  : { nextCursor: page.success.nextCursor }),
+              },
+              mark,
+            );
+            notifyChanged(session);
+            if (projection.pendingLeafId !== pending) break;
+          }
+          // A failed or stale answer changes nothing: the view keeps its branch and is
+          // asked again at a bounded rate.
+          yield* Effect.sleep(Duration.millis(delayMs));
+          delayMs = Math.min(delayMs * 2, BUILD_RETRY_MAX_MS);
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (session.leafWatch === watch) session.leafWatch = null;
+          }),
+        ),
+      ),
+    );
+  };
   const create = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
     input: NeoPiNativeSessionsOpenInput,
@@ -1093,6 +1165,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const fence = skip ? "none" : projection.fold(folded);
         const current = session;
         if (!current || current.closed) return;
+        watchLeaf(current);
         if (frame.type === "agent_start") {
           current.busy = true;
           current.busyEpoch++;
@@ -1359,6 +1432,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           demanding: false,
           refusal: null,
           busyEpoch: 0,
+          leafWatch: null,
           bulkStale: false,
           recovery: null,
           takeoverRequested: false,

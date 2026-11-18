@@ -37,7 +37,6 @@ const storeSource = (store: NeoPiNativeKeyedStore): NeoPiNativeReadSource => ({
   deliverableJournalEnd: 0,
   horizonCursor: undefined,
   inbox: [],
-  settlePendingLeaf: () => "none",
 });
 
 type PassReply = Extract<NeoPiNativeSessionsReadResult, { type: "pass" }>;
@@ -753,12 +752,17 @@ describe("NeoPiNativeCursor", () => {
         leafId: "e1",
       });
       const limits = { scanSteps: 100, replyBytes: 100_000 };
-      // The next read already knows: the old branch is never served again,
-      // and the build owner is told to rebuild (C3.5).
+      // Until the owner's timeout, a read cannot tell this from a flush in
+      // flight and serves what it holds; then the move is settled, the build
+      // owner is told (C3.5), and the old branch is never served again.
+      const held = readNeoPiNativeObservation(projection, mirror.cursor, limits, "reader");
+      assert.notEqual(held.type, "building");
+      assert.deepEqual(fences, []);
+      projection.settlePendingLeaf();
+      assert.deepEqual(fences, ["navigated"]);
       assert.deepEqual(readNeoPiNativeObservation(projection, mirror.cursor, limits, "reader"), {
         type: "building",
       });
-      assert.deepEqual(fences, ["navigated"]);
       projection.beginBuildAttempt();
       const mark = projection.mark();
       projection.applyStateReply({ sessionId }, mark);

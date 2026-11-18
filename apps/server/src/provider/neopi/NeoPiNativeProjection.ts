@@ -433,6 +433,12 @@ const OPERATION_ENDS: Readonly<Record<string, string>> = {
 };
 
 const TERMINAL_CHILD_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "aborted"]);
+const SETTLED_CHILD_EVENTS: ReadonlySet<string> = new Set([
+  "message_end",
+  "tool_execution_end",
+  "agent_end",
+]);
+const DICTATION_PHASES: ReadonlySet<string> = new Set(["starting", "recording", "transcribing"]);
 
 const messageKey = (messageId: string) => `message:${messageId}`;
 const toolKey = (toolCallId: string) => `tool:${toolCallId}`;
@@ -466,6 +472,10 @@ export class NeoPiNativeProjection {
   readonly #pendingJoins = new Map<string, string>();
   #stateApplied = false;
   #pageApplied = false;
+  #rosterApplied = false;
+  /** Child id → revision of the last live frame; a roster reply never overwrites a newer one. */
+  readonly #rosterLive = new Map<string, number>();
+  #commandOutputs = 0;
   #horizonCursor: { readonly firstEntryId: string; readonly cursor: string } | null = null;
   /** A leaf announced before its entry; decided by the next frame (see `#journalState`). */
   #pendingLeaf: NeoPiNativeIdentity | null = null;
@@ -494,9 +504,13 @@ export class NeoPiNativeProjection {
     return this.#identity;
   }
 
-  /** C3.4: published once live state and one validated horizon page exist. */
+  /**
+   * C3.4: published once live state and one validated horizon page exist; the
+   * roster inventory is part of live state, so the Agents view is complete
+   * when the first build publishes.
+   */
   get published(): boolean {
-    return this.#stateApplied && this.#pageApplied;
+    return this.#stateApplied && this.#pageApplied && this.#rosterApplied;
   }
 
   /** Live-only records without a reducer, in `seq` order; at most one `gap`, first. */
@@ -565,6 +579,7 @@ export class NeoPiNativeProjection {
     };
     this.#stateApplied = false;
     this.#pageApplied = false;
+    this.#rosterApplied = false;
     this.#pendingLeaf = null;
     const running: Array<[string, ToolValue]> = [];
     for (const record of this.store.values())
@@ -586,6 +601,7 @@ export class NeoPiNativeProjection {
     this.#domain = { ...this.#domain, buildAttempt: this.#domain.buildAttempt + 1 };
     this.#stateApplied = false;
     this.#pageApplied = false;
+    this.#rosterApplied = false;
     return this.#domain;
   }
 
@@ -661,6 +677,32 @@ export class NeoPiNativeProjection {
       case "subagent_progress":
         this.#roster(type, frame);
         return "none";
+      case "subagent_event":
+        this.#rosterTick(frame);
+        return "none";
+      case "job_lifecycle":
+        this.#job(frame);
+        return "none";
+      case "command_output":
+        this.#commandOutput(frame);
+        return "none";
+      case "dictation_state":
+      case "dictation_transcript":
+      case "dictation_end":
+        this.#dictation(frame);
+        return "none";
+      case "prompt_result": {
+        const error = asRecord(frame.error);
+        this.store.put("presentation:promptResult", {
+          class: "presentation",
+          value: {
+            status: frame.status ?? null,
+            error:
+              frame.status === "error" ? String(error?.message ?? "Native command failed.") : null,
+          },
+        });
+        return "none";
+      }
       case "extension_ui_request":
         this.#uiRequest(frame);
         return "none";
@@ -682,11 +724,10 @@ export class NeoPiNativeProjection {
       case "chat_mode_changed":
         this.#setting("chatMode", { value: frame.mode });
         return "none";
-      case "thinking_level_changed": {
-        const { type: _type, ...value } = frame;
-        this.#setting("thinkingLevel", { value });
+      case "thinking_level_changed":
+        // The `get_state` field's shape: the effective level.
+        this.#setting("thinkingLevel", { value: frame.thinkingLevel ?? null });
         return "none";
-      }
       case "goal_updated":
         this.#setting("goal", { value: frame.goal ?? null });
         return "none";
@@ -735,12 +776,103 @@ export class NeoPiNativeProjection {
       if (!(field in state) || (this.store.get(key)?.revision ?? 0) > mark.revision) continue;
       this.store.put(key, { class: "setting", value: { property, value: state[field] ?? null } });
     }
+    // The whole record (less the session-dump fields), as the client reads it
+    // today; refreshed by every `get_state` the build or a trigger issues.
+    if ((this.store.get("setting:state")?.revision ?? 0) <= mark.revision) {
+      const { systemPrompt: _prompt, dumpTools: _tools, ...value } = state;
+      this.store.put("setting:state", { class: "setting", value: { property: "state", value } });
+    }
     const run = this.store.get(RUN_KEY);
     if (typeof state.isStreaming === "boolean" && (run?.revision ?? 0) <= mark.revision) {
       const held = run?.value?.class === "run" ? run.value.value : {};
       this.store.put(RUN_KEY, { class: "run", value: { ...held, active: state.isStreaming } });
     }
     this.#stateApplied = true;
+    return true;
+  }
+
+  /**
+   * The live child inventory (`get_subagents`), C1 roster recovery authority.
+   * Each listed child's row is kept as `inventory`; a child held here but not
+   * listed gets `inventory: null` (not active as of the read). Children a
+   * frame touched after the request keep their newer state.
+   */
+  applySubagentsReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
+    if (!this.#acceptsReply(mark) || !Array.isArray(reply.subagents)) return false;
+    const listed = new Set<string>();
+    for (const raw of reply.subagents) {
+      const row = asRecord(raw);
+      const id = text(row?.id);
+      if (!row || id === undefined) continue;
+      listed.add(id);
+      this.#rosterRow(id, mark, (entry) => {
+        entry.inventory = row;
+      });
+    }
+    for (const record of this.store.values())
+      if (record.value?.class === "roster") {
+        const id = text(record.value.value.id);
+        if (id !== undefined && !listed.has(id) && record.value.value.inventory !== null)
+          this.#rosterRow(id, mark, (entry) => {
+            entry.inventory = null;
+          });
+      }
+    this.#rosterApplied = true;
+    return true;
+  }
+
+  /** The session's whole roster, finished and persisted children included (`get_subagent_history`). */
+  applySubagentHistoryReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
+    if (!this.#acceptsReply(mark) || !Array.isArray(reply.subagents)) return false;
+    for (const raw of reply.subagents) {
+      const row = asRecord(raw);
+      const id = text(row?.id);
+      if (row && id !== undefined)
+        this.#rosterRow(id, mark, (entry) => {
+          entry.history = row;
+        });
+    }
+    return true;
+  }
+
+  /**
+   * The background-job inventory (`get_jobs` `{running, recent, runningCount}`):
+   * listed jobs replace older state; a held job absent from both lists aged
+   * out and is removed, unless a frame touched it after the request.
+   */
+  applyJobsReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
+    if (
+      !this.#acceptsReply(mark) ||
+      (!Array.isArray(reply.running) && !Array.isArray(reply.recent))
+    )
+      return false;
+    const listed = new Set<string>();
+    for (const raw of [
+      ...(Array.isArray(reply.running) ? reply.running : []),
+      ...(Array.isArray(reply.recent) ? reply.recent : []),
+    ]) {
+      const job = asRecord(raw);
+      const id = text(job?.id);
+      if (!job || id === undefined) continue;
+      listed.add(id);
+      const key = `job:${id}`;
+      if ((this.store.get(key)?.revision ?? 0) <= mark.revision)
+        this.store.put(key, { class: "presentation", value: { job } });
+    }
+    for (const record of this.store.values())
+      if (
+        record.key.startsWith("job:") &&
+        record.value !== null &&
+        record.revision <= mark.revision &&
+        !listed.has(record.key.slice(4))
+      )
+        this.store.remove(record.key);
+    const count = this.store.get("presentation:jobs");
+    if (typeof reply.runningCount === "number" && (count?.revision ?? 0) <= mark.revision)
+      this.store.put("presentation:jobs", {
+        class: "presentation",
+        value: { runningCount: reply.runningCount },
+      });
     return true;
   }
 
@@ -824,11 +956,13 @@ export class NeoPiNativeProjection {
       this.#inboxMeta = [];
       this.#inboxBytes = 0;
       this.#pendingJoins.clear();
+      this.#rosterLive.clear();
       this.#heldEntries.clear();
       this.#pendingLeaf = null;
       this.#horizonCursor = null;
       this.#stateApplied = false;
       this.#pageApplied = false;
+      this.#rosterApplied = false;
       this.#domain = {
         ...this.#domain,
         projectionIncarnation: this.#domain.projectionIncarnation + 1,
@@ -1253,22 +1387,132 @@ export class NeoPiNativeProjection {
     this.store.put(RUN_KEY, { class: "run", value: run });
   }
 
-  /** Roster key is child id + run token (C1). Progress never revives a finished activation. */
+  /**
+   * One roster entity per child, key `roster:<id>`, value `{id, runToken,
+   * lifecycle?, progress?, inventory?, history?, ticks}`. A lifecycle start
+   * with a new run token is a new activation and replaces the live part.
+   * Progress never revives a finished activation.
+   */
   #roster(type: "subagent_lifecycle" | "subagent_progress", frame: NativeRecord): void {
     const payload = asRecord(frame.payload);
     const runToken = text(payload?.runToken);
     const id = text(type === "subagent_lifecycle" ? payload?.id : asRecord(payload?.progress)?.id);
     if (!payload || runToken === undefined || id === undefined) return;
-    const key = `roster:${id}:${runToken}`;
+    const key = `roster:${id}`;
     const held = this.store.get(key)?.value;
-    const entry: NativeRecord = { id, runToken, ...(held?.class === "roster" ? held.value : {}) };
-    if (type === "subagent_lifecycle") entry.lifecycle = payload;
-    else {
+    const previous = held?.class === "roster" ? held.value : undefined;
+    const sameRun = previous?.runToken === runToken;
+    const entry: NativeRecord = sameRun
+      ? { ...previous }
+      : { ...previous, id, runToken, lifecycle: undefined, progress: undefined, ticks: 0 };
+    if (type === "subagent_lifecycle") {
+      if (!sameRun && payload.status !== "started" && previous?.runToken !== undefined) return;
+      entry.lifecycle = payload;
+    } else {
+      if (!sameRun && previous?.runToken !== undefined) return;
       const status = text(asRecord(entry.lifecycle)?.status);
       if (status !== undefined && TERMINAL_CHILD_STATUSES.has(status)) return;
       entry.progress = payload;
     }
+    for (const field of ["lifecycle", "progress"] as const)
+      if (entry[field] === undefined) delete entry[field];
+    this.#rosterLive.set(id, this.store.put(key, { class: "roster", value: entry }));
+  }
+
+  /** A settled step of a child (`subagent_event` at the `events` level): a re-read trigger, not content. */
+  #rosterTick(frame: NativeRecord): void {
+    const payload = asRecord(frame.payload);
+    const id = text(payload?.id);
+    const eventType = asRecord(payload?.event)?.type;
+    if (id === undefined || !SETTLED_CHILD_EVENTS.has(String(eventType))) return;
+    const key = `roster:${id}`;
+    const held = this.store.get(key)?.value;
+    const entry: NativeRecord = held?.class === "roster" ? { ...held.value } : { id };
+    entry.ticks = (typeof entry.ticks === "number" ? entry.ticks : 0) + 1;
+    this.#rosterLive.set(id, this.store.put(key, { class: "roster", value: entry }));
+  }
+
+  #rosterRow(
+    id: string,
+    mark: NeoPiNativeRequestMark,
+    update: (entry: NativeRecord) => void,
+  ): void {
+    const key = `roster:${id}`;
+    const record = this.store.get(key);
+    if ((this.#rosterLive.get(id) ?? 0) > mark.revision) return;
+    const entry: NativeRecord =
+      record?.value?.class === "roster" ? { ...record.value.value } : { id, ticks: 0 };
+    update(entry);
     this.store.put(key, { class: "roster", value: entry });
+  }
+
+  /** `job_lifecycle` `{event, job, runningCount}`: a settled job is final; only a fresh registration reopens its id. */
+  #job(frame: NativeRecord): void {
+    const job = asRecord(frame.job);
+    const id = text(job?.id);
+    if (job && id !== undefined) {
+      const key = `job:${id}`;
+      const held = this.store.get(key)?.value;
+      const previous = held?.class === "presentation" ? asRecord(held.value.job) : undefined;
+      const reopens = previous && previous.status !== "running" && job.status === "running";
+      if (!reopens || frame.event === "registered")
+        this.store.put(key, { class: "presentation", value: { job } });
+    }
+    if (typeof frame.runningCount === "number")
+      this.store.put("presentation:jobs", {
+        class: "presentation",
+        value: { runningCount: frame.runningCount },
+      });
+  }
+
+  /**
+   * `command_output`, in arrival order, anchored after the last delivered
+   * journal entry and the newest live message at arrival (C1 informational
+   * receipt; its durable re-read is N11a, a later stage).
+   */
+  #commandOutput(frame: NativeRecord): void {
+    if (typeof frame.text !== "string" || frame.text === "") return;
+    let afterMessageId: string | null = null;
+    for (const record of this.store.values())
+      if (record.value?.class === "message") afterMessageId = record.value.messageId;
+    const afterEntry = this.journal.at(this.deliverableJournalEnd - 1);
+    this.store.put(`receipt:command:${this.#commandOutputs++}`, {
+      class: "receipt",
+      value: {
+        kind: "command_output",
+        text: frame.text,
+        afterEntryId: afterEntry?.id ?? null,
+        afterMessageId,
+      },
+    });
+  }
+
+  /**
+   * One native microphone capture, key `presentation:dictation`. NeoPi runs one
+   * capture at a time and opens it with a state frame; any other frame for a
+   * different or ended capture is a straggler.
+   */
+  #dictation(frame: NativeRecord): void {
+    const captureId = text(frame.captureId);
+    if (captureId === undefined) return;
+    const held = this.store.get("presentation:dictation")?.value;
+    const current = held?.class === "presentation" ? held.value : undefined;
+    const same = current?.captureId === captureId;
+    if (same && current?.phase === "ended") return;
+    let next: NativeRecord | undefined;
+    if (frame.type === "dictation_state" && DICTATION_PHASES.has(String(frame.state)))
+      next = { captureId, phase: frame.state, text: same ? current?.text : "", error: null };
+    else if (current !== undefined && !same) return;
+    else if (frame.type === "dictation_transcript" && typeof frame.text === "string")
+      next = { captureId, phase: current?.phase ?? "recording", text: frame.text, error: null };
+    else if (frame.type === "dictation_end")
+      next = {
+        captureId,
+        phase: "ended",
+        text: typeof frame.text === "string" ? frame.text : "",
+        error: typeof frame.error === "string" && frame.error ? frame.error : null,
+      };
+    if (next) this.store.put("presentation:dictation", { class: "presentation", value: next });
   }
 
   #uiRequest(frame: NativeRecord): void {
@@ -1278,7 +1522,15 @@ export class NeoPiNativeProjection {
     if (DIALOG_METHODS.has(method)) this.openObligation(id, frame as NeoPiNativeSessionCommand);
     else if (method === "cancel" && typeof frame.targetId === "string")
       this.settleObligation(frame.targetId, "cancelled");
-    else if (method === "setStatus" || method === "setWidget" || method === "setTitle") {
+    else if (method === "set_editor_text" && typeof frame.text === "string")
+      this.store.put("presentation:editorText", {
+        class: "presentation",
+        value: { id, text: frame.text },
+      });
+    else if (method === "notify" && typeof frame.message === "string") {
+      const { type: _type, id: _id, ...value } = frame;
+      this.store.put("presentation:notify", { class: "presentation", value });
+    } else if (method === "setStatus" || method === "setWidget" || method === "setTitle") {
       const name =
         method === "setStatus"
           ? text(frame.statusKey)

@@ -31,6 +31,7 @@ const published = (capacity = { tombstones: 1000, journal: 512 }) => {
     leafId: null,
   });
   projection.applyStateReply({ sessionId }, projection.mark());
+  projection.applySubagentsReply({ subagents: [] }, projection.mark());
   projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
   return projection;
 };
@@ -215,6 +216,7 @@ describe("NeoPiNativeProjection", () => {
       message: assistant("final"),
     });
     projection.applyStateReply({ sessionId }, mark);
+    projection.applySubagentsReply({ subagents: [] }, mark);
     projection.applyJournalPage({ sessionId, entries: [] }, mark);
     assert.isTrue(projection.published);
     let served = servedMessage(projection, messageId);
@@ -526,6 +528,7 @@ describe("NeoPiNativeProjection", () => {
       assert.isFalse(projection.published);
       const second = projection.mark();
       projection.applyStateReply({ sessionId }, second);
+      projection.applySubagentsReply({ subagents: [] }, second);
       assert.isFalse(projection.published);
       projection.applyJournalPage({ sessionId, entries: [] }, second);
       assert.isTrue(projection.published);
@@ -550,6 +553,7 @@ describe("NeoPiNativeProjection", () => {
         leafId: null,
       });
       projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applySubagentsReply({ subagents: [] }, projection.mark());
       projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
       return projection;
     };
@@ -648,6 +652,224 @@ describe("NeoPiNativeProjection", () => {
           ["tool_stream_update", 4],
         ],
       );
+    });
+  });
+
+  describe("parity with today's feed", () => {
+    const value = (projection: NeoPiNativeProjection, key: string) => {
+      const held = projection.store.get(key)?.value;
+      return held && "value" in held ? held.value : undefined;
+    };
+
+    it("the first build publishes only with the roster, complete from inventory and history", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      const mark = projection.mark();
+      // A child that starts during the build is newer than the inventory read.
+      projection.fold({
+        type: "subagent_lifecycle",
+        payload: {
+          id: "late",
+          runToken: "r9",
+          status: "started",
+          agent: "task",
+          agentSource: "bundled",
+          index: 3,
+        },
+      });
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applyJournalPage({ sessionId, entries: [] }, mark);
+      assert.isFalse(projection.published, "no Agents view without the inventory");
+      projection.applySubagentHistoryReply(
+        {
+          subagents: [
+            { id: "done", status: "parked" },
+            { id: "running", status: "running" },
+          ],
+        },
+        mark,
+      );
+      projection.applySubagentsReply(
+        {
+          subagents: [
+            { id: "running", status: "running", index: 1 },
+            { id: "late", status: "running" },
+          ],
+        },
+        mark,
+      );
+      assert.isTrue(projection.published);
+      assert.deepEqual(value(projection, "roster:done"), {
+        id: "done",
+        ticks: 0,
+        history: { id: "done", status: "parked" },
+        // Not in the live inventory: finished, not interrupted.
+        inventory: null,
+      });
+      assert.deepEqual(value(projection, "roster:running"), {
+        id: "running",
+        ticks: 0,
+        history: { id: "running", status: "running" },
+        inventory: { id: "running", status: "running", index: 1 },
+      });
+      const late = value(projection, "roster:late");
+      assert.equal(late?.runToken, "r9");
+      assert.isUndefined(
+        late?.inventory,
+        "the older inventory row does not overwrite the newer frame",
+      );
+      projection.fold({
+        type: "subagent_event",
+        payload: { id: "running", event: { type: "message_end" } },
+      });
+      projection.fold({
+        type: "subagent_event",
+        payload: { id: "running", event: { type: "message_update" } },
+      });
+      assert.equal(value(projection, "roster:running")?.ticks, 1);
+    });
+
+    it("folds jobs from frames and the inventory, keeping the newer of the two", () => {
+      const projection = published();
+      const mark = projection.mark();
+      projection.fold({
+        type: "job_lifecycle",
+        event: "registered",
+        job: { id: "j1", status: "running" },
+        runningCount: 1,
+      });
+      projection.fold({
+        type: "job_lifecycle",
+        event: "updated",
+        job: { id: "j1", status: "completed" },
+        runningCount: 0,
+      });
+      projection.fold({
+        type: "job_lifecycle",
+        event: "updated",
+        job: { id: "j1", status: "running" },
+        runningCount: 1,
+      });
+      assert.deepEqual(value(projection, "job:j1"), { job: { id: "j1", status: "completed" } });
+      projection.applyJobsReply(
+        {
+          running: [
+            { id: "j1", status: "running" },
+            { id: "j2", status: "running" },
+          ],
+          recent: [],
+          runningCount: 2,
+        },
+        mark,
+      );
+      assert.deepEqual(value(projection, "job:j1"), { job: { id: "j1", status: "completed" } });
+      assert.deepEqual(value(projection, "job:j2"), { job: { id: "j2", status: "running" } });
+      assert.deepEqual(value(projection, "presentation:jobs"), { runningCount: 1 });
+      projection.applyJobsReply({ running: [], recent: [], runningCount: 0 }, projection.mark());
+      assert.isNull(projection.store.get("job:j2")?.value, "aged out of both lists");
+    });
+
+    it("keeps the whole get_state record, and live frames in its field shapes", () => {
+      const projection = published();
+      projection.applyStateReply(
+        {
+          sessionId,
+          contextUsage: { percent: 12 },
+          sessionUsage: { cost: 1.5 },
+          sessionName: "fix it",
+          fastModeEnabled: true,
+          isCompacting: false,
+          systemPrompt: ["very long"],
+          dumpTools: [],
+        },
+        projection.mark(),
+      );
+      assert.deepEqual(value(projection, "setting:state"), {
+        property: "state",
+        value: {
+          sessionId,
+          contextUsage: { percent: 12 },
+          sessionUsage: { cost: 1.5 },
+          sessionName: "fix it",
+          fastModeEnabled: true,
+          isCompacting: false,
+        },
+      });
+      projection.fold({
+        type: "thinking_level_changed",
+        thinkingLevel: "high",
+        configured: "auto",
+      });
+      projection.fold({ type: "queue_update", steering: ["a"], followUp: [], liveSteered: 0 });
+      assert.deepEqual(value(projection, "setting:thinkingLevel"), {
+        property: "thinkingLevel",
+        value: "high",
+      });
+      assert.deepEqual(value(projection, "setting:queue"), {
+        property: "queue",
+        value: { steering: ["a"], followUp: [], liveSteered: 0 },
+      });
+    });
+
+    it("folds command output, dictation, editor text, notify and prompt results as the feed shows them", () => {
+      const projection = published();
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e1", null) });
+      projection.fold({ type: "message_start", messageId: "m1", message: assistant("x") });
+      projection.fold({ type: "command_output", text: "first" });
+      projection.fold({ type: "command_output", text: "" });
+      projection.fold({ type: "command_output", text: "second" });
+      assert.deepEqual(value(projection, "receipt:command:0"), {
+        kind: "command_output",
+        text: "first",
+        afterEntryId: "e1",
+        afterMessageId: "m1",
+      });
+      assert.equal(value(projection, "receipt:command:1")?.text, "second");
+      projection.fold({ type: "dictation_state", captureId: "c1", state: "recording" });
+      projection.fold({ type: "dictation_transcript", captureId: "c1", text: "hello" });
+      projection.fold({ type: "dictation_transcript", captureId: "old", text: "straggler" });
+      projection.fold({ type: "dictation_end", captureId: "c1", text: "hello world" });
+      projection.fold({ type: "dictation_transcript", captureId: "c1", text: "late" });
+      assert.deepEqual(value(projection, "presentation:dictation"), {
+        captureId: "c1",
+        phase: "ended",
+        text: "hello world",
+        error: null,
+      });
+      projection.fold({
+        type: "extension_ui_request",
+        id: "u1",
+        method: "set_editor_text",
+        text: "draft",
+      });
+      projection.fold({
+        type: "extension_ui_request",
+        id: "u2",
+        method: "notify",
+        message: "saved",
+      });
+      assert.deepEqual(value(projection, "presentation:editorText"), { id: "u1", text: "draft" });
+      assert.equal(value(projection, "presentation:notify")?.message, "saved");
+      projection.fold({ type: "prompt_result", status: "error", error: { message: "no model" } });
+      assert.deepEqual(value(projection, "presentation:promptResult"), {
+        status: "error",
+        error: "no model",
+      });
+      projection.fold({ type: "prompt_result", status: "ok" });
+      assert.deepEqual(value(projection, "presentation:promptResult"), {
+        status: "ok",
+        error: null,
+      });
     });
   });
 });

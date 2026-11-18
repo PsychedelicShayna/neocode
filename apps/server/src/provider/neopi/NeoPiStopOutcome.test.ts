@@ -94,6 +94,7 @@ describe("NeoPiStopOutcome", () => {
         leafId: null,
       });
       projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applySubagentsReply({ subagents: [] }, projection.mark());
       // Journal page reply, then each live boundary: snapshot message, live end, journal entry.
       projection.applyJournalPage(
         {

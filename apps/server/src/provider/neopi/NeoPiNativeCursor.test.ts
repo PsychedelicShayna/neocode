@@ -350,6 +350,7 @@ describe("NeoPiNativeCursor", () => {
       leafId: null,
     });
     projection.applyStateReply({ sessionId }, projection.mark());
+    projection.applySubagentsReply({ subagents: [] }, projection.mark());
     projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
     const body = (id: number, length: number) => ({
       role: "assistant",
@@ -479,6 +480,7 @@ describe("NeoPiNativeCursor", () => {
       leafId: null,
     });
     projection.applyStateReply({ sessionId, isStreaming: true }, projection.mark());
+    projection.applySubagentsReply({ subagents: [] }, projection.mark());
     projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
     const mirror = new Mirror();
     const bulk = mirror.read(projection, { scanSteps: 100, replyBytes: 10_000 });
@@ -566,6 +568,7 @@ describe("NeoPiNativeCursor", () => {
         leafId: null,
       });
       projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applySubagentsReply({ subagents: [] }, projection.mark());
       projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
       let parent: string | null = null;
       const append = (id: string, message?: Record<string, unknown>) => {

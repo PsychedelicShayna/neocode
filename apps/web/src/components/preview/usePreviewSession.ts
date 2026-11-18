@@ -44,17 +44,21 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
   return Atom.make((get) => {
     let disposed = false;
     let eventsVersion = 0;
+    let discardedListRefetches = 0;
 
     const reconcileSessions = (result: Atom.Type<typeof sessionsAtom>) => {
       if (!AsyncResult.isSuccess(result)) return;
-      // A list computed before an event already applied here is discarded as
-      // older. Until one list has landed, fetch again rather than staying unlisted.
-      if (
-        !reconcilePreviewServerSessions(threadRef, result.value) &&
-        !readThreadPreviewState(threadRef).listed
-      ) {
-        get.refresh(sessionsAtom);
+      if (reconcilePreviewServerSessions(threadRef, result.value)) {
+        discardedListRefetches = 0;
+        return;
       }
+      // A list computed before an event already applied here is discarded as
+      // older. Until one list has landed, fetch again, at most three times in a
+      // row so a steady event stream cannot keep requesting lists; past that the
+      // panel stays fail-soft until a resync or the next ordinary list.
+      if (readThreadPreviewState(threadRef).listed || discardedListRefetches >= 3) return;
+      discardedListRefetches += 1;
+      get.refresh(sessionsAtom);
     };
 
     const applyLatestEvent = (result: Atom.Type<typeof eventsAtom>) => {

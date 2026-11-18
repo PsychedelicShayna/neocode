@@ -87,6 +87,12 @@ const pass = (input: {
   inbox: input.inbox ?? [],
   journal: null,
 });
+/** Issues the feed's one read and applies `result` as its reply. */
+const applyRead = (feed: NativeSessionFeed, result: NeoPiNativeSessionsReadResult) => {
+  const issued = reduceNativeSessionFeed(feed, { type: "read-issued" });
+  const readId = issued.observation.outstanding?.readId ?? -1;
+  return reduceNativeSessionFeed(issued, { type: "read", readId, result });
+};
 const live = (messageId: string, content: string, revision: number): NeoPiNativeEntity => ({
   key: `message:${messageId}`,
   ordinal: 1,
@@ -482,10 +488,9 @@ describe("native inbox bound", () => {
     });
     const total = NATIVE_INBOX_LIMIT * 4;
     for (let seq = 1; seq <= total; seq++)
-      feed = reduceNativeSessionFeed(feed, {
-        type: "read",
-        sent: feed.observation.cursor,
-        result: pass({
+      feed = applyRead(
+        feed,
+        pass({
           epoch,
           watermark: seq,
           kind: seq === 1 ? "full" : "incremental",
@@ -499,7 +504,7 @@ describe("native inbox bound", () => {
             },
           ],
         }),
-      });
+      );
     const inbox = feed.observation.inbox;
     expect(inbox.length).toBeLessThanOrEqual(NATIVE_INBOX_LIMIT);
     const gap = inbox[0];
@@ -539,16 +544,13 @@ describe("native projection mapping", () => {
       value: { kind: "command_output", text: "Printed", afterEntryId: null, afterMessageId: null },
     },
   };
-  const read = (feed: NativeSessionFeed, result: NeoPiNativeSessionsReadResult) =>
-    reduceNativeSessionFeed(feed, { type: "read", sent: feed.observation.cursor, result });
-
   it("keeps children and command output through a rebuild and drops a removed child", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
       revision: 1,
       session,
     });
-    feed = read(
+    feed = applyRead(
       feed,
       pass({ epoch: domain(), watermark: 2, entities: [child(1, "running"), output] }),
     );
@@ -558,14 +560,14 @@ describe("native projection mapping", () => {
 
     // A rebuilt projection holds the child again but not the live-only receipt.
     const rebuilt = domain({ projectionIncarnation: 2 });
-    feed = read(feed, pass({ epoch: rebuilt, watermark: 3, entities: [child(3, "running")] }));
+    feed = applyRead(feed, pass({ epoch: rebuilt, watermark: 3, entities: [child(3, "running")] }));
     expect(feed.agents[0]?.status).toBe("running");
     expect(feed.agents[0]?.native.disconnected).toBe(false);
     expect(feed.agentTicks).toEqual({ child: 3 });
     expect(feed.commandOutputs.map((item) => item.text)).toEqual(["Printed"]);
 
     // A full pass that no longer holds the child removes it, never marks it interrupted.
-    feed = read(feed, pass({ epoch: rebuilt, watermark: 4 }));
+    feed = applyRead(feed, pass({ epoch: rebuilt, watermark: 4 }));
     expect(feed.agents).toEqual([]);
   });
 });
@@ -583,11 +585,7 @@ describe("native observation status", () => {
     expect(nativeObservationStatus(feed).catchingUp).toBe(true);
     feed = reduceNativeSessionFeed(feed, { type: "lifecycle", revision: 3, state: "observing" });
     expect(nativeObservationStatus(feed)).toEqual({ phase: "rebasing", catchingUp: true });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "read",
-      sent: null,
-      result: pass({ epoch, watermark: 3 }),
-    });
+    feed = applyRead(feed, pass({ epoch, watermark: 3 }));
     expect(nativeObservationStatus(feed)).toEqual({ phase: "observing", catchingUp: false });
   });
 });

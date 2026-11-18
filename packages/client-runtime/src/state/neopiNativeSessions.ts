@@ -159,20 +159,21 @@ export function createNativeSessionAtoms<R, E>(
 
           const read = (leaseId: string) =>
             Effect.gen(function* () {
-              let readId = 0;
               let failures = 0;
               while (true) {
-                readId++;
-                // The reducer applies a reply only while the feed still holds this cursor.
-                const sent = current.observation.cursor;
+                // The feed numbers the read and keeps it as its one outstanding read;
+                // only the reply to that read applies.
+                yield* apply({ type: "read-issued" });
+                const outstanding = current.observation.outstanding;
+                if (!outstanding) return;
                 const reply = yield* rpcRequest(WS_METHODS.neopiNativeSessionsRead, {
                   leaseId,
-                  readId,
-                  cursor: sent,
+                  readId: outstanding.readId,
+                  cursor: outstanding.cursor,
                 }).pipe(Effect.result);
                 if (Result.isSuccess(reply)) {
                   failures = 0;
-                  yield* apply({ type: "read", sent, result: reply.success });
+                  yield* apply({ type: "read", readId: outstanding.readId, result: reply.success });
                   continue;
                 }
                 const error = reply.failure;

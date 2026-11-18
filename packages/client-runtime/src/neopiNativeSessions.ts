@@ -882,35 +882,47 @@ function stageNativeMembership(
 ): NativeObservation {
   if (result.type !== "pass") return after;
   const prior = before.staged;
-  const staged = new Map(
-    prior && !result.promoted && prior.passId === result.passId ? prior.entities : [],
-  );
-  for (const tombstone of result.tombstones) staged.delete(tombstone.key);
-  const entities = new Map(after.entities);
+  const kept = prior && !result.promoted && prior.passId === result.passId ? prior.entities : null;
   const pass = result.continuation.pass;
   if (result.kind === "full" && pass === null) {
-    for (const [key, entity] of staged)
-      if (!entities.has(key) && (after.removed.get(key) ?? -1) < entity.revision)
+    if (!kept) return after.staged === null ? after : { ...after, staged: null };
+    const tombstoned = new Set(result.tombstones.map((tombstone) => tombstone.key));
+    const entities = new Map(after.entities);
+    for (const [key, entity] of kept)
+      if (
+        !tombstoned.has(key) &&
+        !entities.has(key) &&
+        (after.removed.get(key) ?? -1) < entity.revision
+      )
         entities.set(key, entity);
-    return staged.size === 0 && after.staged === null
-      ? after
-      : { ...after, entities, staged: null };
+    return { ...after, entities, staged: null };
   }
-  if (result.kind !== "full" || pass === null) return { ...after, staged: null };
-  for (const [key, entity] of after.entities) {
-    if (before.entities.has(key)) continue;
+  if (result.kind !== "full" || pass === null)
+    return after.staged === null ? after : { ...after, staged: null };
+  const staged = new Map(kept ?? []);
+  for (const tombstone of result.tombstones) staged.delete(tombstone.key);
+  // Only keys this reply brought can be new.
+  let entities: Map<string, NativeObservedEntity> | null = null;
+  const arrived = [
+    ...result.entities.map((entity) => entity.key),
+    ...result.segments.map((segment) => segment.key),
+  ];
+  for (const key of arrived) {
+    const entity = after.entities.get(key);
+    if (!entity || before.entities.has(key)) continue;
     const kind = entity.value.class;
     if (kind !== "roster" && kind !== "tool") continue;
     if (entity.revision > pass.watermark) {
       staged.delete(key);
       continue;
     }
+    entities ??= new Map(after.entities);
     entities.delete(key);
     staged.set(key, entity);
   }
   return {
     ...after,
-    entities,
+    entities: entities ?? after.entities,
     staged: staged.size > 0 ? { passId: result.passId, entities: staged } : null,
   };
 }
@@ -978,6 +990,8 @@ function projectNativeChild(
 function projectNativeEntities(
   before: NativeSessionFeed,
   feed: NativeSessionFeed,
+  /** Keys the reply touched; null when it may have removed any key (a completed full pass). */
+  changed: ReadonlySet<string> | null,
 ): NativeSessionFeed {
   const previous = before.observation.entities;
   const entities = feed.observation.entities;
@@ -1002,10 +1016,11 @@ function projectNativeEntities(
   // Copied on first write, then written in place.
   let agentTicks: Record<string, number> | null = null;
   let notices: Record<string, string> | null = null;
-  const outputs = new Set(feed.commandOutputs.map((output) => output.id));
+  let outputs: Set<string> | null = null;
   const added: NativeCommandOutput[] = [];
-  for (const [key, entity] of entities) {
-    if (previous.get(key)?.value === entity.value) continue;
+  for (const key of changed ?? entities.keys()) {
+    const entity = entities.get(key);
+    if (!entity || previous.get(key)?.value === entity.value) continue;
     const value = entity.value;
     if (value.class === "roster") {
       const row = value.value;
@@ -1017,6 +1032,7 @@ function projectNativeEntities(
     } else if (value.class === "receipt") {
       const receipt = value.value;
       const id = `${scope}:${key}`;
+      outputs ??= new Set(feed.commandOutputs.map((output) => output.id));
       if (receipt.kind === "command_output" && typeof receipt.text === "string" && !outputs.has(id))
         added.push({
           id,
@@ -1089,8 +1105,9 @@ function projectNativeEntities(
       }
     }
   }
-  for (const [key, entity] of previous) {
-    if (entities.has(key)) continue;
+  for (const key of changed ?? previous.keys()) {
+    const entity = previous.get(key);
+    if (!entity || entities.has(key)) continue;
     if (entity.value.class === "roster") {
       const id = entity.value.value.id;
       agents = agents.filter((agent) => agent.id !== id);
@@ -1330,7 +1347,16 @@ export function reduceNativeSessionFeed(
       observation: stageNativeMembership(feed.observation, next.observation, event.result),
       ...(observer ? { observer } : {}),
     };
-    const projected = projectNativeEntities(feed, staged);
+    const result = event.result;
+    const changed =
+      result.type === "pass" && !(result.kind === "full" && result.continuation.pass === null)
+        ? new Set([
+            ...result.entities.map((entity) => entity.key),
+            ...result.segments.map((segment) => segment.key),
+            ...result.tombstones.map((tombstone) => tombstone.key),
+          ])
+        : null;
+    const projected = projectNativeEntities(feed, staged, changed);
     const observation = boundNativeInbox(projected.observation);
     return observation === projected.observation ? projected : { ...projected, observation };
   }

@@ -152,6 +152,13 @@ function defaultBindingForBinding(
   );
 }
 
+/** One chord's keycaps (`mod+shift+k` → mod, shift, k), keeping a literal `+` key whole. */
+export function keybindingChordParts(chord: string): ReadonlyArray<string> {
+  if (chord === "+") return ["+"];
+  if (chord.endsWith("++")) return [...chord.slice(0, -2).split("+"), "+"];
+  return chord.split("+");
+}
+
 /** A rule's `key` as the settings show and save it; a sequence's chords are space-separated. */
 export function keybindingRuleInput(binding: ResolvedKeybindingRule): string {
   return keybindingRuleSteps(binding).map(shortcutToKeybindingInput).join(" ");

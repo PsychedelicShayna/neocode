@@ -58,6 +58,7 @@ import {
   commandLabel,
   DEFAULT_WHEN_VARIABLE,
   isKnownWhenVariable,
+  keybindingChordParts,
   keybindingConflictLabels,
   recordKeybindingStep,
   parseWhenExpressionDraft,
@@ -86,9 +87,9 @@ function KeybindingPill({ value }: { value: string }) {
 }
 
 function KeybindingChordPill({ value }: { value: string }) {
-  // Keys dedupe repeated parts; a literal "+" in a shortcut splits into empty strings.
+  // Keys dedupe repeated parts.
   const seenParts = new Map<string, number>();
-  const parts = value.split("+").map((part) => {
+  const parts = keybindingChordParts(value).map((part) => {
     const seen = seenParts.get(part) ?? 0;
     seenParts.set(part, seen + 1);
     return { part, key: seen === 0 ? part : `${part}-${seen}` };

@@ -133,7 +133,10 @@ A key can also be a sequence of two chords separated by a space, such as
 `ctrl+w h`: press the first chord, release it, then press the second. There is no
 time limit between them. Any other key cancels the sequence and works as usual.
 To record one in **Settings → Keybindings**, press both chords; to keep a single
-chord, press Enter or Tab after it.
+chord, press Enter or Tab after it. Settings only records shortcuts whose first chord
+uses a modifier, so ordinary typing cannot set one by accident; for a sequence that
+starts with a plain key, such as `g h`, edit the configuration file. Such a sequence
+never starts while a text field has focus.
 
 ## When conditions
 

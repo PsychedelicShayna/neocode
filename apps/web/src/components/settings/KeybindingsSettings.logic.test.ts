@@ -10,6 +10,7 @@ import {
   buildKeybindingCommandOptions,
   buildWhenVariableOptions,
   commandLabel,
+  keybindingChordParts,
   keybindingConflictLabels,
   keybindingFromKeyboardEvent,
   recordKeybindingStep,
@@ -458,6 +459,13 @@ describe("KeybindingsSettings.logic", () => {
       ]);
       expect(draftConflicts(rules, { key: "ctrl+\\", when: "!terminalFocus" })).toEqual([]);
     });
+  });
+
+  it("splits a chord into its keycaps, keeping a literal plus key", () => {
+    expect(keybindingChordParts("mod+shift+k")).toEqual(["mod", "shift", "k"]);
+    expect(keybindingChordParts("mod++")).toEqual(["mod", "+"]);
+    expect(keybindingChordParts("ctrl+shift++")).toEqual(["ctrl", "shift", "+"]);
+    expect(keybindingChordParts("+")).toEqual(["+"]);
   });
 
   describe("recording a binding", () => {

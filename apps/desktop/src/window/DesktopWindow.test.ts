@@ -722,6 +722,21 @@ describe("DesktopWindow", () => {
     assert.equal(fakeWindow.setOpacity.mock.calls.length, 0);
   });
 
+  // The overlay is sized in window points while the title bar lays out in CSS
+  // pixels; an unscaled overlay shrank the strip under app zoom and clipped the
+  // second line of the session tabs.
+  it("keeps the title-bar overlay 40 CSS pixels tall at every app zoom step", () => {
+    assert.equal(DesktopWindow.titleBarOverlayHeight(1), 40);
+    // 1.2 ** 1 carries float noise above 1.2; it must not round up to 49.
+    assert.equal(DesktopWindow.titleBarOverlayHeight(1.2 ** 1), 48);
+    for (let level = -3; level <= 4; level += 0.5) {
+      const zoomFactor = 1.2 ** level;
+      const cssHeight = DesktopWindow.titleBarOverlayHeight(zoomFactor) / zoomFactor;
+      assert.isAtLeast(cssHeight, 40 - 1e-6, `zoom level ${level}`);
+      assert.isBelow(cssHeight, 40 + 1 / zoomFactor, `zoom level ${level}`);
+    }
+  });
+
   it("restores bounds only when the entire window remains on connected displays", () => {
     const persistedBounds = { x: 2040, y: 80, width: 1320, height: 880 };
     const displays = [

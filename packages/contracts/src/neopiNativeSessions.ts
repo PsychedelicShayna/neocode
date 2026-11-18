@@ -222,11 +222,17 @@ export const NeoPiNativeEntity = Schema.Struct({
 });
 export type NeoPiNativeEntity = typeof NeoPiNativeEntity.Type;
 
-/** A removed key. Absence in a patch or incremental pass never means removal. */
+/**
+ * A removed key. Absence in a patch or incremental pass never means removal.
+ * `joinEntryId` is set when a live message or tool was retired by its durable
+ * journal entry: the client keeps the live row until it holds that entry, and
+ * never erases it before (r12 C2 coherence invariant 2).
+ */
 export const NeoPiNativeTombstone = Schema.Struct({
   key: Schema.String,
   ordinal: NeoPiNativeOrdinal,
   revision: NeoPiNativeRevision,
+  joinEntryId: Schema.optionalKey(Schema.String),
 });
 export type NeoPiNativeTombstone = typeof NeoPiNativeTombstone.Type;
 
@@ -247,7 +253,10 @@ export type NeoPiNativeSegment = typeof NeoPiNativeSegment.Type;
 
 /**
  * Ordered retention for live-only records without a reducer: every
- * `tool_stream_update` of a tool other than `edit`, and every notice.
+ * `tool_stream_update` of a tool other than `edit`, and every notice. The inbox
+ * is bounded; evicted records are replaced by one `gap` covering
+ * `fromSeq..toSeq`, whose `seq` is `toSeq`. A gap that grows keeps its
+ * `fromSeq` and replaces the shorter one with the same `fromSeq`.
  */
 export const NeoPiNativeInboxRecord = Schema.Union([
   Schema.Struct({
@@ -263,6 +272,31 @@ export const NeoPiNativeInboxRecord = Schema.Union([
     level: Schema.String,
     message: Schema.String,
     source: Schema.optionalKey(Schema.String),
+  }),
+  /**
+   * Confirmed eviction: these records were received and are no longer
+   * retained, with no replay source. Not missing coverage and not a read
+   * failure. Counts are of records received in the whole interval.
+   */
+  Schema.Struct({
+    type: Schema.Literal("gap"),
+    seq: NonNegativeInt,
+    cause: Schema.Literal("evicted"),
+    fromSeq: NonNegativeInt,
+    toSeq: NonNegativeInt,
+    /** Server receive times (ms since epoch) of the first and last evicted record. */
+    firstReceivedAt: Schema.Number,
+    lastReceivedAt: Schema.Number,
+    notices: NonNegativeInt,
+    toolStreams: Schema.Array(
+      Schema.Struct({
+        toolCallId: Schema.String,
+        toolName: Schema.String,
+        updates: NonNegativeInt,
+      }),
+    ),
+    /** More tool calls were evicted than `toolStreams` lists; their per-call detail is not known. */
+    toolStreamsTruncated: Schema.Boolean,
   }),
 ]);
 export type NeoPiNativeInboxRecord = typeof NeoPiNativeInboxRecord.Type;

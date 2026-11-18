@@ -84,6 +84,35 @@ describe("mobile tool disclosure identity", () => {
     expect(rebased[0]?.kind === "entry" && rebased[0].entry.message).toEqual(message);
   });
 
+  it("keeps a streaming message's row when it gains its first call, through the join", () => {
+    const feed = emptyNativeSessionFeed();
+    const thinking = { type: "thinking", thinking: "Planning" };
+    const streaming = (content: unknown[]) => ({
+      ...feed,
+      conversation: {
+        ...feed.conversation,
+        pending: [{ messageId: "m1", message: { role: "assistant", content } }],
+      },
+    });
+    const before = nativeTranscriptRows(streaming([thinking]), false);
+    // An open reasoning toggle lives in the row; a new key remounts it closed.
+    const opened = before[0]!.id;
+    const withCall = nativeTranscriptRows(streaming([thinking, ...message.content]), false, before);
+    expect(withCall[0]!.id).toBe(opened);
+    const durable = {
+      ...feed,
+      conversation: {
+        ...feed.conversation,
+        entries: [
+          { ...entry, message: { role: "assistant", content: [thinking, ...message.content] } },
+        ],
+      },
+    };
+    const joined = nativeTranscriptRows(durable, false, withCall);
+    expect(joined.map((row) => row.id)).toEqual([opened]);
+    expect(nativeTranscriptRows(durable, false, joined).map((row) => row.id)).toEqual([opened]);
+  });
+
   it("never gives repeated tool call ids the same row key", () => {
     const feed = emptyNativeSessionFeed();
     const rows = nativeTranscriptRows(

@@ -31,6 +31,7 @@ import {
   NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
   nativeObservationStatus,
+  nativeTranscriptRows,
   reduceNativeSessionFeed,
   type NativeSession,
   type NativeSessionFeed,
@@ -957,6 +958,76 @@ describe("native projection mapping", () => {
       tombstones: [{ key: fault.key, ordinal: 1, revision: 3 }],
     });
     expect(feed.agentsNote).toBeNull();
+  });
+});
+
+describe("rebuild after a fast primary (acc-prep-1 capture, defect B)", () => {
+  it("shows the final entry last when a retired live row joins an entry older than the horizon", () => {
+    const entry = (id: string, parentId: string | null, content: string) => ({
+      id,
+      parentId,
+      type: "message",
+      timestamp: "2026-11-18T00:00:00Z",
+      message: { role: "assistant", content },
+    });
+    const before = domain({ buildAttempt: 2, branchGeneration: 1 });
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    // Loop 0 streams: the view holds its live row.
+    feed = applyRead(feed, {
+      ...pass({ epoch: before, watermark: 2386, entities: [live("m0", "loop 0 block 799", 2386)] }),
+      journal: { continuity: "horizon", leafId: "u", entries: [entry("u", null, "prompt")] },
+    });
+    expect(feed.conversation.pending.map((row) => row.messageId)).toEqual(["m0"]);
+    // The rebuild's full pass: m0 is retired by its entry a0, which the byte-capped
+    // horizon (the newest entries only) does not carry.
+    const after = domain({ buildAttempt: 3, branchGeneration: 10 });
+    feed = applyRead(feed, {
+      ...pass({ epoch: after, watermark: 9720 }),
+      tombstones: [{ key: "message:m0", ordinal: 1, revision: 9700, joinEntryId: "a0" }],
+      journal: {
+        continuity: "horizon",
+        leafId: "a3",
+        nextCursor: "before-tr1",
+        entries: [
+          entry("tr1", "a1", "tool result 1"),
+          entry("a2", "tr1", "loop 2"),
+          entry("tr2", "a2", "tool result 2"),
+          entry("a3", "tr2", "loop 3 final"),
+        ],
+      },
+    });
+    const entryIds = (value: NativeSessionFeed) =>
+      nativeTranscriptRows(value, false).map((row) =>
+        row.kind === "entry" ? row.entry.id : row.id,
+      );
+    // The retired row is older history: not live, not a loss, never the tail.
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toEqual([]);
+    expect(entryIds(feed)).toEqual(["tr1", "a2", "tr2", "a3"]);
+    expect(feed.conversation.cursor).toBe("before-tr1");
+    // Paging back joins its entry in order.
+    feed = reduceNativeSessionFeed(feed, {
+      type: "page",
+      older: true,
+      revision: feed.conversation.revision,
+      page: {
+        sessionId: session.sessionId,
+        sessionFile: session.ref.sessionFile,
+        leafId: feed.conversation.cursorLeaf,
+        entries: [
+          entry("u", null, "prompt"),
+          entry("a0", "u", "loop 0"),
+          entry("tr0", "a0", "r0"),
+          entry("a1", "tr0", "loop 1"),
+        ],
+        totalEntries: 8,
+      },
+    });
+    expect(entryIds(feed)).toEqual(["u", "a0", "tr0", "a1", "tr1", "a2", "tr2", "a3"]);
   });
 });
 

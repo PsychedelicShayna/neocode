@@ -212,8 +212,8 @@ describe("native subagent history roster", () => {
     );
     expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
       ["late", "cancelled"],
-      ["early", "completed"],
-      ["accepted", "completed"],
+      ["early", "interrupted"],
+      ["accepted", "interrupted"],
     ]);
     const early = agents.find((agent) => agent.id === "early")!;
     expect(early).toMatchObject({
@@ -233,9 +233,35 @@ describe("native subagent history roster", () => {
     expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
   });
 
-  it("reads a child restored as idle the same as one whose finish was seen live", () => {
+  it.each(["idle", "parked"])(
+    "keeps a failure or abort seen live when history later lists the child as %s",
+    (status) => {
+      // Failure detail arrives on the terminal progress frame; the lifecycle settles it.
+      let failed = reduceNativeSubagents(
+        [],
+        progress({ status: "failed", retryFailure: { errorMessage: "Provider refused" } }),
+        1,
+        at,
+      );
+      failed = reduceNativeSubagents(failed, lifecycle("failed"), 2, at);
+      expect(failed[0]).toMatchObject({ status: "failed", error: "Provider refused" });
+      const afterFailure = mergeNativeSubagentHistory(failed, [entry("worker", { status })], 3, at);
+      expect(afterFailure[0]).toMatchObject({ status: "failed", error: "Provider refused" });
+      const aborted = reduceNativeSubagents(
+        reduceNativeSubagents([], lifecycle("started"), 1, at),
+        lifecycle("aborted"),
+        2,
+        at,
+      );
+      const afterAbort = mergeNativeSubagentHistory(aborted, [entry("worker", { status })], 3, at);
+      expect(afterAbort[0]?.status).toBe(aborted[0]?.status);
+    },
+  );
+
+  it("shows a child known finished only from outcome-less history as finished, never completed", () => {
     // From acc-prep-1's capture (native-rpc-1115712.jsonl, npi 18.18.8): a
-    // finished keep-alive child, still in memory.
+    // finished keep-alive child whose run this view never saw end. It may have
+    // failed: NeoPi's history records no outcome.
     const captured = {
       id: "Load0",
       kind: "sub",
@@ -254,23 +280,17 @@ describe("native subagent history roster", () => {
     };
     const [restored] = mergeNativeSubagentHistory([], [captured], 0, at);
     expect(restored).toMatchObject({
-      status: "completed",
+      status: "interrupted",
       completedAt: "2026-11-18T13:06:28.424Z",
+      native: { restored: true, outcomeUnrecorded: true, disconnected: false },
     });
-    let observed = reduceNativeSubagents(
-      [],
-      { type: "subagent_lifecycle", payload: { id: "Load0", runToken: "r", status: "started" } },
-      1,
-      at,
-    );
-    observed = reduceNativeSubagents(
-      observed,
-      { type: "subagent_lifecycle", payload: { id: "Load0", runToken: "r", status: "completed" } },
-      2,
-      at,
-    );
-    expect(observed[0]?.status).toBe(restored?.status);
     expect(deriveAgentPanelModel({ agents: [restored!] }).runningCount).toBe(0);
+    // A parked child is the same: finished, outcome not recorded.
+    const [parked] = mergeNativeSubagentHistory([], [{ ...captured, status: "parked" }], 0, at);
+    expect(parked?.native.outcomeUnrecorded).toBe(true);
+    // An aborted one is an outcome history does record.
+    const [aborted] = mergeNativeSubagentHistory([], [{ ...captured, status: "aborted" }], 0, at);
+    expect(aborted).toMatchObject({ status: "cancelled", native: { outcomeUnrecorded: false } });
   });
 
   it("never overrides a child a frame touched after the read began, nor one still observed live", () => {
@@ -302,9 +322,9 @@ describe("native subagent history roster", () => {
     agents = mergeNativeSubagentHistory(agents, [entry("worker", { description: "gist" })], 2, at);
     expect(agents[0]).toMatchObject({
       id: "worker",
-      status: "completed",
+      status: "interrupted",
       title: "Inspect native protocol",
-      native: { restored: true, disconnected: false },
+      native: { restored: true, disconnected: false, outcomeUnrecorded: true },
     });
     expect(agents[0]?.native.facts).toMatchObject({
       task: "Inspect native protocol",
@@ -332,8 +352,8 @@ describe("native subagent history roster", () => {
       at,
     );
     expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
-      ["done", "completed"],
-      ["accepted", "completed"],
+      ["done", "interrupted"],
+      ["accepted", "interrupted"],
       ["working", "running"],
     ]);
     // An inventory that omits a child history called running means it is gone.

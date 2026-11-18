@@ -23,6 +23,11 @@ export interface AgentHubAgent {
   readonly status: RuntimeSubagentStatus;
   /** When the last view left, for a child that finished unseen; null otherwise. */
   readonly unobservedSince: number | null;
+  /**
+   * Finished, known only from history that records no outcome: status
+   * `interrupted`; show it as finished (neutral) and count it as done.
+   */
+  readonly outcomeUnrecorded: boolean;
   /** Working: the agent is running or waiting, so steering and live controls apply. */
   readonly live: boolean;
   readonly model: string | null;
@@ -94,6 +99,7 @@ export function nativeAgentHubAgents(
         role: agent.role,
         status: agent.status,
         unobservedSince: agent.native.unobservedSince,
+        outcomeUnrecorded: agent.native.outcomeUnrecorded,
         live: isActiveSubagentStatus(agent.status),
         model: agent.model,
         effort: agent.effort,
@@ -146,7 +152,12 @@ export function summarizeAgentHub(agents: readonly AgentHubAgent[]): AgentHubSum
     if (agent.live) working++;
     else if (agent.status === "idle") idle++;
     // Finished unseen counts as done (outcome unknown), never as stopped.
-    else if (agent.status === "completed" || agent.unobservedSince !== null) done++;
+    else if (
+      agent.status === "completed" ||
+      agent.unobservedSince !== null ||
+      agent.outcomeUnrecorded
+    )
+      done++;
     else if (agent.status === "failed") failed++;
     else stopped++;
     tokens += agent.tokens ?? 0;

@@ -53,6 +53,12 @@ export interface NativeSubagent extends RuntimeSubagent {
      * `interrupted`, but it counts as finished, outcome unknown. Null otherwise.
      */
     readonly unobservedSince: number | null;
+    /**
+     * Known finished only from `get_subagent_history`, which records no outcome
+     * (`idle`/`parked`): status `interrupted`, shown and counted as finished,
+     * never as completed or failed. An outcome seen live always wins.
+     */
+    readonly outcomeUnrecorded: boolean;
     readonly usageBase: SubagentUsage | null;
     readonly facts: NativeSubagentFacts;
   };
@@ -235,6 +241,7 @@ function observe(
       disconnected: false,
       restored: false,
       unobservedSince: null,
+      outcomeUnrecorded: false,
       usageBase: base,
       facts: facts(fresh ? undefined : previous.native.facts, payload, progress),
     },
@@ -351,24 +358,25 @@ export function snapshotNativeSubagents(
 }
 
 /**
- * NeoPi's registry status, mapped to what a live observer saw for the same child
- * (neopi-nightly 01cf16cf72): a run that ends emits `subagent_lifecycle`
- * `completed`/`failed`/`aborted` (task/executor.ts emitTerminal), then the
- * keep-alive child is set `idle` and adopted for follow-ups (executor.ts:
- * "finished and failed subagents both stay interrogable"; agent-lifecycle.ts
- * adopt: "Take ownership of a finished subagent"); after its idle TTL it is
- * `parked` and its session disposed. So `idle` and `parked` are both a finished
- * run, shown as live shows it: completed. History keeps no failure detail
- * (rpc-types.ts RpcSubagentHistoryEntry), so a run that failed reads completed
- * once restored, for either status.
+ * NeoPi's registry status (neopi-nightly 01cf16cf72): a run that ends emits
+ * `subagent_lifecycle` `completed`/`failed`/`aborted` (task/executor.ts
+ * emitTerminal); the keep-alive child is then set `idle` and adopted for
+ * follow-ups (executor.ts: "finished and failed subagents both stay
+ * interrogable"; agent-lifecycle.ts adopt: "Take ownership of a finished
+ * subagent"), and after its idle TTL it is `parked`. `idle` and `parked` are a
+ * finished run whose outcome history does not record
+ * (modes/rpc/rpc-types.ts RpcSubagentHistoryEntry: "Failure detail is not
+ * persisted"), so they read as finished with no outcome: `interrupted` plus
+ * `outcomeUnrecorded`, never completed or failed.
  */
+const UNRECORDED_OUTCOMES: ReadonlySet<unknown> = new Set(["idle", "parked"]);
 function historyStatus(value: unknown): RuntimeSubagentStatus | null {
   switch (value) {
     case "running":
       return "running";
     case "idle":
     case "parked":
-      return "completed";
+      return "interrupted";
     case "aborted":
       return "cancelled";
     default:
@@ -432,7 +440,11 @@ function restore(
       ? (isoTime(entry.terminalAt) ?? isoTime(entry.lastActivity) ?? agent.completedAt)
       : null,
     updatedAt: isoTime(entry.lastActivity) ?? agent.updatedAt,
-    native: { ...agent.native, restored: true },
+    native: {
+      ...agent.native,
+      restored: true,
+      outcomeUnrecorded: UNRECORDED_OUTCOMES.has(entry.status),
+    },
   };
 }
 
@@ -460,7 +472,12 @@ export function mergeNativeSubagentHistory(
     if (!row) return agent;
     rows.delete(agent.id);
     if (agent.native.revision > readRevision) return agent;
-    if (!agent.native.restored && !agent.native.disconnected) {
+    // An outcome seen live is authoritative; outcome-less history never replaces it.
+    if (
+      !agent.native.restored &&
+      !agent.native.disconnected &&
+      agent.native.unobservedSince === null
+    ) {
       const created = isoTime(row.entry.createdAt);
       return created !== null && created < agent.firstSeenAt
         ? { ...agent, firstSeenAt: created }

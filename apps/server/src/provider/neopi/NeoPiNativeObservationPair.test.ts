@@ -359,7 +359,7 @@ describe("server reader and client reducer, paired", () => {
     append("A");
     const losses: readonly NativeSessionUpdate[] = [
       { type: "disconnected" },
-      { type: "lifecycle", state: "detached", reason: "bye" },
+      { type: "lifecycle", revision: 0, state: "detached", reason: "bye" },
     ];
     for (const loss of losses) {
       const viewer = new Viewer(loss.type);

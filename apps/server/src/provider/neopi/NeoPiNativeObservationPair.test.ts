@@ -14,6 +14,7 @@ import {
   reduceNativeSessionFeed,
   type NativeSession,
   type NativeSessionFeed,
+  type NativeSessionUpdate,
 } from "../../../../../packages/client-runtime/src/neopiNativeSessions.ts";
 import { readNeoPiNativeObservation, type NeoPiNativeReadLimits } from "./NeoPiNativeCursor.ts";
 import { NeoPiNativeProjection } from "./NeoPiNativeProjection.ts";
@@ -290,10 +291,11 @@ describe("server reader and client reducer, paired", () => {
   it("a reconnect or close between a read and its reply never applies the stale reply", () => {
     const { projection, append } = owner();
     append("A");
-    for (const loss of [
-      { type: "disconnected" as const },
-      { type: "closed" as const, code: "detached", reason: "bye" },
-    ]) {
+    const losses: readonly NativeSessionUpdate[] = [
+      { type: "disconnected" },
+      { type: "closed", code: "detached", reason: "bye" },
+    ];
+    for (const loss of losses) {
       const viewer = new Viewer(loss.type);
       viewer.drain(projection);
       append(`after-${loss.type}`);

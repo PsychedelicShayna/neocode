@@ -1388,23 +1388,32 @@ describe("NeoPiNativeProjection", () => {
       assert.isTrue(store.wasRetired("message:0"));
     });
 
-    it("record only: when only gaps remain, a forced merge across reasons is not-observed", () => {
+    it("when only gaps remain, a forced merge across reasons says the cause is no longer known", () => {
       const projection = new NeoPiNativeProjection({
         domain,
         tombstoneCapacity: 10,
         journalCapacity: 10,
-        inboxLimits: { records: 1, bytes: 100_000 },
+        inboxLimits: { records: 2, bytes: 100_000 },
       });
-      projection.fold({ type: "notice", level: "info", message: "a" });
-      projection.setInboxObserved(false); // a: a not-observed gap
+      const notice = (message: string) =>
+        projection.fold({ type: "notice", level: "info", message });
+      notice("a");
+      projection.setInboxObserved(false); // not-observed 1
       projection.setInboxObserved(true);
-      // b is evicted into an evicted gap; two gaps over a bound of one merge.
-      projection.fold({ type: "notice", level: "info", message: "b" });
+      notice("b");
+      notice("c"); // evicted 2–3
+      projection.setInboxObserved(false);
+      notice("d"); // not-observed 4: three gaps over a bound of two
       assert.deepEqual(
         projection.inbox.map((record) =>
-          record.type === "gap" ? [record.reason, record.fromSeq, record.toSeq] : [],
+          record.type === "gap"
+            ? [record.reason, record.fromSeq, record.toSeq, record.notices]
+            : [],
         ),
-        [["not-observed", 1, 2]],
+        [
+          ["mixed", 1, 3, 3],
+          ["not-observed", 4, 4, 1],
+        ],
       );
     });
   });

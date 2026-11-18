@@ -1034,9 +1034,10 @@ const clock = (ms: number) =>
   DateTime.formatLocal(DateTime.makeUnsafe(ms), { timeStyle: "medium" });
 const LOSS_REASON: Record<NativeInboxLoss, string> = {
   evicted: "The server dropped them to stay within its limit before this view read them.",
-  "not-observed": "No view was attached while they happened, so they were not kept.",
+  "not-observed":
+    "No view of this session read them before the last one was closed or hidden, so they were not kept.",
   mixed:
-    "Records were missed in this interval. Whether the server dropped them or no view was attached is no longer known.",
+    "Records were missed in this interval. Whether the server dropped them or no view read them in time is no longer known.",
   trimmed: "This view received them, then dropped the oldest records to stay within its own limit.",
 };
 

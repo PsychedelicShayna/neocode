@@ -47,6 +47,12 @@ export interface NativeSubagent extends RuntimeSubagent {
     readonly disconnected: boolean;
     /** Last observed through `get_subagent_history`, not a lifecycle frame; it is not a spawn or exit event. */
     readonly restored: boolean;
+    /**
+     * When the last view left, for a child that finished while no view watched
+     * and that neither the live inventory nor a history lists: its status is
+     * `interrupted`, but it counts as finished, outcome unknown. Null otherwise.
+     */
+    readonly unobservedSince: number | null;
     readonly usageBase: SubagentUsage | null;
     readonly facts: NativeSubagentFacts;
   };
@@ -228,6 +234,7 @@ function observe(
       sessionFile: text(payload.sessionFile) ?? previous?.native.sessionFile ?? null,
       disconnected: false,
       restored: false,
+      unobservedSince: null,
       usageBase: base,
       facts: facts(fresh ? undefined : previous.native.facts, payload, progress),
     },

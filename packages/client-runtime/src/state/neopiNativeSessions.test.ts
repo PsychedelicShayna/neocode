@@ -36,6 +36,8 @@ import {
   type NativeSession,
   type NativeSessionFeed,
 } from "../neopiNativeSessions.ts";
+import { nativeAgentHubAgents, summarizeAgentHub } from "../neopiNativeAgentHub.ts";
+import { subagentFlashFor } from "../neopiNativeStatus.ts";
 import { DEFAULT_NATIVE_DEMAND, createNativeSessionAtoms } from "./neopiNativeSessions.ts";
 
 const ref = {
@@ -926,6 +928,107 @@ describe("native projection mapping", () => {
       leafId: null,
     });
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
+  });
+
+  it("counts a child that finished unseen as finished, never as interrupted", () => {
+    const lifecycle = {
+      id: "child",
+      runToken: "run",
+      status: "started",
+      agent: "scout",
+      description: "Find the bug",
+    };
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({
+        epoch,
+        watermark: 1,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 1,
+            value: {
+              class: "roster",
+              value: { id: "child", runToken: "run", lifecycle, ticks: 0 },
+            },
+          },
+        ],
+      }),
+    );
+    const running = feed.agents;
+    expect(running.map((agent) => agent.status)).toEqual(["running"]);
+    // The view left while it ran; it finished unseen and no history lists it.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ buildAttempt: 2 }),
+        watermark: 3,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 3,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                inventory: null,
+                unobserved: { since: 1_795_000_000_000, lifecycle },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    const [agent] = feed.agents;
+    expect(agent).toMatchObject({
+      id: "child",
+      native: { unobservedSince: 1_795_000_000_000, disconnected: false },
+    });
+    expect(agent?.status === "interrupted" && agent.native.unobservedSince !== null).toBe(true);
+    const hub = nativeAgentHubAgents(feed.agents, feed.agentTicks, "session");
+    expect(hub.map((row) => [row.live, row.unobservedSince])).toEqual([[false, 1_795_000_000_000]]);
+    expect(summarizeAgentHub(hub)).toMatchObject({ done: 1, stopped: 0, failed: 0, working: 0 });
+    expect(subagentFlashFor(running, feed.agents)).toBe("exit");
+
+    // A later inventory listing clears the marker.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ buildAttempt: 2 }),
+        watermark: 4,
+        kind: "incremental",
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 4,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                inventory: { id: "child", status: "completed", runToken: "run" },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(feed.agents[0]).toMatchObject({
+      status: "completed",
+      native: { unobservedSince: null },
+    });
   });
 
   it("notes a refused subagent level for the Agents view and clears it when withdrawn", () => {

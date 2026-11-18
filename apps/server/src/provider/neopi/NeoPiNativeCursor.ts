@@ -400,7 +400,9 @@ export function readNeoPiNativeObservation(
   for (let index = low; index < source.inbox.length; index++) {
     const record = source.inbox[index]!;
     const bytes = encodedBytes(record);
-    if (inbox.length > 0 && (bytes > budget || steps >= limits.scanSteps)) break;
+    // The scan limit is shared with the journal and the keys; only the byte
+    // budget lets the reply's first inbox record through regardless.
+    if (steps >= limits.scanSteps || (inbox.length > 0 && bytes > budget)) break;
     inbox.push(record);
     budget -= bytes;
     steps++;

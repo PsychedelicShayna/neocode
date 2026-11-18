@@ -133,7 +133,11 @@ interface FakeRead {
  * the stream never runs more than `creditWindow` ahead of applied credit.
  */
 const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
-  options: { readonly creditWindow?: number } = {},
+  options: {
+    readonly creditWindow?: number;
+    /** Open obligations a lease replays before its lifecycle, by lease number from 1. */
+    readonly replay?: (lease: number) => readonly NeoPiNativeEssentialEnvelope[];
+  } = {},
 ) {
   const creditWindow = options.creditWindow ?? 4;
   const leases = yield* Queue.unbounded<FakeLease>();
@@ -186,6 +190,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
           yield* lease.push(
             { type: "leased", leaseId: id, domain: domain(), creditWindow, readDeadlineMs: 1_000 },
             { type: "session", revision: ++revision, session },
+            ...(options.replay?.(leaseCount) ?? []),
             { type: "lifecycle", revision: ++revision, state: "observing" },
           );
           yield* Queue.offer(leases, lease);
@@ -509,37 +514,48 @@ describe("native observation controller", () => {
   );
 
   it.effect(
-    "a dialog answered while the view was hidden does not come back on the next lease",
+    "across hide and show a still-open dialog keeps its object and never vanishes; an answered one goes",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
-          const h = yield* makeHarness();
-          const approval = (id: string) => ({
+          const opened = (id: string, type = "tool_approval_request") => ({
             type: "obligation-opened" as const,
-            revision: h.nextRevision(),
+            revision: 1,
             id,
-            request: { type: "tool_approval_request", id },
+            request: { type, id },
+          });
+          // The second lease replays only B (A was answered elsewhere) and C (opened while hidden).
+          const h = yield* makeHarness({
+            replay: (lease) =>
+              lease === 2 ? [opened("B", "extension_ui_request"), opened("C")] : [],
           });
           let unmount = h.registry.mount(h.watch);
           const first = yield* Queue.take(h.leases);
-          yield* first.push(approval("answered-elsewhere"));
-          yield* h.observe((feed) => feed.dialogs.length === 1);
-          // Hidden: the lease ends and the cache keeps the feed.
+          yield* first.push(opened("A"), opened("B", "extension_ui_request"));
+          const before = yield* h.observe((feed) => feed.dialogs.length === 2);
+          const heldB = before.dialogs.find((dialog) => dialog.id === "B");
           unmount();
           yield* Deferred.await(first.released);
-          expect(h.atoms.cached(h.target)?.dialogs.map((dialog) => dialog.id)).toEqual([
-            "answered-elsewhere",
-          ]);
-          // Shown again after another client answered it: the new lease replays only
-          // what is still open, here one opened while hidden.
-          unmount = h.registry.mount(h.watch);
-          const second = yield* Queue.take(h.leases);
-          yield* second.push(approval("opened-while-hidden"));
-          const shown = yield* h.observe(
-            (feed) =>
-              feed.connected && feed.dialogs.some((dialog) => dialog.id === "opened-while-hidden"),
+          // Every feed the view could draw on reattach keeps B, the same object.
+          const drawn: NativeSessionFeed[] = [];
+          const stop = h.registry.subscribe(
+            h.watch,
+            (value) => {
+              if (AsyncResult.isSuccess(value)) drawn.push(value.value);
+            },
+            { immediate: true },
           );
-          expect(shown.dialogs.map((dialog) => dialog.id)).toEqual(["opened-while-hidden"]);
+          unmount = h.registry.mount(h.watch);
+          yield* Queue.take(h.leases);
+          const shown = yield* h.observe(
+            (feed) => feed.connected && feed.dialogs.some((dialog) => dialog.id === "C"),
+          );
+          expect(shown.dialogs.map((dialog) => dialog.id)).toEqual(["B", "C"]);
+          expect(shown.dialogs.find((dialog) => dialog.id === "B")).toBe(heldB);
+          expect(drawn.length).toBeGreaterThan(0);
+          for (const feed of drawn)
+            expect(feed.dialogs.find((dialog) => dialog.id === "B")).toBe(heldB);
+          stop();
           unmount();
         }),
       ),

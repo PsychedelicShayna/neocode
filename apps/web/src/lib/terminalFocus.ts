@@ -16,24 +16,40 @@ export function isTerminalFocused(): boolean {
   return getTerminalFocusOwner() !== null;
 }
 
-let lastTerminalFocusOwner: TerminalFocusOwner | null = null;
+/** One terminal, identified as its viewport names it. */
+export interface TerminalIdentity {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly terminalId: string;
+}
+
+function readFocusedTerminal(): TerminalIdentity | null {
+  if (typeof document === "undefined") return null;
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof HTMLElement) || !activeElement.isConnected) return null;
+  const viewport = activeElement.closest<HTMLElement>("[data-terminal-id]");
+  const { terminalId, terminalThreadId, terminalEnvironmentId } = viewport?.dataset ?? {};
+  if (!terminalId || !terminalThreadId || !terminalEnvironmentId) return null;
+  return { environmentId: terminalEnvironmentId, threadId: terminalThreadId, terminalId };
+}
+
+let lastFocusedTerminal: TerminalIdentity | null = null;
 if (typeof document !== "undefined") {
   document.addEventListener(
     "focusin",
     () => {
-      lastTerminalFocusOwner = getTerminalFocusOwner() ?? lastTerminalFocusOwner;
+      lastFocusedTerminal = readFocusedTerminal() ?? lastFocusedTerminal;
     },
     true,
   );
 }
 
 /**
- * The terminal that has focus, or else the one that had it last. Commands
- * invoked from outside a terminal act on this one; the caller checks that it
- * still exists.
+ * The terminal that has focus, or else the one that had it last. The Ex line
+ * acts on this one; the caller checks that it still exists.
  */
-export function getLastTerminalFocusOwner(): TerminalFocusOwner | null {
-  return getTerminalFocusOwner() ?? lastTerminalFocusOwner;
+export function getLastFocusedTerminal(): TerminalIdentity | null {
+  return readFocusedTerminal() ?? lastFocusedTerminal;
 }
 
 /**

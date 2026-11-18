@@ -48,7 +48,6 @@ import { Textarea } from "../ui/textarea";
 import { Checkbox } from "../ui/checkbox";
 import { SidebarInset } from "../ui/sidebar";
 import { Dialog, DialogPopup, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
-import { ExLine } from "./ExLine";
 import { NativeSessionStatusBar } from "./NativeSessionStatusBar";
 import { NativeSessionTabBar } from "./NativeSessionTabBar";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
@@ -677,8 +676,6 @@ export function NativeSessionView({
       .then((result) => nativeNotify(command, nativeRoleCycleNotice(result)))
       .catch(nativeFail);
   };
-  const [exLineOpen, setExLineOpen] = useState(false);
-  const exLineInputRef = useRef<HTMLInputElement>(null);
   useCommandHandlers("workspace", {
     "composer.thinking.cycle": {
       label: "Cycle reasoning level",
@@ -690,14 +687,16 @@ export function NativeSessionView({
           )
           .catch(nativeFail),
     },
+    // A key explains in a toast why roles cannot cycle; the Ex line keeps its
+    // inline message instead, so there the command is unavailable.
     "composer.role.cycleForward": {
       label: "Next role",
-      available: () => true,
+      available: (invocation) => invocation === undefined || canCycleRole,
       run: () => cycleRole("composer.role.cycleForward", "forward"),
     },
     "composer.role.cycleBackward": {
       label: "Previous role",
-      available: () => true,
+      available: (invocation) => invocation === undefined || canCycleRole,
       run: () => cycleRole("composer.role.cycleBackward", "backward"),
     },
     "transcript.thinking.toggle": {
@@ -715,12 +714,6 @@ export function NativeSessionView({
       label: "Expand or collapse tool output",
       available: () => true,
       run: () => setToolOutputSerial((value) => value + 1),
-    },
-    "exLine.open": {
-      label: "Open command line",
-      available: () => true,
-      // Asked for again while open, it takes the keyboard back.
-      run: () => (exLineInputRef.current ? exLineInputRef.current.focus() : setExLineOpen(true)),
     },
   });
   // Streamed tokens re-render this view, and the composer is the costliest
@@ -1015,11 +1008,7 @@ export function NativeSessionView({
             onReturnFocus={focusComposer}
           />
         </ComposerSurface.Shell>
-        {/* The command line takes the status bar's place at its height, so the transcript does not move. */}
-        {exLineOpen ? (
-          <ExLine inputRef={exLineInputRef} onClose={() => setExLineOpen(false)} />
-        ) : null}
-        <NativeSessionStatusBar target={target} hidden={exLineOpen} />
+        <NativeSessionStatusBar target={target} />
       </NativeSessionWorkspacePanels>
       {expandedImage ? (
         <ExpandedImageDialog preview={expandedImage} onClose={() => setExpandedImage(null)} />

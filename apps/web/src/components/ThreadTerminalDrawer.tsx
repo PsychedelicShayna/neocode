@@ -1016,6 +1016,9 @@ export function TerminalViewport({
     <div
       ref={containerRef}
       tabIndex={-1}
+      data-terminal-id={terminalId}
+      data-terminal-thread-id={threadId}
+      data-terminal-environment-id={environmentId}
       className="relative h-full w-full overflow-hidden bg-(--terminal-background)"
     />
   );

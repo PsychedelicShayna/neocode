@@ -27,6 +27,8 @@ export interface NativeSessionTerminalHandle {
   newTerminal: () => void;
   splitTerminal: (direction?: "horizontal" | "vertical") => void;
   closeActiveTerminal: () => void;
+  /** Closes one terminal after the same confirmation `closeActiveTerminal` asks for. */
+  closeTerminal: (terminalId: string) => void;
 }
 
 export interface NativeSessionTerminalProps {
@@ -190,21 +192,19 @@ function NativeSessionTerminalBody({
     [closeTerminal, target, threadId, surface],
   );
 
-  useImperativeHandle(
-    controllerRef,
-    () => ({
+  useImperativeHandle(controllerRef, () => {
+    const confirmAndClose = (terminalId: string) => {
+      void confirmTerminalClose([labels.get(terminalId) ?? terminalId]).then((confirmed) => {
+        if (confirmed) removeTerminal(terminalId);
+      });
+    };
+    return {
       newTerminal: () => createTerminal("new"),
       splitTerminal: (direction = "horizontal") => createTerminal(direction),
-      closeActiveTerminal: () => {
-        void confirmTerminalClose([labels.get(activeTerminalId) ?? activeTerminalId]).then(
-          (confirmed) => {
-            if (confirmed) removeTerminal(activeTerminalId);
-          },
-        );
-      },
-    }),
-    [activeTerminalId, createTerminal, removeTerminal, labels],
-  );
+      closeActiveTerminal: () => confirmAndClose(activeTerminalId),
+      closeTerminal: confirmAndClose,
+    };
+  }, [activeTerminalId, createTerminal, removeTerminal, labels]);
 
   if (!hasOpened && !visible) return null;
   return (

@@ -13,6 +13,7 @@ import {
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
 import { isEditableFocused } from "./lib/editableFocus";
+import { isExLineFocused } from "./lib/exLineFocus";
 import { getTerminalFocusOwner, isTerminalInputFocused } from "./lib/terminalFocus";
 
 export interface ShortcutEventLike {
@@ -344,6 +345,9 @@ export function resolveShortcutCommand(
   if (isModifierKeyEvent(event)) return null;
   const focus = advanceSequence(event);
   if (isTerminalInputFocused()) return null;
+  // The Ex line's keys are its own: there, only a modified single chord resolves.
+  const exLineFocus = isExLineFocused();
+  if (exLineFocus && !event.ctrlKey && !event.metaKey && !event.altKey) return null;
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
   const sequenceContext = {
@@ -352,7 +356,7 @@ export function resolveShortcutCommand(
     terminalFocus: focus.terminalFocus,
   };
 
-  if (event.repeat) {
+  if (event.repeat && !exLineFocus) {
     // Holding the first chord down keeps it held, as the terminal escape does.
     const stillHeld = sequenceKeydownHeld.filter((binding) =>
       matchesShortcut(event, binding.sequence[0], platform),
@@ -364,7 +368,7 @@ export function resolveShortcutCommand(
       event.preventDefault?.();
       return null;
     }
-  } else {
+  } else if (!exLineFocus) {
     for (const binding of sequenceKeydownHeld) {
       if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
       if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
@@ -377,7 +381,7 @@ export function resolveShortcutCommand(
     "sequence" in binding &&
     matchesWhenClause(binding.whenAst, sequenceContext) &&
     matchesShortcut(event, binding.sequence[0], platform);
-  const mayBeginSequence = !(focus.editableFocus && typesText(event));
+  const mayBeginSequence = !exLineFocus && !(focus.editableFocus && typesText(event));
   for (let index = keybindings.length - 1; index >= 0; index -= 1) {
     const binding = keybindings[index];
     if (!binding) continue;

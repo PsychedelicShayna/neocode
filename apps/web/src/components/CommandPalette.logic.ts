@@ -15,6 +15,7 @@ import { getThreadSortTimestamp, sortThreads } from "../lib/threadSort";
 import { normalizeSearchText } from "../lib/utils";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { type Project, type SidebarThreadSummary, type Thread } from "../types";
+import { findCommand, runCommand } from "../commandTable";
 
 export const RECENT_THREAD_LIMIT = 12;
 export const ITEM_ICON_CLASS = "size-4 text-icon-muted";
@@ -148,6 +149,18 @@ export interface CommandPaletteActionItem extends CommandPaletteItem {
   readonly kind: "action";
   readonly keepOpen?: boolean;
   readonly run: () => Promise<void>;
+}
+
+/**
+ * A palette action that runs `command` through the command table, offered only
+ * while a mounted handler would act on it.
+ */
+export function commandTableAction(
+  command: KeybindingCommand,
+  item: Omit<CommandPaletteActionItem, "kind" | "run" | "shortcutCommand">,
+): CommandPaletteActionItem | null {
+  if (!findCommand(command)?.available()) return null;
+  return { ...item, kind: "action", shortcutCommand: command, run: () => runCommand(command) };
 }
 
 export interface CommandPaletteSubmenuItem extends CommandPaletteItem {

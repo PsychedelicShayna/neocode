@@ -21,20 +21,13 @@ import {
   type RefObject,
 } from "react";
 import type { ComposerImageAttachment } from "~/composerDraftStore";
-import { isCommandPaletteOpen } from "~/commandPaletteBus";
 import { requestConfirmDialog } from "~/confirmDialog";
-import { isElectron } from "~/env";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
-import { dispatchKeybindingCommand, useCommandHandlers } from "~/commandTable";
-import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
-import { getLastTerminalFocusOwner, getTerminalFocusOwner } from "~/lib/terminalFocus";
-import { isPreviewFocused } from "~/lib/previewFocus";
-import { confirmTerminalClose, isTerminalCloseConfirmPending } from "~/lib/terminalCloseConfirm";
-import {
-  preventRepeatedTerminalCloseShortcut,
-  preventTerminalCloseShortcut,
-} from "~/lib/terminalCloseShortcut";
+import { useCommandHandlers, type CommandInvocation } from "~/commandTable";
+import { shortcutLabelForCommand } from "~/keybindings";
+import { getTerminalFocusOwner } from "~/lib/terminalFocus";
+import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import type { TerminalContextSelection } from "~/lib/terminalContext";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
 import {
@@ -72,8 +65,10 @@ import { subscribePreviewAction } from "../preview/previewActionBus";
 import { ThreadPreviewMiniPlayer } from "../preview/ThreadPreviewMiniPlayer";
 import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
+import { ExLine } from "./ExLine";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
 import { useNativePendingFiles } from "./useNativePendingFiles";
+import { useNativeWorkspaceKeys } from "./useNativeWorkspaceKeys";
 
 /** Escape belongs to these while one is open; it must not also interrupt the turn. */
 const ESCAPE_OWNING_OVERLAYS = [
@@ -84,6 +79,12 @@ const ESCAPE_OWNING_OVERLAYS = [
   '[data-slot="combobox-popup"]',
   '[data-slot="autocomplete-popup"]',
   "[data-composer-stash-drawer]",
+].join(",");
+/** Modal surfaces that hold the keyboard until they close, the narrow window's panel sheet among them. */
+const MODAL_POPUPS = [
+  '[data-slot="dialog-popup"]',
+  '[data-slot="alert-dialog-popup"]',
+  '[data-slot="sheet-popup"]',
 ].join(",");
 import { NativeSessionTreePanel } from "./NativeSessionTreePanel";
 
@@ -196,7 +197,10 @@ export function NativeSessionWorkspacePanels({
   const [maximized, setMaximized] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const drawerRef = useRef<NativeSessionTerminalHandle | null>(null);
-  const panelRef = useRef<NativeSessionTerminalHandle | null>(null);
+  /** Every right-panel terminal surface's controller, by surface id. */
+  const panelControllers = useRef(new Map<string, NativeSessionTerminalHandle>());
+  const [exLineOpen, setExLineOpen] = useState(false);
+  const exLineInputRef = useRef<HTMLInputElement>(null);
   const sheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   const activeSurface =
     panel.surfaces.find((surface) => surface.id === panel.activeSurfaceId) ??
@@ -333,19 +337,49 @@ export function NativeSessionWorkspacePanels({
       }),
     [target],
   );
-  // Invoked from outside a terminal, terminal commands act on the one focused
-  // last, while it is still showing.
-  const terminalInPanel = () =>
-    getLastTerminalFocusOwner() === "right-panel" &&
-    panel.isOpen &&
-    activeSurface?.kind === "terminal";
-  const splitTerminal = (direction: "horizontal" | "vertical") => {
-    if (terminalInPanel()) {
-      panelRef.current?.splitTerminal(direction);
+  // A keybinding or palette item acts on the terminal where focus is, the drawer
+  // unless the right panel's terminal has it. The Ex line names the terminal
+  // focused last instead, which must still exist in this workspace.
+  const focusedTerminalController = () =>
+    getTerminalFocusOwner() === "right-panel"
+      ? (panelControllers.current.get(activeSurface?.id ?? "") ?? null)
+      : drawerRef.current;
+  const locateTerminal = (invocation: CommandInvocation | undefined) => {
+    const terminal = invocation?.terminal;
+    if (
+      !terminal ||
+      terminal.environmentId !== target.environmentId ||
+      terminal.threadId !== resourceId
+    )
+      return null;
+    const surface = panel.surfaces.find(
+      (candidate) =>
+        candidate.kind === "terminal" && candidate.terminalIds.includes(terminal.terminalId),
+    );
+    if (surface) return { surfaceId: surface.id, terminalId: terminal.terminalId };
+    return terminalUi.terminalIds.includes(terminal.terminalId)
+      ? { surfaceId: null, terminalId: terminal.terminalId }
+      : null;
+  };
+  const splitTerminal = (
+    direction: "horizontal" | "vertical",
+    invocation: CommandInvocation | undefined,
+  ) => {
+    const located = locateTerminal(invocation);
+    if (located?.surfaceId) {
+      useRightPanelStore.getState().activateSurface(target, located.surfaceId);
+      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction);
       return;
     }
-    useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-    drawerRef.current?.splitTerminal(direction);
+    if (located) {
+      useTerminalUiStateStore.getState().setActiveTerminal(target, located.terminalId);
+      useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+      drawerRef.current?.splitTerminal(direction);
+      return;
+    }
+    if (getTerminalFocusOwner() !== "right-panel")
+      useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+    focusedTerminalController()?.splitTerminal(direction);
   };
   useCommandHandlers("workspace", {
     "terminal.toggle": {
@@ -374,8 +408,9 @@ export function NativeSessionWorkspacePanels({
     "terminal.new": {
       label: "New terminal",
       available: () => cwd !== null,
-      run: () => {
-        if (terminalInPanel()) {
+      run: (invocation) => {
+        const located = locateTerminal(invocation);
+        if (located ? located.surfaceId !== null : getTerminalFocusOwner() === "right-panel") {
           createTerminal();
           return;
         }
@@ -386,17 +421,32 @@ export function NativeSessionWorkspacePanels({
     "terminal.split": {
       label: "Split terminal",
       available: () => cwd !== null,
-      run: () => splitTerminal("horizontal"),
+      run: (invocation) => splitTerminal("horizontal", invocation),
     },
     "terminal.splitVertical": {
       label: "Split terminal vertically",
       available: () => cwd !== null,
-      run: () => splitTerminal("vertical"),
+      run: (invocation) => splitTerminal("vertical", invocation),
     },
     "terminal.close": {
       label: "Close terminal",
-      available: () => terminalInPanel() || terminalUi.terminalOpen,
-      run: () => (terminalInPanel() ? panelRef : drawerRef).current?.closeActiveTerminal(),
+      available: (invocation) =>
+        invocation
+          ? locateTerminal(invocation) !== null
+          : getTerminalFocusOwner() !== null || terminalUi.terminalOpen,
+      run: (invocation) => {
+        if (!invocation) {
+          focusedTerminalController()?.closeActiveTerminal();
+          return;
+        }
+        const located = locateTerminal(invocation);
+        if (!located) return;
+        const controller =
+          located.surfaceId === null
+            ? drawerRef.current
+            : panelControllers.current.get(located.surfaceId);
+        controller?.closeTerminal(located.terminalId);
+      },
     },
     "diff.toggle": {
       label: "Toggle diff",
@@ -444,45 +494,19 @@ export function NativeSessionWorkspacePanels({
         !document.querySelector(ESCAPE_OWNING_OVERLAYS),
       run: onInterrupt,
     },
+    "exLine.open": {
+      label: "Open command line",
+      // A modal keeps the keyboard, so the line could not take it.
+      available: () => !document.querySelector(MODAL_POPUPS),
+      // Asked for again while open, it takes the keyboard back.
+      run: () => (exLineInputRef.current ? exLineInputRef.current.focus() : setExLineOpen(true)),
+    },
   });
-  useEffect(() => {
-    const handle = (event: KeyboardEvent) => {
-      if (
-        preventRepeatedTerminalCloseShortcut(event, keybindings) ||
-        (isTerminalCloseConfirmPending() && preventTerminalCloseShortcut(event, keybindings))
-      ) {
-        event.stopPropagation();
-        return;
-      }
-      if (isCommandPaletteOpen()) return;
-      const terminalFocus = getTerminalFocusOwner();
-      if (event.defaultPrevented && terminalFocus === null) return;
-      const command = resolveShortcutCommand(event, keybindings, {
-        context: {
-          terminalFocus: terminalFocus !== null,
-          terminalOpen: terminalUi.terminalOpen,
-          previewFocus: isPreviewFocused(),
-          previewOpen: panel.isOpen && activeSurface?.kind === "preview",
-          modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
-          editableFocus:
-            event.target instanceof HTMLElement &&
-            Boolean(event.target.closest("input,textarea,select,[contenteditable=true]")),
-          isWeb: !isElectron,
-          isDesktop: isElectron,
-          nativeSession: true,
-          composerFocus:
-            event.target instanceof HTMLElement &&
-            event.target.closest("[data-composer-rich-text]") !== null,
-        },
-      });
-      if (!command) return;
-      // Escape that ends an IME composition belongs to the input method.
-      if (command === "thread.stop" && event.isComposing) return;
-      dispatchKeybindingCommand(command, event, "workspace");
-    };
-    window.addEventListener("keydown", handle, true);
-    return () => window.removeEventListener("keydown", handle, true);
-  }, [keybindings, terminalUi.terminalOpen, panel.isOpen, activeSurface, composerRef]);
+  useNativeWorkspaceKeys(keybindings, () => ({
+    terminalOpen: terminalUi.terminalOpen,
+    previewOpen: panel.isOpen && activeSurface?.kind === "preview",
+    modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
+  }));
 
   const openFile = (path: string) => useRightPanelStore.getState().openFile(target, path);
   const active = (surface: RightPanelSurface) => panel.isOpen && activeSurface?.id === surface.id;
@@ -605,7 +629,10 @@ export function NativeSessionWorkspacePanels({
                 surface={surface}
                 visible={active(surface)}
                 onAddTerminalContext={onAddTerminalContext}
-                {...(activeSurface?.id === surface.id ? { controllerRef: panelRef } : {})}
+                controllerRef={(handle: NativeSessionTerminalHandle | null) => {
+                  if (handle) panelControllers.current.set(surface.id, handle);
+                  else panelControllers.current.delete(surface.id);
+                }}
               />
             </div>
           ) : surface.kind === "file" || surface.kind === "files" ? (
@@ -740,6 +767,14 @@ export function NativeSessionWorkspacePanels({
         ) : (
           tabs
         )}
+        {/* Laid over the foot of the workspace, which stays on screen with the panel maximised or the Agent Hub open. */}
+        {exLineOpen ? (
+          <ExLine
+            inputRef={exLineInputRef}
+            activePanelSurfaceIsTerminal={panel.isOpen && activeSurface?.kind === "terminal"}
+            onClose={() => setExLineOpen(false)}
+          />
+        ) : null}
       </div>
     </div>
   );

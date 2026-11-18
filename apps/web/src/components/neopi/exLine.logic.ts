@@ -1,4 +1,4 @@
-import type { CommandHandler } from "../../commandTable";
+import type { CommandHandler, CommandInvocation } from "../../commandTable";
 
 /**
  * The Vim names, each standing for the existing command it maps to. A Map, so
@@ -14,8 +14,10 @@ const EX_ALIASES: ReadonlyMap<string, string> = new Map([
 export interface ExLineCommands {
   /** The dispatch table's handler for a command id. */
   readonly find: (command: string) => CommandHandler | undefined;
-  /** Whether a terminal had focus at some point, so `:q` closes it rather than a panel tab. */
-  readonly terminalFocusedLast: boolean;
+  /** Passed to every handler: names the terminal focused last. */
+  readonly invocation: CommandInvocation;
+  /** Whether the right panel's active tab is a terminal, which `:q` closes only by name. */
+  readonly activePanelSurfaceIsTerminal: boolean;
 }
 
 export type ExLineAction =
@@ -39,20 +41,21 @@ export function resolveExLine(text: string, commands: ExLineCommands): ExLineAct
   if (name === "b") return { kind: "error", message: "Type a space after :b to pick a session" };
   if (name === "q") {
     if (argument !== "") return { kind: "error", message: ":q takes no argument" };
-    // The close action for the surface used last: its terminal while one is open, else the panel tab.
-    const command =
-      commands.terminalFocusedLast && commands.find("terminal.close")?.available()
-        ? "terminal.close"
-        : "rightPanel.close";
-    return commands.find(command)?.available()
-      ? { kind: "run", command }
-      : { kind: "error", message: "Nothing to close" };
+    // The terminal focused last while it still exists, else a non-terminal panel tab.
+    if (commands.find("terminal.close")?.available(commands.invocation))
+      return { kind: "run", command: "terminal.close" };
+    if (
+      !commands.activePanelSurfaceIsTerminal &&
+      commands.find("rightPanel.close")?.available(commands.invocation)
+    )
+      return { kind: "run", command: "rightPanel.close" };
+    return { kind: "error", message: "Nothing to close" };
   }
   const command = EX_ALIASES.get(name) ?? name;
   const handler = commands.find(command);
   if (!handler) return { kind: "error", message: `Not a command: ${name}` };
   if (argument !== "") return { kind: "error", message: `:${name} takes no argument` };
-  if (!handler.available()) {
+  if (!handler.available(commands.invocation)) {
     return { kind: "error", message: `${handler.label} is not available here` };
   }
   return { kind: "run", command };
@@ -121,7 +124,8 @@ export interface ExLineContext {
 
 /**
  * Applies one key. Tab and the arrows only move through the `:b` matches or
- * the history; nothing runs before Enter.
+ * the history; nothing runs before Enter. Once Up has recalled a line, the
+ * arrows keep stepping the history, back down to what was typed.
  */
 export function exLineKey(
   state: ExLineState,
@@ -137,7 +141,8 @@ export function exLineKey(
     case "ShiftTab":
     case "ArrowUp":
     case "ArrowDown": {
-      if (completing) {
+      const steppingHistory = state.historyIndex !== null && key !== "Tab" && key !== "ShiftTab";
+      if (completing && !steppingHistory) {
         if (count === 0) return { state, effect: null };
         const step = key === "Tab" || key === "ArrowDown" ? 1 : -1;
         return {
@@ -167,6 +172,8 @@ export function exLineKey(
 }
 
 function stepHistory(state: ExLineState, step: 1 | -1, history: readonly string[]): ExLineState {
+  // Down before any recall has nowhere to go and keeps what is typed.
+  if (state.historyIndex === null && step === -1) return state;
   const next = (state.historyIndex ?? -1) + step;
   if (next >= history.length) return state;
   if (next < 0) return { ...state, text: state.draft, historyIndex: null, message: null };

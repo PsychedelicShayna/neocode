@@ -108,7 +108,7 @@ import {
   resolveProjectPathForDispatch,
 } from "../lib/projectPaths";
 import { onOpenCommandPalette } from "../commandPaletteBus";
-import { runCommand, useCommandHandlers } from "../commandTable";
+import { useCommandHandlers } from "../commandTable";
 import { isPreviewFocused } from "../lib/previewFocus";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
@@ -138,6 +138,7 @@ import {
   browseInputEndPaddingClass,
   buildBrowseGroups,
   buildCommandPaletteProjectMetadata,
+  commandTableAction,
   buildProjectActionItems,
   buildRootGroups,
   buildThreadActionItems,
@@ -1793,14 +1794,18 @@ function OpenCommandPaletteDialog(props: {
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
   if (neopiSessionAction) actionItems.push(neopiSessionAction);
-  actionItems.push({
-    kind: "action",
+  const newThreadAction = commandTableAction("chat.new", {
     value: "action:new-native-session",
     title: "New thread",
     searchTerms: ["new thread", "chat", "create", "native"],
-    shortcutCommand: "chat.new",
     icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-    run: () => runCommand("chat.new"),
+  });
+  if (newThreadAction) actionItems.push(newThreadAction);
+  const toggleTerminalAction = commandTableAction("terminal.toggle", {
+    value: "action:native-terminal",
+    title: "Toggle terminal",
+    searchTerms: ["terminal", "shell", "workspace"],
+    icon: <TerminalSquare className={ITEM_ICON_CLASS} />,
   });
   if (nativeTarget) {
     const surfaces = [
@@ -1822,16 +1827,8 @@ function OpenCommandPaletteDialog(props: {
         },
       })),
     );
+    if (toggleTerminalAction) actionItems.push(toggleTerminalAction);
     actionItems.push(
-      {
-        kind: "action",
-        value: "action:native-terminal",
-        title: "Toggle terminal",
-        searchTerms: ["terminal", "shell", "workspace"],
-        shortcutCommand: "terminal.toggle",
-        icon: <TerminalSquare className={ITEM_ICON_CLASS} />,
-        run: () => runCommand("terminal.toggle"),
-      },
       {
         kind: "action",
         value: "action:native-model",

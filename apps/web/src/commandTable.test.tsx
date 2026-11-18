@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, useLayoutEffect } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -131,5 +131,31 @@ describe("useCommandHandlers", () => {
 
     act(() => renderer.unmount());
     expect(findCommand("terminal.new")).toBeUndefined();
+  });
+
+  it("is gone before a surviving component's layout effect in the unmounting commit", () => {
+    const run = vi.fn();
+    const seen: string[] = [];
+    function Survivor({ ownerShown }: { ownerShown: boolean }) {
+      useLayoutEffect(() => {
+        seen.push(dispatchCommand("terminal.new").status);
+      }, [ownerShown]);
+      return null;
+    }
+    function Page({ ownerShown }: { ownerShown: boolean }) {
+      return (
+        <>
+          {ownerShown ? <Owner run={run} available /> : null}
+          <Survivor ownerShown={ownerShown} />
+        </>
+      );
+    }
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<Page ownerShown />);
+    });
+    act(() => renderer.update(<Page ownerShown={false} />));
+    expect(seen).toEqual(["ran", "unknown"]);
+    act(() => renderer.unmount());
   });
 });

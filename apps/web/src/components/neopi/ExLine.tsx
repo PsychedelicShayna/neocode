@@ -13,7 +13,8 @@ import {
   type RefObject,
 } from "react";
 import { dispatchCommand, findCommand } from "../../commandTable";
-import { getLastTerminalFocusOwner } from "../../lib/terminalFocus";
+import { EX_LINE_INPUT_ATTRIBUTE } from "../../lib/exLineFocus";
+import { getLastFocusedTerminal } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { selectNativeSession, useNativeSessionSelection } from "../../state/neopiNativeSessions";
 import { toastManager } from "../ui/toast";
@@ -93,15 +94,17 @@ function keyOf(event: KeyboardEvent<HTMLInputElement>): ExLineKey | null {
 }
 
 /**
- * The Vim-style command line, in the status bar's place at the foot of the
- * transcript. It takes the keyboard when it mounts; the owner refocuses it
- * through `inputRef` when asked for again.
+ * The Vim-style command line, laid over the foot of the workspace so that
+ * nothing beneath it moves. It takes the keyboard when it mounts; the owner
+ * refocuses it through `inputRef` when asked for again.
  */
 export function ExLine({
   inputRef,
+  activePanelSurfaceIsTerminal,
   onClose,
 }: {
   inputRef: RefObject<HTMLInputElement | null>;
+  activePanelSurfaceIsTerminal: boolean;
   onClose: () => void;
 }) {
   // Read before the input takes focus: where Escape returns to.
@@ -111,6 +114,9 @@ export function ExLine({
       : null,
   );
   const [state, setState] = useState(EX_LINE_INITIAL);
+  // Enter or Escape decided what happens; it happens once that key is released,
+  // so its auto-repeat lands in this input rather than wherever focus goes next.
+  const pending = useRef<{ key: string; effect: ExLineEffect } | null>(null);
   const tabs = useNativeSessionSelection((selection) => selection.tabs);
   const [labels, setLabels] = useState<ReadonlyMap<string, SessionLabel>>(new Map());
   const onLabel = useCallback((key: string, label: SessionLabel) => {
@@ -134,22 +140,22 @@ export function ExLine({
     inputRef.current?.focus();
   }, [inputRef]);
 
-  const close = () => {
+  const finish = () => {
+    const decided = pending.current;
+    if (!decided) return;
+    pending.current = null;
+    const { effect } = decided;
+    if (effect.kind !== "close" && history[0] !== state.text) history.unshift(state.text);
     onClose();
     if (returnFocus?.isConnected) returnFocus.focus();
     else inputRef.current?.blur();
-  };
-
-  const apply = (effect: ExLineEffect) => {
-    if (effect.kind !== "close" && history[0] !== state.text) history.unshift(state.text);
-    close();
     if (effect.kind === "switchSession") {
       const match = matches.find((candidate) => candidate.key === effect.key);
       if (match) selectNativeSession(match.tab);
       return;
     }
     if (effect.kind !== "run") return;
-    const dispatch = dispatchCommand(effect.command);
+    const dispatch = dispatchCommand(effect.command, { terminal: getLastFocusedTerminal() });
     if (dispatch.status !== "ran") return;
     void dispatch.done.catch((cause) =>
       toastManager.add({
@@ -164,21 +170,23 @@ export function ExLine({
     const key = keyOf(event);
     if (!key) return;
     event.preventDefault();
+    if (event.repeat || pending.current) return;
     const next = exLineKey(state, key, {
       matches,
       history,
       commands: {
         find: findCommand,
-        terminalFocusedLast: getLastTerminalFocusOwner() !== null,
+        invocation: { terminal: getLastFocusedTerminal() },
+        activePanelSurfaceIsTerminal,
       },
     });
-    if (next.effect) apply(next.effect);
+    if (next.effect) pending.current = { key: event.key, effect: next.effect };
     else setState(next.state);
   };
 
   const selected = Math.min(state.selected, matches.length - 1);
   return (
-    <div className="relative flex h-6 shrink-0 items-center gap-1 border-t border-border/60 bg-background px-3 font-mono text-xs sm:px-4">
+    <div className="absolute inset-x-0 bottom-0 z-40 flex h-6 items-center gap-1 border-t border-border/60 bg-background px-3 font-mono text-xs sm:px-4">
       {query !== null
         ? tabs.map((tab) => (
             <SessionLabelProbe key={nativeSessionKey(tab)} tab={tab} onLabel={onLabel} />
@@ -201,9 +209,14 @@ export function ExLine({
       <input
         ref={inputRef}
         aria-label="Command"
+        {...{ [EX_LINE_INPUT_ATTRIBUTE]: "" }}
         value={state.text}
         onChange={(event) => setState(editExLine(event.target.value))}
         onKeyDown={onKeyDown}
+        onKeyUp={(event) => {
+          if (event.key === pending.current?.key) finish();
+        }}
+        onBlur={finish}
         spellCheck={false}
         autoComplete="off"
         className="h-full min-w-0 flex-1 bg-transparent text-foreground outline-none"

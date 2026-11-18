@@ -244,15 +244,8 @@ function ContextMeter({
  * commits, model changes and (for a terminal-owned session) on a slow timer while
  * the tab is visible, plus the feed's lifecycle frames; a value NeoPi did not
  * report is left out rather than guessed.
- * `hidden` keeps it mounted, and its reads current, while the command line has its place.
  */
-export function NativeSessionStatusBar({
-  target,
-  hidden,
-}: {
-  target: NativeSessionTarget;
-  hidden: boolean;
-}) {
+export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget }) {
   const state = useNativeSessionSlice(target, selectState);
   const cwd = useNativeSessionSlice(target, selectCwd);
   const connected = useNativeSessionSlice(target, selectConnected);
@@ -274,10 +267,7 @@ export function NativeSessionStatusBar({
     <div
       role="status"
       aria-label="Session status"
-      className={cn(
-        "@container/status-bar flex h-6 shrink-0 items-center gap-3 border-t border-border/60 bg-background px-3 text-xs text-muted-foreground tabular-nums sm:px-4",
-        hidden && "hidden",
-      )}
+      className="@container/status-bar flex h-6 shrink-0 items-center gap-3 border-t border-border/60 bg-background px-3 text-xs text-muted-foreground tabular-nums sm:px-4"
     >
       <span className="hidden shrink-0 font-semibold text-foreground/70 @4xl/status-bar:inline">
         {APP_BASE_NAME}

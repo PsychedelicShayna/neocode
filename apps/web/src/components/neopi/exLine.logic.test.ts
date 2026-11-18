@@ -1,12 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
-import {
-  dispatchCommand,
-  dispatchKeybindingCommand,
-  findCommand,
-  registerCommand,
-  type CommandHandler,
-} from "../../commandTable";
+import type { CommandHandler } from "../../commandTable";
 import {
   EX_LINE_INITIAL,
   editExLine,
@@ -19,13 +13,17 @@ import {
   type ExLineContext,
 } from "./exLine.logic";
 
-function table(entries: Record<string, Partial<CommandHandler>>, terminalFocusedLast = false) {
+function table(
+  entries: Record<string, Partial<CommandHandler>>,
+  activePanelSurfaceIsTerminal = false,
+) {
   return {
     find: (command: string) => {
       const entry = Object.hasOwn(entries, command) ? entries[command] : undefined;
       return entry ? { label: command, available: () => true, run: vi.fn(), ...entry } : undefined;
     },
-    terminalFocusedLast,
+    invocation: { terminal: null },
+    activePanelSurfaceIsTerminal,
   } satisfies ExLineCommands;
 }
 
@@ -92,20 +90,18 @@ describe("resolveExLine", () => {
     });
   });
 
-  it("closes the last-focused terminal with :q, else the panel tab", () => {
+  it("closes the named terminal with :q, else a non-terminal panel tab", () => {
     const both = { "terminal.close": {}, "rightPanel.close": {} };
-    expect(resolveExLine("q", table(both, true))).toEqual({
-      kind: "run",
-      command: "terminal.close",
-    });
-    expect(resolveExLine("q", table(both, false))).toEqual({
-      kind: "run",
-      command: "rightPanel.close",
-    });
+    expect(resolveExLine("q", table(both))).toEqual({ kind: "run", command: "terminal.close" });
     const terminalGone = { "terminal.close": { available: () => false }, "rightPanel.close": {} };
-    expect(resolveExLine("q", table(terminalGone, true))).toEqual({
+    expect(resolveExLine("q", table(terminalGone))).toEqual({
       kind: "run",
       command: "rightPanel.close",
+    });
+    // A terminal tab is closed only by name, never as "the panel tab".
+    expect(resolveExLine("q", table(terminalGone, true))).toEqual({
+      kind: "error",
+      message: "Nothing to close",
     });
     expect(resolveExLine("q", table({ "rightPanel.close": { available: () => false } }))).toEqual({
       kind: "error",
@@ -184,34 +180,22 @@ describe("exLineKey", () => {
     state = exLineKey(state, "ArrowDown", ctx).state;
     expect(state.text).toBe("ne");
   });
-});
 
-describe("one handler behind every entry point", () => {
-  const cleanups: Array<() => void> = [];
-  afterEach(() => {
-    for (const cleanup of cleanups.splice(0)) cleanup();
+  it("keeps a partly typed command when Down comes before any recall", () => {
+    const step = exLineKey(editExLine("vsp"), "ArrowDown", context({ history: ["split"] }));
+    expect(step.state.text).toBe("vsp");
   });
 
-  it("reaches the same handler from a keybinding and from :split", () => {
-    const run = vi.fn();
-    cleanups.push(
-      registerCommand("terminal.split", "workspace", {
-        label: "Split terminal",
-        available: () => true,
-        run,
-      }),
-    );
-    const event = { repeat: false, preventDefault: vi.fn(), stopPropagation: vi.fn() };
-    dispatchKeybindingCommand("terminal.split", event, "workspace");
-
-    const step = exLineKey(
-      editExLine("split"),
-      "Enter",
-      context({ commands: { find: findCommand, terminalFocusedLast: false } }),
-    );
-    expect(step.effect).toEqual({ kind: "run", command: "terminal.split" });
-    if (step.effect?.kind === "run") dispatchCommand(step.effect.command);
-
-    expect(run).toHaveBeenCalledTimes(2);
+  it("steps the history past a recalled :b line, back to the draft", () => {
+    const ctx = context({ history: ["b release", "split"], matches: sessions });
+    let state = editExLine("ne");
+    state = exLineKey(state, "ArrowUp", ctx).state;
+    expect(state.text).toBe("b release");
+    state = exLineKey(state, "ArrowUp", ctx).state;
+    expect(state.text).toBe("split");
+    state = exLineKey(state, "ArrowDown", ctx).state;
+    expect(state.text).toBe("b release");
+    state = exLineKey(state, "ArrowDown", ctx).state;
+    expect(state.text).toBe("ne");
   });
 });

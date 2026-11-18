@@ -1159,8 +1159,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   ) {
     const scope = yield* Scope.fork(lifetime);
     const pendingUi = new Map<string, SessionEventFrame>();
+    // A void "something changed" signal: the Models hub re-reads, so one pending is enough.
     const modelChanges = yield* Effect.acquireRelease(
-      PubSub.unbounded<void>(),
+      PubSub.sliding<void>(1),
       PubSub.shutdown,
     ).pipe(Effect.provideService(Scope.Scope, scope));
     const modelUi = yield* Effect.acquireRelease(

@@ -1559,6 +1559,8 @@ describe("native observation (r12 §3.1)", () => {
         assert.equal(builds(), buildsBefore);
         // A move back to an entry the branch already holds is navigation: the reader rebases.
         const target = native.entries.at(-10)!;
+        // The native branch now ends at the target, as its next page will show.
+        native.entries = native.entries.slice(0, native.entries.indexOf(target) + 1);
         yield* native.publish({
           type: "journal_state",
           reason: "leaf",
@@ -1568,7 +1570,8 @@ describe("native observation (r12 §3.1)", () => {
         });
         const rebased = yield* lease.pass(behind.cursor);
         assert.equal(rebased.cursor!.epoch.branchGeneration, domain.branchGeneration + 1);
-        assert.equal(rebased.cursor!.epoch.buildAttempt, domain.buildAttempt);
+        // Unlike an append, the navigation restarts the build and fetches a fresh page (C3.5).
+        assert.equal(rebased.cursor!.epoch.buildAttempt, domain.buildAttempt + 1);
         assert.equal(rebased.entries.at(-1)?.id, target.id);
       }).pipe(Effect.scoped),
   );

@@ -206,8 +206,16 @@ export function readNeoPiNativeObservation(
   /** Absolute positions the reader holds after this reply, continuously: [historyStart, coveredPosition]. */
   let historyStart = journal.start;
   let coveredPosition = -1;
-  const atPosition = journalAt === null ? -1 : journal.positionOf(journalAt);
-  if (atPosition >= 0 && atPosition < deliverableEnd) {
+  // A reader of this domain that held an empty history follows appends from
+  // the tail's start, as long as nothing has been evicted since it restarted.
+  const heldNothing =
+    sameDomain && cursor !== null && journalAt === null && journal.start === journal.origin;
+  const atPosition = heldNothing
+    ? journal.start - 1
+    : journalAt === null
+      ? -1
+      : journal.positionOf(journalAt);
+  if ((atPosition >= 0 || heldNothing) && atPosition < deliverableEnd) {
     const entries: NeoPiNativeObservedJournalEntry[] = [];
     let used = 0;
     for (let position = atPosition + 1; position < deliverableEnd; position++) {

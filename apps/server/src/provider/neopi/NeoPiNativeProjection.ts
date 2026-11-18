@@ -367,6 +367,7 @@ export class NeoPiNativeJournalTail {
   #entries: NeoPiNativeObservedJournalEntry[] = [];
   #offset = 0;
   #start = 0;
+  #origin = 0;
   readonly #positions = new Map<string, number>();
 
   readonly capacity: number;
@@ -378,6 +379,11 @@ export class NeoPiNativeJournalTail {
   /** Absolute position of the oldest retained entry. */
   get start(): number {
     return this.#start;
+  }
+
+  /** Absolute position where the tail last restarted; equal to `start` while nothing was evicted. */
+  get origin(): number {
+    return this.#origin;
   }
 
   /** One past the absolute position of the newest entry. */
@@ -429,6 +435,7 @@ export class NeoPiNativeJournalTail {
     this.#offset = 0;
     this.#positions.clear();
     this.#start = end;
+    this.#origin = end;
   }
 }
 
@@ -441,10 +448,13 @@ export interface NeoPiNativeIdentity {
 /**
  * What a reply must have been requested under to be applied (C3.3): replies
  * from another projection incarnation, build attempt or branch are rejected,
- * and a key changed after `revision` is not overwritten.
+ * a key changed after `revision` is not overwritten, and of two replies of one
+ * kind the one requested later (`request`, unique per mark) wins, even when no
+ * store write separates the requests.
  */
 export interface NeoPiNativeRequestMark {
   readonly revision: number;
+  readonly request: number;
   readonly projectionIncarnation: number;
   readonly buildAttempt: number;
   readonly branchGeneration: number;
@@ -590,7 +600,8 @@ export class NeoPiNativeProjection {
   /** Child id → revision of the last live lifecycle/progress frame; replies never overwrite it. */
   readonly #rosterLive = new Map<string, number>();
   /** Request marks of the newest applied replies; an older reply arriving later is refused (C3.3). */
-  #replyMarks = { state: -1, inventory: -1, history: -1 };
+  #replyMarks = { state: -1, inventory: -1, history: -1, jobs: -1 };
+  #requests = 0;
   #commandOutputs = 0;
   /** The newest live message, the anchor of a command output. */
   #lastMessageId: string | null = null;
@@ -683,6 +694,7 @@ export class NeoPiNativeProjection {
   mark(): NeoPiNativeRequestMark {
     return {
       revision: this.store.revision,
+      request: ++this.#requests,
       projectionIncarnation: this.#domain.projectionIncarnation,
       buildAttempt: this.#domain.buildAttempt,
       branchGeneration: this.#domain.branchGeneration,
@@ -921,8 +933,8 @@ export class NeoPiNativeProjection {
    */
   applyStateReply(state: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
     if (!this.#acceptsReply(mark) || state.sessionId !== this.#identity?.sessionId) return false;
-    if (mark.revision < this.#replyMarks.state) return false;
-    this.#replyMarks.state = mark.revision;
+    if (mark.request < this.#replyMarks.state) return false;
+    this.#replyMarks.state = mark.request;
     for (const [field, property] of Object.entries(STATE_SETTINGS)) {
       const key = `setting:${property}`;
       if (!(field in state) || (this.store.get(key)?.revision ?? 0) > mark.revision) continue;
@@ -959,8 +971,8 @@ export class NeoPiNativeProjection {
    */
   applySubagentsReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
     if (!this.#acceptsReply(mark) || !Array.isArray(reply.subagents)) return false;
-    if (mark.revision < this.#replyMarks.inventory) return false;
-    this.#replyMarks.inventory = mark.revision;
+    if (mark.request < this.#replyMarks.inventory) return false;
+    this.#replyMarks.inventory = mark.request;
     const listed = new Set<string>();
     for (const raw of reply.subagents) {
       const row = asRecord(raw);
@@ -993,8 +1005,8 @@ export class NeoPiNativeProjection {
   applySubagentHistoryReply(reply: NativeRecord | null, mark: NeoPiNativeRequestMark): boolean {
     if (!this.#acceptsReply(mark) || (reply !== null && !Array.isArray(reply.subagents)))
       return false;
-    if (mark.revision < this.#replyMarks.history) return false;
-    this.#replyMarks.history = mark.revision;
+    if (mark.request < this.#replyMarks.history) return false;
+    this.#replyMarks.history = mark.request;
     if (reply !== null && Array.isArray(reply.subagents)) {
       const listed = new Set<string>();
       for (const raw of reply.subagents) {
@@ -1054,6 +1066,8 @@ export class NeoPiNativeProjection {
       (!Array.isArray(reply.running) && !Array.isArray(reply.recent))
     )
       return false;
+    if (mark.request < this.#replyMarks.jobs) return false;
+    this.#replyMarks.jobs = mark.request;
     const listed = new Set<string>();
     for (const raw of [
       ...(Array.isArray(reply.running) ? reply.running : []),
@@ -1214,7 +1228,7 @@ export class NeoPiNativeProjection {
       this.#heldEntries.clear();
       this.#settledJobs = [];
       this.#lastMessageId = null;
-      this.#replyMarks = { state: -1, inventory: -1, history: -1 };
+      this.#replyMarks = { state: -1, inventory: -1, history: -1, jobs: -1 };
       // The previous session's pending interactions are fenced with it.
       for (const id of this.#obligations.keys()) this.settleObligation(id, "cancelled");
       this.#pendingLeaf = null;

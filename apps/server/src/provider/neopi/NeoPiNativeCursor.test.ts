@@ -865,6 +865,29 @@ describe("NeoPiNativeCursor", () => {
       assert.equal(reply.journal?.entries.length, 3);
     });
 
+    it("a reader that held an empty history receives every later entry, in order", () => {
+      const { sessionId, projection } = built();
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      let parent: string | null = null;
+      for (let n = 0; n < 5; n++) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: {
+            id: `e${n}`,
+            parentId: parent,
+            type: "custom",
+            timestamp: "t",
+            data: "y".repeat(150),
+          },
+        });
+        parent = `e${n}`;
+      }
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 500 });
+      assert.deepEqual([...mirror.entryIds], ["e0", "e1", "e2", "e3", "e4"]);
+    });
+
     it("record only: one journal entry larger than the reply budget is sent whole", () => {
       const { sessionId, projection } = built();
       projection.fold({
@@ -885,6 +908,34 @@ describe("NeoPiNativeCursor", () => {
         "reader",
       );
       assert.equal(reply.type === "pass" ? reply.journal?.entries[0]?.id : undefined, "big");
+    });
+
+    it("one scan step is shared by every lane: a journal entry takes it, the inbox waits", () => {
+      const { sessionId, projection } = built();
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: { id: "e1", parentId: null, type: "custom", timestamp: "t" },
+      });
+      projection.fold({ type: "notice", level: "info", message: "pending" });
+      const reply = mirror.read(projection, { scanSteps: 1, replyBytes: 100_000 });
+      assert.deepEqual([reply.journal?.entries.length, reply.inbox.length], [1, 0]);
+      const next = mirror.read(projection, { scanSteps: 1, replyBytes: 100_000 });
+      assert.equal(next.inbox.length, 1, "the inbox gets the next step");
+    });
+
+    it("record only: one inbox record larger than the reply budget is sent whole", () => {
+      const { projection } = built();
+      projection.fold({ type: "notice", level: "info", message: "x".repeat(100_000) });
+      const reply = readNeoPiNativeObservation(
+        projection,
+        null,
+        { scanSteps: 100, replyBytes: 65_536 },
+        "reader",
+      );
+      assert.equal(reply.type === "pass" ? reply.inbox.length : 0, 1);
     });
   });
 });

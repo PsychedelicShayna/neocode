@@ -1263,3 +1263,120 @@ it.live("carries a dictation capture: both commands and every frame in order", (
     }),
   ),
 );
+
+const sinkClient = (
+  peer: { readonly handle: ChildProcessSpawner.ChildProcessHandle },
+  delivered: Array<string>,
+) =>
+  Client.make({
+    spawn: () => Effect.succeed(peer.handle),
+    command: "npi",
+    args: ["--mode", "rpc-ui"],
+    cwd: "/tmp",
+    env: {},
+    sink: {
+      event: (frame) => delivered.push(`event:${frame.type}:${String(frame.seq ?? "")}`),
+      uiRequest: (frame) => delivered.push(`ui:${frame.id}`),
+      hostToolCall: (frame) => delivered.push(`${frame.type}:${frame.id}`),
+      hostUriRequest: (frame) => delivered.push(`uri:${frame.id}`),
+    },
+  });
+
+it.live("delivers every frame family to the sink in wire order before the next reply", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            yield* emit({ type: "message_update", seq: 1 });
+            yield* emit({ type: "extension_ui_request", id: "ui-1", method: "confirm" });
+            yield* emit({
+              type: "host_tool_call",
+              id: "tool-1",
+              toolCallId: "call-1",
+              toolName: "preview",
+              arguments: {},
+            });
+            yield* emit({ type: "host_tool_cancel", id: "cancel-1", targetId: "tool-1" });
+            yield* emit({ type: "host_uri_request", id: "uri-1", operation: "read", url: "x://y" });
+            yield* emit({ type: "message_update", seq: 2 });
+            yield* emit({
+              id: message.id,
+              type: "response",
+              command: "get_state",
+              success: true,
+              data: {},
+            });
+          }),
+      });
+      const delivered: Array<string> = [];
+      const client = yield* sinkClient(peer, delivered);
+      yield* Effect.addFinalizer(() => client.close(20));
+      yield* client.request({ type: "get_state" });
+      // No yield between the reply and this read: a queue with its own consumer could not
+      // promise that the frames written before the reply have been applied.
+      assert.deepEqual(delivered, [
+        "event:message_update:1",
+        "ui:ui-1",
+        "host_tool_call:tool-1",
+        "host_tool_cancel:cancel-1",
+        "uri:uri-1",
+        "event:message_update:2",
+      ]);
+    }),
+  ),
+);
+
+it.live("keeps nothing in the frame queues when a fast producer feeds a sink", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const burst = 10_000;
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            for (let seq = 0; seq < burst; seq++) yield* emit({ type: "message_update", seq });
+            yield* emit({ type: "extension_ui_request", id: "ui-1", method: "confirm" });
+            yield* emit({
+              type: "host_tool_call",
+              id: "tool-1",
+              toolCallId: "call-1",
+              toolName: "preview",
+              arguments: {},
+            });
+            yield* emit({ type: "host_uri_request", id: "uri-1", operation: "read", url: "x://y" });
+            yield* emit({
+              id: message.id,
+              type: "response",
+              command: "get_state",
+              success: true,
+              data: {},
+            });
+          }),
+      });
+      const delivered: Array<string> = [];
+      const client = yield* sinkClient(peer, delivered);
+      yield* client.request({ type: "get_state" });
+      assert.equal(delivered.length, burst + 3);
+      // Nobody read the streams while the burst arrived. Once the process exits they end,
+      // and anything the parser had offered to a queue would still be there to collect.
+      yield* client.close(0);
+      yield* Deferred.await(client.exit);
+      const leftovers = yield* Effect.all([
+        Stream.runCollect(client.events),
+        Stream.runCollect(client.uiRequests),
+        Stream.runCollect(client.hostToolCalls),
+        Stream.runCollect(client.hostUriRequests),
+      ]);
+      assert.deepEqual(
+        leftovers.map((items) => items.length),
+        [0, 0, 0, 0],
+      );
+    }),
+  ),
+);

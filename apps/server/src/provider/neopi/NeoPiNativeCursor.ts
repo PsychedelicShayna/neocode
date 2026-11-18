@@ -11,12 +11,18 @@ import type {
   NeoPiNativeTombstone,
 } from "@t3tools/contracts";
 
-import type { NeoPiNativeJournalTail, NeoPiNativeKeyedStore } from "./NeoPiNativeProjection.ts";
+import type {
+  NeoPiNativeFrozenEncoding,
+  NeoPiNativeJournalTail,
+  NeoPiNativeKeyedStore,
+  NeoPiNativeStoreRecord,
+} from "./NeoPiNativeProjection.ts";
 
 /**
- * The bulk cursor reader (r12 §2.3 C2). Pure and synchronous: one call answers
- * one `read` from the projection's current state and the client-held cursor.
- * The server keeps nothing per observer between reads.
+ * The bulk cursor reader (r12 §2.3 C2). Synchronous: one call answers one
+ * `read` from the projection's current state and the client-held cursor. The
+ * server keeps nothing per observer between reads; the only state a read
+ * writes is the shared frozen encoding of an oversized value.
  */
 
 /** What a read needs from a projection. `NeoPiNativeProjection` satisfies it. */
@@ -25,8 +31,10 @@ export interface NeoPiNativeReadSource {
   readonly published: boolean;
   readonly store: NeoPiNativeKeyedStore;
   readonly journal: NeoPiNativeJournalTail;
+  /** Entries at and after this absolute position are held from readers. */
+  readonly deliverableJournalEnd: number;
   readonly horizonCursor: string | undefined;
-  /** Ascending, contiguous `seq`. */
+  /** Ascending `seq`; a `gap` stands for its whole `fromSeq..toSeq` interval. */
   readonly inbox: readonly NeoPiNativeInboxRecord[];
 }
 
@@ -120,6 +128,44 @@ function segmentBounds(json: string, budget: number): number[] {
 }
 
 /**
+ * The encoding a reader segments for `record`. Frozen encodings are shared by
+ * every reader so a pass finishes "in a bounded number of reads under fair
+ * service whatever the producer does" (C2 "Progress, stated exactly"): a
+ * changing value does not restart a transfer, and the next pass returns the
+ * newer revision. At most two are kept per key. A new one is frozen only when
+ * the newest is no use to this pass, and, while the value keeps changing after
+ * the pass's cut, only once some reader has finished the newest; so a transfer
+ * in progress keeps its encoding until it ends. Returns undefined when this
+ * pass should leave the key to the next one.
+ */
+function encodingFor(
+  record: NeoPiNativeStoreRecord,
+  entityJson: string,
+  pass: NeoPiNativePass,
+  base: number,
+  segmentBudget: number,
+): NeoPiNativeFrozenEncoding | undefined {
+  const newest = record.frozen[record.frozen.length - 1];
+  const changedAfterCut = record.revision > pass.watermark;
+  const floor = pass.kind === "incremental" ? base : -1;
+  const useful =
+    newest !== undefined &&
+    newest.revision > floor &&
+    (changedAfterCut ? true : newest.revision === record.revision);
+  if (useful) return newest;
+  // Before the cut the value as of the watermark is the current one and must be sent.
+  if (changedAfterCut && newest !== undefined && !newest.completed) return undefined;
+  const frozen: NeoPiNativeFrozenEncoding = {
+    revision: record.revision,
+    json: entityJson,
+    bounds: segmentBounds(entityJson, segmentBudget),
+    completed: false,
+  };
+  record.frozen = [...record.frozen.slice(-1), frozen];
+  return frozen;
+}
+
+/**
  * Answers one read. Pass rules are r12 C2's, in order:
  *
  * - A null cursor or a cursor from another identity domain starts a full pass
@@ -136,11 +182,16 @@ function segmentBounds(json: string, budget: number): number[] {
  *   neither skips nor repeats a key. When the cohort is exhausted, `base`
  *   becomes the watermark.
  *
- * Coherence (C2 "Reply coherence"): the domain fence is decided before any key;
- * the journal slice comes first, and a retired message or tool's tombstone is
- * held until the reader holds the durable entry that replaced it (invariant
- * 2); absence never removes in a patch (invariant 3), and only a completed
- * `full` pass lets the client reconcile membership (invariant 4).
+ * Coherence (C2 "Reply coherence"): the domain fence is decided before any key.
+ * Invariant 2, "a message's alias, its durable entry and its retirement form
+ * one join, applied together or held": the journal slice comes first and stops
+ * at an entry whose live copy is not known yet; a retirement whose entry is in
+ * this reply's slice is sent in the same reply; a retirement whose entry the
+ * reader can still receive waits for it; a retirement whose entry is out of
+ * reach (behind a horizon page or out of the ring) is sent with `joinEntryId`,
+ * so the client keeps the live row until it holds that entry. Absence never
+ * removes in a patch (invariant 3), and only a completed `full` pass lets the
+ * client reconcile membership (invariant 4).
  */
 export function readNeoPiNativeObservation(
   source: NeoPiNativeReadSource,
@@ -154,7 +205,11 @@ export function readNeoPiNativeObservation(
   let journalAt = sameDomain ? cursor.journalAt : null;
   let inboxSeq = sameDomain ? cursor.inboxSeq : 0;
   const lastInboxSeq = source.inbox[source.inbox.length - 1]?.seq ?? 0;
-  const headId = journal.head?.id ?? null;
+  const deliverableEnd = Math.max(
+    journal.start,
+    Math.min(source.deliverableJournalEnd, journal.end),
+  );
+  const headId = journal.at(deliverableEnd - 1)?.id ?? null;
 
   let pass: NeoPiNativePass;
   let promoted = false;
@@ -176,12 +231,14 @@ export function readNeoPiNativeObservation(
   // Journal first, at most half the reply unless one entry alone is larger.
   let budget = limits.replyBytes;
   let journalSlice: NeoPiNativeJournalSlice | null = null;
+  /** Absolute positions the reader holds after this reply, continuously: [historyStart, coveredPosition]. */
+  let historyStart = journal.start;
   let coveredPosition = -1;
   const atPosition = journalAt === null ? -1 : journal.positionOf(journalAt);
-  if (atPosition >= 0) {
+  if (atPosition >= 0 && atPosition < deliverableEnd) {
     const entries: NeoPiNativeObservedJournalEntry[] = [];
     let used = 0;
-    for (let position = atPosition + 1; position < journal.end; position++) {
+    for (let position = atPosition + 1; position < deliverableEnd; position++) {
       const entry = journal.at(position)!;
       const bytes = encodedBytes(entry);
       if (entries.length > 0 && used + bytes > budget / 2) break;
@@ -195,13 +252,13 @@ export function readNeoPiNativeObservation(
       journalAt = last.id;
       budget -= used;
     }
-  } else if (journal.end > journal.start) {
+  } else if (deliverableEnd > journal.start) {
     // C3.4: a reader behind the ring takes a fresh horizon page backward from
     // the leaf; what does not fit stays a placeholder on the client.
     const entries: NeoPiNativeObservedJournalEntry[] = [];
     let used = 0;
-    let first = journal.end;
-    for (let position = journal.end - 1; position >= journal.start; position--) {
+    let first = deliverableEnd;
+    for (let position = deliverableEnd - 1; position >= journal.start; position--) {
       const entry = journal.at(position)!;
       const bytes = encodedBytes(entry);
       if (entries.length > 0 && used + bytes > budget / 2) break;
@@ -218,17 +275,42 @@ export function readNeoPiNativeObservation(
       ...(nextCursor === undefined ? {} : { nextCursor }),
     };
     journalAt = headId;
-    coveredPosition = journal.end - 1;
+    historyStart = first;
+    coveredPosition = deliverableEnd - 1;
     budget -= used;
-  } else journalAt = null;
-  const covered = (entryId: string) => {
+  } else if (atPosition < 0) journalAt = null;
+  /**
+   * `covered`: the reader holds the entry after this reply. `later`: it will
+   * receive it by following appends. `unreachable`: it can only get it by
+   * loading history (behind its horizon page, or out of the ring).
+   */
+  const joinState = (entryId: string): "covered" | "later" | "unreachable" => {
     const position = journal.positionOf(entryId);
-    return position < 0 || position <= coveredPosition;
+    if (position < 0 || position < historyStart) return "unreachable";
+    return position <= coveredPosition ? "covered" : "later";
   };
 
   const entities: NeoPiNativeEntity[] = [];
   const tombstones: NeoPiNativeTombstone[] = [];
+  const tombstoneKeys = new Set<string>();
   const segments: NeoPiNativeSegment[] = [];
+  const tombstoneOf = (record: NeoPiNativeStoreRecord): NeoPiNativeTombstone => ({
+    key: record.key,
+    ordinal: record.ordinal,
+    revision: record.revision,
+    ...(record.joinEntryId === null ? {} : { joinEntryId: record.joinEntryId }),
+  });
+  // Retirements joined to entries in this slice travel with them.
+  for (const entry of journalSlice?.entries ?? []) {
+    const record = store.retiredBy(entry.id);
+    if (!record || record.value !== null || record.removed) continue;
+    if (pass.kind === "incremental" && record.revision <= base) continue;
+    const tombstone = tombstoneOf(record);
+    tombstones.push(tombstone);
+    tombstoneKeys.add(record.key);
+    budget -= encodedBytes(tombstone);
+  }
+
   const segmentBudget = Math.max(1, Math.floor(limits.replyBytes / 2) - 160);
   let afterOrdinal = pass.afterOrdinal;
   let segment = pass.segment;
@@ -244,83 +326,97 @@ export function readNeoPiNativeObservation(
       completed = true;
       break;
     }
-    // A retired record's tombstone waits for its durable entry wherever it
-    // would act: sent in an incremental pass, or removed by absence when a
-    // full pass completes.
-    if (
-      record.value === null &&
-      !record.removed &&
-      record.joinEntryId !== null &&
-      (pass.kind === "full" || record.revision > base) &&
-      !covered(record.joinEntryId)
-    )
-      break;
+    const advance = () => {
+      afterOrdinal = record.ordinal;
+      segment = null;
+      index++;
+    };
+    const retired = record.value === null && !record.removed;
+    const joined = retired && record.joinEntryId !== null;
+    // A full pass sends a retirement only when it carries a join, so the
+    // client learns the join instead of removing the row by absence.
     if (
       record.removed ||
-      (pass.kind === "incremental" ? record.revision <= base : record.value === null)
+      (pass.kind === "incremental" ? record.revision <= base : retired && !joined)
     ) {
-      afterOrdinal = record.ordinal;
-      segment = null;
-      index++;
+      advance();
       continue;
     }
-    if (record.value === null) {
-      const tombstone = { key: record.key, ordinal: record.ordinal, revision: record.revision };
-      const bytes = encodedBytes(tombstone);
-      if (sent > 0 && bytes > budget) break;
-      tombstones.push(tombstone);
-      budget -= bytes;
+    if (retired) {
+      if (joined && joinState(record.joinEntryId!) === "later") break;
+      if (!tombstoneKeys.has(record.key)) {
+        const tombstone = tombstoneOf(record);
+        const bytes = encodedBytes(tombstone);
+        if (sent > 0 && bytes > budget) break;
+        tombstones.push(tombstone);
+        tombstoneKeys.add(record.key);
+        budget -= bytes;
+      }
       sent++;
-      afterOrdinal = record.ordinal;
-      segment = null;
-      index++;
+      advance();
       continue;
     }
     const entity: NeoPiNativeEntity = {
       key: record.key,
       ordinal: record.ordinal,
       revision: record.revision,
-      value: record.value,
+      value: record.value!,
     };
     const json = JSON.stringify(entity);
     const bytes = utf8Length(json);
-    if (bytes <= budget && (segment?.key !== record.key || segment.revision !== record.revision)) {
+    const continuing = segment?.key === record.key ? segment : null;
+    if (bytes <= budget && continuing === null) {
+      record.frozen = [];
       entities.push(entity);
       budget -= bytes;
       sent++;
-      segment = null;
-      afterOrdinal = record.ordinal;
-      index++;
+      advance();
       continue;
     }
     if (sent > 0) break;
-    // Browser-hop segmentation (r12 §2.7 R1): one segment per reply; a newer
-    // revision restarts at index 0.
-    const bounds = segmentBounds(json, segmentBudget);
-    const count = bounds.length - 1;
-    const next =
-      segment?.key === record.key && segment.revision === record.revision ? segment.nextIndex : 0;
+    // Browser-hop segmentation (r12 §2.7 R1): one segment per reply, cut from
+    // a frozen encoding so a changing value cannot restart the transfer forever.
+    let encoding =
+      continuing === null
+        ? undefined
+        : record.frozen.find((frozen) => frozen.revision === continuing.revision);
+    let next = encoding === undefined ? 0 : continuing!.nextIndex;
+    if (encoding === undefined) {
+      encoding = encodingFor(record, json, pass, base, segmentBudget);
+      next = 0;
+    }
+    if (encoding === undefined) {
+      advance();
+      continue;
+    }
+    const count = encoding.bounds.length - 1;
     segments.push({
       key: record.key,
-      revision: record.revision,
+      revision: encoding.revision,
       index: next,
       count,
-      encodedBytes: bytes,
-      data: json.slice(bounds[next], bounds[next + 1]),
+      encodedBytes: utf8Length(encoding.json),
+      data: encoding.json.slice(encoding.bounds[next], encoding.bounds[next + 1]),
     });
     sent++;
     if (next + 1 < count)
-      segment = { key: record.key, revision: record.revision, nextIndex: next + 1 };
+      segment = { key: record.key, revision: encoding.revision, nextIndex: next + 1 };
     else {
-      segment = null;
-      afterOrdinal = record.ordinal;
+      encoding.completed = true;
+      advance();
     }
     break;
   }
 
   const inbox: NeoPiNativeInboxRecord[] = [];
-  const firstSeq = source.inbox[0]?.seq ?? 1;
-  for (let index = Math.max(0, inboxSeq - firstSeq + 1); index < source.inbox.length; index++) {
+  let low = 0;
+  let high = source.inbox.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (source.inbox[middle]!.seq <= inboxSeq) low = middle + 1;
+    else high = middle;
+  }
+  for (let index = low; index < source.inbox.length; index++) {
     const record = source.inbox[index]!;
     const bytes = encodedBytes(record);
     if (inbox.length > 0 && bytes > budget) break;

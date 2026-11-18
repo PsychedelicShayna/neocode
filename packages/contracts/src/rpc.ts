@@ -46,6 +46,11 @@ import {
   NeoPiNativeSessionsSetSettledResult,
   NeoPiNativeSessionsGetDiffPreviewInput,
   NeoPiNativeSessionsGetDiffFileContentsInput,
+  NeoPiNativeSessionsReadInput,
+  NeoPiNativeSessionsReadResult,
+  NeoPiNativeSessionsSetDemandInput,
+  NeoPiNativeSessionsSetDemandResult,
+  NeoPiNativeSessionsCreditInput,
 } from "./neopiNativeSessions.ts";
 import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 import {
@@ -327,6 +332,9 @@ export const WS_METHODS = {
   neopiNativeSessionsOpen: "neopiNativeSessions.open",
   neopiNativeSessionsRequest: "neopiNativeSessions.request",
   neopiNativeSessionsWatch: "neopiNativeSessions.watch",
+  neopiNativeSessionsRead: "neopiNativeSessions.read",
+  neopiNativeSessionsSetDemand: "neopiNativeSessions.setDemand",
+  neopiNativeSessionsCredit: "neopiNativeSessions.credit",
   neopiNativeSessionsClose: "neopiNativeSessions.close",
   neopiNativeSessionsSetSettled: "neopiNativeSessions.setSettled",
   neopiNativeSessionsGetDiffPreview: "neopiNativeSessions.getDiffPreview",
@@ -998,6 +1006,22 @@ const WsNeoPiNativeSessionsWatchRpc = Rpc.make(WS_METHODS.neopiNativeSessionsWat
   success: NeoPiNativeSessionsStreamEvent,
   error: NeoPiNativeSessionsRpcError,
   stream: true,
+});
+/** Bulk long-poll by cursor; one active read per lease. */
+export const WsNeoPiNativeSessionsReadRpc = Rpc.make(WS_METHODS.neopiNativeSessionsRead, {
+  payload: NeoPiNativeSessionsReadInput,
+  success: NeoPiNativeSessionsReadResult,
+  error: NeoPiNativeSessionsRpcError,
+});
+export const WsNeoPiNativeSessionsSetDemandRpc = Rpc.make(WS_METHODS.neopiNativeSessionsSetDemand, {
+  payload: NeoPiNativeSessionsSetDemandInput,
+  success: NeoPiNativeSessionsSetDemandResult,
+  error: NeoPiNativeSessionsRpcError,
+});
+/** Returns essential `watch` credit; see `NeoPiNativeSessionsCreditInput`. */
+export const WsNeoPiNativeSessionsCreditRpc = Rpc.make(WS_METHODS.neopiNativeSessionsCredit, {
+  payload: NeoPiNativeSessionsCreditInput,
+  error: NeoPiNativeSessionsRpcError,
 });
 const WsNeoPiNativeSessionsCloseRpc = Rpc.make(WS_METHODS.neopiNativeSessionsClose, {
   payload: NeoPiNativeSessionsCloseInput,

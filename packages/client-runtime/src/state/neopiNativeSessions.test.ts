@@ -116,6 +116,7 @@ type Item =
   | { readonly type: "end" };
 interface FakeLease {
   readonly id: string;
+  readonly purpose: string | undefined;
   readonly items: Queue.Queue<Item>;
   readonly applied: SubscriptionRef.SubscriptionRef<number>;
   readonly released: Deferred.Deferred<void>;
@@ -132,7 +133,11 @@ interface FakeRead {
  * the stream never runs more than `creditWindow` ahead of applied credit.
  */
 const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
-  options: { readonly creditWindow?: number } = {},
+  options: {
+    readonly creditWindow?: number;
+    /** Open obligations a lease replays before its lifecycle, by lease number from 1. */
+    readonly replay?: (lease: number) => readonly NeoPiNativeEssentialEnvelope[];
+  } = {},
 ) {
   const creditWindow = options.creditWindow ?? 4;
   const leases = yield* Queue.unbounded<FakeLease>();
@@ -156,7 +161,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
         if (input.command.type === "prompt") prompts++;
         return {};
       }),
-    [WS_METHODS.neopiNativeSessionsWatch]: () =>
+    [WS_METHODS.neopiNativeSessionsWatch]: (input: { readonly purpose?: string }) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const id = `lease-${++leaseCount}`;
@@ -165,6 +170,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
           const released = yield* Deferred.make<void>();
           const lease: FakeLease = {
             id,
+            purpose: input.purpose,
             items,
             applied,
             released,
@@ -184,6 +190,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
           yield* lease.push(
             { type: "leased", leaseId: id, domain: domain(), creditWindow, readDeadlineMs: 1_000 },
             { type: "session", revision: ++revision, session },
+            ...(options.replay?.(leaseCount) ?? []),
             { type: "lifecycle", revision: ++revision, state: "observing" },
           );
           yield* Queue.offer(leases, lease);
@@ -287,6 +294,50 @@ describe("native observation controller", () => {
         );
         expect(result._tag).toBe("Success");
         expect(h.atoms.cached(h.target)).toBeUndefined();
+      }),
+    ),
+  );
+
+  it.effect("a thread view leaves the owner's subagent level alone beside a session view", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const thread = h.atoms.watch({
+          environmentId: h.target.environmentId,
+          input: { ref, purpose: "thread" },
+        });
+        const unmountThread = h.registry.mount(thread);
+        const threadLease = yield* Queue.take(h.leases);
+        expect(threadLease.purpose).toBe("thread");
+        expect(yield* Queue.take(h.demands)).toEqual({
+          leaseId: threadLease.id,
+          generation: 1,
+          demand: [{ kind: "summary" }, { kind: "transcript" }],
+        });
+        // The session view of the same session is its own lease, with the roster.
+        const unmountSession = h.registry.mount(h.watch);
+        const sessionLease = yield* Queue.take(h.leases);
+        expect(sessionLease.purpose).toBeUndefined();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: DEFAULT_NATIVE_DEMAND,
+        });
+        // A child view's hold goes to session leases only.
+        const child = { kind: "child" as const, childId: "c", runToken: "r" };
+        const release = h.atoms.holdDemand(h.target, [child]);
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: [...DEFAULT_NATIVE_DEMAND, child],
+        });
+        release();
+        yield* Queue.take(h.demands);
+        // Concealing the session view leaves the thread view's lease in place.
+        unmountSession();
+        yield* Deferred.await(sessionLease.released);
+        expect(h.counts().active).toBe(1);
+        expect(yield* Queue.size(h.demands)).toBe(0);
+        unmountThread();
+        yield* Deferred.await(threadLease.released);
       }),
     ),
   );
@@ -462,6 +513,77 @@ describe("native observation controller", () => {
       ),
   );
 
+  it.effect(
+    "across hide and show a still-open dialog keeps its object and never vanishes; an answered one goes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const opened = (id: string, type = "tool_approval_request") => ({
+            type: "obligation-opened" as const,
+            revision: 1,
+            id,
+            request: { type, id },
+          });
+          // The second lease replays only B (A was answered elsewhere) and C (opened while hidden).
+          const h = yield* makeHarness({
+            replay: (lease) =>
+              lease === 2 ? [opened("B", "extension_ui_request"), opened("C")] : [],
+          });
+          let unmount = h.registry.mount(h.watch);
+          const first = yield* Queue.take(h.leases);
+          yield* first.push(opened("A"), opened("B", "extension_ui_request"));
+          const before = yield* h.observe((feed) => feed.dialogs.length === 2);
+          const heldB = before.dialogs.find((dialog) => dialog.id === "B");
+          unmount();
+          yield* Deferred.await(first.released);
+          // Every feed the view could draw on reattach keeps B, the same object.
+          const drawn: NativeSessionFeed[] = [];
+          const stop = h.registry.subscribe(
+            h.watch,
+            (value) => {
+              if (AsyncResult.isSuccess(value)) drawn.push(value.value);
+            },
+            { immediate: true },
+          );
+          unmount = h.registry.mount(h.watch);
+          yield* Queue.take(h.leases);
+          const shown = yield* h.observe(
+            (feed) => feed.connected && feed.dialogs.some((dialog) => dialog.id === "C"),
+          );
+          expect(shown.dialogs.map((dialog) => dialog.id)).toEqual(["B", "C"]);
+          expect(shown.dialogs.find((dialog) => dialog.id === "B")).toBe(heldB);
+          expect(drawn.length).toBeGreaterThan(0);
+          for (const feed of drawn)
+            expect(feed.dialogs.find((dialog) => dialog.id === "B")).toBe(heldB);
+          stop();
+          unmount();
+        }),
+      ),
+  );
+
+  it.effect("retry re-attaches a stopped observation without opening the session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const unmount = h.registry.mount(h.watch);
+        const first = yield* Queue.take(h.leases);
+        yield* first.push({
+          type: "lifecycle",
+          revision: h.nextRevision(),
+          state: "owner-stopped",
+        });
+        yield* Queue.offer(first.items, { type: "end" });
+        yield* h.observe((feed) => feed.ownerLoss === "orphaned");
+        yield* Deferred.await(first.released);
+        h.atoms.retry(h.target);
+        yield* Queue.take(h.leases);
+        yield* h.observe((feed) => feed.connected && feed.ownerLoss === null);
+        expect(h.counts().opens).toBe(0);
+        unmount();
+      }),
+    ),
+  );
+
   it.effect("draft, attachments, terminals, layout and scroll survive every transition", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -551,6 +673,51 @@ describe("native observation controller", () => {
 });
 
 describe("native inbox bound", () => {
+  it("never re-adds applied records when a rebuild keeps the server's inbox", () => {
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    const notice = (seq: number): NeoPiNativeInboxRecord => ({
+      type: "notice",
+      seq,
+      level: "info",
+      message: `notice ${seq}`,
+    });
+    const gap: NeoPiNativeInboxRecord = {
+      type: "gap",
+      seq: 2,
+      reason: "evicted",
+      fromSeq: 2,
+      toSeq: 2,
+      firstReceivedAt: 1,
+      lastReceivedAt: 2,
+      notices: 1,
+      toolStreams: [],
+      toolStreamsTruncated: false,
+    };
+    feed = applyRead(
+      feed,
+      pass({ epoch: domain(), watermark: 3, inbox: [notice(1), gap, notice(3)] }),
+    );
+    expect(feed.observation.inbox.length).toBe(3);
+    // The view hid before the server saw its cursor; the next lease's build
+    // advanced the projection incarnation and replays the same inbox.
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain({ projectionIncarnation: 2, branchGeneration: 1 }),
+        watermark: 2,
+        inbox: [notice(1), gap, notice(3), notice(4)],
+      }),
+    );
+    const seqs = feed.observation.inbox.map((item) =>
+      item.type === "gap" ? `gap:${item.fromSeq}` : "seq" in item ? item.seq : item.type,
+    );
+    expect(seqs).toEqual([1, "gap:2", 3, 4]);
+  });
+
   it("keeps a tool that streams forever within bounds, server gaps exact, cuts as trimmed", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
@@ -561,7 +728,11 @@ describe("native inbox bound", () => {
     const perProjection = NATIVE_INBOX_LIMIT * 3;
     // Two projections: sequence numbers restart with the second.
     for (const incarnation of [1, 2]) {
-      const epoch = domain({ projectionIncarnation: incarnation });
+      // A new projection object: its own server incarnation, sequence numbers restart.
+      const epoch = domain({
+        serverIncarnation: `server-${incarnation}`,
+        projectionIncarnation: incarnation,
+      });
       for (let seq = 1; seq <= perProjection; seq++) {
         const record: NeoPiNativeInboxRecord =
           seq % 10 === 0
@@ -977,6 +1148,54 @@ describe("native projection mapping", () => {
       leafId: null,
     });
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
+  });
+
+  it("restores a failure the projection held over history's outcome-less entry", () => {
+    // After a reload the client holds nothing: the roster row carries the live
+    // failure the server kept (settled children are not marked unobserved) and
+    // the history entry read on rebuild.
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain(),
+        watermark: 2,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 2,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                history: {
+                  id: "child",
+                  kind: "sub",
+                  status: "idle",
+                  createdAt: 1,
+                  lastActivity: 2,
+                },
+                lifecycle: { id: "child", runToken: "run", agent: "scout", status: "failed" },
+                progress: {
+                  progress: { id: "child", status: "failed" },
+                  retryFailure: { errorMessage: "Provider refused" },
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(feed.agents[0]).toMatchObject({ id: "child", status: "failed" });
+    const hub = nativeAgentHubAgents(feed.agents, feed.agentTicks, "session");
+    expect(summarizeAgentHub(hub)).toMatchObject({ failed: 1, done: 0 });
   });
 
   it("counts a child that finished unseen as finished, never as interrupted", () => {

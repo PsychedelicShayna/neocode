@@ -347,6 +347,12 @@ export interface NativeSessionFeed {
   readonly busy: boolean;
   readonly queue: NativePromptQueue;
   readonly dialogs: readonly Record<string, unknown>[];
+  /**
+   * Ids of held dialogs a new lease has not re-opened yet. They stay shown,
+   * the same objects, until the lease's replay of open obligations completes
+   * (its first `lifecycle`); those still unconfirmed then are removed.
+   */
+  readonly unconfirmedDialogs: ReadonlySet<string> | null;
   readonly notices: Readonly<Record<string, string>>;
   readonly commandOutputs: readonly NativeCommandOutput[];
   /** Bumped when NeoPi announces a changed command list; readers re-request it. */
@@ -403,6 +409,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   busy: false,
   queue: EMPTY_NATIVE_QUEUE,
   dialogs: [],
+  unconfirmedDialogs: null,
   notices: {},
   commandOutputs: [],
   commandsRevision: 0,
@@ -725,12 +732,10 @@ export function applyNativeRead(
   if (completed)
     for (const [key, revision] of removed)
       if (revision <= result.continuation.base) removed.delete(key);
-  // Inbox sequence numbers belong to one projection; a navigation keeps them.
-  const inboxKey = JSON.stringify([
-    domain.serverIncarnation,
-    domain.ownerEpoch,
-    domain.projectionIncarnation,
-  ]);
+  // Inbox sequence numbers are monotonic for one server projection object, which
+  // its serverIncarnation names: a rebuild, a successor owner or a navigation
+  // keeps the inbox and its numbering, so applied records are never re-added.
+  const inboxKey = domain.serverIncarnation;
   const sameInbox = held.inboxKey === inboxKey;
   let inboxSeq = sameInbox ? held.inboxSeq : -1;
   const kept = sameInbox ? held.inboxLedger : [];
@@ -1426,7 +1431,15 @@ function reduceNativeEssential(
 ): NativeSessionFeed {
   switch (envelope.type) {
     case "leased":
-      return feed;
+      // The new lease replays every obligation still open before its first
+      // lifecycle. Until then held dialogs stay as they are, unconfirmed.
+      return {
+        ...feed,
+        unconfirmedDialogs:
+          feed.dialogs.length === 0
+            ? null
+            : new Set(feed.dialogs.map((dialog) => String(dialog.id))),
+      };
     case "session": {
       const session = envelope.session;
       const sameSession =
@@ -1485,6 +1498,22 @@ function reduceNativeEssential(
       };
     }
     case "lifecycle": {
+      // A lease's first building/observing/reconnecting lifecycle follows its
+      // complete replay of open obligations (server contract): a held dialog the
+      // replay did not re-open was answered or cancelled while unwatched.
+      if (
+        feed.unconfirmedDialogs !== null &&
+        (envelope.state === "building" ||
+          envelope.state === "observing" ||
+          envelope.state === "reconnecting")
+      ) {
+        const gone = feed.unconfirmedDialogs;
+        feed = {
+          ...feed,
+          dialogs: feed.dialogs.filter((dialog) => !gone.has(String(dialog.id))),
+          unconfirmedDialogs: null,
+        };
+      }
       const observer: NativeObserver = { phase: envelope.state, reason: envelope.reason ?? null };
       const reason = envelope.reason ?? "The native session ended.";
       switch (envelope.state) {
@@ -1537,10 +1566,16 @@ function reduceNativeEssential(
     case "obligation-opened": {
       const request = envelope.request;
       if (!DIALOG_REQUESTS.has(request.type)) return feed;
-      return {
-        ...feed,
-        dialogs: [...feed.dialogs.filter((dialog) => dialog.id !== envelope.id), request],
-      };
+      const unconfirmed = feed.unconfirmedDialogs;
+      const confirmed =
+        unconfirmed?.has(envelope.id) === true
+          ? new Set([...unconfirmed].filter((id) => id !== envelope.id))
+          : unconfirmed;
+      // A dialog already shown keeps its object and place: typed text, focus and
+      // selection in it survive a re-attach.
+      if (feed.dialogs.some((dialog) => dialog.id === envelope.id))
+        return confirmed === unconfirmed ? feed : { ...feed, unconfirmedDialogs: confirmed };
+      return { ...feed, dialogs: [...feed.dialogs, request], unconfirmedDialogs: confirmed };
     }
     case "obligation-settled":
       return { ...feed, dialogs: feed.dialogs.filter((dialog) => dialog.id !== envelope.id) };
@@ -1719,8 +1754,7 @@ export function reduceNativeSessionFeed(
     ...invalidateNativeReads(feed),
     connected: false,
     ownerLoss: feed.ownerLoss === "reconnecting" ? null : feed.ownerLoss,
-    // Open obligations are re-sent as `obligation-opened` on the next lease.
-    dialogs: [],
+    // Dialogs stay shown; the next lease's replay confirms or removes them.
     agentsEpoch: feed.agentsEpoch + 1,
     activity: closeNativeActivity(feed.activity, nowMs()),
   };

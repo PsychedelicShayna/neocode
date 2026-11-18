@@ -61,6 +61,8 @@ interface Harness {
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
   readonly captures: Array<SpawnCapture>;
   readonly root: string;
+  /** Event frames the client handed to the generation's sink, counted as they arrive. */
+  readonly sinkEvents: { count: number };
 }
 
 const scenarioFor = (reply: string) => ({
@@ -240,6 +242,7 @@ const makeHarness = (
         return handle;
       });
 
+    const sinkEvents = { count: 0 };
     const textGeneration = makeNeoPiTextGeneration({
       binary: "npi",
       env: { OMP_PROFILE: PROFILE },
@@ -247,12 +250,23 @@ const makeHarness = (
       makeClient: (clientOptions) =>
         NeoPiRpcClient.make({
           ...clientOptions,
+          ...(clientOptions.sink
+            ? {
+                sink: {
+                  ...clientOptions.sink,
+                  event: (frame) => {
+                    sinkEvents.count++;
+                    clientOptions.sink!.event(frame);
+                  },
+                },
+              }
+            : {}),
           command: process.execPath,
           args: [peerPath, ...peerArgs, ...clientOptions.args],
         }),
       deadlineMs: options.deadlineMs ?? 5_000,
     });
-    return { textGeneration, captures, root };
+    return { textGeneration, captures, root, sinkEvents };
   });
 
 const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -463,7 +477,7 @@ it.live("answers from the last attempt after a burst of deltas nobody could queu
           messageId: "m1",
           assistantMessageEvent: { type: "text_delta", delta: "x" },
         }));
-        const { textGeneration } = yield* makeHarness({
+        const { textGeneration, sinkEvents } = yield* makeHarness({
           peerSource: streamingPeer([
             { type: "message_start", message: { role: "assistant" }, messageId: "m1" },
             ...burst,
@@ -488,6 +502,9 @@ it.live("answers from the last attempt after a burst of deltas nobody could queu
           modelSelection: TEST_MODEL,
         });
         expect(title.title).toBe("After the burst");
+        // Every frame was folded in the parser path as it arrived: none waited in a queue for a
+        // reader, which is what a queue-backed collector would have done.
+        expect(sinkEvents.count).toBeGreaterThanOrEqual(burst.length + 5);
       }),
     ),
   ),

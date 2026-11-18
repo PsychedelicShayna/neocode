@@ -1025,6 +1025,54 @@ describe("native projection mapping", () => {
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
   });
 
+  it("restores a failure the projection held over history's outcome-less entry", () => {
+    // After a reload the client holds nothing: the roster row carries the live
+    // failure the server kept (settled children are not marked unobserved) and
+    // the history entry read on rebuild.
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain(),
+        watermark: 2,
+        entities: [
+          {
+            key: "roster:child",
+            ordinal: 1,
+            revision: 2,
+            value: {
+              class: "roster",
+              value: {
+                id: "child",
+                runToken: "run",
+                ticks: 0,
+                history: {
+                  id: "child",
+                  kind: "sub",
+                  status: "idle",
+                  createdAt: 1,
+                  lastActivity: 2,
+                },
+                lifecycle: { id: "child", runToken: "run", agent: "scout", status: "failed" },
+                progress: {
+                  progress: { id: "child", status: "failed" },
+                  retryFailure: { errorMessage: "Provider refused" },
+                },
+              },
+            },
+          },
+        ],
+      }),
+    );
+    expect(feed.agents[0]).toMatchObject({ id: "child", status: "failed" });
+    const hub = nativeAgentHubAgents(feed.agents, feed.agentTicks, "session");
+    expect(summarizeAgentHub(hub)).toMatchObject({ failed: 1, done: 0 });
+  });
+
   it("counts a child that finished unseen as finished, never as interrupted", () => {
     const lifecycle = {
       id: "child",

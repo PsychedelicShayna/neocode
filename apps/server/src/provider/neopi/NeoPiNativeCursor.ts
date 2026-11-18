@@ -12,7 +12,6 @@ import type {
 } from "@t3tools/contracts";
 
 import type {
-  NeoPiNativeFence,
   NeoPiNativeJournalTail,
   NeoPiNativeKeyedStore,
   NeoPiNativeStoreRecord,
@@ -36,8 +35,6 @@ export interface NeoPiNativeReadSource {
   readonly horizonCursor: string | undefined;
   /** Ascending `seq`; a `gap` stands for its whole `fromSeq..toSeq` interval. */
   readonly inbox: readonly NeoPiNativeInboxRecord[];
-  /** Decides a leaf announced without its entry before anything is read (see the projection). */
-  settlePendingLeaf(): NeoPiNativeFence;
 }
 
 export interface NeoPiNativeReadLimits {
@@ -163,9 +160,6 @@ export function readNeoPiNativeObservation(
   limits: NeoPiNativeReadLimits,
   reader: string,
 ): NeoPiNativeSessionsReadResult {
-  // A quiet move to a leaf the tail no longer holds is decided here, so the
-  // next read already serves the new branch with no further native frame.
-  source.settlePendingLeaf();
   if (!source.published) return { type: "building" };
   const { store, journal, domain } = source;
   const sameDomain = cursor !== null && sameObservationDomain(cursor.epoch, domain);

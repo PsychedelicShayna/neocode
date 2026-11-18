@@ -483,11 +483,14 @@ describe("NeoPiNativeProjection", () => {
         }),
         "none",
       );
-      assert.equal(projection.fold({ type: "agent_start" }), "navigated");
+      // Other frames, such as a flush's message_persisted, never settle it.
+      assert.equal(projection.fold({ type: "agent_start" }), "none");
+      assert.isTrue(projection.pendingLeaf);
+      // The owner side's timeout settles a quiet move.
+      assert.equal(projection.settlePendingLeaf(), "navigated");
       assert.equal(projection.domain.branchGeneration, generation + 1);
       assert.deepEqual(tailIds(projection), []);
       assert.equal(projection.identity?.leafId, "e1");
-      // A caller with no further frame settles it directly.
       projection.fold({ type: "journal_entry", sessionId, entry: entry("e5", "e1") });
       projection.fold({
         type: "journal_state",
@@ -989,6 +992,47 @@ describe("NeoPiNativeProjection", () => {
       assert.deepEqual(fences, ["none", "none", "none", "none"]);
       assert.equal(projection.domain.branchGeneration, generation);
       assert.deepEqual(tail(projection), ["h", "b1", "b2"]);
+    });
+
+    it("a NeoPi flush (leaf = last, each entry followed by its message_persisted) is never a navigation", () => {
+      // The frame order of the verifier's stalled run (branchGeneration 1 → 10
+      // in a linear session): NeoPi's `committed()` announces the manager's
+      // current leaf, the LAST appended entry, then emits each committed entry,
+      // each followed at once by its `message_persisted`, with streaming frames
+      // and reads in between.
+      const projection = published();
+      const fences: string[] = [];
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("h", null) });
+      const generation = projection.domain.branchGeneration;
+      const fold = (frame: Record<string, unknown>) => fences.push(projection.fold(frame));
+      for (const id of ["e1", "e2", "last"])
+        fold({ type: "message_end", messageId: `m-${id}`, message: assistant(id) });
+      fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: "last",
+      });
+      let parent = "h";
+      for (const id of ["e1", "e2", "last"]) {
+        fold({ type: "journal_entry", sessionId, entry: entry(id, parent, assistant(id)) });
+        // A read lands inside the flush; it changes nothing.
+        const before = projection.domain;
+        readNeoPiNativeObservation(projection, null, WIDE, "reader");
+        assert.deepEqual(projection.domain, before);
+        fold({ type: "message_persisted", sessionId, messageId: `m-${id}`, entryId: id });
+        fold({ type: "message_update", messageId: "m-next", message: assistant("…") });
+        parent = id;
+      }
+      assert.isTrue(
+        fences.every((fence) => fence === "none"),
+        fences.join(","),
+      );
+      assert.isFalse(projection.pendingLeaf);
+      assert.equal(projection.domain.branchGeneration, generation);
+      assert.isTrue(projection.published);
+      assert.deepEqual(tail(projection), ["h", "e1", "e2", "last"]);
     });
 
     it("every entry hold ends: an alias for an unheld message, the run's end, eviction from the ring", () => {

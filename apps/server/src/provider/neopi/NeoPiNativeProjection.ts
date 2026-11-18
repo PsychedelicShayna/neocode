@@ -754,27 +754,33 @@ export class NeoPiNativeProjection {
   }
 
   fold(frame: NativeRecord): NeoPiNativeFence {
-    let fence: NeoPiNativeFence = "none";
     const pending = this.#pendingLeaf;
-    if (pending) {
-      const entry = frame.type === "journal_entry" ? asRecord(frame.entry) : undefined;
-      if (entry?.id === pending.leafId) this.#pendingLeaf = null;
-      // An append batch shares one leaf announcement: entries that extend the
-      // head keep it pending until the announced entry arrives.
-      else if (!(entry && entry.parentId === (this.journal.head?.id ?? null)))
-        fence = this.#settle();
+    if (pending && frame.type === "journal_entry") {
+      const entry = asRecord(frame.entry);
+      // NeoPi flushes pending entries as: leaf = the LAST entry, then each
+      // entry in order, each followed by its `message_persisted`
+      // (`session-journal-events.ts` `committed`; `rpc-session-events.ts`
+      // `#journalEvent`). Entries that extend the head keep the leaf pending;
+      // its own entry resolves it; any other entry is a navigation that
+      // `#journalEntry` decides by its parent. No other frame resolves it.
+      if (entry?.id === pending.leafId || entry?.parentId !== (this.journal.head?.id ?? null))
+        this.#pendingLeaf = null;
     }
-    const next = this.#fold(frame);
-    if (next !== "none") fence = next === "identity-changed" || fence === "none" ? next : fence;
+    const fence = this.#fold(frame);
     if (fence !== "none") this.#onFence?.(fence);
     return fence;
   }
 
+  /** A leaf was announced and neither its entry nor a navigation has arrived yet. */
+  get pendingLeaf(): boolean {
+    return this.#pendingLeaf !== null;
+  }
+
   /**
    * A leaf announced with no entry after it is a move to an entry the tail no
-   * longer holds: history is replaced (C3.4 navigation). `fold` settles it on
-   * the next frame that is not an append, and every read settles it first, so
-   * a quiet move is visible to the next read with no further frame.
+   * longer holds: history is replaced (C3.4 navigation). Neither frames nor
+   * reads can tell that from a flush still in flight, so the owner side calls
+   * this once a leaf has stayed pending past its own timeout.
    */
   settlePendingLeaf(): NeoPiNativeFence {
     const fence = this.#settle();

@@ -1170,6 +1170,22 @@ describe("NeoPiNativeProjection", () => {
       );
     });
 
+    it("a child marked unobserved stays until inventory or history lists it", () => {
+      const projection = published();
+      projection.store.put("roster:c", {
+        class: "roster",
+        value: { id: "c", runToken: "r", ticks: 0, unobserved: { since: 1 } },
+      });
+      projection.applySubagentHistoryReply({ subagents: [] }, projection.mark());
+      assert.isDefined(projection.store.get("roster:c")?.value, "never silently removed");
+      projection.applySubagentHistoryReply(
+        { subagents: [{ id: "c", status: "parked" }] },
+        projection.mark(),
+      );
+      const value = projection.store.get("roster:c")?.value;
+      assert.isUndefined(value?.class === "roster" ? value.value.unobserved : "missing");
+    });
+
     it("entries folded after a page's request survive that page when it is empty", () => {
       // B4's case: the build's page is read from an empty branch, then a flush
       // arrives before the page is applied.

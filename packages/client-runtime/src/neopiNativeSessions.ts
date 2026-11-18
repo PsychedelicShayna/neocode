@@ -1163,6 +1163,51 @@ function projectNativeChild(
       revision,
       at,
     );
+  // Finished while no view watched, and listed by neither the live inventory nor
+  // a history: identity from the last frames seen; status `interrupted`, marked
+  // so every consumer counts it as finished with an unknown outcome.
+  const unobserved = nativeRecord(row.unobserved);
+  if (
+    row.unobserved !== undefined &&
+    row.history === undefined &&
+    (row.inventory === undefined || row.inventory === null) &&
+    typeof unobserved.since === "number"
+  ) {
+    if (unobserved.history !== undefined)
+      child = mergeNativeSubagentHistory(child, [unobserved.history], revision, at);
+    if (unobserved.inventory !== undefined && unobserved.inventory !== null)
+      child = snapshotNativeSubagents(child, [unobserved.inventory], revision, revision, at);
+    if (unobserved.lifecycle !== undefined)
+      child = reduceNativeSubagents(
+        child,
+        { type: "subagent_lifecycle", payload: unobserved.lifecycle },
+        revision,
+        at,
+      );
+    if (unobserved.progress !== undefined)
+      child = reduceNativeSubagents(
+        child,
+        { type: "subagent_progress", payload: unobserved.progress },
+        revision,
+        at,
+      );
+    const known = child[0];
+    if (known)
+      child = [
+        {
+          ...known,
+          status: "interrupted",
+          completedAt:
+            known.completedAt ?? DateTime.formatIso(DateTime.makeUnsafe(unobserved.since)),
+          native: {
+            ...known.native,
+            disconnected: false,
+            unobservedSince: unobserved.since,
+            revision,
+          },
+        },
+      ];
+  }
   const next = child[0];
   if (!next) return agents;
   return index < 0

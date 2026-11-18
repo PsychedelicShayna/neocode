@@ -382,8 +382,15 @@ describe("native observation controller", () => {
           const h = yield* makeHarness();
           const visible = Atom.make(true);
           // The atom used by both clients: a hidden page, background app or a
-          // covered screen reads the cache instead of keeping an observation.
+          // covered screen holds the cache instead of keeping an observation.
           const view = Atom.make((get) => get(h.atoms.view(h.target, get(visible))));
+          // What a client view shows: the observation's feed, else the cache.
+          const shownFeed = () => {
+            const result = h.registry.get(view);
+            return AsyncResult.isSuccess(result) ? result.value : h.atoms.cached(h.target);
+          };
+          // A collapsed panel of the same session, concealed before anything arrived.
+          const unmountPanel = h.registry.mount(h.atoms.view(h.target, false));
           const unmount = h.registry.mount(view);
           const first = yield* Queue.take(h.leases);
           const read = yield* Queue.take(h.reads);
@@ -401,17 +408,17 @@ describe("native observation controller", () => {
           yield* Deferred.await(first.released);
           yield* Deferred.await(waiting.interrupted);
           expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 0 });
-          const concealed = AsyncResult.getOrThrow(h.registry.get(view));
-          expect(concealed.conversation.pending[0]?.message.content).toBe("At my place");
+          const concealed = shownFeed();
+          expect(concealed?.conversation.pending[0]?.message.content).toBe("At my place");
 
           h.registry.set(visible, true);
           const next = yield* Queue.take(h.leases);
           const resumed = yield* h.readOf(next.id);
           expect(resumed.input.cursor).toEqual(cursorAt(epoch, 5));
-          const shown = AsyncResult.getOrThrow(h.registry.get(view));
-          expect(shown.conversation).toBe(concealed.conversation);
+          expect(shownFeed()?.conversation).toBe(concealed?.conversation);
           expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 1 });
           unmount();
+          unmountPanel();
         }),
       ),
   );

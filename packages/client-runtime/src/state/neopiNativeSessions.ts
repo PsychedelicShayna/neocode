@@ -100,6 +100,12 @@ export function createNativeSessionAtoms<R, E>(
         }),
       ),
     );
+  /**
+   * A concealed view's hold: keeps the cached feed from eviction and carries no
+   * value of its own, because one hold is shared by every concealed view of the
+   * session and a value taken when the first one mounted would be stale for the
+   * next. A concealed view reads `cached` instead.
+   */
   const concealed = Atom.family((key: string) =>
     Atom.make((get) => {
       holds.set(key, (holds.get(key) ?? 0) + 1);
@@ -111,7 +117,7 @@ export function createNativeSessionAtoms<R, E>(
           if (!updates.has(key)) Effect.runFork(evictLater([key]));
         }
       });
-      return AsyncResult.success(cache.get(key) ?? emptyNativeSessionFeed());
+      return AsyncResult.initial();
     }).pipe(Atom.setIdleTTL(0)),
   );
   const publish = (key: string, update: NativeSessionUpdate) =>
@@ -421,9 +427,10 @@ export function createNativeSessionAtoms<R, E>(
     watch: observation,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
     /**
-     * The feed a view reads. Visible: subscribes to the observation (its lease).
-     * Concealed: holds only the cached feed, so the place stays, with no lease,
-     * read or demand. Returning to visible resumes from that feed.
+     * The atom a view subscribes to. Visible: the observation (its lease).
+     * Concealed: only a hold on the cached feed, with no lease, read or demand;
+     * the view shows `cached`, so it keeps its place, and returning to visible
+     * resumes from that feed.
      */
     view: (target: NativeSessionTarget, visible: boolean) =>
       visible

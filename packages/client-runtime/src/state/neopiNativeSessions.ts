@@ -15,7 +15,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, type Atom, type AtomRegistry } from "effect/unstable/reactivity";
+import type { Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { request as rpcRequest } from "../rpc/client.ts";
@@ -430,14 +430,11 @@ export function createNativeSessionAtoms<R, E>(
      * The explicit route back for an owner-stopped or detached session: opens it
      * (the server attaches to a live terminal owner when there is one and
      * otherwise starts NeoCode's own, so this is also how a quit terminal is
-     * taken over), then wakes the observation. Rejects with the open failure;
-     * otherwise resolves once the feed has a live owner, or after `timeoutMs`.
+     * taken over), then wakes a mounted observation. Rejects with the open
+     * failure. It never subscribes itself, so a view concealed meanwhile holds no
+     * lease; the visible view shows the owner once its watch reports it.
      */
-    reconnect: async (
-      registry: AtomRegistry.AtomRegistry,
-      target: NativeSessionTarget,
-      timeoutMs = 15_000,
-    ) => {
+    reconnect: async (registry: AtomRegistry.AtomRegistry, target: NativeSessionTarget) => {
       const result = await open.run(registry, {
         environmentId: target.environmentId,
         input: target.ref,
@@ -445,28 +442,6 @@ export function createNativeSessionAtoms<R, E>(
       if (result._tag === "Failure") throw Cause.squash(result.cause);
       const restart = restarts.get(nativeSessionKey(target));
       if (restart) Queue.offerUnsafe(restart, undefined);
-      const atom = observation({ environmentId: target.environmentId, input: { ref: target.ref } });
-      await new Promise<void>((resolve) => {
-        let unsubscribe: (() => void) | undefined;
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          unsubscribe?.();
-          resolve();
-        };
-        // @effect-diagnostics-next-line globalTimers:off - a bounded wait in this async UI action, outside an Effect runtime
-        const timer = setTimeout(finish, timeoutMs);
-        unsubscribe = registry.subscribe(
-          atom,
-          (value) => {
-            if (AsyncResult.isSuccess(value) && value.value.connected) finish();
-          },
-          { immediate: true },
-        );
-        if (done) unsubscribe();
-      });
     },
   };
 }

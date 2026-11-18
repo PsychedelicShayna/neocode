@@ -134,6 +134,7 @@ import {
   TYPOGRAPHY_ADVANCED_STORAGE_KEY,
 } from "../../appearanceFonts";
 import { CodeFontPreview, PromptFontPreview, TerminalFontPreview } from "./SettingsFontPreviews";
+import { resolveDefaultTerminalFontLabel } from "../../terminal/ghostty/surface";
 import { discoverInstalledFonts, FontFamilyPicker, useFontEnumeration } from "./FontFamilyPicker";
 import {
   NumberField,
@@ -1465,12 +1466,14 @@ function useFontDefaultFamilies() {
     () => ({
       sans: resolveDefaultFamilyLabel(DEFAULT_SANS_FONT_STACK) ?? "System default",
       code: resolveDefaultFamilyLabel(DEFAULT_CODE_FONT_STACK) ?? "System monospace",
+      terminal: resolveDefaultTerminalFontLabel() ?? "System monospace",
     }),
     [],
   );
   return {
     sans: defaults.sans,
     code: defaults.code,
+    terminal: defaults.terminal,
     // The composer inherits whatever the interface preference resolves to.
     interfaceFamily: settings.fontFamilySans.trim() || defaults.sans,
   };
@@ -1587,7 +1590,7 @@ function TerminalFontRow() {
     <FontFamilySettingsRow
       {...searchableSetting("terminal-font")}
       description="Terminal output, independent from code blocks and diffs."
-      defaultFamily={defaults.code}
+      defaultFamily={defaults.terminal}
       defaultValue={DEFAULT_UNIFIED_SETTINGS.fontFamilyTerminal}
       value={settings.fontFamilyTerminal}
       onValueChange={(fontFamilyTerminal) => updateSettings({ fontFamilyTerminal })}

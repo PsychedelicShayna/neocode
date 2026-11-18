@@ -19,6 +19,7 @@ import {
   nativeSlashCommands,
   nativeTranscriptRows,
   type NativeCommandCompletion,
+  type NativeSessionFeed,
   type NativeSessionTarget,
   type NativeSlashCommand,
   type NativeTranscriptRow,
@@ -79,6 +80,38 @@ export function NativeSessionScreen({ route }: StaticScreenProps<Params>) {
     [route.params.environmentId, route.params.providerInstanceId, route.params.sessionFile],
   );
   return <NativeSessionBody key={nativeSessionKey(target)} target={target} />;
+}
+/**
+ * The transcript rows, derived from the rows this screen showed last, so a row
+ * keeps its key (and its open toggles) when a streaming message gains its first
+ * call. The last result is kept in state and re-derived during render when an
+ * input changes, the pattern React gives for state from previous renders.
+ */
+function useTranscriptRows(
+  conversation: NativeSessionFeed["conversation"],
+  commandOutputs: NativeSessionFeed["commandOutputs"],
+  debug: boolean,
+): readonly NativeTranscriptRow[] {
+  const [shown, setShown] = useState(() => ({
+    conversation,
+    commandOutputs,
+    debug,
+    rows: nativeTranscriptRows({ conversation, commandOutputs }, debug),
+  }));
+  if (
+    shown.conversation === conversation &&
+    shown.commandOutputs === commandOutputs &&
+    shown.debug === debug
+  )
+    return shown.rows;
+  const next = {
+    conversation,
+    commandOutputs,
+    debug,
+    rows: nativeTranscriptRows({ conversation, commandOutputs }, debug, shown.rows),
+  };
+  setShown(next);
+  return next.rows;
 }
 function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const { feed, request, error } = useNativeSession(target);
@@ -352,16 +385,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       })
       .catch((cause) => setLocalError(String(cause)));
   }, [request, target, feed.session?.capabilities]);
-  const rows = useMemo(
-    () =>
-      nativeTranscriptRows(
-        { conversation: feed.conversation, commandOutputs: feed.commandOutputs },
-        debug,
-        // The rows last shown, so a row keeps its key (and its open toggles).
-        followRowsRef.current,
-      ),
-    [feed.conversation, feed.commandOutputs, debug],
-  );
+  const rows = useTranscriptRows(feed.conversation, feed.commandOutputs, debug);
   const callIdsByRow = useMemo(
     () =>
       new Map(

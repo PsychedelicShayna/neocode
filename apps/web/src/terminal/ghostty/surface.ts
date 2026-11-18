@@ -15,7 +15,7 @@ import {
   type GhosttyCellMetrics,
 } from "./renderer";
 import symbolsFontUrl from "./fonts/SymbolsNerdFontMono-Regular.woff2?url";
-import { isMonospaceFamily } from "../../appearanceFonts";
+import { isMonospaceFamily, resolveDefaultFamilyLabel } from "../../appearanceFonts";
 
 export const DEFAULT_TERMINAL_FONT_SIZE = 12;
 const MIN_TERMINAL_FONT_SIZE = 6;
@@ -28,11 +28,18 @@ const TERMINAL_GLYPH_FALLBACKS =
   '"Symbols Nerd Font Mono", "Symbols Nerd Font", "JetBrainsMono Nerd Font", ' +
   '"JetBrainsMono NF", "FiraCode Nerd Font", "Hack Nerd Font", "MesloLGS NF", ' +
   '"CaskaydiaCove Nerd Font", "PowerlineSymbols", monospace';
-// The platform's own monospace faces; concrete names only, because an
-// unknown keyword (like ui-monospace) makes canvas font shorthand parsing
-// reject the whole string.
-export const DEFAULT_TERMINAL_FONT_FAMILY =
-  '"SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", ' + TERMINAL_GLYPH_FALLBACKS;
+// Text faces for a terminal without an explicit font: installed Nerd Fonts in
+// preference order (Meslo, then JetBrains Mono, then other common ones), then
+// the platform's own monospace faces. The engine renders the first installed
+// face, so nothing enumerates fonts before the terminal paints, and a machine
+// without a Nerd Font (or an engine that hides local fonts) keeps the platform
+// faces. Concrete names only, because an unknown keyword (like ui-monospace)
+// makes canvas font shorthand parsing reject the whole string.
+const DEFAULT_TERMINAL_TEXT_FACES =
+  '"MesloLGS Nerd Font", "MesloLGS NF", "JetBrainsMono Nerd Font", "JetBrainsMono NF", ' +
+  '"FiraCode Nerd Font", "Hack Nerd Font", "CaskaydiaCove Nerd Font", ' +
+  '"SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono"';
+export const DEFAULT_TERMINAL_FONT_FAMILY = `${DEFAULT_TERMINAL_TEXT_FACES}, ${TERMINAL_GLYPH_FALLBACKS}`;
 const CONTENT_PADDING = 4;
 const MIN_SCROLLBAR_THUMB_HEIGHT = 18;
 /** Half a blink cycle: the visible and hidden phases are equally long. */
@@ -104,6 +111,11 @@ export function terminalFontFamily(family?: string): string {
   if (!isMonospaceFamily(custom)) return DEFAULT_TERMINAL_FONT_FAMILY;
   // A custom face keeps the glyph fallbacks so prompt symbols stay covered.
   return uncheckedTerminalFontFamily(custom);
+}
+
+/** The text face an unset terminal font renders as on this machine, or null when unnameable. */
+export function resolveDefaultTerminalFontLabel(): string | null {
+  return resolveDefaultFamilyLabel(`${DEFAULT_TERMINAL_TEXT_FACES}, monospace`);
 }
 
 /** Load every style the renderer can request, then validate the actual face. */

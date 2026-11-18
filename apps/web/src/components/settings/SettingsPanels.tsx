@@ -134,6 +134,7 @@ import {
   TYPOGRAPHY_ADVANCED_STORAGE_KEY,
 } from "../../appearanceFonts";
 import { CodeFontPreview, PromptFontPreview, TerminalFontPreview } from "./SettingsFontPreviews";
+import { resolveDefaultTerminalFontLabel } from "../../terminal/ghostty/surface";
 import { discoverInstalledFonts, FontFamilyPicker, useFontEnumeration } from "./FontFamilyPicker";
 import {
   NumberField,
@@ -1582,12 +1583,13 @@ function CodeFontRow({
 function TerminalFontRow() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
-  const defaults = useFontDefaultFamilies();
+  // Probed here, not in useFontDefaultFamilies: no other row shows it.
+  const defaultFamily = useMemo(() => resolveDefaultTerminalFontLabel() ?? "System monospace", []);
   return (
     <FontFamilySettingsRow
       {...searchableSetting("terminal-font")}
       description="Terminal output, independent from code blocks and diffs."
-      defaultFamily={defaults.code}
+      defaultFamily={defaultFamily}
       defaultValue={DEFAULT_UNIFIED_SETTINGS.fontFamilyTerminal}
       value={settings.fontFamilyTerminal}
       onValueChange={(fontFamilyTerminal) => updateSettings({ fontFamilyTerminal })}

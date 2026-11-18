@@ -72,7 +72,6 @@ import type { NeoPiAdapterShape } from "../Services/NeoPiAdapter.ts";
 import { makeNeoPiLoginUi } from "../neopi/NeoPiLoginUi.ts";
 import { makeNeoPiModelsConnection } from "../neopi/NeoPiModelsConnection.ts";
 import { parseNeoPiLaunchArguments } from "../neopi/NeoPiLaunchArgs.ts";
-import { NeoPiRuntimeError } from "../neopi/NeoPiRuntimeError.ts";
 
 const PROVIDER = ProviderDriverKind.make("neopi");
 const record = (value: unknown): Record<string, unknown> =>

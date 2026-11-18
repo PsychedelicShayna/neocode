@@ -1007,18 +1007,18 @@ const WsNeoPiNativeSessionsWatchRpc = Rpc.make(WS_METHODS.neopiNativeSessionsWat
   stream: true,
 });
 /** Bulk long-poll by cursor; one active read per lease. */
-export const WsNeoPiNativeSessionsReadRpc = Rpc.make(WS_METHODS.neopiNativeSessionsRead, {
+const WsNeoPiNativeSessionsReadRpc = Rpc.make(WS_METHODS.neopiNativeSessionsRead, {
   payload: NeoPiNativeSessionsReadInput,
   success: NeoPiNativeSessionsReadResult,
   error: NeoPiNativeSessionsRpcError,
 });
-export const WsNeoPiNativeSessionsSetDemandRpc = Rpc.make(WS_METHODS.neopiNativeSessionsSetDemand, {
+const WsNeoPiNativeSessionsSetDemandRpc = Rpc.make(WS_METHODS.neopiNativeSessionsSetDemand, {
   payload: NeoPiNativeSessionsSetDemandInput,
   success: NeoPiNativeSessionsSetDemandResult,
   error: NeoPiNativeSessionsRpcError,
 });
 /** Returns essential `watch` credit; see `NeoPiNativeSessionsCreditInput`. */
-export const WsNeoPiNativeSessionsCreditRpc = Rpc.make(WS_METHODS.neopiNativeSessionsCredit, {
+const WsNeoPiNativeSessionsCreditRpc = Rpc.make(WS_METHODS.neopiNativeSessionsCredit, {
   payload: NeoPiNativeSessionsCreditInput,
   error: NeoPiNativeSessionsRpcError,
 });

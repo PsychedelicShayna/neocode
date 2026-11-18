@@ -66,7 +66,7 @@ export type NativeObservationPurpose = NonNullable<NeoPiNativeSessionsWatchInput
  * no lease. A view that is still mounted but concealed holds the feed (`view`),
  * so it is never evicted under that view.
  */
-export const NATIVE_WARM_CACHE_MS = 5 * 60_000;
+const NATIVE_WARM_CACHE_MS = 5 * 60_000;
 /** Re-attach and re-read backoff: 250 ms doubling to 5 s, reset by any lease or reply. */
 const retryDelayMs = (failures: number) => Math.min(250 * 2 ** failures, 5_000);
 

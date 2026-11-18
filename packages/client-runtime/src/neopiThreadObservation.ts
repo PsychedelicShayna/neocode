@@ -3,7 +3,12 @@ import type {
   NeoPiNativeObservationLifecycle,
   NeoPiThreadNativeRef,
 } from "@t3tools/contracts";
-import type { NativeConversation } from "./neopiConversation.ts";
+import {
+  emptyNativeConversation,
+  reduceNativeConversation,
+  sameNativeSession,
+  type NativeConversation,
+} from "./neopiConversation.ts";
 
 /** What a thread's transcript, tree and status line show about its native observation. */
 export interface ThreadNativeConnection {
@@ -169,3 +174,46 @@ export async function findOlderNativePage(
   }
   return null;
 }
+
+/**
+ * What a thread transcript shows: the source conversation (live from the observation, or a
+ * read-only journal page) with any older history the view paged in kept in front of it.
+ * Pure, so views derive it during render. `paged` is the conversation the last older page
+ * was joined into; it is used only while it is the same session.
+ */
+export function mergeThreadConversation(
+  paged: NativeConversation | null,
+  source: NativeConversation,
+): NativeConversation {
+  if (
+    paged === null ||
+    source.identity === null ||
+    source.needsSnapshot ||
+    !sameNativeSession(paged.identity, source.identity)
+  )
+    return source;
+  const merged = reduceNativeConversation(paged, {
+    type: "snapshot",
+    page: {
+      ...source.identity,
+      sessionFile: source.identity.sessionFile ?? "",
+      entries: source.entries,
+      totalEntries: source.entries.length,
+      ...(source.cursor ? { nextCursor: source.cursor } : {}),
+    },
+  });
+  // The paged cursor stays usable while the branch has not moved since it was read.
+  const keepCursor =
+    paged.identity?.leafId === source.identity.leafId && paged.cursorLeaf === source.cursorLeaf;
+  return {
+    ...source,
+    entries: merged.entries,
+    ...(keepCursor ? { cursor: paged.cursor, cursorLeaf: paged.cursorLeaf } : {}),
+  };
+}
+
+/** A read-only transcript from one journal page, for a session no owner can be observed for. */
+export const readOnlyThreadConversation = (page: NeoPiJournalPage | null): NativeConversation =>
+  page === null
+    ? emptyNativeConversation()
+    : reduceNativeConversation(emptyNativeConversation(), { type: "snapshot", page });

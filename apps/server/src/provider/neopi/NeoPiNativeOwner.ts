@@ -35,6 +35,7 @@ export interface NeoPiNativeOwner {
   }) => Effect.Effect<unknown, NeoPiRpcError | NeoPiRuntimeError>;
 }
 const Cursor = Schema.Struct({ sessionId: Schema.String, sessionFile: Schema.String });
+const decodeCursor = Schema.decodeUnknownOption(Cursor);
 const Catalog = Schema.fromJsonString(
   Schema.Struct({
     version: Schema.Literal(1),
@@ -98,7 +99,7 @@ export const readNeoPiNativeOwnerCatalog = Effect.fn("NeoPiNativeOwner.readCatal
  * instance that owns it, and a check that the binding has not changed since it was read.
  * Opens no connection.
  */
-export const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(function* () {
+const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(function* () {
   const directory = yield* ProviderSessionDirectory;
   const instances = yield* ProviderInstanceRegistry;
   const fs = yield* FileSystem.FileSystem;
@@ -106,7 +107,7 @@ export const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(func
     const binding = yield* directory.getBinding(threadId);
     if (Option.isNone(binding) || binding.value.provider !== "neopi")
       return { status: "unavailable" as const, reason: "This thread has no native NeoPi session." };
-    const saved = Schema.decodeUnknownOption(Cursor)(binding.value.resumeCursor);
+    const saved = decodeCursor(binding.value.resumeCursor);
     if (Option.isNone(saved) || !NodePath.isAbsolute(saved.value.sessionFile))
       return {
         status: "unavailable" as const,
@@ -135,7 +136,7 @@ export const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(func
         (yield* instances.getInstance(instance.instanceId)) !== instance
       )
         return false;
-      const cursor = Schema.decodeUnknownOption(Cursor)(current.value.resumeCursor);
+      const cursor = decodeCursor(current.value.resumeCursor);
       return (
         Option.isSome(cursor) &&
         cursor.value.sessionId === expected.sessionId &&

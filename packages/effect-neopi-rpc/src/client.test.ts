@@ -703,7 +703,6 @@ it.live("pauses negotiation while a startup confirmation awaits the user, then r
           return Effect.void;
         },
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startupTransport = yield* Deferred.make<Client.NeoPiRpcTransport>();
       const clientFiber = yield* Client.make({
@@ -786,7 +785,6 @@ it.live("resumes the negotiation deadline when a startup dialog is cancelled", (
             ? emit({ type: "extension_ui_request", id: "cancel-me", method: "confirm" })
             : Effect.void,
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startup = yield* Client.make({
         spawn: () => Effect.succeed(peer.handle),
@@ -828,7 +826,6 @@ it.live("fails promptly when a peer exits during a pending startup dialog", () =
             ? emit({ type: "extension_ui_request", id: "abandoned", method: "confirm" })
             : Effect.void,
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startup = yield* Client.make({
         spawn: () => Effect.succeed(peer.handle),
@@ -1370,7 +1367,8 @@ it.live("fails pending requests and stops the peer when the sink throws", () =>
           },
         },
       });
-      const error = yield* client.request({ type: "get_state" }).pipe(Effect.flip);
+      // The reply value is irrelevant: the request must fail.
+      const error = yield* client.request({ type: "get_state" }).pipe(Effect.asVoid, Effect.flip);
       assert.equal(error.code, "sink_failed");
       assert.include(error.message, "sink broke");
       // The kill is forked into the client's lifetime; its receipt is the recorded signal.

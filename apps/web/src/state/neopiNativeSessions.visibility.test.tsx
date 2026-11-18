@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, useEffect } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import {
@@ -66,7 +66,11 @@ const selectBusy = (feed: NativeSessionFeed) => feed.busy;
 function View({ shown = true }: { shown?: boolean }) {
   const { feed } = useNativeSession(target, shown);
   const busy = useNativeSessionSlice(target, selectBusy, shown);
-  displayed = `${feed.conversation.pending[0]?.message.content ?? ""}:${busy}`;
+  const text = `${feed.conversation.pending[0]?.message.content ?? ""}:${busy}`;
+  // Recorded after commit, not during render.
+  useEffect(() => {
+    displayed = text;
+  }, [text]);
   return null;
 }
 const publish = (text: string, busy: boolean) =>

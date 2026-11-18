@@ -11,6 +11,7 @@ import {
   CONTROL_PLANE_OFF_REASON,
   SESSION_CHANGED_REASON,
   findOlderNativePage,
+  mergeThreadConversation,
   nativeOlderHistoryAvailable,
   threadNativeConnection,
   type ThreadObservationInput,
@@ -170,5 +171,41 @@ describe("older native history", () => {
     });
     expect(nativeOlderHistoryAvailable(whole)).toBe(false);
     expect(await findOlderNativePage(whole, journal)).toBeNull();
+  });
+});
+
+describe("mergeThreadConversation", () => {
+  const identity = { sessionId: "s-1", sessionFile: "/s/a.jsonl", leafId: "e9" };
+  const entry = (index: number): NeoPiJournalEntry => ({
+    id: `e${index}`,
+    parentId: index === 0 ? null : `e${index - 1}`,
+    type: "message",
+    timestamp: "2026-11-18T00:00:00Z",
+  });
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, offset) => entry(from + offset));
+  const live = (from: number, to: number) =>
+    reduceNativeConversation(emptyNativeConversation(), {
+      type: "snapshot",
+      page: { ...identity, leafId: `e${to}`, entries: range(from, to), totalEntries: 20 },
+    });
+
+  it("keeps paged older history in front of a live tail that moved on", () => {
+    const paged = reduceNativeConversation(emptyNativeConversation(), {
+      type: "snapshot",
+      page: { ...identity, entries: range(2, 9), totalEntries: 20 },
+    });
+    const shown = mergeThreadConversation(paged, live(5, 11));
+    expect(shown.entries.map((item) => item.id)).toEqual(range(2, 11).map((item) => item.id));
+    expect(shown.identity?.leafId).toBe("e11");
+  });
+
+  it("never carries paged history into another session", () => {
+    const other = reduceNativeConversation(emptyNativeConversation(), {
+      type: "snapshot",
+      page: { ...identity, sessionId: "other", entries: range(0, 4), totalEntries: 5 },
+    });
+    const source = live(5, 9);
+    expect(mergeThreadConversation(other, source)).toBe(source);
   });
 });

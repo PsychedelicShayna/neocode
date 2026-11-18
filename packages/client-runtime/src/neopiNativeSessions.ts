@@ -305,7 +305,7 @@ export interface NativeObservation {
     readonly cursor: NeoPiNativeCursor | null;
   } | null;
 }
-export const emptyNativeObservation = (): NativeObservation => ({
+const emptyNativeObservation = (): NativeObservation => ({
   domain: null,
   cursor: null,
   entities: new Map(),
@@ -465,7 +465,7 @@ function retainNativePending(
  * Ends the outstanding read, so its reply changes nothing. Called whenever the
  * owner, the identity domain or the lease the read was sent under ends.
  */
-export const invalidateNativeReads = (feed: NativeSessionFeed): NativeSessionFeed =>
+const invalidateNativeReads = (feed: NativeSessionFeed): NativeSessionFeed =>
   feed.observation.outstanding === null
     ? feed
     : { ...feed, observation: { ...feed.observation, outstanding: null } };
@@ -481,7 +481,7 @@ const decodeSegmentedEntity = Schema.decodeUnknownOption(Schema.fromJsonString(N
  * present; a row the authority no longer holds and cannot identify becomes a
  * continuity loss.
  */
-export function applyNativeRead(
+function applyNativeRead(
   feed: NativeSessionFeed,
   readId: number,
   result: NeoPiNativeSessionsReadResult,
@@ -827,7 +827,7 @@ export const NATIVE_INBOX_LIMIT = 512;
 /** Gap entries (server gaps, client `trimmed` gaps, one `older-details-trimmed`) a feed keeps. */
 export const NATIVE_INBOX_GAP_LIMIT = 64;
 /** Command output rows a feed keeps: the projection retains the newest 256 receipts. */
-export const NATIVE_COMMAND_OUTPUT_LIMIT = 256;
+const NATIVE_COMMAND_OUTPUT_LIMIT = 256;
 /** Per-call detail one `trimmed` gap lists before it reports `toolStreamsTruncated`. */
 const NATIVE_GAP_TOOL_STREAMS = 64;
 /** B5: the owner refused the subagent subscription level; removed once it is granted or not needed. */
@@ -845,7 +845,7 @@ const isRawInboxRecord = (item: NativeInboxItem): item is NativeInboxRawRecord =
  * past that bound the oldest become one `older-details-trimmed` entry, which
  * claims no cause and no count.
  */
-export function boundNativeInbox(observation: NativeObservation): NativeObservation {
+function boundNativeInbox(observation: NativeObservation): NativeObservation {
   let raw = 0;
   let gaps = 0;
   for (const item of observation.inbox) {
@@ -1760,7 +1760,7 @@ export function reduceNativeSessionFeed(
   };
 }
 
-export function nativeTranscriptEntries(
+function nativeTranscriptEntries(
   conversation: NativeConversation,
   debug: boolean,
 ): readonly NeoPiJournalEntry[] {

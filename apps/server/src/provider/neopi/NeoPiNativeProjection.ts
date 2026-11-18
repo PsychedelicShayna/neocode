@@ -496,7 +496,7 @@ export interface NeoPiNativeInboxLimits {
  * this bound and would be 500 MiB worst case, which is why rule (a) — nothing
  * retained without a lease — matters (B5).
  */
-export const NEOPI_NATIVE_INBOX_LIMITS: NeoPiNativeInboxLimits = {
+const NEOPI_NATIVE_INBOX_LIMITS: NeoPiNativeInboxLimits = {
   records: 512,
   bytes: 512 * 1024,
 };

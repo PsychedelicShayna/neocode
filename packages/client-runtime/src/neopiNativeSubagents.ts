@@ -32,12 +32,6 @@ export interface NativeSubagentFacts {
   }[];
 }
 
-/**
- * NeoPi advertises this once `get_subagent_history` can list every child of the
- * session, finished and persisted ones included, not only the live roster.
- */
-export const SUBAGENT_HISTORY_CAPABILITY = "subagent_history";
-
 /** Native ownership and read barriers stay out of the source-neutral panel model. */
 export interface NativeSubagent extends RuntimeSubagent {
   readonly native: {

@@ -8,17 +8,19 @@ import {
 import {
   emptyNativeConversation,
   reduceNativeConversation,
-  sameNativeSession,
+  type NativeConversation,
 } from "@t3tools/client-runtime/neopi-conversation";
 import {
   findOlderNativePage,
+  mergeThreadConversation,
   nativeOlderHistoryAvailable,
+  readOnlyThreadConversation,
 } from "@t3tools/client-runtime/neopi-thread-observation";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { nativeSessionAtoms, usePageVisible } from "../../state/neopiNativeSessions";
@@ -26,7 +28,7 @@ import { neopiSessionJournal } from "../../state/neopiSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 
 export const nativeConversationAtoms = createNeoPiConversationAtoms(connectionAtomRuntime);
-export const threadObservationAtoms = createNeoPiThreadObservationAtoms(
+const threadObservationAtoms = createNeoPiThreadObservationAtoms(
   connectionAtomRuntime,
   nativeSessionAtoms,
 );
@@ -42,80 +44,42 @@ export function useThreadNativeObservation(threadRef: ScopedThreadRef) {
 }
 
 export function useNeoPiConversation(threadRef: ScopedThreadRef) {
+  const { environmentId, threadId } = threadRef;
   const { observation, connection } = useThreadNativeObservation(threadRef);
   const refresh = useCallback(
-    () => threadObservationAtoms.refresh(appAtomRegistry, threadRef),
-    [threadRef.environmentId, threadRef.threadId],
+    () => threadObservationAtoms.refresh(appAtomRegistry, { environmentId, threadId }),
+    [environmentId, threadId],
   );
   const read = useAtomCommand(neopiSessionJournal, { reportFailure: false });
-  const [conversation, setConversation] = useState(emptyNativeConversation);
+  /** The conversation the last older page was joined into; the view derives from it. */
+  const [paged, setPaged] = useState<NativeConversation | null>(null);
+  const [readOnlyPage, setReadOnlyPage] = useState<NeoPiJournalPage | null>(null);
   const [paging, setPaging] = useState(false);
   const [pagingError, setPagingError] = useState<string | null>(null);
   const feed = observation.feed;
   const history = connection?.history ?? null;
-  const live = history === "live" ? (feed?.conversation ?? null) : null;
   const phase = feed?.observer.phase ?? null;
-  const sourceEntries = useRef<ReadonlyArray<NeoPiJournalPage["entries"][number]> | null>(null);
-  const current = useRef(conversation);
-  current.current = conversation;
-  // Nothing of another session is rendered or bound: the view only says the session changed.
-  useEffect(() => {
-    if (history !== "none") return;
-    sourceEntries.current = null;
-    setConversation(emptyNativeConversation());
-  }, [history]);
+  // Derived during render. Nothing of another session is rendered or bound: with history
+  // "none" the view shows nothing, and paged history joins only the same session.
+  const conversation = useMemo(() => {
+    if (history === "live" && feed) return mergeThreadConversation(paged, feed.conversation);
+    if (history === "read-only")
+      return mergeThreadConversation(paged, readOnlyThreadConversation(readOnlyPage));
+    return emptyNativeConversation();
+  }, [history, feed, paged, readOnlyPage]);
   // A stop is re-read from the binding: whether NeoCode's own runtime still runs decides
   // between "stopped" and "control plane off".
   useEffect(() => {
     if (phase === "owner-stopped" || phase === "incompatible")
-      threadObservationAtoms.refreshRef(appAtomRegistry, threadRef);
-  }, [phase, threadRef.environmentId, threadRef.threadId]);
-  useEffect(() => {
-    if (!live) return;
-    const unchangedEntries = sourceEntries.current === live.entries;
-    sourceEntries.current = live.entries;
-    setConversation((previous) => {
-      const next = live;
-      if (!next.identity || next.needsSnapshot) return next;
-      if (
-        unchangedEntries &&
-        sameNativeSession(previous.identity, next.identity) &&
-        previous.identity?.leafId === next.identity.leafId
-      )
-        return {
-          ...previous,
-          pending: next.pending,
-          persisted: next.persisted,
-          revision: next.revision,
-        };
-      const merged = reduceNativeConversation(previous, {
-        type: "snapshot",
-        page: {
-          ...next.identity,
-          sessionFile: next.identity.sessionFile ?? "",
-          entries: next.entries,
-          totalEntries: next.entries.length,
-          ...(next.cursor ? { nextCursor: next.cursor } : {}),
-        },
-      });
-      const keepCursor =
-        sameNativeSession(previous.identity, next.identity) &&
-        previous.identity?.leafId === next.identity.leafId &&
-        previous.cursorLeaf === next.cursorLeaf;
-      return {
-        ...next,
-        entries: merged.entries,
-        ...(keepCursor ? { cursor: previous.cursor, cursorLeaf: previous.cursorLeaf } : {}),
-      };
-    });
-  }, [live]);
+      threadObservationAtoms.refreshRef(appAtomRegistry, { environmentId, threadId });
+  }, [phase, environmentId, threadId]);
 
   const fetchPage = useCallback(
     async (nextCursor: string | undefined, limit: number): Promise<NeoPiJournalPage> => {
       const response = await read({
-        environmentId: threadRef.environmentId,
+        environmentId,
         input: {
-          threadId: threadRef.threadId,
+          threadId,
           scope: "branch",
           direction: "backward",
           limit,
@@ -132,18 +96,17 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
         );
       return response.value.page;
     },
-    [read, threadRef.environmentId, threadRef.threadId],
+    [read, environmentId, threadId],
   );
 
-  // No owner can be observed: show the session's history read-only. The journal read never
-  // starts an owner.
+  // No owner can be observed: read the session's history once, read-only. The journal read
+  // never starts an owner.
   useEffect(() => {
     if (history !== "read-only") return;
     let cancelled = false;
     fetchPage(undefined, 128).then(
       (page) => {
-        if (!cancelled)
-          setConversation((state) => reduceNativeConversation(state, { type: "snapshot", page }));
+        if (!cancelled) setReadOnlyPage(page);
       },
       (cause: unknown) => {
         if (!cancelled)
@@ -156,17 +119,17 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   }, [history, fetchPage]);
 
   const loadOlder = useCallback(async () => {
-    if (paging) return;
-    const captured = current.current;
-    if (!captured.identity) return;
+    if (paging || !conversation.identity) return;
+    const captured = conversation;
+    const leafId = conversation.identity.leafId;
     setPaging(true);
     setPagingError(null);
     try {
       const page = await findOlderNativePage(captured, (cursor) => fetchPage(cursor, 100));
       if (!page) return;
-      setConversation((state) =>
+      setPaged(
         reduceNativeConversation(
-          { ...state, cursorLeaf: captured.identity!.leafId },
+          { ...captured, cursorLeaf: leafId },
           { type: "older", page, revision: captured.revision },
         ),
       );
@@ -177,7 +140,7 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     } finally {
       setPaging(false);
     }
-  }, [paging, fetchPage]);
+  }, [paging, conversation, fetchPage]);
 
   return {
     conversation,

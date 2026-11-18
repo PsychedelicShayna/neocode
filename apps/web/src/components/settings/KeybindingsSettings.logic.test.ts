@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { ResolvedKeybindingsConfig } from "@t3tools/contracts";
-import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
+import type { KeybindingRule, ResolvedKeybindingsConfig } from "@t3tools/contracts";
+import {
+  compileResolvedKeybindingsConfig,
+  DEFAULT_RESOLVED_KEYBINDINGS,
+} from "@t3tools/shared/keybindings";
 
 import {
   buildKeybindingRows,
@@ -9,6 +12,7 @@ import {
   commandLabel,
   keybindingConflictLabels,
   keybindingFromKeyboardEvent,
+  recordKeybindingStep,
   parseWhenExpressionDraft,
   shortcutToKeybindingInput,
   unknownWhenVariables,
@@ -357,5 +361,137 @@ describe("KeybindingsSettings.logic", () => {
         when: "",
       }),
     ).toEqual(["Chat: New Local"]);
+  });
+
+  describe("clash analysis", () => {
+    const rowsFor = (rules: ReadonlyArray<KeybindingRule>) =>
+      buildKeybindingRows(compileResolvedKeybindingsConfig(rules), "");
+    const conflictsOf = (rules: ReadonlyArray<KeybindingRule>, command: string) =>
+      rowsFor(rules).find((row) => row.command === command)?.conflicts;
+    const draftConflicts = (
+      rules: ReadonlyArray<KeybindingRule>,
+      draft: { key: string; when?: string; command?: KeybindingRule["command"] },
+      platform = "Linux",
+    ) =>
+      keybindingConflictLabels(
+        rowsFor(rules),
+        { rowId: "new", key: draft.key, when: draft.when ?? "", command: draft.command ?? null },
+        platform,
+      );
+
+    it("finds no conflicts among the defaults", () => {
+      for (const platform of ["Linux", "MacIntel"]) {
+        const rows = buildKeybindingRows(DEFAULT_RESOLVED_KEYBINDINGS, "");
+        for (const row of rows) {
+          expect(
+            keybindingConflictLabels(
+              rows,
+              {
+                rowId: row.id,
+                key: row.key,
+                when: row.when,
+                command: row.command,
+                order: row.order,
+              },
+              platform,
+            ),
+            `${row.command} ${row.key} on ${platform}`,
+          ).toEqual([]);
+        }
+      }
+    });
+
+    it("compares keys as the platform presses them, not as written", () => {
+      const rules = [{ key: "ctrl+k", command: "sidebar.toggle" }] satisfies KeybindingRule[];
+      expect(draftConflicts(rules, { key: "mod+k" }, "Linux")).toEqual(["Sidebar: Toggle"]);
+      expect(draftConflicts(rules, { key: "mod+k" }, "MacIntel")).toEqual([]);
+    });
+
+    it("reports overlapping conditions but not exclusive ones", () => {
+      const rules = [
+        { key: "mod+g", command: "sidebar.toggle", when: "nativeSession && !composerFocus" },
+      ] satisfies KeybindingRule[];
+      expect(draftConflicts(rules, { key: "mod+g", when: "composerFocus" })).toEqual([]);
+      expect(
+        draftConflicts(rules, { key: "mod+g", when: "!nativeSession || editableFocus" }),
+      ).toEqual(["Sidebar: Toggle"]);
+      // Focus is in one place, so terminal-focused and preview-focused rules never meet.
+      expect(
+        conflictsOf(
+          [
+            { key: "mod+g", command: "preview.refresh", when: "previewFocus" },
+            { key: "mod+g", command: "diff.toggle", when: "terminalFocus || editableFocus" },
+          ],
+          "preview.refresh",
+        ),
+      ).toEqual(["Diff: Toggle"]);
+    });
+
+    it("treats a later rule that only narrows an earlier one as an override", () => {
+      const general = { key: "mod+g", command: "sidebar.toggle", when: "!terminalFocus" } as const;
+      const narrow = {
+        key: "mod+g",
+        command: "diff.toggle",
+        when: "nativeSession && !terminalFocus",
+      } as const;
+      expect(conflictsOf([general, narrow], "sidebar.toggle")).toEqual([]);
+      // The other way round, the broad rule hides the narrow one entirely.
+      expect(conflictsOf([narrow, general], "sidebar.toggle")).toEqual(["Diff: Toggle"]);
+    });
+
+    it("reports a chord that is the first chord of a sequence, not two sequences sharing it", () => {
+      const rules = [{ key: "ctrl+w h", command: "sidebar.toggle" }] satisfies KeybindingRule[];
+      expect(draftConflicts(rules, { key: "ctrl+w" })).toEqual(["Sidebar: Toggle"]);
+      expect(draftConflicts(rules, { key: "ctrl+w l" })).toEqual([]);
+      expect(draftConflicts(rules, { key: "ctrl+w h" })).toEqual(["Sidebar: Toggle"]);
+    });
+
+    it("reserves the terminal escape and font keys in a focused terminal", () => {
+      const rules = [
+        { key: "ctrl+\\ ctrl+\\", command: "terminal.leaveFocus", when: "terminalFocus" },
+        { key: "mod+=", command: "terminal.fontSize.increase", when: "terminalFocus" },
+      ] satisfies KeybindingRule[];
+      expect(draftConflicts(rules, { key: "ctrl+\\" })).toEqual(["Terminal: Leave Focus"]);
+      // A narrower later rule cannot take the key back from the terminal.
+      expect(draftConflicts(rules, { key: "mod+=", when: "terminalFocus && isDesktop" })).toEqual([
+        "Terminal: Font Size: Increase",
+      ]);
+      expect(draftConflicts(rules, { key: "ctrl+\\", when: "!terminalFocus" })).toEqual([]);
+    });
+  });
+
+  describe("recording a binding", () => {
+    const keydown = (
+      key: string,
+      modifiers: Partial<Record<"ctrlKey" | "shiftKey", boolean>> = {},
+    ) => ({
+      key,
+      code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+      metaKey: false,
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: false,
+      ...modifiers,
+    });
+
+    it("records a two-chord sequence whose second chord may be a bare key", () => {
+      const first = recordKeybindingStep(null, keydown("w", { ctrlKey: true }), "Linux");
+      expect(first).toEqual({ key: "mod+w", done: false });
+      expect(
+        recordKeybindingStep("mod+w", keydown("Shift", { shiftKey: true }), "Linux"),
+      ).toBeNull();
+      expect(recordKeybindingStep("mod+w", keydown("h"), "Linux")).toEqual({
+        key: "mod+w h",
+        done: true,
+      });
+    });
+
+    it("keeps a single chord on Enter and needs a modifier to start", () => {
+      expect(recordKeybindingStep("mod+w", keydown("Enter"), "Linux")).toEqual({
+        key: "mod+w",
+        done: true,
+      });
+      expect(recordKeybindingStep(null, keydown("h"), "Linux")).toBeNull();
+    });
   });
 });

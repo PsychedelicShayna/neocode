@@ -107,15 +107,23 @@ export function sameSnapShotShortcut(
   return shortcutConflictKey(left, platform) === shortcutConflictKey(right, platform);
 }
 
+/** The app binding a global capture shortcut would take keys from: one on that chord, or a sequence starting on it. */
 export function snapShotKeybindingConflict<Command extends string>(
   shortcut: SnapShotShortcut,
-  keybindings: ReadonlyArray<{ readonly command: Command; readonly shortcut: KeybindingShortcut }>,
+  keybindings: ReadonlyArray<
+    { readonly command: Command } & (
+      | { readonly shortcut: KeybindingShortcut }
+      | { readonly sequence: readonly [KeybindingShortcut, KeybindingShortcut] }
+    )
+  >,
   platform = navigator.platform,
 ): Command | null {
   if (isModifierPairShortcut(shortcut)) return null;
   const key = shortcutConflictKey(shortcut, platform);
   return (
-    keybindings.find((binding) => shortcutConflictKey(binding.shortcut, platform) === key)
-      ?.command ?? null
+    keybindings.find((binding) => {
+      const first = "sequence" in binding ? binding.sequence[0] : binding.shortcut;
+      return shortcutConflictKey(first, platform) === key;
+    })?.command ?? null
   );
 }

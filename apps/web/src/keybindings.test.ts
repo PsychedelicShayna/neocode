@@ -1683,3 +1683,77 @@ describe("focused terminal input", () => {
     );
   });
 });
+
+describe("two-chord sequences", () => {
+  const bindings = mergeWithDefaultKeybindings(
+    compileResolvedKeybindingsConfig([
+      { key: "ctrl+w h", command: "sidebar.toggle", when: "!terminalFocus" },
+      { key: "ctrl+w l", command: "rightPanel.toggle", when: "!terminalFocus" },
+    ]),
+  );
+  const options = { platform: "Linux", context: { terminalFocus: false } };
+  // Each keydown is its own event object, as the browser delivers them.
+  const press = (overrides: Partial<ShortcutEventLike>) => {
+    let prevented = false;
+    const keydown = event({
+      type: "keydown",
+      ...overrides,
+      preventDefault: () => {
+        prevented = true;
+      },
+    });
+    return { keydown, prevented: () => prevented };
+  };
+  // Starts each case from a keypress that begins nothing.
+  const settle = () => resolveShortcutCommand(press({ key: "F7" }).keydown, bindings, options);
+
+  it("holds the first chord, consuming it, and runs the command on the second", () => {
+    settle();
+    const first = press({ key: "w", ctrlKey: true });
+    assert.isNull(resolveShortcutCommand(first.keydown, bindings, options));
+    assert.isTrue(first.prevented());
+    assert.strictEqual(
+      resolveShortcutCommand(press({ key: "l" }).keydown, bindings, options),
+      "rightPanel.toggle",
+    );
+    // The sequence is used up: a second `l` is an ordinary key again.
+    assert.isNull(resolveShortcutCommand(press({ key: "l" }).keydown, bindings, options));
+  });
+
+  it("drops the first chord on any other key, which then resolves on its own", () => {
+    settle();
+    resolveShortcutCommand(press({ key: "w", ctrlKey: true }).keydown, bindings, options);
+    assert.strictEqual(
+      resolveShortcutCommand(press({ key: "k", ctrlKey: true }).keydown, bindings, options),
+      "commandPalette.toggle",
+    );
+    assert.isNull(resolveShortcutCommand(press({ key: "h" }).keydown, bindings, options));
+  });
+
+  it("waits through bare modifier presses between the chords", () => {
+    settle();
+    resolveShortcutCommand(press({ key: "w", ctrlKey: true }).keydown, bindings, options);
+    resolveShortcutCommand(press({ key: "Shift", shiftKey: true }).keydown, bindings, options);
+    assert.strictEqual(
+      resolveShortcutCommand(press({ key: "h" }).keydown, bindings, options),
+      "sidebar.toggle",
+    );
+  });
+
+  it("gives every listener of one keydown the same answer", () => {
+    settle();
+    const first = press({ key: "w", ctrlKey: true }).keydown;
+    // A window listener and a React handler both see the first chord; the
+    // React event wraps the same browser event.
+    assert.isNull(resolveShortcutCommand(first, bindings, options));
+    assert.isNull(resolveShortcutCommand({ ...first, nativeEvent: first }, bindings, options));
+    const second = press({ key: "h" }).keydown;
+    for (let listener = 0; listener < 3; listener += 1) {
+      assert.strictEqual(resolveShortcutCommand(second, bindings, options), "sidebar.toggle");
+    }
+  });
+
+  it("labels a sequence with both chords", () => {
+    assert.strictEqual(shortcutLabelForCommand(bindings, "sidebar.toggle", "Linux"), "Ctrl+W H");
+  });
+});

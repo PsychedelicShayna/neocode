@@ -12,6 +12,7 @@ import {
   KeybindingsConfigError,
   KeybindingShortcut,
   KeybindingWhenNode,
+  keybindingRuleSteps,
   MAX_KEYBINDINGS_COUNT,
   ResolvedKeybindingRule,
   ResolvedKeybindingsConfig,
@@ -45,10 +46,12 @@ import { writeFileStringAtomically } from "./atomicWrite.ts";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import {
   DEFAULT_KEYBINDINGS,
+  RETIRED_TERMINAL_FOCUS_DEFAULT_KEYBINDINGS,
   mergeWithDefaultKeybindings,
   compileResolvedKeybindingRule,
   compileResolvedKeybindingsConfig,
   parseKeybindingShortcut,
+  parseKeybindingSteps,
 } from "@t3tools/shared/keybindings";
 
 export {
@@ -76,7 +79,7 @@ export const ResolvedKeybindingFromConfig = KeybindingRule.pipe(
 
       encode: (resolved) =>
         Effect.gen(function* () {
-          const key = encodeShortcut(resolved.shortcut);
+          const key = encodeKeybindingSteps(keybindingRuleSteps(resolved));
           if (!key) {
             return yield* Effect.fail(
               new SchemaIssue.InvalidValue({
@@ -105,9 +108,9 @@ function isSameKeybindingRule(left: KeybindingRule, right: KeybindingRule): bool
 }
 
 function keybindingShortcutContext(rule: KeybindingRule): string | null {
-  const parsed = parseKeybindingShortcut(rule.key);
-  if (!parsed) return null;
-  const encoded = encodeShortcut(parsed);
+  const steps = parseKeybindingSteps(rule.key);
+  if (!steps) return null;
+  const encoded = encodeKeybindingSteps(steps);
   if (!encoded) return null;
   return `${encoded}\u0000${rule.when ?? ""}`;
 }
@@ -149,6 +152,16 @@ function encodeShortcut(shortcut: KeybindingShortcut): string | null {
   if (shortcut.key !== "+" && shortcut.key.includes("+")) return null;
   const key = shortcut.key === " " ? "space" : shortcut.key;
   return [...modifiers, key].join("+");
+}
+
+function encodeKeybindingSteps(steps: ReadonlyArray<KeybindingShortcut>): string | null {
+  const encoded: string[] = [];
+  for (const step of steps) {
+    const key = encodeShortcut(step);
+    if (!key) return null;
+    encoded.push(key);
+  }
+  return encoded.join(" ");
 }
 
 function encodeWhenAst(node: KeybindingWhenNode): string {
@@ -469,7 +482,25 @@ const make = Effect.gen(function* () {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
-      const customConfig = runtimeConfig.keybindings;
+      // Files written before `terminal.leaveFocus` existed still hold the
+      // retired terminal-focus defaults, which can no longer fire in a terminal.
+      // Drop exact copies of them once: backfill below then adds
+      // `terminal.leaveFocus`, which marks the file as migrated, and the retired
+      // commands have no defaults left for backfill to restore. Any other rule,
+      // including the user's own rules for those commands, is kept.
+      const savedConfig = runtimeConfig.keybindings;
+      const migratesRetiredDefaults = !savedConfig.some(
+        (entry) => entry.command === "terminal.leaveFocus",
+      );
+      const customConfig = migratesRetiredDefaults
+        ? savedConfig.filter(
+            (entry) =>
+              !RETIRED_TERMINAL_FOCUS_DEFAULT_KEYBINDINGS.some((retired) =>
+                isSameKeybindingRule(entry, retired),
+              ),
+          )
+        : savedConfig;
+      const removedRetiredDefaults = customConfig.length !== savedConfig.length;
       const existingCommands = new Set(customConfig.map((entry) => entry.command));
       const missingDefaults: KeybindingRule[] = [];
       const shortcutConflictWarnings: Array<{
@@ -506,7 +537,7 @@ const make = Effect.gen(function* () {
           reason: "shortcut context already used by existing rule",
         });
       }
-      if (missingDefaults.length === 0) {
+      if (missingDefaults.length === 0 && !removedRetiredDefaults) {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
@@ -535,7 +566,7 @@ const make = Effect.gen(function* () {
           commands: skippedDefaults.map((rule) => rule.command),
         });
       }
-      if (defaultsToAppend.length === 0) {
+      if (defaultsToAppend.length === 0 && !removedRetiredDefaults) {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }

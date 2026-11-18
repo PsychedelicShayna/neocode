@@ -1,6 +1,7 @@
 import {
   STATIC_KEYBINDING_COMMANDS,
   type KeybindingCommand,
+  keybindingRuleSteps,
   type KeybindingShortcut,
   type KeybindingWhenNode,
   type ResolvedKeybindingRule,
@@ -8,10 +9,15 @@ import {
 } from "@t3tools/contracts";
 import {
   DEFAULT_RESOLVED_KEYBINDINGS,
+  parseKeybindingSteps,
   parseKeybindingWhenExpression,
 } from "@t3tools/shared/keybindings";
 
-import { shortcutKeyFromEvent } from "../../keybindings";
+import {
+  isTerminalKeybindingCommand,
+  shortcutConflictKey,
+  shortcutKeyFromEvent,
+} from "../../keybindings";
 import { isMacPlatform } from "../../lib/utils";
 
 export type KeybindingSource = "Default" | "Custom" | "Project";
@@ -25,6 +31,8 @@ export interface KeybindingRow {
   readonly defaultKey: string | null;
   readonly defaultWhen: string;
   readonly binding: ResolvedKeybindingRule;
+  /** Position among the resolved rules: of two matching rules, the later one wins. */
+  readonly order: number;
   readonly conflicts: ReadonlyArray<string>;
 }
 
@@ -111,12 +119,12 @@ function sourceForBinding(binding: ResolvedKeybindingRule): KeybindingSource {
     return "Project";
   }
 
-  const bindingKey = shortcutToKeybindingInput(binding.shortcut);
+  const bindingKey = keybindingRuleInput(binding);
   const bindingWhen = whenAstToExpression(binding.whenAst);
   const isDefault = DEFAULT_RESOLVED_KEYBINDINGS.some(
     (entry) =>
       entry.command === binding.command &&
-      shortcutToKeybindingInput(entry.shortcut) === bindingKey &&
+      keybindingRuleInput(entry) === bindingKey &&
       whenAstToExpression(entry.whenAst) === bindingWhen,
   );
 
@@ -126,14 +134,14 @@ function sourceForBinding(binding: ResolvedKeybindingRule): KeybindingSource {
 function defaultBindingForBinding(
   binding: ResolvedKeybindingRule,
 ): ResolvedKeybindingRule | undefined {
-  const bindingKey = shortcutToKeybindingInput(binding.shortcut);
+  const bindingKey = keybindingRuleInput(binding);
   const bindingWhen = whenAstToExpression(binding.whenAst);
 
   return (
     DEFAULT_RESOLVED_KEYBINDINGS.find(
       (entry) =>
         entry.command === binding.command &&
-        shortcutToKeybindingInput(entry.shortcut) === bindingKey &&
+        keybindingRuleInput(entry) === bindingKey &&
         whenAstToExpression(entry.whenAst) === bindingWhen,
     ) ??
     DEFAULT_RESOLVED_KEYBINDINGS.find(
@@ -144,28 +152,153 @@ function defaultBindingForBinding(
   );
 }
 
+/** A rule's `key` as the settings show and save it; a sequence's chords are space-separated. */
+export function keybindingRuleInput(binding: ResolvedKeybindingRule): string {
+  return keybindingRuleSteps(binding).map(shortcutToKeybindingInput).join(" ");
+}
+
 function keybindingRowId(command: KeybindingCommand, key: string, when: string): string {
   return `${command}\u0000${key}\u0000${when}`;
 }
 
-function conflictsWithWhen(leftWhen: string, rightWhen: string): boolean {
-  return leftWhen.length === 0 || rightWhen.length === 0 || leftWhen === rightWhen;
+function evaluateWhen(
+  node: KeybindingWhenNode | undefined,
+  values: Readonly<Record<string, boolean>>,
+): boolean {
+  if (!node) return true;
+  switch (node.type) {
+    case "identifier":
+      if (node.name === "true") return true;
+      if (node.name === "false") return false;
+      return values[node.name] === true;
+    case "not":
+      return !evaluateWhen(node.node, values);
+    case "and":
+      return evaluateWhen(node.left, values) && evaluateWhen(node.right, values);
+    case "or":
+      return evaluateWhen(node.left, values) || evaluateWhen(node.right, values);
+  }
 }
 
+// Beyond this many distinct variables in a pair of conditions, they are
+// assumed to overlap rather than enumerated.
+const MAX_ENUMERATED_WHEN_VARIABLES = 12;
+
+/**
+ * Every state the context keys of two conditions can be in together. The
+ * app never reports the web and desktop app at once, nor keyboard focus in a
+ * terminal and the preview at once, so those states are left out. Null when
+ * there are too many variables to enumerate.
+ */
+function whenStates(
+  left: KeybindingWhenNode | undefined,
+  right: KeybindingWhenNode | undefined,
+): Array<Record<string, boolean>> | null {
+  const identifiers = new Set<string>();
+  collectWhenIdentifiersFromNode(left, identifiers);
+  collectWhenIdentifiersFromNode(right, identifiers);
+  identifiers.delete("true");
+  identifiers.delete("false");
+  const names = [...identifiers];
+  if (names.length > MAX_ENUMERATED_WHEN_VARIABLES) return null;
+  const states: Array<Record<string, boolean>> = [];
+  for (let mask = 0; mask < 1 << names.length; mask += 1) {
+    const values: Record<string, boolean> = {};
+    names.forEach((name, index) => {
+      values[name] = (mask & (1 << index)) !== 0;
+    });
+    const webAndDesktop = identifiers.has("isWeb") && identifiers.has("isDesktop");
+    if (webAndDesktop && values.isWeb === values.isDesktop) continue;
+    if (values.terminalFocus && values.previewFocus) continue;
+    states.push(values);
+  }
+  return states;
+}
+
+interface ConflictCandidate {
+  readonly command: KeybindingCommand | null;
+  readonly steps: ReadonlyArray<string>;
+  readonly whenAst: KeybindingWhenNode | undefined;
+  readonly order: number;
+}
+
+/**
+ * Whether two rules compete for the same keypress: the same chords, or one
+ * rule's chord is the first chord of the other's sequence, under conditions
+ * that can hold at once. A focused terminal acts only on its own commands
+ * (leaving it, font size), so a key one of those holds there is reserved:
+ * any other rule on it conflicts. Otherwise the later rule wins, and a later
+ * rule whose condition only narrows the earlier one's is a deliberate
+ * override, not a conflict.
+ */
+function rulesConflict(left: ConflictCandidate, right: ConflictCandidate): boolean {
+  const [shorter, longer] = left.steps.length <= right.steps.length ? [left, right] : [right, left];
+  const clash =
+    shorter.steps.length === longer.steps.length
+      ? shorter.steps.every((step, index) => step === longer.steps[index])
+      : shorter.steps[0] === longer.steps[0];
+  if (!clash) return false;
+
+  const states = whenStates(left.whenAst, right.whenAst);
+  if (!states) return true;
+  const applyTogether = states.some(
+    (values) => evaluateWhen(left.whenAst, values) && evaluateWhen(right.whenAst, values),
+  );
+  if (!applyTogether) return false;
+
+  const leftTerminal = left.command !== null && isTerminalKeybindingCommand(left.command);
+  const rightTerminal = right.command !== null && isTerminalKeybindingCommand(right.command);
+  if (leftTerminal !== rightTerminal) return true;
+
+  const [earlier, later] = left.order <= right.order ? [left, right] : [right, left];
+  const laterImpliesEarlier = states.every(
+    (values) => !evaluateWhen(later.whenAst, values) || evaluateWhen(earlier.whenAst, values),
+  );
+  const earlierAlone = states.some(
+    (values) => evaluateWhen(earlier.whenAst, values) && !evaluateWhen(later.whenAst, values),
+  );
+  return !(laterImpliesEarlier && earlierAlone);
+}
+
+/**
+ * Labels of the commands whose rules compete with a binding being edited, as
+ * `rulesConflict` defines it. A draft has no command until one is chosen and
+ * is saved as the last rule unless `order` says otherwise.
+ */
 export function keybindingConflictLabels(
   rows: ReadonlyArray<KeybindingRow>,
-  input: { readonly rowId: string; readonly key: string; readonly when: string },
+  input: {
+    readonly rowId: string;
+    readonly key: string;
+    readonly when: string;
+    readonly command?: KeybindingCommand | null;
+    readonly order?: number;
+  },
+  platform = navigator.platform,
 ): ReadonlyArray<string> {
-  if (input.key.trim().length === 0) return [];
+  const steps = input.key.trim().length === 0 ? null : parseKeybindingSteps(input.key);
+  if (!steps) return [];
+  const when = input.when.trim();
+  const whenAst = when.length === 0 ? undefined : parseKeybindingWhenExpression(when);
+  if (whenAst === null) return [];
+  const draft: ConflictCandidate = {
+    command: input.command ?? null,
+    steps: steps.map((step) => shortcutConflictKey(step, platform)),
+    whenAst,
+    order: input.order ?? Number.POSITIVE_INFINITY,
+  };
   const conflicts: Array<string> = [];
   for (const candidate of rows) {
-    if (
-      candidate.id !== input.rowId &&
-      candidate.key === input.key &&
-      conflictsWithWhen(candidate.when, input.when)
-    ) {
-      conflicts.push(commandLabel(candidate.command));
-    }
+    if (candidate.id === input.rowId) continue;
+    const other: ConflictCandidate = {
+      command: candidate.command,
+      steps: keybindingRuleSteps(candidate.binding).map((step) =>
+        shortcutConflictKey(step, platform),
+      ),
+      whenAst: candidate.binding.whenAst,
+      order: candidate.order,
+    };
+    if (rulesConflict(draft, other)) conflicts.push(commandLabel(candidate.command));
   }
   return [...new Set(conflicts)].toSorted();
 }
@@ -177,7 +310,7 @@ export function buildKeybindingRows(
   const normalizedQuery = query.trim().toLowerCase();
   const rows = keybindings.map((binding, index) => {
     const defaultBinding = defaultBindingForBinding(binding);
-    const key = shortcutToKeybindingInput(binding.shortcut);
+    const key = keybindingRuleInput(binding);
     const when = whenAstToExpression(binding.whenAst);
     return {
       id: `${keybindingRowId(binding.command, key, when)}\u0000${index}`,
@@ -185,9 +318,10 @@ export function buildKeybindingRows(
       key,
       when,
       source: sourceForBinding(binding),
-      defaultKey: defaultBinding ? shortcutToKeybindingInput(defaultBinding.shortcut) : null,
+      defaultKey: defaultBinding ? keybindingRuleInput(defaultBinding) : null,
       defaultWhen: whenAstToExpression(defaultBinding?.whenAst),
       binding,
+      order: index,
       conflicts: [],
     } satisfies KeybindingRow;
   });
@@ -197,6 +331,8 @@ export function buildKeybindingRows(
       rowId: row.id,
       key: row.key,
       when: row.when,
+      command: row.command,
+      order: row.order,
     });
     return conflicts.length > 0
       ? Object.assign({}, row, { conflicts: [...new Set(conflicts)].toSorted() })
@@ -331,9 +467,15 @@ function normalizeShortcutKeyToken(key: string): string | null {
   return null;
 }
 
-export function keybindingFromKeyboardEvent(
-  event: Pick<KeyboardEvent, "key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">,
+type RecordedKeyEvent = Pick<
+  KeyboardEvent,
+  "key" | "code" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
+>;
+
+function chordFromKeyboardEvent(
+  event: RecordedKeyEvent,
   platform: string,
+  requireModifier: boolean,
 ): string | null {
   const keyToken = normalizeShortcutKeyToken(shortcutKeyFromEvent(event));
   if (!keyToken) return null;
@@ -348,9 +490,37 @@ export function keybindingFromKeyboardEvent(
   }
   if (event.altKey) parts.push("alt");
   if (event.shiftKey) parts.push("shift");
-  if (parts.length === 0) {
+  if (requireModifier && parts.length === 0) {
     return null;
   }
   parts.push(keyToken);
   return parts.join("+");
+}
+
+export function keybindingFromKeyboardEvent(
+  event: RecordedKeyEvent,
+  platform: string,
+): string | null {
+  return chordFromKeyboardEvent(event, platform, true);
+}
+
+/**
+ * One keypress while recording a binding. The first chord needs a modifier;
+ * the press after it becomes the second chord of a sequence (`ctrl+w h`), or
+ * plain Enter keeps the first chord alone. `done` ends the recording. Null
+ * for a press that records nothing, such as a bare modifier.
+ */
+export function recordKeybindingStep(
+  firstStep: string | null,
+  event: RecordedKeyEvent,
+  platform: string,
+): { readonly key: string; readonly done: boolean } | null {
+  if (firstStep === null) {
+    const chord = chordFromKeyboardEvent(event, platform, true);
+    return chord ? { key: chord, done: false } : null;
+  }
+  const bare = !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
+  if (bare && event.key === "Enter") return { key: firstStep, done: true };
+  const chord = chordFromKeyboardEvent(event, platform, false);
+  return chord ? { key: `${firstStep} ${chord}`, done: true } : null;
 }

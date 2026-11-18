@@ -24,6 +24,7 @@ import {
 } from "react";
 import {
   type KeybindingCommand,
+  keybindingRuleSteps,
   type KeybindingWhenNode,
   type ServerRemoveKeybindingInput,
   type ServerUpsertKeybindingInput,
@@ -36,7 +37,7 @@ import {
 
 import { isElectron } from "../../env";
 import { useOpenInPreferredEditor } from "../../editorPreferences";
-import { formatShortcutLabel } from "../../keybindings";
+import { formatKeybindingStepsLabel } from "../../keybindings";
 import { cn } from "../../lib/utils";
 import { serverEnvironment } from "../../state/server";
 import { useSettingsScope } from "./SettingsScopeContext";
@@ -58,7 +59,7 @@ import {
   DEFAULT_WHEN_VARIABLE,
   isKnownWhenVariable,
   keybindingConflictLabels,
-  keybindingFromKeyboardEvent,
+  recordKeybindingStep,
   parseWhenExpressionDraft,
   type KeybindingCommandOption,
   type KeybindingRow,
@@ -72,7 +73,19 @@ import { keybindingSearchAnchorId, searchableSetting } from "./settingsSearch";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useAtomCommand } from "../../state/use-atom-command";
 
+/** A binding's chords; a sequence shows its two chords side by side. */
 function KeybindingPill({ value }: { value: string }) {
+  const [first, second] = value.split(" ");
+  if (first === undefined || second === undefined) return <KeybindingChordPill value={value} />;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <KeybindingChordPill value={first} />
+      <KeybindingChordPill value={second} />
+    </span>
+  );
+}
+
+function KeybindingChordPill({ value }: { value: string }) {
   // Keys dedupe repeated parts; a literal "+" in a shortcut splits into empty strings.
   const seenParts = new Map<string, number>();
   const parts = value.split("+").map((part) => {
@@ -712,6 +725,8 @@ type KeybindingRowDraftState = {
   keyDraft: string;
   whenDraft: KeybindingWhenNode | undefined;
   isRecording: boolean;
+  /** The first chord pressed in this recording, waiting for a possible second. */
+  recordedFirstStep: string | null;
   isWhenDraftValid: boolean;
 };
 
@@ -720,8 +735,27 @@ function createKeybindingRowDraft(row: KeybindingRow): KeybindingRowDraftState {
     keyDraft: row.key,
     whenDraft: row.binding.whenAst,
     isRecording: false,
+    recordedFirstStep: null,
     isWhenDraftValid: true,
   };
+}
+
+/** The draft change for one keypress in a shortcut capture input. */
+function recordKeybindingPatch(
+  draft: KeybindingRowDraftState,
+  event: KeyboardEvent<HTMLInputElement>,
+  restoreKey: string,
+): Partial<KeybindingRowDraftState> | null {
+  if (event.key === "Tab") return null;
+  event.preventDefault();
+  if (event.key === "Escape") {
+    return { keyDraft: restoreKey, isRecording: false, recordedFirstStep: null };
+  }
+  const next = recordKeybindingStep(draft.recordedFirstStep, event.nativeEvent, navigator.platform);
+  if (!next) return null;
+  return next.done
+    ? { keyDraft: next.key, isRecording: false, recordedFirstStep: null }
+    : { keyDraft: next.key, recordedFirstStep: next.key };
 }
 
 function keybindingRowDraftReducer(
@@ -757,6 +791,7 @@ function useKeybindingRowEditor({
     rowId: row.id,
     key: keyDraft,
     when: whenDraftExpression,
+    command: row.command,
   });
 
   const save = () => {
@@ -769,19 +804,13 @@ function useKeybindingRowEditor({
   };
 
   const captureKeybinding = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "Tab") return;
-    event.preventDefault();
-    if (event.key === "Escape") {
-      setDraft({ keyDraft: row.key, isRecording: false });
-      return;
-    }
-    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform);
-    if (!next) return;
-    setDraft({ keyDraft: next, isRecording: false });
+    const patch = recordKeybindingPatch(draft, event, row.key);
+    if (patch) setDraft(patch);
   };
 
   return {
     keyDraft,
+    recordedFirstStep: draft.recordedFirstStep,
     whenDraft,
     isRecording,
     isWhenDraftValid,
@@ -841,7 +870,7 @@ function KeybindingKeyControl({
         <button
           type="button"
           onClick={() => setDraft({ isRecording: true })}
-          aria-label={`Edit shortcut for ${commandLabel(row.command)}: ${formatShortcutLabel(row.binding.shortcut)}`}
+          aria-label={`Edit shortcut for ${commandLabel(row.command)}: ${formatKeybindingStepsLabel(keybindingRuleSteps(row.binding))}`}
           className={cn(
             "inline-flex h-8 cursor-pointer items-center rounded-md border border-transparent px-1.5 sm:h-7 outline-none transition-colors hover:border-border/70 hover:bg-accent focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/24",
             pillClassName,
@@ -854,13 +883,13 @@ function KeybindingKeyControl({
           data-keybinding-capture=""
           autoFocus={isRecording}
           aria-label={`Keybinding for ${commandLabel(row.command)}`}
-          value={isRecording ? "" : keyDraft}
+          value={isRecording ? (editor.recordedFirstStep ?? "") : keyDraft}
           placeholder={isRecording ? "Press shortcut" : "Unassigned"}
           size="sm"
           font="mono"
           className="w-44"
-          onFocus={() => setDraft({ isRecording: true })}
-          onBlur={() => setDraft({ isRecording: false })}
+          onFocus={() => setDraft({ isRecording: true, recordedFirstStep: null })}
+          onBlur={() => setDraft({ isRecording: false, recordedFirstStep: null })}
           onChange={(event) => setDraft({ keyDraft: event.currentTarget.value })}
           onKeyDown={captureKeybinding}
         />
@@ -1062,6 +1091,7 @@ function useNewKeybindingDraft({
     keyDraft: "",
     whenDraft: undefined,
     isRecording: false,
+    recordedFirstStep: null,
     isWhenDraftValid: true,
   });
   const { keyDraft, whenDraft, isRecording, isWhenDraftValid } = draft;
@@ -1070,6 +1100,7 @@ function useNewKeybindingDraft({
     rowId: "new",
     key: keyDraft,
     when: whenDraftExpression,
+    command: commandDraft || null,
   });
   const commandLabelText = commandDraft ? commandLabel(commandDraft) : "new keybinding";
   const canSave = Boolean(commandDraft) && keyDraft.trim().length > 0 && isWhenDraftValid;
@@ -1084,21 +1115,15 @@ function useNewKeybindingDraft({
   };
 
   const captureKeybinding = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "Tab") return;
-    event.preventDefault();
-    if (event.key === "Escape") {
-      setDraft({ keyDraft: "", isRecording: false });
-      return;
-    }
-    const next = keybindingFromKeyboardEvent(event.nativeEvent, navigator.platform);
-    if (!next) return;
-    setDraft({ keyDraft: next, isRecording: false });
+    const patch = recordKeybindingPatch(draft, event, "");
+    if (patch) setDraft(patch);
   };
 
   return {
     commandDraft,
     setCommandDraft,
     keyDraft,
+    recordedFirstStep: draft.recordedFirstStep,
     whenDraft,
     whenDraftExpression,
     isRecording,
@@ -1164,13 +1189,13 @@ function NewKeybindingKeyInput({
       data-keybinding-capture=""
       autoFocus={autoFocus}
       aria-label={`Keybinding for ${draft.commandLabelText}`}
-      value={draft.isRecording ? "" : draft.keyDraft}
+      value={draft.isRecording ? (draft.recordedFirstStep ?? "") : draft.keyDraft}
       placeholder={draft.isRecording ? "Press shortcut" : "Unassigned"}
       size="sm"
       font="mono"
       className={className}
-      onFocus={() => draft.setDraft({ isRecording: true })}
-      onBlur={() => draft.setDraft({ isRecording: false })}
+      onFocus={() => draft.setDraft({ isRecording: true, recordedFirstStep: null })}
+      onBlur={() => draft.setDraft({ isRecording: false, recordedFirstStep: null })}
       onChange={(event) => draft.setDraft({ keyDraft: event.currentTarget.value })}
       onKeyDown={draft.captureKeybinding}
     />

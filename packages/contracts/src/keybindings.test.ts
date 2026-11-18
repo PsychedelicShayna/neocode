@@ -2,9 +2,14 @@ import { assert, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
 
+import { ForwardCompatibleArray } from "./baseSchemas.ts";
 import {
+  KeybindingCommand,
   KeybindingsConfig,
   KeybindingRule,
+  keybindingRuleSteps,
+  KeybindingShortcut,
+  KeybindingWhenNode,
   ResolvedKeybindingRule,
   ResolvedKeybindingsConfig,
 } from "./keybindings.ts";
@@ -197,9 +202,51 @@ it.effect("parses resolved keybinding rules", () =>
         },
       },
     });
-    assert.strictEqual(parsed.shortcut.key, "d");
+    assert.strictEqual(keybindingRuleSteps(parsed)[0].key, "d");
   }),
 );
+
+it.effect("keeps sequence rules, which clients from before sequences drop", () =>
+  Effect.gen(function* () {
+    const payload = [
+      { command: "terminal.toggle", shortcut: { ...chord, key: "j" } },
+      {
+        command: "sidebar.toggle",
+        sequence: [
+          { ...chord, key: "w" },
+          { ...chord, modKey: false, key: "h" },
+        ],
+      },
+    ];
+    const parsed = yield* decode(ResolvedKeybindingsConfig, payload);
+    assert.deepEqual(
+      parsed.map((rule) => keybindingRuleSteps(rule).map((step) => step.key)),
+      [["j"], ["w", "h"]],
+    );
+    // The rule shape those clients decode: it must not read a sequence as its first chord.
+    const beforeSequences = ForwardCompatibleArray(
+      Schema.Struct({
+        command: KeybindingCommand,
+        shortcut: KeybindingShortcut,
+        whenAst: Schema.optional(KeybindingWhenNode),
+      }).annotate({ parseOptions: { onExcessProperty: "ignore" } }),
+    );
+    const legacy = yield* decode(beforeSequences, payload);
+    assert.deepEqual(
+      legacy.map((rule) => rule.command),
+      ["terminal.toggle"],
+    );
+  }),
+);
+
+const chord = {
+  key: "w",
+  metaKey: false,
+  ctrlKey: false,
+  shiftKey: false,
+  altKey: false,
+  modKey: true,
+};
 
 it.effect("parses resolved keybindings arrays", () =>
   Effect.gen(function* () {

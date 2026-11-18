@@ -1,8 +1,12 @@
-import { shortcutKeyFromEvent } from "../keybindings";
-import { isTerminalCompositionKey } from "./ghostty/surface";
+import { keybindingRuleSteps } from "@t3tools/contracts";
 
-/** The byte Ctrl+Backslash sends to a program in the legacy keyboard encoding. */
-export const TERMINAL_FOCUS_ESCAPE_BYTE = "\u001c";
+import {
+  isModifierKeyEvent,
+  matchesShortcut,
+  type TerminalKeybindingCommand,
+  type TerminalKeybindingRule,
+} from "../keybindings";
+import { isTerminalCompositionKey } from "./ghostty/surface";
 
 export type TerminalFocusEscapeKey = Pick<
   KeyboardEvent,
@@ -19,79 +23,92 @@ export type TerminalFocusEscapeKey = Pick<
   | "stopPropagation"
 >;
 
-const MODIFIER_KEYS: Readonly<Record<string, true>> = {
-  Control: true,
-  Shift: true,
-  Alt: true,
-  Meta: true,
-  AltGraph: true,
-};
-
-function isEscapeChord(event: TerminalFocusEscapeKey): boolean {
-  return (
-    event.ctrlKey &&
-    !event.altKey &&
-    !event.metaKey &&
-    !event.shiftKey &&
-    shortcutKeyFromEvent(event) === "\\"
-  );
-}
-
 /**
- * Ctrl+Backslash pressed twice leaves a focused terminal, as Neovim's terminal
- * mode leaves on Ctrl+Backslash followed by a second key. There is no timeout:
- * the first press is held until the next key.
+ * The keys a focused terminal acts on itself: `terminal.leaveFocus`
+ * (Ctrl+Backslash twice by default, as Neovim's terminal mode leaves on
+ * Ctrl+Backslash followed by a second key) and the font size commands. Every
+ * other key belongs to the program. `rules` is read on each keydown, so a
+ * rebinding applies at once; see `terminalKeybindingRules`.
+ *
+ * A key that begins a two-chord rule is held until the next key, with no
+ * timeout. If that key completes no rule, the held key goes to the program
+ * first, as `encode` wrote it when it was pressed.
  *
  * Every byte of user input bound for the program must go through `send`, so
- * a held press goes out ahead of anything else the user enters (keys, IME
- * commits, AltGr text, pastes) and the next Ctrl+Backslash starts over. The
+ * a held key goes out ahead of anything else the user enters (keys, IME
+ * commits, AltGr text, pastes) and the next press starts over. The
  * terminal's own replies to program queries must bypass it: they are not the
- * user's next key and must not release the hold. `beforeKey`
- * runs first on each keydown and returns false for a key it consumed. Call
- * `reset` when the terminal loses focus: a held press is then dropped unsent.
+ * user's next key and must not release the hold. `beforeKey` runs first on
+ * each keydown and returns false for a key it consumed. Call `reset` when the
+ * terminal loses focus: a held key is then dropped unsent.
  */
-export function createTerminalFocusEscape({
+export function createTerminalFocusEscape<Key extends TerminalFocusEscapeKey>({
   write,
-  leave,
+  encode,
+  rules,
+  run,
 }: {
   readonly write: (data: string) => void;
-  readonly leave: () => void;
+  readonly encode: (event: Key) => string;
+  readonly rules: () => ReadonlyArray<TerminalKeybindingRule>;
+  readonly run: (command: TerminalKeybindingCommand) => void;
 }) {
-  let holding = false;
+  let held: { readonly data: string; readonly rules: TerminalKeybindingRule[] } | null = null;
   const send = (data: string) => {
-    const output = holding ? TERMINAL_FOCUS_ESCAPE_BYTE + data : data;
-    holding = false;
+    const output = held ? held.data + data : data;
+    held = null;
     if (output.length > 0) write(output);
   };
-  const consume = (event: TerminalFocusEscapeKey) => {
+  const consume = (event: Key) => {
     event.preventDefault();
     event.stopPropagation();
     return false;
   };
+  const begin = (event: Key): boolean => {
+    const sequences: TerminalKeybindingRule[] = [];
+    for (const rule of rules()) {
+      const steps = keybindingRuleSteps(rule);
+      if (!matchesShortcut(event, steps[0])) continue;
+      if (steps.length === 2) {
+        sequences.push(rule);
+        continue;
+      }
+      // A more recent sequence starting on this key shadows a chord rule.
+      if (sequences.length > 0) break;
+      // Holding a font size key repeats it, as terminal emulators do; holding
+      // the escape across a refocus must not leave again.
+      if (event.repeat && rule.command === "terminal.leaveFocus") return true;
+      run(rule.command);
+      return consume(event);
+    }
+    // A repeat is an ordinary key: only a fresh press can start a sequence.
+    if (sequences.length === 0 || event.repeat) return true;
+    held = { data: encode(event), rules: sequences };
+    return consume(event);
+  };
   return {
     send,
-    beforeKey(event: TerminalFocusEscapeKey): boolean {
-      if (!holding) {
-        // A repeat is an ordinary key: only a fresh press can start the escape.
-        if (event.repeat || !isEscapeChord(event)) return true;
-        holding = true;
-        return consume(event);
-      }
-      if (MODIFIER_KEYS[event.key] || isTerminalCompositionKey(event, false)) return true;
-      if (isEscapeChord(event)) {
-        // Holding the chord down must not leave the terminal by auto-repeat.
+    beforeKey(event: Key): boolean {
+      if (!held) return begin(event);
+      if (isModifierKeyEvent(event) || isTerminalCompositionKey(event, false)) return true;
+      const completed = held.rules.find((rule) => {
+        const steps = keybindingRuleSteps(rule);
+        return steps.length === 2 && matchesShortcut(event, steps[1]);
+      });
+      if (completed) {
+        // Holding the first chord down must not complete it by auto-repeat.
         if (event.repeat) return consume(event);
-        holding = false;
-        leave();
+        held = null;
+        run(completed.command);
         return consume(event);
       }
-      // Any other key releases the held press ahead of itself, even a key the
-      // terminal then encodes as nothing.
+      // Any other key releases the held key ahead of itself, even a key the
+      // terminal then encodes as nothing, and may itself begin a rule.
       send("");
-      return true;
+      return begin(event);
     },
     reset(): void {
-      holding = false;
+      held = null;
     },
   };
 }

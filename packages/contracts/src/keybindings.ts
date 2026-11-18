@@ -66,6 +66,11 @@ export const STATIC_KEYBINDING_COMMANDS = [
   "terminal.splitVertical",
   "terminal.new",
   "terminal.close",
+  "terminal.leaveFocus",
+  "terminal.fontSize.increase",
+  "terminal.fontSize.decrease",
+  "terminal.fontSize.reset",
+  "exLine.open",
   "rightPanel.toggle",
   "rightPanel.toggleMaximized",
   "rightPanel.close",
@@ -181,12 +186,36 @@ export type KeybindingWhenNode =
   | { type: "and"; left: KeybindingWhenNode; right: KeybindingWhenNode }
   | { type: "or"; left: KeybindingWhenNode; right: KeybindingWhenNode };
 
-export const ResolvedKeybindingRule = Schema.Struct({
-  command: KeybindingCommand,
-  shortcut: KeybindingShortcut,
-  whenAst: Schema.optional(KeybindingWhenNode),
-}).annotate({ parseOptions: { onExcessProperty: "ignore" } });
+/** Two chords pressed one after the other, written `ctrl+w h` in a rule's `key`. */
+export const KeybindingSequence = Schema.Tuple([KeybindingShortcut, KeybindingShortcut]);
+export type KeybindingSequence = typeof KeybindingSequence.Type;
+
+/**
+ * A rule bound to one chord carries `shortcut`; a rule bound to a two-chord
+ * sequence carries `sequence` instead. Clients that predate sequences find no
+ * `shortcut` on a sequence rule and drop it, rather than firing on its first
+ * chord alone.
+ */
+export const ResolvedKeybindingRule = Schema.Union([
+  Schema.Struct({
+    command: KeybindingCommand,
+    shortcut: KeybindingShortcut,
+    whenAst: Schema.optional(KeybindingWhenNode),
+  }).annotate({ parseOptions: { onExcessProperty: "ignore" } }),
+  Schema.Struct({
+    command: KeybindingCommand,
+    sequence: KeybindingSequence,
+    whenAst: Schema.optional(KeybindingWhenNode),
+  }).annotate({ parseOptions: { onExcessProperty: "ignore" } }),
+]);
 export type ResolvedKeybindingRule = typeof ResolvedKeybindingRule.Type;
+
+/** The chords a rule is pressed as: one, or two for a sequence. */
+export function keybindingRuleSteps(
+  rule: ResolvedKeybindingRule,
+): readonly [KeybindingShortcut] | KeybindingSequence {
+  return "sequence" in rule ? rule.sequence : [rule.shortcut];
+}
 
 /**
  * The command set grows over time, so a client may receive rules it cannot

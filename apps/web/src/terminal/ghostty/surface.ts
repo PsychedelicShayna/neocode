@@ -792,6 +792,12 @@ export class GhosttyTerminalSurface {
     this.requestRender();
   }
 
+  /** The bytes this key press sends the program under the terminal's current modes. */
+  encodeKey(event: KeyboardEvent): string {
+    if (this.disposed) return "";
+    return this.core.encodeKey(event);
+  }
+
   resetAndWrite(data: string): void {
     if (this.disposed) return;
     this.lastMouseMotionData = "";

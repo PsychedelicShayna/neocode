@@ -24,7 +24,7 @@ const cursor = {
     passId: "pass-1",
     watermark: 14,
     lastOrdinal: 7,
-    afterKey: "message:a",
+    afterOrdinal: 3,
     segment: { key: "message:b", revision: 13, nextIndex: 1 },
   },
   inboxSeq: 4,

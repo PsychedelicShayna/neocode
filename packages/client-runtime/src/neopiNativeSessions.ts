@@ -400,6 +400,15 @@ export interface NativeSessionFeed {
   readonly agentsEpoch: number;
   /** The live inventory has been read since the roster last reset; until then an empty roster means unknown, not none. */
   readonly agentsKnown: boolean;
+  /**
+   * The owner refused the subagent subscription level the views need
+   * (`fault:subagent-subscription`): live spawns, finishes and progress are not
+   * flowing, so the Agents view shows the build-time roster with this note.
+   */
+  readonly agentsNote: {
+    readonly requestedLevel: string | null;
+    readonly message: string;
+  } | null;
   /** Settled-step counter per child (`subagent_event` at the `events` level); a re-read trigger, not content. */
   readonly agentTicks: Readonly<Record<string, number>>;
   /** Background jobs; maintained only for a NeoPi that advertises `background_jobs`. */
@@ -445,6 +454,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   agentsRevision: 0,
   agentsEpoch: 0,
   agentsKnown: false,
+  agentsNote: null,
   agentTicks: {},
   jobs: EMPTY_NATIVE_JOBS,
   activity: EMPTY_NATIVE_ACTIVITY,
@@ -830,6 +840,8 @@ export const NATIVE_INBOX_GAP_LIMIT = 64;
 export const NATIVE_COMMAND_OUTPUT_LIMIT = 256;
 /** Per-call detail one `trimmed` gap lists before it reports `toolStreamsTruncated`. */
 const NATIVE_GAP_TOOL_STREAMS = 64;
+/** B5: the owner refused the subagent subscription level; removed once it is granted or not needed. */
+const SUBSCRIPTION_FAULT_KEY = "fault:subagent-subscription";
 
 const isRawInboxRecord = (item: NativeInboxItem): item is NativeInboxRawRecord =>
   item.type === "notice" || item.type === "tool_stream_update";
@@ -1028,6 +1040,7 @@ function projectNativeEntities(
   let queue = feed.queue;
   let activity = feed.activity;
   let error = feed.error;
+  let agentsNote = feed.agentsNote;
   let commandsRevision = feed.commandsRevision;
   let dictation = feed.dictation;
   let editor = feed.editor;
@@ -1067,6 +1080,15 @@ function projectNativeEntities(
       }
     } else if (value.class === "setting" && value.value.property === "queue")
       queue = nativePromptQueue(value.value.value) ?? queue;
+    else if (key === SUBSCRIPTION_FAULT_KEY && value.class === "fault")
+      agentsNote =
+        typeof value.value.message === "string"
+          ? {
+              requestedLevel:
+                typeof value.value.requestedLevel === "string" ? value.value.requestedLevel : null,
+              message: value.value.message,
+            }
+          : null;
     else if (value.class === "fault" && typeof value.value.message === "string")
       error = value.value.message;
     else if (value.class === "presentation") {
@@ -1120,6 +1142,7 @@ function projectNativeEntities(
       const id = entity.value.value.id;
       agents = agents.filter((agent) => agent.id !== id);
     } else if (key.startsWith("job:")) jobsChanged = true;
+    else if (key === SUBSCRIPTION_FAULT_KEY) agentsNote = null;
   }
   if (jobsChanged) {
     const running: unknown[] = [];
@@ -1147,6 +1170,7 @@ function projectNativeEntities(
     agentsKnown: feed.agentsKnown || feed.observation.passId === null,
     agentTicks: agentTicks ?? feed.agentTicks,
     // The projection keeps the newest NATIVE_COMMAND_OUTPUT_LIMIT receipts; so does the feed.
+    agentsNote,
     commandOutputs:
       added.length > 0
         ? [...feed.commandOutputs, ...added].slice(-NATIVE_COMMAND_OUTPUT_LIMIT)

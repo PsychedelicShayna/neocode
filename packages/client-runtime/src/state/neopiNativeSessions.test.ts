@@ -926,6 +926,38 @@ describe("native projection mapping", () => {
     });
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
   });
+
+  it("notes a refused subagent level for the Agents view and clears it when withdrawn", () => {
+    const fault: NeoPiNativeEntity = {
+      key: "fault:subagent-subscription",
+      ordinal: 1,
+      revision: 2,
+      value: {
+        class: "fault",
+        value: {
+          source: "subagent-subscription",
+          level: "error",
+          requestedLevel: "progress",
+          message: "Owner refused",
+        },
+      },
+    };
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(feed, pass({ epoch, watermark: 2, entities: [fault] }));
+    expect(feed.agentsNote).toEqual({ requestedLevel: "progress", message: "Owner refused" });
+    // Not a session error: the composer and transcript are unaffected.
+    expect(feed.error).toBeNull();
+    feed = applyRead(feed, {
+      ...pass({ epoch, watermark: 3, kind: "incremental" }),
+      tombstones: [{ key: fault.key, ordinal: 1, revision: 3 }],
+    });
+    expect(feed.agentsNote).toBeNull();
+  });
 });
 
 describe("native observation status", () => {

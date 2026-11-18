@@ -68,7 +68,9 @@ function Screen() {
 const change = (apply: () => void) =>
   act(() => {
     apply();
-    for (const listener of [...screen.appStateListeners]) listener();
+    // A snapshot: a listener may resubscribe while they are called.
+    const listeners = Array.from(screen.appStateListeners);
+    for (const listener of listeners) listener();
   });
 
 let root: Root | undefined;

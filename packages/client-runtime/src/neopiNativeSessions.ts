@@ -725,12 +725,10 @@ export function applyNativeRead(
   if (completed)
     for (const [key, revision] of removed)
       if (revision <= result.continuation.base) removed.delete(key);
-  // Inbox sequence numbers belong to one projection; a navigation keeps them.
-  const inboxKey = JSON.stringify([
-    domain.serverIncarnation,
-    domain.ownerEpoch,
-    domain.projectionIncarnation,
-  ]);
+  // Inbox sequence numbers are monotonic for one server projection object, which
+  // its serverIncarnation names: a rebuild, a successor owner or a navigation
+  // keeps the inbox and its numbering, so applied records are never re-added.
+  const inboxKey = domain.serverIncarnation;
   const sameInbox = held.inboxKey === inboxKey;
   let inboxSeq = sameInbox ? held.inboxSeq : -1;
   const kept = sameInbox ? held.inboxLedger : [];
@@ -1269,7 +1267,9 @@ function reduceNativeEssential(
 ): NativeSessionFeed {
   switch (envelope.type) {
     case "leased":
-      return feed;
+      // A new lease replays every obligation still open right after it; anything
+      // held from before (answered or cancelled while unwatched) is gone.
+      return feed.dialogs.length === 0 ? feed : { ...feed, dialogs: [] };
     case "session": {
       const session = envelope.session;
       const sameSession =

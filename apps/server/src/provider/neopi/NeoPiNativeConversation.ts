@@ -26,6 +26,7 @@ import {
 import {
   makeNeoPiNativeOwnerResolver,
   makeNeoPiNativeSessionStarter,
+  makeNeoPiThreadNativeRef,
   type NeoPiNativeOwner,
 } from "./NeoPiNativeOwner.ts";
 import type { NeoPiConfigurationIdentity } from "./NeoPiSessionConfiguration.ts";
@@ -364,10 +365,12 @@ export const makeNeoPiNativeConversation = Effect.fn("NeoPiNativeConversation.ma
   const fs = yield* FileSystem.FileSystem;
   const startStopped = yield* makeNeoPiNativeSessionStarter();
   const journal = yield* makeNeoPiSessionJournal();
-  return yield* makeNeoPiNativeConversationWith(
+  const nativeRef = yield* makeNeoPiThreadNativeRef();
+  const conversation = yield* makeNeoPiNativeConversationWith(
     resolve,
     (file) => fs.realPath(file),
     startStopped,
     (threadId) => journal({ threadId, scope: "branch", direction: "backward", limit: 128 }),
   );
+  return { ...conversation, nativeRef };
 });

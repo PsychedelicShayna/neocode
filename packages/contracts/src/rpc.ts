@@ -54,8 +54,9 @@ import {
 } from "./neopiNativeSessions.ts";
 import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 import {
-  NeoPiWatchJournalInput,
+  NeoPiNativeThreadInput,
   NeoPiJournalStreamEvent,
+  NeoPiThreadNativeRef,
   NeoPiNavigateTreeInput,
   NeoPiResumeTreeInput,
   NeoPiTreeOperationResult,
@@ -346,6 +347,7 @@ export const WS_METHODS = {
   neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
   neopiSessionsJournal: "neopiSessions.journal",
   neopiSessionsWatchJournal: "neopiSessions.watchJournal",
+  neopiSessionsNativeRef: "neopiSessions.nativeRef",
   neopiSessionsNavigateTree: "neopiSessions.navigateTree",
   neopiSessionsResumeTree: "neopiSessions.resumeTree",
   neopiSessionsCancelNavigation: "neopiSessions.cancelNavigation",
@@ -961,10 +963,15 @@ const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
 });
 
 const WsNeoPiWatchJournalRpc = Rpc.make(WS_METHODS.neopiSessionsWatchJournal, {
-  payload: NeoPiWatchJournalInput,
+  payload: NeoPiNativeThreadInput,
   success: NeoPiJournalStreamEvent,
   error: EnvironmentAuthorizationError,
   stream: true,
+});
+const WsNeoPiNativeRefRpc = Rpc.make(WS_METHODS.neopiSessionsNativeRef, {
+  payload: NeoPiNativeThreadInput,
+  success: NeoPiThreadNativeRef,
+  error: EnvironmentAuthorizationError,
 });
 const WsNeoPiNavigateTreeRpc = Rpc.make(WS_METHODS.neopiSessionsNavigateTree, {
   payload: NeoPiNavigateTreeInput,
@@ -977,7 +984,7 @@ const WsNeoPiResumeTreeRpc = Rpc.make(WS_METHODS.neopiSessionsResumeTree, {
   error: EnvironmentAuthorizationError,
 });
 const WsNeoPiCancelNavigationRpc = Rpc.make(WS_METHODS.neopiSessionsCancelNavigation, {
-  payload: NeoPiWatchJournalInput,
+  payload: NeoPiNativeThreadInput,
   success: NeoPiTreeCancelResult,
   error: EnvironmentAuthorizationError,
 });
@@ -1637,6 +1644,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiSessionsWatchConfigurationRpc,
   WsNeoPiSessionsJournalRpc,
   WsNeoPiWatchJournalRpc,
+  WsNeoPiNativeRefRpc,
   WsNeoPiNavigateTreeRpc,
   WsNeoPiResumeTreeRpc,
   WsNeoPiCancelNavigationRpc,

@@ -239,6 +239,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           observeConfiguration: adapter.observeConfiguration,
           journal: adapter.readJournal,
           observeNative: adapter.observeNative,
+          hasSession: adapter.hasSession,
           modelsConnection: adapter.getModelsConnection,
         },
       );

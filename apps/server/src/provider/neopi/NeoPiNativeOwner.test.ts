@@ -6,7 +6,18 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { readNeoPiNativeOwnerCatalog } from "./NeoPiNativeOwner.ts";
+import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import type { ProviderInstance } from "../ProviderDriver.ts";
+import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+} from "../Services/ProviderSessionDirectory.ts";
+import { readNeoPiNativeOwnerCatalog, makeNeoPiThreadNativeRef } from "./NeoPiNativeOwner.ts";
+import { registerNeoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
 const source = { binary: "/opt/npi", env: {} };
@@ -111,5 +122,82 @@ describe("native owner discovery lifetime", () => {
       assert.equal(result._tag, "Failure");
       assert.equal(released, true);
     }).pipe(Effect.scoped),
+  );
+});
+
+describe("thread native ref", () => {
+  const threadId = ThreadId.make("thread-1");
+  const providerInstanceId = ProviderInstanceId.make("neopi-main");
+  const lookup = (input: {
+    readonly binding: ProviderRuntimeBinding | undefined;
+    readonly running: boolean;
+  }) => {
+    const instance = registerNeoPiSessionCatalogSource(
+      {
+        instanceId: providerInstanceId,
+        driverKind: "neopi",
+        enabled: true,
+      } as unknown as ProviderInstance,
+      {
+        binary: "/opt/npi",
+        env: {},
+        profile: "default",
+        capabilities: new Set(),
+        probe: { status: "compatible", version: "test" },
+        hasSession: () => Effect.succeed(input.running),
+      },
+    );
+    return Effect.gen(function* () {
+      const nativeRef = yield* makeNeoPiThreadNativeRef();
+      return yield* nativeRef(threadId);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProviderSessionDirectory, {
+            getBinding: () => Effect.succeed(Option.fromNullishOr(input.binding)),
+          } as unknown as ProviderSessionDirectory["Service"]),
+          Layer.succeed(ProviderInstanceRegistry, {
+            getInstance: () => Effect.succeed(instance),
+          } as unknown as ProviderInstanceRegistry["Service"]),
+          FileSystem.layerNoop({ realPath: (path) => Effect.succeed(`/canonical${path}`) }),
+        ),
+      ),
+    );
+  };
+  const binding: ProviderRuntimeBinding = {
+    threadId,
+    provider: "neopi" as ProviderRuntimeBinding["provider"],
+    providerInstanceId,
+    resumeCursor: { sessionId: "s-1", sessionFile: "/sessions/a.jsonl" },
+  };
+
+  // A view that finds no attachable owner needs this to say "control plane off, still running"
+  // instead of "stopped" for a runtime NeoCode itself is running.
+  it.effect("names the canonical ref and whether NeoCode's own runtime is running", () =>
+    Effect.gen(function* () {
+      const running = yield* lookup({ binding, running: true });
+      const stopped = yield* lookup({ binding, running: false });
+      assert.deepStrictEqual(running, {
+        status: "available",
+        ref: { providerInstanceId, sessionFile: "/canonical/sessions/a.jsonl" },
+        sessionId: "s-1",
+        ownedRuntime: true,
+      });
+      assert.isTrue(stopped.status === "available" && !stopped.ownedRuntime);
+    }),
+  );
+
+  it.effect(
+    "is unavailable, without a connection, when the thread has no native session file",
+    () =>
+      Effect.gen(function* () {
+        const none = yield* lookup({ binding: undefined, running: false });
+        const relative = yield* lookup({
+          binding: { ...binding, resumeCursor: { sessionId: "s-1", sessionFile: "a.jsonl" } },
+          running: true,
+        });
+        assert.strictEqual(none.status, "unavailable");
+        assert.strictEqual(relative.status, "unavailable");
+      }),
   );
 });

@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 import { ThreadId } from "./baseSchemas.ts";
 import { NeoPiJournalEntry, NeoPiJournalPage } from "./neopiJournal.ts";
+import { NeoPiNativeSessionRef } from "./neopiNativeSessions.ts";
 
 export const NeoPiNativeRecord = Schema.Record(Schema.String, Schema.Unknown);
 export const NeoPiNativeFrame = Schema.StructWithRest(Schema.Struct({ type: Schema.String }), [
@@ -54,8 +55,8 @@ export const NeoPiStreamingMessageSnapshot = Schema.StructWithRest(
   [NeoPiNativeRecord],
 );
 export type NeoPiStreamingMessageSnapshot = typeof NeoPiStreamingMessageSnapshot.Type;
-export const NeoPiWatchJournalInput = Schema.Struct({ threadId: ThreadId });
-export type NeoPiWatchJournalInput = typeof NeoPiWatchJournalInput.Type;
+export const NeoPiNativeThreadInput = Schema.Struct({ threadId: ThreadId });
+export type NeoPiNativeThreadInput = typeof NeoPiNativeThreadInput.Type;
 export const NeoPiJournalConnection = Schema.Struct({
   type: Schema.Literal("connection"),
   status: Schema.Literals(["connected", "unavailable", "disconnected", "gap", "identity_changed"]),
@@ -150,3 +151,18 @@ export const NeoPiTreeCancelResult = Schema.Union([
   Failure,
 ]);
 export type NeoPiTreeCancelResult = typeof NeoPiTreeCancelResult.Type;
+/**
+ * A thread's canonical native session, from its saved binding. `ownedRuntime` is true while
+ * NeoCode's own runtime for the thread is running, so a view that finds no attachable owner
+ * can tell a stopped session from one whose control plane is off or unsupported.
+ */
+export const NeoPiThreadNativeRef = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("available"),
+    ref: NeoPiNativeSessionRef,
+    sessionId: Schema.String,
+    ownedRuntime: Schema.Boolean,
+  }),
+  Unavailable,
+]);
+export type NeoPiThreadNativeRef = typeof NeoPiThreadNativeRef.Type;

@@ -146,13 +146,11 @@ export function NativeSessionAgents({
   agents,
   rosterWarning,
   observationNotice,
-  lossWarnings,
   onClose,
 }: {
   agents: readonly RuntimeSubagent[];
   rosterWarning?: string | null;
   observationNotice?: string | null;
-  lossWarnings?: readonly { readonly key: string; readonly text: string }[];
   onClose: () => void;
 }) {
   const model = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
@@ -173,18 +171,6 @@ export function NativeSessionAgents({
         <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
           {observationNotice}
         </Text>
-      ) : null}
-      {lossWarnings?.length ? (
-        <ScrollView
-          className="max-h-24 shrink-0 px-4 py-1"
-          accessibilityLabel="Live records not kept"
-        >
-          {lossWarnings.map((warning) => (
-            <Text key={warning.key} className="text-xs text-warning-foreground">
-              {warning.text}
-            </Text>
-          ))}
-        </ScrollView>
       ) : null}
       <ScrollView className="flex-1" contentContainerClassName="px-4 pb-4">
         <Text className="text-sm text-foreground-muted">

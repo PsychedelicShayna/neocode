@@ -1,7 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   nativeRecord,
-  nativeObservationStatus,
   type NativeSessionFeed,
   type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
@@ -17,10 +16,6 @@ export const TAB_STATUS = {
   ready: { label: "Ready", dot: "bg-success" },
   connecting: { label: "Connecting", dot: "bg-muted-foreground/50" },
   offline: { label: "Reconnecting · showing cached conversation", dot: "bg-muted-foreground/50" },
-  catchingUp: { label: "Catching up", dot: "bg-muted-foreground/50" },
-  stopped: { label: "Owner stopped", dot: "bg-muted-foreground/50" },
-  detached: { label: "Detached", dot: "bg-muted-foreground/50" },
-  unavailable: { label: "Observation unavailable", dot: "bg-muted-foreground/50" },
   // Background tabs show inventory status without holding a native observation open.
   idle: { label: "Not connected", dot: "bg-muted-foreground/30" },
 } as const;
@@ -36,14 +31,8 @@ const selectStatus = (result: FeedResult): TabStatus => {
   if (!AsyncResult.isSuccess(result))
     return AsyncResult.isInitial(result) ? "connecting" : "offline";
   const feed = result.value;
+  if (!feed.connected) return "offline";
   if (feed.dialogs.length > 0) return "attention";
-  if (feed.ownerLoss === "orphaned") return "stopped";
-  if (feed.ownerLoss === "detached") return "detached";
-  const { phase, catchingUp } = nativeObservationStatus(feed);
-  if (catchingUp) return "catchingUp";
-  if (phase === "unauthorized" || phase === "incompatible" || phase === "identity-changed")
-    return "unavailable";
-  if (!feed.connected || feed.ownerLoss === "reconnecting") return "offline";
   if (feed.busy) return "working";
   return feed.session?.attachment === "terminal" ? "terminal" : "ready";
 };

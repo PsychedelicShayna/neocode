@@ -633,7 +633,6 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           agents={feed.agents}
           rosterWarning={rosterWarning}
           observationNotice={observationNotice?.text}
-          lossWarnings={losses.general}
           onClose={() => setAgents(false)}
         />
       ) : null}

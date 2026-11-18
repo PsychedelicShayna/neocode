@@ -208,8 +208,27 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
 
   const outbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const sink = options.sink;
+  /**
+   * Runs one sink call. A sink that throws breaks the contract every caller relies on, so
+   * the transport is aborted with that error: pending requests fail instead of waiting on
+   * replies nobody reads, and the peer is stopped.
+   */
+  const deliver = (call: () => void): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      try {
+        call();
+        return Effect.void;
+      } catch (cause) {
+        return abortTransport(
+          new NeoPiRpcError({
+            code: "sink_failed",
+            message: `The NeoPi frame handler failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          }),
+        );
+      }
+    });
   const publishEvent = (frame: SessionEventFrame): Effect.Effect<void> =>
-    Effect.sync(() => sink?.event(frame));
+    deliver(() => sink?.event(frame));
   const stderr = yield* Queue.sliding<string, Cause.Done<void>>(DEFAULT_STDERR_QUEUE_CAPACITY);
   const exit = yield* Deferred.make<ProcessExit>();
   const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
@@ -237,17 +256,16 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       }
       pending.clear();
       for (const prompt of prompts.values()) {
-        // Failure must settle requests even when the bounded event consumer has
-        // stopped. Prompt outcomes and process exit remain separate receipts.
-        yield* Effect.sync(() => {
-          const failed = {
+        // Failure must settle every prompt even if the sink throws on this notice; the
+        // transport is already failing, so such a throw changes nothing further.
+        yield* Effect.try(() =>
+          sink?.event({
             type: "t3.prompt.failed",
             id: prompt.id,
             error: error.message,
             code: error.code,
-          };
-          sink?.event(failed);
-        });
+          }),
+        ).pipe(Effect.ignore);
         yield* completePrompt(prompt, {
           kind: "rejected",
           error: error.message,
@@ -564,16 +582,17 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               yield* Queue.offer(startupUiChanges, undefined);
             }
           }
-          return sink?.uiRequest?.(ui);
+          return yield* deliver(() => sink?.uiRequest?.(ui));
         }
         case "host_tool_call":
         case "host_tool_cancel": {
           const call = frame as HostToolCallFrame | HostToolCancelFrame;
-          return sink?.hostToolCall?.(call);
+          return yield* deliver(() => sink?.hostToolCall?.(call));
         }
         case "host_uri_request": {
           const uri = frame as HostUriRequestFrame;
-          if (sink?.hostUriRequest) return sink.hostUriRequest(uri);
+          const handler = sink?.hostUriRequest;
+          if (handler) return yield* deliver(() => handler(uri));
           yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
           return;
         }

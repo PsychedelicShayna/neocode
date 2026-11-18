@@ -1342,3 +1342,41 @@ it.live("delivers a fast producer's burst to the sink before the reply that foll
     }),
   ),
 );
+
+it.live("fails pending requests and stops the peer when the sink throws", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            // The sink throws on this event; the reply after it must not be awaited forever.
+            yield* emit({ type: "message_update", seq: 1 });
+            yield* emit({ id: message.id, type: "response", command: "get_state", success: true });
+          }),
+      });
+      const client = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 60_000,
+        sink: {
+          event: (frame) => {
+            if (frame.type === "message_update") throw new Error("sink broke");
+          },
+        },
+      });
+      const error = yield* client.request({ type: "get_state" }).pipe(Effect.flip);
+      assert.equal(error.code, "sink_failed");
+      assert.include(error.message, "sink broke");
+      // The kill is forked into the client's lifetime; its receipt is the recorded signal.
+      yield* Effect.gen(function* () {
+        while (!peer.signals.includes("SIGTERM")) yield* Effect.sleep("10 millis");
+      }).pipe(Effect.timeout("1 second"));
+    }),
+  ),
+);

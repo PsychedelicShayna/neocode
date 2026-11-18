@@ -254,9 +254,10 @@ export type NeoPiNativeSegment = typeof NeoPiNativeSegment.Type;
 /**
  * Ordered retention for live-only records without a reducer: every
  * `tool_stream_update` of a tool other than `edit`, and every notice. The inbox
- * is bounded; evicted records are replaced by one `gap` covering
- * `fromSeq..toSeq`, whose `seq` is `toSeq`. A gap that grows keeps its
- * `fromSeq` and replaces the shorter one with the same `fromSeq`.
+ * is bounded, and nothing is retained while no view holds a lease; dropped
+ * records are replaced by a `gap` covering `fromSeq..toSeq`, whose `seq` is
+ * `toSeq`. A gap that grows keeps its `fromSeq` and replaces the shorter one
+ * with the same `fromSeq`.
  */
 export const NeoPiNativeInboxRecord = Schema.Union([
   Schema.Struct({
@@ -274,17 +275,20 @@ export const NeoPiNativeInboxRecord = Schema.Union([
     source: Schema.optionalKey(Schema.String),
   }),
   /**
-   * Confirmed eviction: these records were received and are no longer
-   * retained, with no replay source. Not missing coverage and not a read
-   * failure. Counts are of records received in the whole interval.
+   * Records received and no longer retained, with no replay source; never a
+   * temporary read failure. `evicted`: confirmed eviction at the inbox bound.
+   * `not-observed`: dropped while no view held a lease (missing coverage);
+   * coverage must not be presented as complete across it. Adjacent gaps of
+   * one reason merge; a gap forced to absorb the other reason becomes
+   * `not-observed`. Counts are of records received in the whole interval.
    */
   Schema.Struct({
     type: Schema.Literal("gap"),
     seq: NonNegativeInt,
-    cause: Schema.Literal("evicted"),
+    reason: Schema.Literals(["evicted", "not-observed"]),
     fromSeq: NonNegativeInt,
     toSeq: NonNegativeInt,
-    /** Server receive times (ms since epoch) of the first and last evicted record. */
+    /** Server receive times (ms since epoch) of the first and last dropped record. */
     firstReceivedAt: Schema.Number,
     lastReceivedAt: Schema.Number,
     notices: NonNegativeInt,
@@ -295,7 +299,7 @@ export const NeoPiNativeInboxRecord = Schema.Union([
         updates: NonNegativeInt,
       }),
     ),
-    /** More tool calls were evicted than `toolStreams` lists; their per-call detail is not known. */
+    /** More tool calls were dropped than `toolStreams` lists; their per-call detail is not known. */
     toolStreamsTruncated: Schema.Boolean,
   }),
 ]);

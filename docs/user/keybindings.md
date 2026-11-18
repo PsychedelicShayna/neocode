@@ -14,7 +14,7 @@ inserts a new line. This applies to the web and desktop composer at desktop widt
 use `mod+Shift+Enter` for the opposite action. In a new thread, `mod+Enter` keeps
 starting the thread in the background.
 
-Use `mod+shift+m` to choose a model and `mod+shift+h` to choose a host.
+Use `alt+p` to choose a model and `mod+shift+h` to choose a host.
 Use `mod+shift+e` for effort, `mod+shift+a` for access mode, `mod+shift+x` for the
 workspace, and `mod+shift+g` for the Git branch. The workspace menu includes the
 current checkout, a new worktree, and the previous worktree when available.
@@ -107,7 +107,7 @@ It is a JSON array of rules:
 ```json
 [
   { "key": "mod+g", "command": "terminal.toggle" },
-  { "key": "mod+shift+g", "command": "terminal.new", "when": "terminalFocus" }
+  { "key": "ctrl+w h", "command": "sidebar.toggle", "when": "!terminalFocus" }
 ]
 ```
 
@@ -128,6 +128,12 @@ Project scripts use `script.{id}.run`, such as `script.test.run`.
 Join modifiers and a key with `+`, such as `mod+shift+d` or `ctrl+l`.
 `mod` means Command on macOS and Control elsewhere. Other modifiers are
 `cmd` / `meta`, `ctrl` / `control`, `alt` / `option`, and `shift`.
+
+A key can also be a sequence of two chords separated by a space, such as
+`ctrl+w h`: press the first chord, release it, then press the second. There is no
+time limit between them. Any other key cancels the sequence and works as usual.
+To record one in **Settings → Keybindings**, press both chords; to keep a single
+chord, press Enter or Tab after it.
 
 ## When conditions
 
@@ -154,7 +160,9 @@ Combine keys with `!` for not, `&&` for and, `||` for or, and parentheses:
 
 The last rule whose key and condition both match wins, even if it belongs to a
 different command. Put a more specific rule after a general one when they share
-a shortcut.
+a shortcut. A chord that starts a sequence takes the place of a rule on that chord
+alone. Settings marks rules that compete for the same keys under conditions that
+can hold at once.
 
 ## Commands with special behavior
 
@@ -190,15 +198,30 @@ is kept between launches.
 
 ## Reserved shortcuts
 
-In the desktop app, `mod+w` closes the focused terminal or the active right-panel
-tab. When nothing remains to close, it closes the window. In a browser, `mod+w`
-closes the browser tab; rebind `rightPanel.close` and `terminal.close` to an available
-shortcut such as `alt+w`.
+In the desktop app, `mod+w` closes the active right-panel tab. When nothing remains
+to close, it closes the window. In a browser, `mod+w` closes the browser tab;
+rebind `rightPanel.close` to an available shortcut such as `alt+w`.
+`terminal.close` has no default shortcut.
 If closing an integrated terminal fails, its tab stays open so you can retry once
 the environment is available. A failed close does not type `exit` into the shell.
 
-Many defaults include `!terminalFocus` so they do not intercept terminal input.
-Keep that condition when remapping them if you want the same behavior.
+## Terminal focus
+
+While a terminal has focus, every key goes to the program running in it, whatever
+your keybindings say: `ctrl+d`, `ctrl+w`, `ctrl+b`, Tab and Escape included. Only
+these act in the terminal itself:
+
+| Default                         | Command                      | Does                                         |
+| ------------------------------- | ---------------------------- | -------------------------------------------- |
+| `ctrl+\ ctrl+\`                 | `terminal.leaveFocus`        | Leave the terminal so app shortcuts work     |
+| `mod+=`, `mod++`, `mod+shift+=` | `terminal.fontSize.increase` | Make the terminal text larger                |
+| `mod+-`                         | `terminal.fontSize.decrease` | Make the terminal text smaller               |
+| `mod+0`                         | `terminal.fontSize.reset`    | Return the terminal text to its default size |
+
+A single `ctrl+\` followed by any other key reaches the program as usual. The font
+size keys change the terminal size in **Settings → Appearance**: the terminal font
+with Advanced typography, otherwise the monospace font. These keys can be rebound;
+Settings warns when another rule uses a key they hold in the terminal.
 
 If an integrated terminal cannot attach, the failure appears inside that terminal
 even when its shell is quiet. Reconnect the environment before trying again.

@@ -7,6 +7,7 @@ import {
   type NeoPiNativeJournalSlice,
   type NeoPiNativeObservationDomain,
   type NeoPiNativeInboxRecord,
+  type NeoPiNativeSegment,
   type NeoPiNativeTombstone,
 } from "@t3tools/contracts";
 import { nativeConversationGaps } from "./neopiConversation.ts";
@@ -1564,6 +1565,7 @@ describe("observation rebase", () => {
     tombstones?: readonly NeoPiNativeTombstone[];
     journal?: NeoPiNativeJournalSlice;
     inbox?: readonly NeoPiNativeInboxRecord[];
+    segments?: readonly NeoPiNativeSegment[];
   }
   const reply = (input: Reply) => {
     const kind = input.kind ?? "full";
@@ -1591,7 +1593,7 @@ describe("observation rebase", () => {
       promoted: false,
       entities: input.entities ?? [],
       tombstones: input.tombstones ?? [],
-      segments: [],
+      segments: input.segments ?? [],
       inbox: input.inbox ?? [],
       journal: input.journal ?? null,
     };
@@ -2158,11 +2160,125 @@ describe("observation rebase", () => {
     expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
     expect(ids(feed)).toEqual(["u", "E"]);
     expect(feed.conversation.losses).toEqual([]);
-    // The successor's full pass ends without `E`: continuity across owners is not
-    // established, so the row is a continuity loss at the nearest durable entry.
-    feed = step(partial, { epoch: successor, passId: "q", watermark: 2 });
+    // The successor's full pass ends with a disjoint page after `E`: `E` is in
+    // history not yet loaded, so the row is held, neither dropped nor lost.
+    feed = step(partial, {
+      epoch: successor,
+      passId: "q",
+      watermark: 2,
+      journal: horizon(chain(["F", "G"], "E"), "before-F"),
+    });
+    expect(transcript(feed)).toEqual(["u", "F", "G", "saved body", "command", "successor body"]);
+    expect(feed.conversation.losses).toEqual([]);
+    // A later page reaches `E`: the row retires onto it.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "r",
+      kind: "incremental",
+      watermark: 3,
+      journal: horizon(chain(["E", "F", "G"], "u")),
+    });
+    expect(ids(feed)).toEqual(["u", "E", "F", "G"]);
+    expect(transcript(feed)).toEqual(["u", "E", "command", "F", "G", "successor body"]);
+    expect(feed.conversation.losses).toEqual([]);
+  });
+
+  it("loses a held row only once its whole branch is loaded without its entry", () => {
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, "E", "saved body")],
+    });
+    const successor = domain({ ownerEpoch: 2, projectionIncarnation: 2, branchGeneration: 2 });
+    // A disjoint horizon with a placeholder before it: `E` may be in the gap.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "q",
+      watermark: 4,
+      journal: horizon(chain(["x", "y"], "w"), "before-x"),
+    });
+    expect(contents(feed)).toEqual(["saved body"]);
+    // The branch is loaded back to its root without `E`: it is not on this branch.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "r",
+      kind: "full",
+      watermark: 5,
+      journal: horizon(chain(["v", "w", "x", "y"], null)),
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toEqual([{ messageId: "durable:E", afterEntryId: "y" }]);
+  });
+
+  it("keeps command output visible when a successor turns its live row into a loss", () => {
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "old owner")],
+    });
+    feed = reduceNativeSessionFeed(feed, {
+      type: "event",
+      frame: { type: "command_output", text: "after the old row" },
+    });
+    feed = step(feed, {
+      epoch: domain({ ownerEpoch: 2, projectionIncarnation: 2 }),
+      passId: "q",
+      watermark: 2,
+      done: false,
+      entities: [message("m", 2, null, "successor body")],
+    });
     expect(transcript(feed)).toEqual(["u", "command", "successor body"]);
-    expect(feed.conversation.losses).toEqual([{ messageId: "durable:E", afterEntryId: "u" }]);
+    expect(feed.conversation.losses).toEqual([{ messageId: "m", afterEntryId: "u" }]);
+  });
+
+  it("shows a message once when its entry and its join arrive in one reply", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "reply")],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      kind: "incremental",
+      watermark: 5,
+      journal: { continuity: "append", leafId: "r", entries: [journalEntry("r", "u", "reply")] },
+      tombstones: [{ key: "message:m", ordinal: 1, revision: 5, joinEntryId: "r" }],
+    });
+    expect(transcript(feed)).toEqual(["u", "reply"]);
+  });
+
+  it("drops segment data of a transfer its pass did not finish", () => {
+    const epoch = domain();
+    const part = { key: "big", revision: 12, index: 0, count: 2, encodedBytes: 10, data: "{" };
+    let feed = step(observing(), { epoch, passId: "p0", watermark: 10 });
+    feed = step(feed, {
+      epoch,
+      passId: "inc",
+      kind: "incremental",
+      watermark: 14,
+      done: false,
+      segments: [part],
+    });
+    expect(feed.observation.segments.size).toBe(1);
+    // Promoted to a fresh full pass that never returns `big`.
+    const [issued, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, {
+      type: "read",
+      readId,
+      result: { ...reply({ epoch, passId: "full", watermark: 15, done: false }), promoted: true },
+    });
+    expect(feed.observation.segments.size).toBe(0);
+    feed = step(feed, { epoch, passId: "full", watermark: 15, done: false, segments: [part] });
+    feed = step(feed, { epoch, passId: "full", watermark: 15 });
+    expect(feed.observation.segments.size).toBe(0);
   });
 
   it("keeps a row retired by its durable entry until that entry is held", () => {
@@ -2193,7 +2309,7 @@ describe("observation rebase", () => {
     expect(transcript(feed)).toEqual(["u", "reply"]);
   });
 
-  it("keeps inbox gaps in order, replacing a grown gap and merging adjacent ones", () => {
+  it("keeps inbox gaps exact: what this view missed, once, in order", () => {
     const epoch = domain();
     const notice = (seq: number): NeoPiNativeInboxRecord => ({
       type: "notice",
@@ -2206,6 +2322,7 @@ describe("observation rebase", () => {
       toSeq: number,
       reason: "evicted" | "not-observed",
       notices: number,
+      updates = 0,
     ): NeoPiNativeInboxRecord => ({
       type: "gap",
       seq: toSeq,
@@ -2215,41 +2332,61 @@ describe("observation rebase", () => {
       firstReceivedAt: fromSeq * 1000,
       lastReceivedAt: toSeq * 1000,
       notices,
-      toolStreams: [{ toolCallId: "t", toolName: "bash", updates: 1 }],
+      toolStreams: updates ? [{ toolCallId: "t", toolName: "bash", updates }] : [],
       toolStreamsTruncated: false,
     });
+    const shape = (feed: NativeSessionFeed) =>
+      feed.observation.inbox.map((record) =>
+        record.type === "gap"
+          ? [record.fromSeq, record.toSeq, record.reason, record.notices, record.toolStreams.length]
+          : record.seq,
+      );
     let feed = step(observing(), {
       epoch,
       passId: "p1",
       watermark: 1,
-      inbox: [notice(1), gap(2, 4, "evicted", 2)],
+      inbox: [gap(1, 2, "evicted", 2), notice(3)],
     });
-    // The server grew its gap; the shorter one is replaced, not repeated.
-    feed = step(feed, {
-      epoch,
-      passId: "p2",
-      watermark: 2,
-      inbox: [gap(2, 6, "evicted", 4), notice(7)],
-    });
+    // The server grew its gap over notice 3, which this view holds: only 4 was missed.
+    feed = step(feed, { epoch, passId: "p2", watermark: 2, inbox: [gap(1, 4, "evicted", 4)] });
+    expect(shape(feed)).toEqual([[1, 2, "evicted", 2, 0], 3, [4, 4, "evicted", 1, 0]]);
+    // Gaps of two reasons stay apart; a grown one counts only its new records.
     feed = step(feed, {
       epoch,
       passId: "p3",
       watermark: 3,
-      inbox: [gap(8, 9, "not-observed", 1), gap(10, 11, "evicted", 1), notice(5)],
+      inbox: [gap(5, 6, "evicted", 2), gap(7, 8, "not-observed", 1, 1)],
     });
-    expect(
-      feed.observation.inbox.map((record) =>
-        record.type === "gap"
-          ? [record.fromSeq, record.toSeq, record.reason, record.notices, record.toolStreams]
-          : record.seq,
-      ),
-    ).toEqual([
-      1,
-      [2, 6, "evicted", 4, [{ toolCallId: "t", toolName: "bash", updates: 1 }]],
-      7,
-      [8, 11, "not-observed", 2, [{ toolCallId: "t", toolName: "bash", updates: 2 }]],
+    feed = step(feed, {
+      epoch,
+      passId: "p4",
+      watermark: 4,
+      inbox: [gap(7, 9, "not-observed", 2, 1)],
+    });
+    expect(shape(feed).slice(3)).toEqual([
+      [5, 6, "evicted", 2, 0],
+      [7, 8, "not-observed", 1, 1],
+      [9, 9, "not-observed", 1, 0],
     ]);
+    // A consumer may drain mapped records: a replay is still recognised, and a
+    // later grown gap still subtracts what this view held.
+    const drained = { ...feed, observation: { ...feed.observation, inbox: [] } };
+    feed = step(drained, {
+      epoch,
+      passId: "p5",
+      watermark: 5,
+      inbox: [notice(9), gap(7, 10, "not-observed", 3, 1)],
+    });
+    expect(shape(feed)).toEqual([[10, 10, "not-observed", 1, 0]]);
+    // A navigation in the same projection keeps sequence numbers.
+    feed = step(feed, {
+      epoch: domain({ branchGeneration: 2 }),
+      passId: "p6",
+      watermark: 6,
+      inbox: [gap(7, 10, "not-observed", 3, 1), notice(11)],
+    });
+    expect(shape(feed)).toEqual([[10, 10, "not-observed", 1, 0], 11]);
     const held = feed.observation.inbox;
-    expect(step(feed, { epoch, passId: "p4", watermark: 4 }).observation.inbox).toBe(held);
+    expect(step(feed, { epoch, passId: "p7", watermark: 7 }).observation.inbox).toBe(held);
   });
 });

@@ -20,6 +20,7 @@ import * as Schema from "effect/Schema";
 import type { EnvironmentRpcSuccess, EnvironmentRpcStreamValue } from "./rpc/client.ts";
 import {
   emptyNativeConversation,
+  nativeConversationGaps,
   reduceNativeConversation,
   sameNativeSession,
   type NativeConversation,
@@ -249,6 +250,16 @@ export interface NativeObservedEntity {
   readonly revision: number;
   readonly value: NeoPiNativeEntityValue;
 }
+/** An applied inbox record or gap, reduced to what gap arithmetic needs. */
+export interface NativeInboxLedgerItem {
+  readonly fromSeq: number;
+  readonly notices: number;
+  readonly toolStreams: ReadonlyArray<{ readonly toolCallId: string; readonly updates: number }>;
+  /** Set for a gap: the receive time of its last record. */
+  readonly lastReceivedAt: number | null;
+}
+/** Applied inbox items remembered for gap arithmetic; a gap reaching further back is counted as given. */
+const INBOX_LEDGER_LIMIT = 4096;
 export interface NativeObservation {
   readonly domain: NeoPiNativeObservationDomain | null;
   /** Send with the next read; null before the first. A `full` pass in it means catching up. */
@@ -261,24 +272,33 @@ export interface NativeObservation {
   /** Revision at which each removed key was removed; an older value never brings it back. */
   readonly removed: ReadonlyMap<string, number>;
   /**
-   * Live rows whose durable entry was known but not loaded when branch
-   * continuity was lost (a navigation, a rebuild that cannot know, an owner
-   * change). The next completed full pass decides them: entry loaded, they
-   * retire; otherwise they are continuity losses.
+   * Live rows whose durable entry was known but not loaded when a navigation
+   * changed the branch. The next completed full pass decides them: entry
+   * loaded, they retire; otherwise they are continuity losses.
    */
   readonly unproven: ReadonlySet<string>;
+  /**
+   * Live rows waiting for an unloaded entry across a rebuild or owner change,
+   * which cannot know the branch. They wait until the entry loads, or until a
+   * completed full pass finds the branch loaded to its root without it.
+   */
+  readonly carried: ReadonlySet<string>;
   /** Oversized values in transit, by key, at one revision. */
   readonly segments: ReadonlyMap<
     string,
     { readonly revision: number; readonly parts: ReadonlyArray<string | undefined> }
   >;
   /**
-   * Live-only records without a reducer, in order, and `gap` records where the
-   * server evicted records this view never received. Nothing is invented for a gap.
+   * Live-only records without a reducer, in order, and `gap` records for what
+   * this view missed: a gap never repeats records already applied here, and
+   * nothing is invented for it. A consumer may remove what it has mapped.
    */
   readonly inbox: readonly NeoPiNativeInboxRecord[];
-  /** Index of the first inbox record of the current projection; sequence numbers restart per projection. */
-  readonly inboxStart: number;
+  /** The projection the inbox sequence numbers belong to, and the last one applied. */
+  readonly inboxKey: string | null;
+  readonly inboxSeq: number;
+  /** What was applied, by sequence and counts only, so a grown gap subtracts what this view holds. */
+  readonly inboxLedger: readonly NativeInboxLedgerItem[];
   /** Last read id issued; only grows, so it rises on every lease. */
   readonly readSeq: number;
   /** The one read whose reply may apply; cleared by its reply or by `invalidateNativeReads`. */
@@ -295,9 +315,12 @@ export const emptyNativeObservation = (): NativeObservation => ({
   returned: new Set(),
   removed: new Map(),
   unproven: new Set(),
+  carried: new Set(),
   segments: new Map(),
   inbox: [],
-  inboxStart: 0,
+  inboxKey: null,
+  inboxSeq: -1,
+  inboxLedger: [],
   readSeq: 0,
   outstanding: null,
 });
@@ -469,10 +492,28 @@ export function applyNativeRead(
     replaced || result.promoted || result.passId !== held.passId ? [] : held.returned,
   );
   const removed = new Map(replaced ? [] : held.removed);
-  const segments = new Map(replaced ? [] : held.segments);
+  // A transfer belongs to its pass: a new, promoted or completed pass drops it.
+  const segments = new Map(
+    replaced || result.promoted || result.passId !== held.passId ? [] : held.segments,
+  );
   const unresolved = new Set<string>();
   let conversation = feed.conversation;
   let commandOutputs = feed.commandOutputs;
+  /** Output on a row that just became a loss stays after the entry its content now reads from. */
+  const relocateLostOutputs = (before: NativeConversation["losses"]) => {
+    const fresh = conversation.losses.filter((loss) => !before.includes(loss));
+    if (fresh.length === 0) return;
+    const anchors = new Map(fresh.map((loss) => [loss.messageId, loss.afterEntryId] as const));
+    commandOutputs = commandOutputs.map((output) =>
+      output.afterMessageId !== null && anchors.has(output.afterMessageId)
+        ? {
+            ...output,
+            afterEntryId: anchors.get(output.afterMessageId) ?? null,
+            afterMessageId: null,
+          }
+        : output,
+    );
+  };
   if (!conversation.identity && feed.session)
     conversation = reduceNativeConversation(conversation, {
       type: "identity",
@@ -499,9 +540,14 @@ export function applyNativeRead(
       for (const entry of journal.entries)
         conversation = reduceNativeConversation(conversation, { type: "entry", identity, entry });
   }
+  let unproven = held.unproven;
+  let carried = held.carried;
   if (ownerChanged) {
     const persisted = conversation.persisted;
+    const losses = conversation.losses;
     conversation = reduceNativeConversation(conversation, { type: "owner_changed" });
+    // Before any successor row can take the same id.
+    relocateLostOutputs(losses);
     // Output on an identified row follows it under its new key, or onto its entry once retired.
     const waiting = conversation.persisted;
     commandOutputs = commandOutputs.map((output) => {
@@ -512,20 +558,30 @@ export function applyNativeRead(
         ? { ...output, afterMessageId: key }
         : { ...output, afterEntryId: entryId, afterMessageId: null };
     });
+    const rename = (ids: ReadonlySet<string>) =>
+      new Set(
+        [...ids].flatMap((messageId) => {
+          const entryId = persisted.get(messageId);
+          return entryId === undefined ? [] : [`durable:${entryId}`];
+        }),
+      );
+    unproven = rename(held.unproven);
+    carried = rename(held.carried);
   }
-  // Same branch: a known entry is on it and will be loaded, so its row waits.
-  // Otherwise nothing proves that entry is on the current branch.
-  let unproven = held.unproven;
+  // Rows waiting for an unloaded entry when continuity breaks. A navigation the
+  // server detected (same projection, new branch generation) leaves them
+  // unproven: the entry may be on the abandoned branch. A rebuild or owner
+  // change cannot know; their rows are carried and keep waiting until the
+  // entry loads or the branch is loaded to its root without it.
   if (was !== null && !continuous) {
     const loadedNow = new Set(conversation.entries.map((entry) => entry.id));
-    const waiting = conversation.pending.filter((row) => {
+    const waiting = conversation.pending.flatMap((row) => {
       const entryId = conversation.persisted.get(row.messageId);
-      return entryId !== undefined && !loadedNow.has(entryId);
+      return entryId !== undefined && !loadedNow.has(entryId) ? [row.messageId] : [];
     });
-    unproven = new Set([
-      ...(ownerChanged ? [] : held.unproven),
-      ...waiting.map((row) => row.messageId),
-    ]);
+    if (!ownerChanged && was.projectionIncarnation === domain.projectionIncarnation)
+      unproven = new Set([...unproven, ...waiting]);
+    else carried = new Set([...carried, ...waiting]);
   }
   const accept = (entity: NeoPiNativeEntity) => {
     returned.add(entity.key);
@@ -603,80 +659,95 @@ export function applyNativeRead(
     for (const row of conversation.pending)
       if (!live.has(row.messageId)) unresolved.add(row.messageId);
   }
-  // An identified row waits for its entry, unless continuity with the branch
-  // that entry is on was lost and a completed full pass still has not loaded it.
+  // An identified row waits for its entry. A completed full pass ends that wait
+  // only with proof the entry is not on this branch: a navigation left it
+  // unproven, or the branch is loaded back to its root without it.
   const loaded = new Set(conversation.entries.map((entry) => entry.id));
+  const wholeBranch =
+    conversation.entries[0]?.parentId === null && nativeConversationGaps(conversation).size === 0;
   for (const messageId of unresolved) {
     const entryId = conversation.persisted.get(messageId);
     if (
       entryId !== undefined &&
-      !(fullCompleted && unproven.has(messageId) && !loaded.has(entryId))
+      !(
+        fullCompleted &&
+        !loaded.has(entryId) &&
+        (unproven.has(messageId) || (carried.has(messageId) && wholeBranch))
+      )
     )
       unresolved.delete(messageId);
   }
   if (unresolved.size > 0) {
+    const losses = conversation.losses;
     conversation = reduceNativeConversation(conversation, {
       type: "unresolved",
       messageIds: unresolved,
     });
-    // Output on a lost row stays after the entry its content now reads from.
-    const anchors = new Map(
-      conversation.losses.map((loss) => [loss.messageId, loss.afterEntryId] as const),
-    );
-    commandOutputs = commandOutputs.map((output) =>
-      output.afterMessageId !== null && unresolved.has(output.afterMessageId)
-        ? {
-            ...output,
-            afterEntryId: anchors.get(output.afterMessageId) ?? null,
-            afterMessageId: null,
-          }
-        : output,
-    );
+    relocateLostOutputs(losses);
   }
   // A completed pass moved `base` past every fence at or below it.
   if (completed)
     for (const [key, revision] of removed)
       if (revision <= result.continuation.base) removed.delete(key);
-  // Inbox sequence numbers belong to one projection.
-  const inboxStart = sameProjection ? held.inboxStart : held.inbox.length;
-  const inbox: NeoPiNativeInboxRecord[] = result.inbox.length === 0 ? [] : [...held.inbox];
+  // Inbox sequence numbers belong to one projection; a navigation keeps them.
+  const inboxKey = JSON.stringify([
+    domain.serverIncarnation,
+    domain.ownerEpoch,
+    domain.projectionIncarnation,
+  ]);
+  const sameInbox = held.inboxKey === inboxKey;
+  let inboxSeq = sameInbox ? held.inboxSeq : -1;
+  const kept = sameInbox ? held.inboxLedger : [];
+  const ledger = result.inbox.length === 0 ? [] : [...kept];
+  const arrived: NeoPiNativeInboxRecord[] = [];
   for (const record of result.inbox) {
-    const last = inbox.length > inboxStart ? inbox.at(-1) : undefined;
-    if (last && record.seq <= last.seq) continue;
+    if (record.seq <= inboxSeq) continue;
     if (record.type !== "gap") {
-      inbox.push(record);
-      continue;
-    }
-    // The server extends its one gap in place, keeping `fromSeq`: that replaces
-    // the shorter gap. A gap straight after another gap merges with it; mixing
-    // reasons leaves coverage unknown, so the merge is `not-observed`.
-    const at = inbox.findLastIndex(
-      (prior, index) =>
-        index >= inboxStart && prior.type === "gap" && prior.fromSeq === record.fromSeq,
-    );
-    if (at >= 0) {
-      inbox.splice(at, 1);
-      inbox.push(record);
-    } else if (last?.type === "gap") {
-      const streams = new Map(last.toolStreams.map((stream) => [stream.toolCallId, stream]));
-      for (const stream of record.toolStreams) {
-        const prior = streams.get(stream.toolCallId);
-        streams.set(
-          stream.toolCallId,
-          prior ? { ...stream, updates: prior.updates + stream.updates } : stream,
-        );
+      arrived.push(record);
+      ledger.push({
+        fromSeq: record.seq,
+        notices: record.type === "notice" ? 1 : 0,
+        toolStreams:
+          record.type === "tool_stream_update"
+            ? [{ toolCallId: record.toolCallId, updates: 1 }]
+            : [],
+        lastReceivedAt: null,
+      });
+    } else {
+      // A gap the server grew can cover records and gaps this view already
+      // applied: only what follows them was missed, counted once.
+      let notices = record.notices;
+      const updates = new Map(
+        record.toolStreams.map((stream) => [stream.toolCallId, stream.updates]),
+      );
+      let firstReceivedAt = record.firstReceivedAt;
+      for (const item of ledger) {
+        if (item.fromSeq < record.fromSeq) continue;
+        notices -= item.notices;
+        for (const stream of item.toolStreams)
+          updates.set(stream.toolCallId, (updates.get(stream.toolCallId) ?? 0) - stream.updates);
+        if (item.lastReceivedAt !== null)
+          firstReceivedAt = Math.max(firstReceivedAt, item.lastReceivedAt);
       }
-      inbox[inbox.length - 1] = {
+      const gap = {
         ...record,
-        fromSeq: last.fromSeq,
-        reason: last.reason === record.reason ? record.reason : "not-observed",
-        firstReceivedAt: Math.min(last.firstReceivedAt, record.firstReceivedAt),
-        lastReceivedAt: Math.max(last.lastReceivedAt, record.lastReceivedAt),
-        notices: last.notices + record.notices,
-        toolStreams: [...streams.values()],
-        toolStreamsTruncated: last.toolStreamsTruncated || record.toolStreamsTruncated,
+        fromSeq: Math.max(record.fromSeq, inboxSeq + 1),
+        firstReceivedAt,
+        notices: Math.max(0, notices),
+        toolStreams: record.toolStreams.flatMap((stream) => {
+          const left = updates.get(stream.toolCallId) ?? 0;
+          return left > 0 ? [{ ...stream, updates: left }] : [];
+        }),
       };
-    } else inbox.push(record);
+      arrived.push(gap);
+      ledger.push({
+        fromSeq: gap.fromSeq,
+        notices: gap.notices,
+        toolStreams: gap.toolStreams,
+        lastReceivedAt: gap.lastReceivedAt,
+      });
+    }
+    inboxSeq = record.seq;
   }
   return {
     ...feed,
@@ -690,9 +761,14 @@ export function applyNativeRead(
       returned: completed ? new Set() : returned,
       removed,
       unproven: fullCompleted ? new Set() : unproven,
-      segments,
-      inbox: result.inbox.length === 0 ? held.inbox : inbox,
-      inboxStart,
+      carried: new Set(
+        conversation.pending.flatMap((row) => (carried.has(row.messageId) ? [row.messageId] : [])),
+      ),
+      segments: completed ? new Map() : segments,
+      inbox: arrived.length === 0 ? held.inbox : [...held.inbox, ...arrived],
+      inboxKey,
+      inboxSeq,
+      inboxLedger: result.inbox.length === 0 ? kept : ledger.slice(-INBOX_LEDGER_LIMIT),
       readSeq: held.readSeq,
       outstanding: null,
     },

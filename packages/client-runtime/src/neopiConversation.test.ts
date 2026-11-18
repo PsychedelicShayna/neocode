@@ -106,6 +106,30 @@ describe("native main conversation", () => {
     ).toEqual(["future_extension", "compaction", "reset_boundary", "branch_summary"]);
   });
 
+  it("changes nothing when an older page reply is replayed after later pages", () => {
+    const all = Array.from({ length: 5 }, (_, index) =>
+      entry(String(index), index ? String(index - 1) : null),
+    );
+    const current = { ...identity, leafId: "4" };
+    let state = reduceNativeConversation(emptyNativeConversation(), {
+      type: "snapshot",
+      page: { ...current, entries: all.slice(3), totalEntries: 5, nextCursor: "3" },
+    });
+    const first = {
+      type: "older" as const,
+      revision: state.revision,
+      page: { ...current, entries: all.slice(2, 3), totalEntries: 5, nextCursor: "2" },
+    };
+    state = reduceNativeConversation(state, first);
+    state = reduceNativeConversation(state, {
+      type: "older",
+      revision: state.revision,
+      page: { ...current, entries: all.slice(0, 2), totalEntries: 5 },
+    });
+    expect(state.cursor).toBeUndefined();
+    expect(reduceNativeConversation(state, first)).toBe(state);
+  });
+
   it.each([true, false])(
     "associates live messages with durable identities in either arrival order: ack first %s",
     (ackFirst) => {

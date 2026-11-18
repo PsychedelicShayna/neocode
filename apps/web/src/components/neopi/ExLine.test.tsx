@@ -77,43 +77,50 @@ describe("ExLine", () => {
     vi.clearAllMocks();
   });
 
-  it("runs :split once on Enter's release, keeping held repeats out of the composer", () => {
-    const run = vi.fn();
-    cleanups.push(
-      registerCommand("terminal.split", "workspace", {
-        label: "Split terminal",
-        available: () => true,
-        run,
-      }),
-    );
+  for (const [closingKey, line] of [
+    ["Enter", "split"],
+    ["Escape", "split"],
+  ] as const) {
+    it(`acts on ${closingKey} at once and keeps its held repeats out of the composer`, () => {
+      const run = vi.fn();
+      cleanups.push(
+        registerCommand("terminal.split", "workspace", {
+          label: "Split terminal",
+          available: () => true,
+          run,
+        }),
+      );
+      const composerKeys: string[] = [];
+      const onComposerKey = (event: KeyboardEvent) => composerKeys.push(event.key);
+      composer.value = "draft";
+      composer.addEventListener("keydown", onComposerKey);
+      const input = open();
+      expect(document.activeElement).toBe(input);
+      type(input, line);
+
+      key(input, "keydown", closingKey);
+      expect(run).toHaveBeenCalledTimes(closingKey === "Enter" ? 1 : 0);
+      expect(onClosed).toHaveBeenCalledOnce();
+      expect(document.activeElement).toBe(composer);
+
+      key(composer, "keydown", closingKey, true);
+      key(composer, "keydown", closingKey, true);
+      expect(composerKeys).toEqual([]);
+
+      key(composer, "keyup", closingKey);
+      key(composer, "keydown", closingKey);
+      expect(composerKeys).toEqual([closingKey]);
+      expect(run).toHaveBeenCalledTimes(closingKey === "Enter" ? 1 : 0);
+      composer.removeEventListener("keydown", onComposerKey);
+    });
+  }
+
+  it("returns focus on an empty Enter without running anything", () => {
     const input = open();
-    expect(document.activeElement).toBe(input);
-    type(input, "split");
-
     key(input, "keydown", "Enter");
-    key(input, "keydown", "Enter", true);
-    key(input, "keydown", "Enter", true);
-    expect(run).not.toHaveBeenCalled();
-    expect(document.activeElement).toBe(input);
-
-    key(input, "keyup", "Enter");
-    expect(run).toHaveBeenCalledOnce();
     expect(onClosed).toHaveBeenCalledOnce();
     expect(document.activeElement).toBe(composer);
-  });
-
-  it("returns focus on Escape and on an empty Enter without running anything", () => {
-    let input = open();
-    key(input, "keydown", "Escape");
-    key(input, "keyup", "Escape");
-    expect(document.activeElement).toBe(composer);
-
-    act(() => root.unmount());
-    input = open();
-    key(input, "keydown", "Enter");
-    key(input, "keyup", "Enter");
-    expect(onClosed).toHaveBeenCalledTimes(2);
-    expect(document.activeElement).toBe(composer);
+    key(composer, "keyup", "Enter");
   });
 
   it("names the terminal focused last to :q, and stays open when none can close", () => {
@@ -139,7 +146,7 @@ describe("ExLine", () => {
     const input = open();
     type(input, "q");
     key(input, "keydown", "Enter");
-    key(input, "keyup", "Enter");
+    key(document, "keyup", "Enter");
     expect(invoked?.terminal).toEqual({
       environmentId: "env-a",
       threadId: "thread-a",
@@ -152,7 +159,7 @@ describe("ExLine", () => {
     const again = open();
     type(again, "q");
     key(again, "keydown", "Enter");
-    key(again, "keyup", "Enter");
+    key(document, "keyup", "Enter");
     expect(document.querySelector("[role='alert']")?.textContent).toBe("Nothing to close");
     expect(document.activeElement).toBe(again);
   });

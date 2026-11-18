@@ -138,7 +138,7 @@ describe("useCommandHandlers", () => {
     const seen: string[] = [];
     function Survivor({ ownerShown }: { ownerShown: boolean }) {
       useLayoutEffect(() => {
-        seen.push(dispatchCommand("terminal.new").status);
+        seen.push(`${ownerShown ? "shown" : "removed"}: ${dispatchCommand("terminal.new").status}`);
       }, [ownerShown]);
       return null;
     }
@@ -155,7 +155,7 @@ describe("useCommandHandlers", () => {
       renderer = create(<Page ownerShown />);
     });
     act(() => renderer.update(<Page ownerShown={false} />));
-    expect(seen).toEqual(["ran", "unknown"]);
+    expect(seen).toEqual(["shown: ran", "removed: unknown"]);
     act(() => renderer.unmount());
   });
 });

@@ -13,7 +13,7 @@ import {
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
 import { isEditableFocused } from "./lib/editableFocus";
-import { isExLineFocused } from "./lib/exLineFocus";
+import { isExLineFocused, isGuardedRepeat } from "./lib/exLineFocus";
 import { getTerminalFocusOwner, isTerminalInputFocused } from "./lib/terminalFocus";
 
 export interface ShortcutEventLike {
@@ -345,6 +345,8 @@ export function resolveShortcutCommand(
   if (isModifierKeyEvent(event)) return null;
   const focus = advanceSequence(event);
   if (isTerminalInputFocused()) return null;
+  // Listeners on the window run before the document's repeat guard.
+  if (isGuardedRepeat(event)) return null;
   // The Ex line's keys are its own: there, only a modified single chord resolves.
   const exLineFocus = isExLineFocused();
   if (exLineFocus && !event.ctrlKey && !event.metaKey && !event.altKey) return null;

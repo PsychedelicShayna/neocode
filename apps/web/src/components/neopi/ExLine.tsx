@@ -13,7 +13,7 @@ import {
   type RefObject,
 } from "react";
 import { dispatchCommand, findCommand } from "../../commandTable";
-import { EX_LINE_INPUT_ATTRIBUTE } from "../../lib/exLineFocus";
+import { EX_LINE_INPUT_ATTRIBUTE, guardHeldKey } from "../../lib/exLineFocus";
 import { getLastFocusedTerminal } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { selectNativeSession, useNativeSessionSelection } from "../../state/neopiNativeSessions";
@@ -114,9 +114,6 @@ export function ExLine({
       : null,
   );
   const [state, setState] = useState(EX_LINE_INITIAL);
-  // Enter or Escape decided what happens; it happens once that key is released,
-  // so its auto-repeat lands in this input rather than wherever focus goes next.
-  const pending = useRef<{ key: string; effect: ExLineEffect } | null>(null);
   const tabs = useNativeSessionSelection((selection) => selection.tabs);
   const [labels, setLabels] = useState<ReadonlyMap<string, SessionLabel>>(new Map());
   const onLabel = useCallback((key: string, label: SessionLabel) => {
@@ -140,11 +137,7 @@ export function ExLine({
     inputRef.current?.focus();
   }, [inputRef]);
 
-  const finish = () => {
-    const decided = pending.current;
-    if (!decided) return;
-    pending.current = null;
-    const { effect } = decided;
+  const apply = (effect: ExLineEffect) => {
     if (effect.kind !== "close" && history[0] !== state.text) history.unshift(state.text);
     onClose();
     if (returnFocus?.isConnected) returnFocus.focus();
@@ -170,7 +163,7 @@ export function ExLine({
     const key = keyOf(event);
     if (!key) return;
     event.preventDefault();
-    if (event.repeat || pending.current) return;
+    if (event.repeat) return;
     const next = exLineKey(state, key, {
       matches,
       history,
@@ -180,8 +173,13 @@ export function ExLine({
         activePanelSurfaceIsTerminal,
       },
     });
-    if (next.effect) pending.current = { key: event.key, effect: next.effect };
-    else setState(next.state);
+    if (!next.effect) {
+      setState(next.state);
+      return;
+    }
+    // Focus is about to leave the line while this key is still down.
+    guardHeldKey(event.key);
+    apply(next.effect);
   };
 
   const selected = Math.min(state.selected, matches.length - 1);
@@ -213,10 +211,6 @@ export function ExLine({
         value={state.text}
         onChange={(event) => setState(editExLine(event.target.value))}
         onKeyDown={onKeyDown}
-        onKeyUp={(event) => {
-          if (event.key === pending.current?.key) finish();
-        }}
-        onBlur={finish}
         spellCheck={false}
         autoComplete="off"
         className="h-full min-w-0 flex-1 bg-transparent text-foreground outline-none"

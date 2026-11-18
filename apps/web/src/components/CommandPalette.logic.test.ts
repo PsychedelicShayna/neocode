@@ -856,7 +856,12 @@ describe("filterCommandPaletteGroups", () => {
 
 describe("command table actions", () => {
   it("offers an action only while a mounted handler would run it, and runs that handler", async () => {
-    const item = { value: "action:native-terminal", title: "Toggle terminal", icon: null };
+    const item = {
+      value: "action:native-terminal",
+      title: "Toggle terminal",
+      searchTerms: ["terminal", "shell"],
+      icon: null,
+    };
     expect(commandTableAction("terminal.toggle", item)).toBeNull();
 
     let available = false;

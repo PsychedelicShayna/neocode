@@ -5,8 +5,10 @@ import {
   type NeoPiJournalPage,
   type NeoPiNativeCursor,
   type NeoPiNativeEntityValue,
+  type NeoPiNativeEssentialEnvelope,
   type NeoPiNativeInboxRecord,
   type NeoPiNativeObservationDomain,
+  type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionsReadResult,
   type ServerProviderSlashCommand,
@@ -54,6 +56,10 @@ export type NativeSessionEvent = EnvironmentRpcStreamValue<
 >;
 export type NativeSessionUpdate =
   | NativeSessionEvent
+  /** One envelope of the essential `watch` stream (the lease). */
+  | NeoPiNativeEssentialEnvelope
+  /** The observation controller's own state; see `NativeObserver`. */
+  | { type: "observer"; phase: NativeObserverPhase; reason?: string }
   | { type: "disconnected" }
   /**
    * One reply of the observation cursor read, applied by `applyNativeRead`.
@@ -287,6 +293,21 @@ export const emptyNativeObservation = (): NativeObservation => ({
   inboxStart: 0,
 });
 export type NativeOwnerLoss = "reconnecting" | "orphaned" | "detached";
+/**
+ * Where the view's observation stands (r12 C5). `attaching` until the server
+ * reports a lifecycle; `transport-lost` while the socket or watch is being
+ * re-attached; `unauthorized` after an authorization or profile change ended
+ * the watch. The rest are the server's lifecycle facts.
+ */
+export type NativeObserverPhase =
+  | "attaching"
+  | NeoPiNativeObservationLifecycle
+  | "transport-lost"
+  | "unauthorized";
+export interface NativeObserver {
+  readonly phase: NativeObserverPhase;
+  readonly reason: string | null;
+}
 export interface NativeSessionFeed {
   readonly session: NativeSession | null;
   readonly conversation: NativeConversation;
@@ -311,6 +332,8 @@ export interface NativeSessionFeed {
   readonly activity: NativeActivity;
   /** Keyed projection state from cursor reads (`applyNativeRead`). */
   readonly observation: NativeObservation;
+  /** The observation controller's state; `nativeObservationStatus` derives catching-up from it. */
+  readonly observer: NativeObserver;
   readonly editor: { readonly id: string; readonly text: string } | null;
   readonly dictation: NativeDictation | null;
   /**
@@ -350,6 +373,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   jobs: EMPTY_NATIVE_JOBS,
   activity: EMPTY_NATIVE_ACTIVITY,
   observation: emptyNativeObservation(),
+  observer: { phase: "attaching", reason: null },
   editor: null,
   dictation: null,
   movedTo: null,
@@ -643,12 +667,491 @@ export function applyNativeRead(
   };
 }
 
+/**
+ * Inbox records a feed keeps (gaps included). Older ones fold into one leading
+ * `evicted` gap per projection, so a tool that streams forever cannot grow the
+ * cache. Nothing in the client reads inbox records beyond this window.
+ */
+export const NATIVE_INBOX_LIMIT = 512;
+/** Per-call detail one folded gap lists before it reports `toolStreamsTruncated`. */
+const NATIVE_GAP_TOOL_STREAMS = 64;
+type NativeInboxGap = Extract<NeoPiNativeInboxRecord, { type: "gap" }>;
+
+/** Folds a run of inbox records of one projection into the gap the server would have sent. */
+function foldNativeInbox(records: readonly NeoPiNativeInboxRecord[], at: number): NativeInboxGap {
+  const streams = new Map<string, NativeInboxGap["toolStreams"][number]>();
+  let truncated = false;
+  let notices = 0;
+  let notObserved = false;
+  // Records carry no server receive time, so a client fold ends at the time it
+  // happened; a folded gap keeps its own earlier start.
+  let firstReceivedAt = at;
+  const count = (stream: NativeInboxGap["toolStreams"][number]) => {
+    const prior = streams.get(stream.toolCallId);
+    if (prior)
+      streams.set(stream.toolCallId, { ...prior, updates: prior.updates + stream.updates });
+    else if (streams.size < NATIVE_GAP_TOOL_STREAMS) streams.set(stream.toolCallId, stream);
+    else truncated = true;
+  };
+  for (const record of records) {
+    if (record.type === "notice") notices++;
+    else if (record.type === "tool_stream_update")
+      count({ toolCallId: record.toolCallId, toolName: record.toolName, updates: 1 });
+    else {
+      notices += record.notices;
+      for (const stream of record.toolStreams) count(stream);
+      truncated ||= record.toolStreamsTruncated;
+      notObserved ||= record.reason === "not-observed";
+      firstReceivedAt = Math.min(firstReceivedAt, record.firstReceivedAt);
+    }
+  }
+  const first = records[0]!;
+  const last = records.at(-1)!;
+  return {
+    type: "gap",
+    seq: last.seq,
+    reason: notObserved ? "not-observed" : "evicted",
+    fromSeq: first.type === "gap" ? first.fromSeq : first.seq,
+    toSeq: last.seq,
+    firstReceivedAt,
+    lastReceivedAt: at,
+    notices,
+    toolStreams: [...streams.values()],
+    toolStreamsTruncated: truncated,
+  };
+}
+
+/** Keeps the inbox within `NATIVE_INBOX_LIMIT`, leaving gaps where it cut. */
+export function boundNativeInbox(observation: NativeObservation, at: number): NativeObservation {
+  const { inbox, inboxStart } = observation;
+  if (inbox.length <= NATIVE_INBOX_LIMIT) return observation;
+  // Room for up to two folded gaps: the previous projection's and this one's.
+  const cut = inbox.length - NATIVE_INBOX_LIMIT + 2;
+  const older = inbox.slice(0, Math.min(cut, inboxStart));
+  const current = inbox.slice(inboxStart, Math.max(cut, inboxStart));
+  const olderGap = older.length > 0 ? [foldNativeInbox(older, at)] : [];
+  const retainedOlder = inbox.slice(older.length, inboxStart);
+  const currentGap = current.length > 0 ? [foldNativeInbox(current, at)] : [];
+  return {
+    ...observation,
+    inbox: [
+      ...olderGap,
+      ...retainedOlder,
+      ...currentGap,
+      ...inbox.slice(inboxStart + current.length),
+    ],
+    inboxStart: olderGap.length + retainedOlder.length,
+  };
+}
+
+/** Catching up (r12 C5, D-19): attaching, building, or a full pass in progress. */
+export function nativeObservationStatus(feed: NativeSessionFeed): {
+  readonly phase: NativeObserverPhase | "rebasing";
+  readonly catchingUp: boolean;
+} {
+  const { phase } = feed.observer;
+  if (phase === "attaching" || phase === "building") return { phase, catchingUp: true };
+  const cursor = feed.observation.cursor;
+  if (phase === "observing" && (cursor === null || cursor.pass?.kind === "full"))
+    return { phase: "rebasing", catchingUp: true };
+  return { phase, catchingUp: false };
+}
+
+/** One child's roster key (`roster:<id>`) replayed in its authority order: history, live inventory, lifecycle, progress. */
+function projectNativeChild(
+  agents: readonly NativeSubagent[],
+  row: Readonly<Record<string, unknown>>,
+  revision: number,
+  at: string,
+): readonly NativeSubagent[] {
+  const id = row.id;
+  const index = agents.findIndex((agent) => agent.id === id);
+  let child: readonly NativeSubagent[] = index < 0 ? [] : [agents[index]!];
+  if (row.history !== undefined)
+    child = mergeNativeSubagentHistory(child, [row.history], revision, at);
+  // `null`: held but missing from the live inventory at its last read.
+  if (row.inventory !== undefined)
+    child = snapshotNativeSubagents(
+      child,
+      row.inventory === null ? [] : [row.inventory],
+      revision,
+      revision,
+      at,
+    );
+  if (row.lifecycle !== undefined)
+    child = reduceNativeSubagents(
+      child,
+      { type: "subagent_lifecycle", payload: row.lifecycle },
+      revision,
+      at,
+    );
+  if (row.progress !== undefined)
+    child = reduceNativeSubagents(
+      child,
+      { type: "subagent_progress", payload: row.progress },
+      revision,
+      at,
+    );
+  const next = child[0];
+  if (!next) return agents;
+  return index < 0
+    ? [...agents, next]
+    : agents.map((agent, position) => (position === index ? next : agent));
+}
+
+/**
+ * Maps projection keys into the feed fields web and mobile read. Keys are
+ * replaced by key: a rebase never flashes agents as disconnected. Command
+ * output stays once shown, as it did across reconnects before.
+ */
+function projectNativeEntities(
+  before: NativeSessionFeed,
+  feed: NativeSessionFeed,
+): NativeSessionFeed {
+  const previous = before.observation.entities;
+  const entities = feed.observation.entities;
+  if (previous === entities) return feed;
+  const at = DateTime.formatIso(DateTime.nowUnsafe());
+  const revision = feed.agentsRevision + 1;
+  const domain = feed.observation.domain;
+  const scope = domain
+    ? `${domain.serverIncarnation}:${domain.ownerEpoch}:${domain.projectionIncarnation}`
+    : "";
+  let agents = feed.agents;
+  let state: Record<string, unknown> | null = null;
+  let queue = feed.queue;
+  let activity = feed.activity;
+  let error = feed.error;
+  let commandsRevision = feed.commandsRevision;
+  let dictation = feed.dictation;
+  let editor = feed.editor;
+  let jobs = feed.jobs;
+  let jobsChanged = false;
+  // Copied on first write, then written in place.
+  let agentTicks: Record<string, number> | null = null;
+  let notices: Record<string, string> | null = null;
+  const outputs = new Set(feed.commandOutputs.map((output) => output.id));
+  const added: NativeCommandOutput[] = [];
+  for (const [key, entity] of entities) {
+    if (previous.get(key)?.value === entity.value) continue;
+    const value = entity.value;
+    if (value.class === "roster") {
+      const row = value.value;
+      agents = projectNativeChild(agents, row, revision, at);
+      if (typeof row.id === "string" && typeof row.ticks === "number") {
+        agentTicks ??= { ...feed.agentTicks };
+        agentTicks[row.id] = row.ticks;
+      }
+    } else if (value.class === "receipt") {
+      const receipt = value.value;
+      const id = `${scope}:${key}`;
+      if (receipt.kind === "command_output" && typeof receipt.text === "string" && !outputs.has(id))
+        added.push({
+          id,
+          text: receipt.text,
+          afterEntryId: typeof receipt.afterEntryId === "string" ? receipt.afterEntryId : null,
+          afterMessageId:
+            typeof receipt.afterMessageId === "string" ? receipt.afterMessageId : null,
+        });
+    } else if (value.class === "setting" && value.value.property === "state") {
+      if (feed.session) {
+        state = nativeRecord(value.value.value);
+        queue = nativePromptQueue(state.queuedMessages) ?? queue;
+        activity = observeNativeActivity(activity, state, feed.busy, nowMs());
+      }
+    } else if (value.class === "setting" && value.value.property === "queue")
+      queue = nativePromptQueue(value.value.value) ?? queue;
+    else if (value.class === "fault" && typeof value.value.message === "string")
+      error = value.value.message;
+    else if (value.class === "presentation") {
+      const record = value.value;
+      if (key.startsWith("job:") || key === "presentation:jobs") jobsChanged = true;
+      else if (key === "presentation:available_commands_update") commandsRevision++;
+      else if (key === "presentation:dictation" && typeof record.captureId === "string")
+        dictation = {
+          captureId: record.captureId,
+          phase: DICTATION_PHASES.has(record.phase)
+            ? (record.phase as NativeDictation["phase"])
+            : "ended",
+          text: typeof record.text === "string" ? record.text : "",
+          error: typeof record.error === "string" && record.error ? record.error : null,
+        };
+      else if (
+        key === "presentation:editorText" &&
+        typeof record.id === "string" &&
+        typeof record.text === "string"
+      )
+        editor = { id: record.id, text: record.text };
+      else if (key === "presentation:promptResult") {
+        if (record.status === "error")
+          error = typeof record.error === "string" ? record.error : "Native command failed.";
+        else if (!feed.reconciliationError) error = null;
+      } else {
+        const notice =
+          key === "presentation:notify" && typeof record.message === "string"
+            ? (["notification", record.message] as const)
+            : record.method === "setStatus" && typeof record.statusKey === "string"
+              ? ([
+                  record.statusKey,
+                  typeof record.statusText === "string" ? record.statusText : "",
+                ] as const)
+              : record.method === "setWidget" && typeof record.widgetKey === "string"
+                ? ([
+                    record.widgetKey,
+                    Array.isArray(record.widgetLines) ? record.widgetLines.join("\n") : "",
+                  ] as const)
+                : null;
+        if (notice) {
+          notices ??= { ...feed.notices };
+          notices[notice[0]] = notice[1];
+        }
+      }
+    }
+  }
+  for (const [key, entity] of previous) {
+    if (entities.has(key)) continue;
+    if (entity.value.class === "roster") {
+      const id = entity.value.value.id;
+      agents = agents.filter((agent) => agent.id !== id);
+    } else if (key.startsWith("job:")) jobsChanged = true;
+  }
+  if (jobsChanged) {
+    const running: unknown[] = [];
+    let runningCount: unknown;
+    for (const [key, { value }] of entities)
+      if (value.class !== "presentation") continue;
+      else if (key.startsWith("job:")) running.push(value.value.job);
+      else if (key === "presentation:jobs") runningCount = value.value.runningCount;
+    jobs = snapshotNativeJobs(jobs, { running, runningCount }, jobs.revision);
+  }
+  return {
+    ...feed,
+    session: state && feed.session ? { ...feed.session, state } : feed.session,
+    queue,
+    activity,
+    error,
+    commandsRevision,
+    dictation,
+    editor,
+    jobs,
+    notices: notices ?? feed.notices,
+    agents,
+    agentsRevision: agents === feed.agents ? feed.agentsRevision : revision,
+    // A completed pass holds every roster key the authority knows.
+    agentsKnown: feed.agentsKnown || feed.observation.passId === null,
+    agentTicks: agentTicks ?? feed.agentTicks,
+    commandOutputs: added.length > 0 ? [...feed.commandOutputs, ...added] : feed.commandOutputs,
+  };
+}
+
+function endNativeOwner(
+  feed: NativeSessionFeed,
+  ownerLoss: NativeOwnerLoss | null,
+  reason: string,
+): NativeSessionFeed {
+  return {
+    ...feed,
+    connected: false,
+    ownerLoss,
+    dialogs: [],
+    agentsEpoch: feed.agentsEpoch + 1,
+    activity: closeNativeActivity(feed.activity, nowMs()),
+    busy: false,
+    // Only a stopped owner stops its agents.
+    agents: disconnectNativeSubagents(
+      feed.agents,
+      feed.agentsRevision + 1,
+      DateTime.formatIso(DateTime.nowUnsafe()),
+    ),
+    agentsRevision: feed.agentsRevision + 1,
+    agentsKnown: false,
+    queue: EMPTY_NATIVE_QUEUE,
+    error: ownerLoss === null ? reason : null,
+    // The owner is gone, so no end frame is coming for a live capture.
+    dictation:
+      feed.dictation && feed.dictation.phase !== "ended"
+        ? { ...feed.dictation, phase: "ended" as const, error: reason }
+        : feed.dictation,
+  };
+}
+
+const DIALOG_REQUESTS: ReadonlySet<unknown> = new Set([
+  "tool_approval_request",
+  "plan_proposal_request",
+  "extension_ui_request",
+]);
+
+/** Applies one essential `watch` envelope. */
+function reduceNativeEssential(
+  feed: NativeSessionFeed,
+  envelope: NeoPiNativeEssentialEnvelope,
+): NativeSessionFeed {
+  switch (envelope.type) {
+    case "leased":
+      return feed;
+    case "session": {
+      const session = envelope.session;
+      const sameSession =
+        feed.session?.ref.sessionFile === session.ref.sessionFile &&
+        feed.session.ref.providerInstanceId === session.ref.providerInstanceId &&
+        feed.session.sessionId === session.sessionId;
+      const busy = session.state.isStreaming === true;
+      return {
+        ...feed,
+        session,
+        ...(sameSession
+          ? {}
+          : {
+              conversation: emptyNativeConversation(),
+              observation: emptyNativeObservation(),
+              commandOutputs: [],
+              agents: [],
+              agentsRevision: feed.agentsRevision + 1,
+              agentsKnown: false,
+              jobs: EMPTY_NATIVE_JOBS,
+            }),
+        activity: observeNativeActivity(
+          sameSession ? feed.activity : EMPTY_NATIVE_ACTIVITY,
+          session.state,
+          busy,
+          nowMs(),
+        ),
+        connected: true,
+        movedTo: null,
+        busy,
+        queue: nativePromptQueue(session.state.queuedMessages) ?? feed.queue,
+        error: null,
+        ownerLoss: null,
+        reconciliationError: null,
+      };
+    }
+    case "identity": {
+      const session = feed.session;
+      // The same session relocated to another file (`/wt`, `/move`): the web
+      // layer repoints to it. The watch then ends as `identity-changed`.
+      if (
+        !session ||
+        envelope.sessionFile === session.ref.sessionFile ||
+        envelope.sessionId !== session.sessionId
+      )
+        return feed;
+      const ref = { ...session.ref, sessionFile: envelope.sessionFile };
+      const identity = feed.conversation.identity;
+      return {
+        ...feed,
+        session: { ...session, ref },
+        conversation: identity
+          ? { ...feed.conversation, identity: { ...identity, sessionFile: envelope.sessionFile } }
+          : feed.conversation,
+        movedTo: ref,
+      };
+    }
+    case "lifecycle": {
+      const observer: NativeObserver = { phase: envelope.state, reason: envelope.reason ?? null };
+      const reason = envelope.reason ?? "The native session ended.";
+      switch (envelope.state) {
+        case "building":
+        case "observing":
+          return {
+            ...feed,
+            observer,
+            ownerLoss: feed.ownerLoss === "reconnecting" ? null : feed.ownerLoss,
+          };
+        case "reconnecting":
+          // The server waits for the owner's successor and holds sends. Nothing
+          // the old owner was doing continues.
+          return {
+            ...feed,
+            observer,
+            ownerLoss: "reconnecting",
+            busy: false,
+            queue: EMPTY_NATIVE_QUEUE,
+            dialogs: [],
+            agents: disconnectNativeSubagents(
+              feed.agents,
+              feed.agentsRevision + 1,
+              DateTime.formatIso(DateTime.nowUnsafe()),
+            ),
+            agentsRevision: feed.agentsRevision + 1,
+            agentsEpoch: feed.agentsEpoch + 1,
+            activity: closeNativeActivity(feed.activity, nowMs()),
+            error: null,
+            dictation:
+              feed.dictation && feed.dictation.phase !== "ended"
+                ? { ...feed.dictation, phase: "ended" as const, error: reason }
+                : feed.dictation,
+          };
+        case "owner-stopped":
+          return { ...endNativeOwner(feed, "orphaned", reason), observer };
+        case "detached":
+          return { ...endNativeOwner(feed, "detached", reason), observer };
+        case "incompatible":
+          return { ...endNativeOwner(feed, null, reason), observer };
+        case "identity-changed":
+          return {
+            ...endNativeOwner(
+              feed,
+              null,
+              "The native owner changed session. Select its new native file before sending commands.",
+            ),
+            observer,
+            editor: null,
+            jobs: EMPTY_NATIVE_JOBS,
+          };
+        case "authority-unresolved":
+          // Cached state stays; the controller retries attach only.
+          return { ...feed, observer, connected: false, dialogs: [] };
+      }
+    }
+    case "status": {
+      const busy = envelope.live.state !== "idle";
+      if (busy === feed.busy) return feed;
+      const at = nowMs();
+      return {
+        ...feed,
+        busy,
+        activity: busy
+          ? openNativeActivity(feed.activity, at)
+          : closeNativeActivity(feed.activity, at),
+      };
+    }
+    case "obligation-opened": {
+      const request = envelope.request;
+      if (!DIALOG_REQUESTS.has(request.type)) return feed;
+      return {
+        ...feed,
+        dialogs: [...feed.dialogs.filter((dialog) => dialog.id !== envelope.id), request],
+      };
+    }
+    case "obligation-settled":
+      return { ...feed, dialogs: feed.dialogs.filter((dialog) => dialog.id !== envelope.id) };
+  }
+}
+
 /** Cache is a projection of the canonical native file, never a second session journal. */
 export function reduceNativeSessionFeed(
   feed: NativeSessionFeed,
   event: NativeSessionUpdate,
 ): NativeSessionFeed {
-  if (event.type === "read") return applyNativeRead(feed, event.sent, event.result);
+  if (event.type === "read") {
+    const next = applyNativeRead(feed, event.sent, event.result);
+    if (next === feed) return feed;
+    const projected = projectNativeEntities(feed, next);
+    const observation = boundNativeInbox(projected.observation, nowMs());
+    return observation === projected.observation ? projected : { ...projected, observation };
+  }
+  if (event.type === "observer")
+    return { ...feed, observer: { phase: event.phase, reason: event.reason ?? null } };
+  if (
+    event.type === "leased" ||
+    event.type === "session" ||
+    event.type === "identity" ||
+    event.type === "lifecycle" ||
+    event.type === "status" ||
+    event.type === "obligation-opened" ||
+    event.type === "obligation-settled"
+  )
+    return reduceNativeEssential(feed, event);
   if (event.type === "reconciliation") {
     if (event.error !== null)
       return {

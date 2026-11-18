@@ -1,10 +1,10 @@
 import type { NeoPiNativeSessionSummary } from "@t3tools/contracts";
 
 /**
- * What a native session asks of the user right now, in the order it should
- * reach them: `waiting` is blocked on an answer, `done` finished something the
- * user has not looked at, `working` is busy and needs nothing, `idle` is
- * simply history.
+ * What a native session asks of the user right now: `waiting` is blocked on
+ * an answer, `done` finished something the user has not looked at, `working`
+ * is busy and needs nothing, `idle` is simply history. Only `waiting` and
+ * `working` choose a section; `done` marks a row within recent history.
  */
 export type NativeSessionStatus = "waiting" | "done" | "working" | "idle";
 
@@ -60,10 +60,10 @@ export function nativeSessionSection(
   if (session.settledAt !== undefined) return "settled";
   switch (status) {
     case "waiting":
-    case "done":
       return "attention";
     case "working":
       return "working";
+    case "done":
     case "idle":
       return "recent";
   }
@@ -80,9 +80,9 @@ const byRecency = (a: NativeSessionSummaryLike, b: NativeSessionSummaryLike) =>
   toMs(b.modifiedAt) - toMs(a.modifiedAt);
 
 /**
- * Splits sessions into the sidebar's sections. Blocked sessions lead the
- * attention section, finished-unseen ones follow; each section is newest
- * first and the settled shelf orders by when each session was settled.
+ * Splits sessions into the sidebar's sections: blocked sessions, then working
+ * ones, then recent history (finished-unseen included), each newest first.
+ * The settled shelf orders by when each session was settled.
  */
 export function partitionNativeSessions<S extends NativeSessionSummaryLike>(
   sessions: ReadonlyArray<S>,
@@ -110,11 +110,7 @@ export function partitionNativeSessions<S extends NativeSessionSummaryLike>(
             : settled;
     target.push({ session, status });
   }
-  attention.sort(
-    (a, b) =>
-      Number(b.status === "waiting") - Number(a.status === "waiting") ||
-      byRecency(a.session, b.session),
-  );
+  attention.sort((a, b) => byRecency(a.session, b.session));
   working.sort((a, b) => byRecency(a.session, b.session));
   recent.sort((a, b) => byRecency(a.session, b.session));
   settled.sort(

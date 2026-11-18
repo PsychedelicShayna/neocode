@@ -782,19 +782,19 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       reconcileBrowserSurfaces: (ref, tabIds) =>
         set((state) =>
           automaticUpdate(state, workspaceKey(ref), (current) => {
+            // Keep every surviving tab where it is, so a dragged order outlives
+            // preview updates; only newly seen browser tabs join at the end.
             const validIds = new Set(tabIds.map((tabId) => `browser:${tabId}`));
-            const nonBrowser = current.surfaces.filter((surface) => surface.kind !== "preview");
-            const existingBrowser = current.surfaces.filter(
-              (surface): surface is Extract<RightPanelSurface, { kind: "preview" }> =>
-                surface.kind === "preview" &&
-                surface.id !== "browser:new" &&
-                validIds.has(surface.id),
+            const kept = current.surfaces.filter(
+              (surface) =>
+                surface.kind !== "preview" ||
+                (surface.id !== "browser:new" && validIds.has(surface.id)),
             );
-            const knownIds = new Set(existingBrowser.map((surface) => surface.id));
+            const knownIds = new Set(kept.map((surface) => surface.id));
             const added = tabIds
               .filter((tabId) => !knownIds.has(`browser:${tabId}`))
               .map((tabId) => browserSurface(tabId));
-            const surfaces = [...nonBrowser, ...existingBrowser, ...added];
+            const surfaces = [...kept, ...added];
             const activeStillExists = surfaces.some(
               (surface) => surface.id === current.activeSurfaceId,
             );

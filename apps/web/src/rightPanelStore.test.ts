@@ -955,6 +955,44 @@ describe("rightPanelStore", () => {
       ),
     ).toEqual(["terminal:term-1", "browser:tab-b", "browser:tab-c"]);
   });
+
+  it("keeps a dragged tab order through preview updates, restarts, and later opens and closes", () => {
+    const session = {
+      environmentId: refA.environmentId,
+      ref: {
+        providerInstanceId: ProviderInstanceId.make("profile-a"),
+        sessionFile: "/sessions/a.jsonl",
+      },
+    };
+    const ids = () =>
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, session).surfaces.map(
+        (surface) => surface.id,
+      );
+    const store = useRightPanelStore.getState();
+    store.openTerminal(session, "fish");
+    store.openBrowser(session, "localhost");
+
+    store.moveSurface(session, "browser:localhost", 0);
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish"]);
+
+    // The panel reconciles browser tabs on every preview session update.
+    store.reconcileBrowserSurfaces(session, ["localhost"]);
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish"]);
+
+    const { partialize } = useRightPanelStore.persist.getOptions();
+    const persisted = JSON.parse(JSON.stringify(partialize!(useRightPanelStore.getState())));
+    useRightPanelStore.setState(migratePersistedRightPanelState(persisted));
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish"]);
+
+    store.openTerminal(session, "zsh");
+    store.reconcileBrowserSurfaces(session, ["localhost", "docs"]);
+    expect(ids()).toEqual(["browser:localhost", "terminal:fish", "terminal:zsh", "browser:docs"]);
+
+    store.moveSurface(session, "browser:docs", 1);
+    store.closeSurface(session, "terminal:fish");
+    store.reconcileBrowserSurfaces(session, ["docs"]);
+    expect(ids()).toEqual(["browser:docs", "terminal:zsh"]);
+  });
 });
 
 describe("native browser panel persistence", () => {

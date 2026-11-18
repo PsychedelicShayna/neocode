@@ -3145,6 +3145,24 @@ const makeWsRpcLayer = (
           observeRpcStream(WS_METHODS.neopiNativeSessionsWatch, neopiNativeSessions.watch(input), {
             "rpc.aggregate": "workspace",
           }),
+        [WS_METHODS.neopiNativeSessionsRead]: (input) =>
+          observeRpcEffect(WS_METHODS.neopiNativeSessionsRead, neopiNativeSessions.read(input), {
+            "rpc.aggregate": "workspace",
+          }),
+        [WS_METHODS.neopiNativeSessionsSetDemand]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsSetDemand,
+            neopiNativeSessions.setDemand(input),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsCredit]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsCredit,
+            neopiNativeSessions.credit(input),
+            {
+              "rpc.aggregate": "workspace",
+            },
+          ),
         [WS_METHODS.neopiNativeSessionsClose]: (input) =>
           observeRpcEffect(WS_METHODS.neopiNativeSessionsClose, neopiNativeSessions.close(input), {
             "rpc.aggregate": "workspace",

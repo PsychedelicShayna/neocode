@@ -364,9 +364,12 @@ export type NeoPiNativeCursor = typeof NeoPiNativeCursor.Type;
 
 export const NeoPiNativeSessionsReadInput = Schema.Struct({
   leaseId: Schema.String,
-  /** Strictly increasing per lease; a lower one than the server has seen is rejected as stale. */
+  /** Strictly increasing per lease; one not above the highest admitted is rejected as stale, and a newer one ends a waiting older read. */
   readId: NonNegativeInt,
-  /** Null for the first read of a lease, which starts a full pass. */
+  /**
+   * Null starts a full pass. A cursor held from an earlier lease may be sent: the
+   * server judges it by its domain alone, and a different domain starts a full pass.
+   */
   cursor: Schema.NullOr(NeoPiNativeCursor),
 });
 export type NeoPiNativeSessionsReadInput = typeof NeoPiNativeSessionsReadInput.Type;

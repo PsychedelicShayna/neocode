@@ -1029,13 +1029,15 @@ export type NativeInboxLossWarning =
   | { readonly key: string; readonly loss: "older-details-trimmed"; readonly text: string };
 
 const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
-const clock = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+/** Local clock time with seconds, in the reader's locale. */
+const clock = (ms: number) =>
+  DateTime.formatLocal(DateTime.makeUnsafe(ms), { timeStyle: "medium" });
 const LOSS_REASON: Record<NativeInboxLoss, string> = {
-  evicted: "NeoCode's server discarded them because this view fell behind.",
+  evicted: "The server dropped them to stay within its limit before this view read them.",
   "not-observed": "No view was attached while they happened, so they were not kept.",
   mixed:
-    "Records were missed in this interval. Whether a view fell behind or none was attached is no longer known.",
-  trimmed: "This view received them, then dropped them to stay within its own limit.",
+    "Records were missed in this interval. Whether the server dropped them or no view was attached is no longer known.",
+  trimmed: "This view received them, then dropped the oldest records to stay within its own limit.",
 };
 
 function lossWarning(
@@ -1081,7 +1083,7 @@ export function nativeInboxLossWarnings(
       general.push({
         key: "older-details-trimmed",
         loss: "older-details-trimmed",
-        text: "Older loss-warning details were trimmed by this client. Their record kinds, intervals, times and causes are no longer available.",
+        text: "Earlier records were also missed. This view dropped the details of those older warnings to stay within its own limit, so what they covered is no longer known.",
       });
       continue;
     }

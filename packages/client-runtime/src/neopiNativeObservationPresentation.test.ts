@@ -145,8 +145,8 @@ describe("inbox loss presentation", () => {
         "call-1",
         "4",
         "9",
-        DateTime.formatIso(DateTime.makeUnsafe(1000)),
-        DateTime.formatIso(DateTime.makeUnsafe(7000)),
+        DateTime.formatLocal(DateTime.makeUnsafe(1000), { timeStyle: "medium" }),
+        DateTime.formatLocal(DateTime.makeUnsafe(7000), { timeStyle: "medium" }),
       ])
         expect(text).toContain(fact);
     },

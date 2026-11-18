@@ -37,6 +37,7 @@ const storeSource = (store: NeoPiNativeKeyedStore): NeoPiNativeReadSource => ({
   deliverableJournalEnd: 0,
   horizonCursor: undefined,
   inbox: [],
+  settlePendingLeaf: () => "none",
 });
 
 type PassReply = Extract<NeoPiNativeSessionsReadResult, { type: "pass" }>;
@@ -111,15 +112,27 @@ class Mirror {
     return result;
   }
 
+  readonly reader: string;
+
+  constructor(reader = "reader") {
+    this.reader = reader;
+  }
+
   read(source: NeoPiNativeReadSource, limits: NeoPiNativeReadLimits): PassReply {
-    return passReply(this.apply(readNeoPiNativeObservation(source, this.cursor, limits))!);
+    return passReply(
+      this.apply(readNeoPiNativeObservation(source, this.cursor, limits, this.reader))!,
+    );
   }
 
   /** Reads until the server answers `unchanged`. */
   drain(source: NeoPiNativeReadSource, limits: NeoPiNativeReadLimits): void {
     for (let reads = 0; ; reads++) {
       assert.isBelow(reads, 100);
-      if (this.apply(readNeoPiNativeObservation(source, this.cursor, limits)) === undefined) return;
+      if (
+        this.apply(readNeoPiNativeObservation(source, this.cursor, limits, this.reader)) ===
+        undefined
+      )
+        return;
     }
   }
 }
@@ -351,6 +364,7 @@ describe("NeoPiNativeCursor", () => {
     });
     projection.applyStateReply({ sessionId }, projection.mark());
     projection.applySubagentsReply({ subagents: [] }, projection.mark());
+    projection.applySubagentHistoryReply(null, projection.mark());
     projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
     const body = (id: number, length: number) => ({
       role: "assistant",
@@ -471,7 +485,9 @@ describe("NeoPiNativeCursor", () => {
       journalCapacity: 16,
       onEssential: (envelope) => essential.push(envelope.revision),
     });
-    assert.deepEqual(readNeoPiNativeObservation(projection, null, ONE_KEY), { type: "building" });
+    assert.deepEqual(readNeoPiNativeObservation(projection, null, ONE_KEY, "reader"), {
+      type: "building",
+    });
     projection.fold({
       type: "journal_state",
       reason: "identity",
@@ -481,11 +497,12 @@ describe("NeoPiNativeCursor", () => {
     });
     projection.applyStateReply({ sessionId, isStreaming: true }, projection.mark());
     projection.applySubagentsReply({ subagents: [] }, projection.mark());
+    projection.applySubagentHistoryReply(null, projection.mark());
     projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
     const mirror = new Mirror();
     const bulk = mirror.read(projection, { scanSteps: 100, replyBytes: 10_000 });
     assert.isNull(bulk.continuation.pass);
-    assert.deepEqual(readNeoPiNativeObservation(projection, mirror.cursor, ONE_KEY), {
+    assert.deepEqual(readNeoPiNativeObservation(projection, mirror.cursor, ONE_KEY, "reader"), {
       type: "unchanged",
     });
     projection.fold({
@@ -569,6 +586,7 @@ describe("NeoPiNativeCursor", () => {
       });
       projection.applyStateReply({ sessionId }, projection.mark());
       projection.applySubagentsReply({ subagents: [] }, projection.mark());
+      projection.applySubagentHistoryReply(null, projection.mark());
       projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
       let parent: string | null = null;
       const append = (id: string, message?: Record<string, unknown>) => {
@@ -617,10 +635,12 @@ describe("NeoPiNativeCursor", () => {
       mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
       append("e-m", assistant("answer"));
       const between = mirror.apply(
-        readNeoPiNativeObservation(projection, mirror.cursor, {
-          scanSteps: 100,
-          replyBytes: 100_000,
-        }),
+        readNeoPiNativeObservation(
+          projection,
+          mirror.cursor,
+          { scanSteps: 100, replyBytes: 100_000 },
+          "reader",
+        ),
       );
       assert.notInclude(
         (between?.journal?.entries ?? []).map((entry) => entry.id),
@@ -660,6 +680,211 @@ describe("NeoPiNativeCursor", () => {
         "message:m",
       );
       assert.isFalse(mirror.held.has("message:m"));
+    });
+  });
+
+  describe("final review", () => {
+    it("1 another reader's transfers at newer cuts never restart a reader mid-transfer", () => {
+      const store = new NeoPiNativeKeyedStore(10);
+      const source = storeSource(store);
+      const big = (n: number) => ({
+        class: "presentation" as const,
+        value: { text: `${n}:`.padEnd(2000, "x") },
+      });
+      store.put("a", big(0));
+      store.put("b", presentation(0));
+      const limits = { scanSteps: 100, replyBytes: 400 };
+      const first = new Mirror("A");
+      const second = new Mirror("B");
+      let completed = 0;
+      for (let round = 1; round <= 300 && completed < 2; round++) {
+        const reply = first.read(source, limits);
+        if (reply.continuation.pass === null) completed++;
+        // Before A's next read: B starts a transfer at two newer cuts.
+        for (const n of [1, 2]) {
+          store.put("a", big(round * 10 + n));
+          second.cursor = null;
+          second.read(source, limits);
+        }
+      }
+      assert.equal(completed, 2, "A's passes complete while B keeps cutting newer revisions");
+      assert.deepEqual(first.held.get("b")?.value, presentation(0));
+      assert.equal(first.held.get("a")?.value.class, "presentation");
+    });
+
+    it("5 a quiet move to an evicted leaf is visible to the next read with no further frame", () => {
+      const sessionId = "session-1";
+      const fences: string[] = [];
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 2,
+        onFence: (fence) => fences.push(fence),
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applySubagentsReply({ subagents: [] }, projection.mark());
+      projection.applySubagentHistoryReply(null, projection.mark());
+      projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
+      let parent: string | null = null;
+      for (const id of ["e1", "e2", "e3"]) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: { id, parentId: parent, type: "custom", timestamp: "t" },
+        });
+        parent = id;
+      }
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      assert.isTrue(mirror.entryIds.has("e3"));
+      const before = mirror.cursor!.epoch.branchGeneration;
+      projection.fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: "e1",
+      });
+      const limits = { scanSteps: 100, replyBytes: 100_000 };
+      // The next read already knows: the old branch is never served again,
+      // and the build owner is told to rebuild (C3.5).
+      assert.deepEqual(readNeoPiNativeObservation(projection, mirror.cursor, limits, "reader"), {
+        type: "building",
+      });
+      assert.deepEqual(fences, ["navigated"]);
+      projection.beginBuildAttempt();
+      const mark = projection.mark();
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applySubagentsReply({ subagents: [] }, mark);
+      projection.applySubagentHistoryReply(null, mark);
+      projection.applyJournalPage(
+        { sessionId, entries: [{ id: "e1", parentId: null, type: "custom", timestamp: "t" }] },
+        mark,
+      );
+      const next = readNeoPiNativeObservation(projection, mirror.cursor, limits, "reader");
+      assert.equal(next.type, "pass");
+      if (next.type !== "pass") return;
+      assert.equal(
+        next.continuation.epoch.branchGeneration,
+        before + 1,
+        "the read is on the new branch",
+      );
+      assert.equal(next.kind, "full");
+      assert.deepEqual(
+        (next.journal?.entries ?? []).map((entry) => entry.id),
+        ["e1"],
+      );
+    });
+
+    const built = () => {
+      const sessionId = "session-1";
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      const mark = projection.mark();
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applySubagentsReply({ subagents: [] }, mark);
+      projection.applySubagentHistoryReply(null, mark);
+      projection.applyJournalPage({ sessionId, entries: [] }, mark);
+      return { sessionId, projection };
+    };
+
+    it("a tool result's entry carries both the tool's and its preview's retirement", () => {
+      const { sessionId, projection } = built();
+      const mirror = new Mirror();
+      projection.fold({ type: "tool_execution_start", toolCallId: "t", toolName: "edit" });
+      projection.fold({
+        type: "tool_stream_update",
+        toolCallId: "t",
+        toolName: "edit",
+        update: { generation: 0, streaming: false, files: [] },
+      });
+      for (let n = 0; n < 20; n++) projection.store.put(`p${n}`, presentation(n));
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      for (let n = 0; n < 20; n++) projection.store.put(`p${n}`, presentation(n + 100));
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: {
+          id: "r",
+          parentId: null,
+          type: "message",
+          timestamp: "t",
+          message: { role: "toolResult", toolCallId: "t" },
+        },
+      });
+      const reply = mirror.read(projection, { scanSteps: 100, replyBytes: 700 });
+      assert.include(
+        (reply.journal?.entries ?? []).map((entry) => entry.id),
+        "r",
+      );
+      assert.includeMembers(
+        reply.tombstones.map((tombstone) => tombstone.key),
+        ["tool:t", "editPreview:t"],
+      );
+    });
+
+    it("journal entries count as scan steps", () => {
+      const { sessionId, projection } = built();
+      let parent: string | null = null;
+      for (let n = 0; n < 10; n++) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: { id: `e${n}`, parentId: parent, type: "custom", timestamp: "t" },
+        });
+        parent = `e${n}`;
+      }
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      for (let n = 10; n < 20; n++) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: { id: `e${n}`, parentId: parent, type: "custom", timestamp: "t" },
+        });
+        parent = `e${n}`;
+      }
+      const reply = mirror.read(projection, { scanSteps: 3, replyBytes: 100_000 });
+      assert.equal(reply.journal?.entries.length, 3);
+    });
+
+    it("record only: one journal entry larger than the reply budget is sent whole", () => {
+      const { sessionId, projection } = built();
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: {
+          id: "big",
+          parentId: null,
+          type: "custom",
+          timestamp: "t",
+          data: "x".repeat(100_000),
+        },
+      });
+      const reply = readNeoPiNativeObservation(
+        projection,
+        null,
+        { scanSteps: 100, replyBytes: 65_536 },
+        "reader",
+      );
+      assert.equal(reply.type === "pass" ? reply.journal?.entries[0]?.id : undefined, "big");
     });
   });
 });

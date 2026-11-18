@@ -30,13 +30,12 @@ const asRecord = (value: unknown): NativeRecord | undefined =>
 const text = (value: unknown): string | undefined =>
   typeof value === "string" ? value : undefined;
 
-/** A frozen encoding of one revision of an oversized value, shared by every reader segmenting it. */
+/** A frozen encoding of one revision of an oversized value, cut into segments. */
 export interface NeoPiNativeFrozenEncoding {
+  readonly key: string;
   readonly revision: number;
   readonly json: string;
   readonly bounds: readonly number[];
-  /** Some reader has received its last segment. */
-  completed: boolean;
 }
 
 /** One projection key. `value === null` is a tombstone; `removed` once its tombstone expired. */
@@ -50,9 +49,9 @@ export interface NeoPiNativeStoreRecord {
    * tombstone is sent only together with, or after, that entry.
    */
   joinEntryId: string | null;
+  /** Which tombstone bound holds this record while it is a tombstone. */
+  retention: "plain" | "message" | "other";
   removed: boolean;
-  /** At most two frozen encodings of an oversized value, newest last (see `NeoPiNativeCursor.ts`). */
-  frozen: NeoPiNativeFrozenEncoding[];
 }
 
 /**
@@ -70,18 +69,28 @@ export class NeoPiNativeKeyedStore {
   /** Ordinal order; expired records stay until compaction and are skipped. */
   #order: NeoPiNativeStoreRecord[] = [];
   #removedInOrder = 0;
-  /** Plain tombstones and join tombstones, each in revision order with its own bound. */
-  readonly #plain = new TombstoneQueue();
-  readonly #joined = new TombstoneQueue();
-  /** Durable entry id → the retired record it joined, while that tombstone is retained. */
-  readonly #joins = new Map<string, NeoPiNativeStoreRecord>();
+  /**
+   * Plain tombstones, message join tombstones and other (tool, edit preview)
+   * join tombstones, each in revision order with its own bound, so tool churn
+   * never expires a message's association.
+   */
+  readonly #queues = {
+    plain: new TombstoneQueue(),
+    message: new TombstoneQueue(),
+    other: new TombstoneQueue(),
+  };
+  /** Durable entry id → the retired records it joined, while their tombstones are retained. */
+  readonly #joins = new Map<string, Set<NeoPiNativeStoreRecord>>();
+  /** Reader → the oversized value it is in the middle of receiving (C2 progress). */
+  readonly #transfers = new Map<string, NeoPiNativeFrozenEncoding>();
 
   readonly tombstoneCapacity: number;
   /**
    * Join tombstones tell a reader that has not received the durable entry to
    * keep the live row until it does (C2 invariant 2), so they are kept apart
-   * from plain churn. The bound matches the 256 live→durable associations a
-   * NeoPi snapshot carries; beyond it the C5 typed continuity loss applies.
+   * from plain churn. The message bound matches the 256 live→durable
+   * associations a NeoPi snapshot carries; beyond it the C5 typed continuity
+   * loss applies. Tool and edit-preview joins have the same bound of their own.
    */
   readonly joinTombstoneCapacity: number;
 
@@ -113,17 +122,45 @@ export class NeoPiNativeKeyedStore {
     return ++this.#revision;
   }
 
-  /** The retired record whose durable entry is `entryId`, while its tombstone is retained. */
-  retiredBy(entryId: string): NeoPiNativeStoreRecord | undefined {
+  /** The retired records whose durable entry is `entryId`, while their tombstones are retained. */
+  retiredBy(entryId: string): ReadonlySet<NeoPiNativeStoreRecord> | undefined {
     return this.#joins.get(entryId);
+  }
+
+  /**
+   * The encoding `reader` is in the middle of receiving. It is the reader's
+   * own: no other reader's activity replaces it, so a transfer ends only when
+   * this reader finishes or leaves it. At most one per reader.
+   */
+  transferOf(reader: string): NeoPiNativeFrozenEncoding | undefined {
+    return this.#transfers.get(reader);
+  }
+
+  /** Starts `reader`'s transfer of `record`'s current value, sharing an identical encoding. */
+  beginTransfer(
+    reader: string,
+    record: NeoPiNativeStoreRecord,
+    json: string,
+    bounds: () => readonly number[],
+  ): NeoPiNativeFrozenEncoding {
+    let encoding: NeoPiNativeFrozenEncoding | undefined;
+    for (const held of this.#transfers.values())
+      if (held.key === record.key && held.revision === record.revision) encoding = held;
+    encoding ??= { key: record.key, revision: record.revision, json, bounds: bounds() };
+    this.#transfers.set(reader, encoding);
+    return encoding;
+  }
+
+  /** Ends `reader`'s transfer: finished, abandoned, or its lease released (B5 calls this). */
+  endTransfer(reader: string): void {
+    this.#transfers.delete(reader);
   }
 
   put(key: string, value: NeoPiNativeEntityValue): number {
     const revision = ++this.#revision;
     const existing = this.#byKey.get(key);
     if (existing) {
-      if (existing.value === null)
-        (existing.joinEntryId === null ? this.#plain : this.#joined).count--;
+      if (existing.value === null) this.#queues[existing.retention].count--;
       this.#unjoin(existing);
       existing.value = value;
       existing.revision = revision;
@@ -135,8 +172,8 @@ export class NeoPiNativeKeyedStore {
       revision,
       value,
       joinEntryId: null,
+      retention: "plain",
       removed: false,
-      frozen: [],
     };
     this.#byKey.set(key, record);
     this.#order.push(record);
@@ -146,31 +183,47 @@ export class NeoPiNativeKeyedStore {
   remove(key: string, joinEntryId: string | null = null): boolean {
     const record = this.#byKey.get(key);
     if (!record || record.value === null) return false;
+    record.retention =
+      joinEntryId === null ? "plain" : record.value.class === "message" ? "message" : "other";
     record.value = null;
     record.revision = ++this.#revision;
-    record.frozen = [];
     record.joinEntryId = joinEntryId;
-    if (joinEntryId !== null) this.#joins.set(joinEntryId, record);
-    (joinEntryId === null ? this.#plain : this.#joined).push(record);
+    if (joinEntryId !== null) {
+      const joined = this.#joins.get(joinEntryId) ?? new Set();
+      joined.add(record);
+      this.#joins.set(joinEntryId, joined);
+    }
+    this.#queues[record.retention].push(record);
     this.#expire();
     return true;
   }
 
   #unjoin(record: NeoPiNativeStoreRecord): void {
-    if (record.joinEntryId !== null && this.#joins.get(record.joinEntryId) === record)
-      this.#joins.delete(record.joinEntryId);
+    const joined = record.joinEntryId === null ? undefined : this.#joins.get(record.joinEntryId);
+    if (joined) {
+      joined.delete(record);
+      if (joined.size === 0) this.#joins.delete(record.joinEntryId!);
+    }
     record.joinEntryId = null;
+    record.retention = "plain";
   }
 
   /** Drops every key; the caller changes the identity domain, so no tombstone is owed. */
   clear(): void {
     this.#byKey.clear();
     this.#joins.clear();
+    this.#transfers.clear();
     this.#order = [];
     this.#removedInOrder = 0;
-    this.#plain.reset();
-    this.#joined.reset();
+    for (const queue of Object.values(this.#queues)) queue.reset();
+    this.#retired.clear();
+    this.#retiredOrder = [];
     this.#horizon = this.#revision;
+  }
+
+  /** Tombstone queue entries held, stale ones included (a bound check). */
+  get tombstoneEntries(): number {
+    return Object.values(this.#queues).reduce((total, queue) => total + queue.size, 0);
   }
 
   /** Index into `recordAt` of the first record whose ordinal exceeds `ordinal`. */
@@ -196,23 +249,63 @@ export class NeoPiNativeKeyedStore {
   }
 
   #expire(): void {
-    for (const [queue, capacity] of [
-      [this.#plain, this.tombstoneCapacity],
-      [this.#joined, this.joinTombstoneCapacity],
-    ] as const)
+    for (const [retention, queue] of Object.entries(this.#queues)) {
+      const capacity = retention === "plain" ? this.tombstoneCapacity : this.joinTombstoneCapacity;
       for (let record = queue.over(capacity); record; record = queue.over(capacity)) {
+        if (record.joinEntryId !== null) this.#rememberRetired(record.key);
         record.removed = true;
         this.#unjoin(record);
         this.#byKey.delete(record.key);
         this.#removedInOrder++;
         if (record.revision > this.#horizon) this.#horizon = record.revision;
       }
+    }
     if (this.#removedInOrder > 64 && this.#removedInOrder * 2 > this.#order.length) {
       this.#order = this.#order.filter((record) => !record.removed);
       this.#removedInOrder = 0;
     }
   }
+
+  /**
+   * Keys retired by a durable join whose tombstone has expired, so a late or
+   * replayed frame cannot recreate them as live (C1: an ended message never
+   * regresses; a joined tool outcome stays retired). A bounded ring.
+   */
+  wasRetired(key: string): boolean {
+    return this.#retired.has(key);
+  }
+
+  readonly #retired = new Set<string>();
+  #retiredOrder: string[] = [];
+
+  #rememberRetired(key: string): void {
+    if (this.#retired.has(key)) return;
+    this.#retired.add(key);
+    this.#retiredOrder.push(key);
+    if (this.#retiredOrder.length > RETIRED_KEY_RING) {
+      const dropped = this.#retiredOrder.length - RETIRED_KEY_RING;
+      for (const old of this.#retiredOrder.slice(0, dropped)) this.#retired.delete(old);
+      this.#retiredOrder = this.#retiredOrder.slice(dropped);
+    }
+  }
 }
+
+/**
+ * Retired keys remembered after their tombstones expire. Late frames for a
+ * retired call arrive within one run; 4096 covers far more than one run's
+ * messages and tool calls.
+ */
+const RETIRED_KEY_RING = 4096;
+
+/** Finished children kept when the owner has no history to say which are gone. */
+const FINISHED_CHILDREN = 256;
+/** Settled jobs kept; NeoPi's own `recent` list is shorter. */
+const SETTLED_JOBS = 64;
+/**
+ * Command outputs kept. They are receipts with no acknowledgement path before
+ * N11a, so the newest are kept and the oldest leave by tombstone.
+ */
+const COMMAND_OUTPUTS = 256;
 
 /** Tombstones in revision order; an entry is stale once its record changed. */
 class TombstoneQueue {
@@ -223,6 +316,21 @@ class TombstoneQueue {
   push(record: NeoPiNativeStoreRecord): void {
     this.#entries.push({ record, revision: record.revision });
     this.count++;
+    // A tombstone overwritten by a later put leaves a stale entry; drop them
+    // so one key put and removed forever cannot grow the queue (I2).
+    if (this.#entries.length - this.#head > 2 * this.count + 64) {
+      this.#entries = this.#entries
+        .slice(this.#head)
+        .filter(
+          ({ record: held, revision }) =>
+            !held.removed && held.value === null && held.revision === revision,
+        );
+      this.#head = 0;
+    }
+  }
+
+  get size(): number {
+    return this.#entries.length - this.#head;
   }
 
   /** The oldest live tombstone to expire while more than `capacity` are held, removed from the count. */
@@ -355,6 +463,11 @@ export interface NeoPiNativeProjectionOptions {
   readonly now?: () => number;
   /** Essential facts, synchronously, in revision order. */
   readonly onEssential?: (envelope: NeoPiNativeProjectionEnvelope) => void;
+  /**
+   * Every fence, wherever it is raised: a fold, or a read settling a quiet
+   * navigation. The build owner restarts its build on it (C3.5).
+   */
+  readonly onFence?: (fence: Exclude<NeoPiNativeFence, "none">) => void;
 }
 
 export interface NeoPiNativeInboxLimits {
@@ -473,9 +586,16 @@ export class NeoPiNativeProjection {
   #stateApplied = false;
   #pageApplied = false;
   #rosterApplied = false;
-  /** Child id → revision of the last live frame; a roster reply never overwrites a newer one. */
+  #historyApplied = false;
+  /** Child id → revision of the last live lifecycle/progress frame; replies never overwrite it. */
   readonly #rosterLive = new Map<string, number>();
+  /** Request marks of the newest applied replies; an older reply arriving later is refused (C3.3). */
+  #replyMarks = { state: -1, inventory: -1, history: -1 };
   #commandOutputs = 0;
+  /** The newest live message, the anchor of a command output. */
+  #lastMessageId: string | null = null;
+  /** Settled job keys, oldest first. */
+  #settledJobs: string[] = [];
   #horizonCursor: { readonly firstEntryId: string; readonly cursor: string } | null = null;
   /** A leaf announced before its entry; decided by the next frame (see `#journalState`). */
   #pendingLeaf: NeoPiNativeIdentity | null = null;
@@ -486,6 +606,13 @@ export class NeoPiNativeProjection {
    */
   readonly #heldEntries = new Map<string, Set<string>>();
   readonly #onEssential: ((envelope: NeoPiNativeProjectionEnvelope) => void) | undefined;
+  readonly #onFence: ((fence: Exclude<NeoPiNativeFence, "none">) => void) | undefined;
+  /** Messages that had ended unassociated when observation was lost (see `applyJournalPage`). */
+  #endedBeforeGap = new Set<string>();
+  /** A rebuild's gap is not yet reconciled by a page of an attempt whose snapshot was folded. */
+  #rebuilt = false;
+  /** The incarnation and attempt whose snapshot marker has been folded. */
+  #snapshotOf: { readonly incarnation: number; readonly attempt: number } | null = null;
 
   constructor(options: NeoPiNativeProjectionOptions) {
     this.store = new NeoPiNativeKeyedStore(options.tombstoneCapacity);
@@ -494,6 +621,7 @@ export class NeoPiNativeProjection {
     this.#inboxLimits = options.inboxLimits ?? NEOPI_NATIVE_INBOX_LIMITS;
     this.#now = options.now ?? Date.now;
     this.#onEssential = options.onEssential;
+    this.#onFence = options.onFence;
   }
 
   get domain(): NeoPiNativeObservationDomain {
@@ -505,12 +633,13 @@ export class NeoPiNativeProjection {
   }
 
   /**
-   * C3.4: published once live state and one validated horizon page exist; the
-   * roster inventory is part of live state, so the Agents view is complete
-   * when the first build publishes.
+   * C3.4: published once live state and one validated horizon page exist; both
+   * roster sources (the live inventory and, where the owner has it, the
+   * history) are part of live state, so the Agents view is complete when the
+   * first build publishes.
    */
   get published(): boolean {
-    return this.#stateApplied && this.#pageApplied && this.#rosterApplied;
+    return this.#stateApplied && this.#pageApplied && this.#rosterApplied && this.#historyApplied;
   }
 
   /** Live-only records without a reducer, in `seq` order; at most one `gap`, first. */
@@ -580,7 +709,13 @@ export class NeoPiNativeProjection {
     this.#stateApplied = false;
     this.#pageApplied = false;
     this.#rosterApplied = false;
+    this.#historyApplied = false;
     this.#pendingLeaf = null;
+    this.#endedBeforeGap = new Set();
+    this.#rebuilt = true;
+    for (const record of this.store.values())
+      if (record.value?.class === "message" && record.value.phase === "ended")
+        this.#endedBeforeGap.add(record.value.messageId);
     const running: Array<[string, ToolValue]> = [];
     for (const record of this.store.values())
       if (
@@ -602,29 +737,40 @@ export class NeoPiNativeProjection {
     this.#stateApplied = false;
     this.#pageApplied = false;
     this.#rosterApplied = false;
+    this.#historyApplied = false;
     return this.#domain;
   }
 
   fold(frame: NativeRecord): NeoPiNativeFence {
+    let fence: NeoPiNativeFence = "none";
     const pending = this.#pendingLeaf;
     if (pending) {
       const entry = frame.type === "journal_entry" ? asRecord(frame.entry) : undefined;
       if (entry?.id === pending.leafId) this.#pendingLeaf = null;
-      else {
-        const fence = this.settlePendingLeaf();
-        const next = this.#fold(frame);
-        return next === "identity-changed" ? next : fence;
-      }
+      // An append batch shares one leaf announcement: entries that extend the
+      // head keep it pending until the announced entry arrives.
+      else if (!(entry && entry.parentId === (this.journal.head?.id ?? null)))
+        fence = this.#settle();
     }
-    return this.#fold(frame);
+    const next = this.#fold(frame);
+    if (next !== "none") fence = next === "identity-changed" || fence === "none" ? next : fence;
+    if (fence !== "none") this.#onFence?.(fence);
+    return fence;
   }
 
   /**
-   * A leaf announced with no entry after it was a move to an entry the tail
-   * no longer holds: history is replaced (C3.4 navigation). `fold` settles it
-   * on the next frame; a caller with no further frame calls this directly.
+   * A leaf announced with no entry after it is a move to an entry the tail no
+   * longer holds: history is replaced (C3.4 navigation). `fold` settles it on
+   * the next frame that is not an append, and every read settles it first, so
+   * a quiet move is visible to the next read with no further frame.
    */
   settlePendingLeaf(): NeoPiNativeFence {
+    const fence = this.#settle();
+    if (fence !== "none") this.#onFence?.(fence);
+    return fence;
+  }
+
+  #settle(): NeoPiNativeFence {
     const pending = this.#pendingLeaf;
     if (!pending) return "none";
     this.#pendingLeaf = null;
@@ -665,6 +811,9 @@ export class NeoPiNativeProjection {
       case "notice":
         this.#notice(frame);
         return "none";
+      case "session_settled":
+        this.#runEnded();
+        return "none";
       case "agent_start":
       case "agent_end":
       case "turn_start":
@@ -672,6 +821,7 @@ export class NeoPiNativeProjection {
       case "run_owners_joined":
       case "run_owners_skipped":
         this.#run(type, frame);
+        if (type === "agent_end") this.#runEnded();
         return "none";
       case "subagent_lifecycle":
       case "subagent_progress":
@@ -771,22 +921,31 @@ export class NeoPiNativeProjection {
    */
   applyStateReply(state: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
     if (!this.#acceptsReply(mark) || state.sessionId !== this.#identity?.sessionId) return false;
+    if (mark.revision < this.#replyMarks.state) return false;
+    this.#replyMarks.state = mark.revision;
     for (const [field, property] of Object.entries(STATE_SETTINGS)) {
       const key = `setting:${property}`;
       if (!(field in state) || (this.store.get(key)?.revision ?? 0) > mark.revision) continue;
       this.store.put(key, { class: "setting", value: { property, value: state[field] ?? null } });
-    }
-    // The whole record (less the session-dump fields), as the client reads it
-    // today; refreshed by every `get_state` the build or a trigger issues.
-    if ((this.store.get("setting:state")?.revision ?? 0) <= mark.revision) {
-      const { systemPrompt: _prompt, dumpTools: _tools, ...value } = state;
-      this.store.put("setting:state", { class: "setting", value: { property: "state", value } });
     }
     const run = this.store.get(RUN_KEY);
     if (typeof state.isStreaming === "boolean" && (run?.revision ?? 0) <= mark.revision) {
       const held = run?.value?.class === "run" ? run.value.value : {};
       this.store.put(RUN_KEY, { class: "run", value: { ...held, active: state.isStreaming } });
     }
+    // The whole record (less the session-dump fields), as the client reads it
+    // today, with every field a newer live frame changed taken from that frame.
+    const { systemPrompt: _prompt, dumpTools: _tools, ...value } = state;
+    for (const [field, property] of Object.entries(STATE_SETTINGS)) {
+      const setting = this.store.get(`setting:${property}`);
+      const newer = setting?.value?.class === "setting" ? setting.value.value : undefined;
+      if (setting && setting.revision > mark.revision && newer && "value" in newer)
+        value[field] = newer.value;
+    }
+    const live = this.store.get(RUN_KEY);
+    if (live?.value?.class === "run" && live.revision > mark.revision)
+      value.isStreaming = live.value.value.active === true;
+    this.store.put("setting:state", { class: "setting", value: { property: "state", value } });
     this.#stateApplied = true;
     return true;
   }
@@ -795,10 +954,13 @@ export class NeoPiNativeProjection {
    * The live child inventory (`get_subagents`), C1 roster recovery authority.
    * Each listed child's row is kept as `inventory`; a child held here but not
    * listed gets `inventory: null` (not active as of the read). Children a
-   * frame touched after the request keep their newer state.
+   * frame touched after the request keep their newer state, and an older
+   * reply never replaces a newer one.
    */
   applySubagentsReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
     if (!this.#acceptsReply(mark) || !Array.isArray(reply.subagents)) return false;
+    if (mark.revision < this.#replyMarks.inventory) return false;
+    this.#replyMarks.inventory = mark.revision;
     const listed = new Set<string>();
     for (const raw of reply.subagents) {
       const row = asRecord(raw);
@@ -817,22 +979,68 @@ export class NeoPiNativeProjection {
             entry.inventory = null;
           });
       }
+    this.#boundRoster();
     this.#rosterApplied = true;
     return true;
   }
 
-  /** The session's whole roster, finished and persisted children included (`get_subagent_history`). */
-  applySubagentHistoryReply(reply: NativeRecord, mark: NeoPiNativeRequestMark): boolean {
-    if (!this.#acceptsReply(mark) || !Array.isArray(reply.subagents)) return false;
-    for (const raw of reply.subagents) {
-      const row = asRecord(raw);
-      const id = text(row?.id);
-      if (row && id !== undefined)
+  /**
+   * The session's whole roster, finished and persisted children included
+   * (`get_subagent_history`); `null` when the owner cannot list it. A child in
+   * neither this history nor the live inventory, with no newer live frame, is
+   * gone from the session and leaves the store by tombstone.
+   */
+  applySubagentHistoryReply(reply: NativeRecord | null, mark: NeoPiNativeRequestMark): boolean {
+    if (!this.#acceptsReply(mark) || (reply !== null && !Array.isArray(reply.subagents)))
+      return false;
+    if (mark.revision < this.#replyMarks.history) return false;
+    this.#replyMarks.history = mark.revision;
+    if (reply !== null && Array.isArray(reply.subagents)) {
+      const listed = new Set<string>();
+      for (const raw of reply.subagents) {
+        const row = asRecord(raw);
+        const id = text(row?.id);
+        if (!row || id === undefined) continue;
+        listed.add(id);
         this.#rosterRow(id, mark, (entry) => {
           entry.history = row;
         });
+      }
+      const gone: string[] = [];
+      for (const record of this.store.values())
+        if (record.value?.class === "roster") {
+          const id = text(record.value.value.id);
+          if (
+            id !== undefined &&
+            !listed.has(id) &&
+            !record.value.value.inventory &&
+            (this.#rosterLive.get(id) ?? 0) <= mark.revision
+          )
+            gone.push(id);
+        }
+      for (const id of gone) {
+        this.store.remove(`roster:${id}`);
+        this.#rosterLive.delete(id);
+      }
     }
+    this.#historyApplied = true;
     return true;
+  }
+
+  /**
+   * Without a history to say which children are gone, finished children (not
+   * in the live inventory) are kept up to a bound, oldest leaving first.
+   */
+  #boundRoster(): void {
+    const finished: NeoPiNativeStoreRecord[] = [];
+    for (const record of this.store.values())
+      if (record.value?.class === "roster" && record.value.value.inventory === null)
+        finished.push(record);
+    finished.sort((left, right) => left.ordinal - right.ordinal);
+    for (const record of finished.slice(0, Math.max(0, finished.length - FINISHED_CHILDREN))) {
+      this.store.remove(record.key);
+      this.#rosterLive.delete(record.key.slice("roster:".length));
+    }
   }
 
   /**
@@ -855,9 +1063,7 @@ export class NeoPiNativeProjection {
       const id = text(job?.id);
       if (!job || id === undefined) continue;
       listed.add(id);
-      const key = `job:${id}`;
-      if ((this.store.get(key)?.revision ?? 0) <= mark.revision)
-        this.store.put(key, { class: "presentation", value: { job } });
+      if ((this.store.get(`job:${id}`)?.revision ?? 0) <= mark.revision) this.#putJob(id, job);
     }
     for (const record of this.store.values())
       if (
@@ -894,6 +1100,7 @@ export class NeoPiNativeProjection {
       const entry = observeNeoPiJournalEntry(raw);
       return entry ? [entry] : [];
     });
+    const oldHead = this.journal.head?.id;
     const pageIds = new Set(entries.map((entry) => entry.id));
     const later: NeoPiNativeObservedJournalEntry[] = [];
     let joined = entries.length === 0;
@@ -905,10 +1112,14 @@ export class NeoPiNativeProjection {
       } else later.push(entry);
     }
     const pageLast = entries[entries.length - 1];
-    if (!joined && later.length > 0 && later[0]!.parentId !== pageLast?.id) {
-      // The page ends before the held tail and does not reach it (the ring
-      // turned over while the page was in flight). Newer state is kept; the
-      // range between stays a placeholder (C3.3, C3.4).
+    // History follows parent identity (C3.4): held entries after the page
+    // continue it only if they descend from its last entry.
+    const continues = later.length > 0 && later[0]!.parentId === pageLast?.id;
+    const heldIsCurrent = oldHead === this.#identity?.leafId;
+    if (!joined && later.length > 0 && !continues && heldIsCurrent) {
+      // The page ends before the held, current tail and does not reach it (the
+      // ring turned over while the page was in flight). Newer state is kept;
+      // the range between stays a placeholder (C3.3, C3.4).
       this.#horizonCursor = null;
       for (const entry of entries) this.#joinEntry(entry);
       this.#pageApplied = true;
@@ -916,14 +1127,57 @@ export class NeoPiNativeProjection {
     }
     this.journal.reset();
     for (const entry of entries) this.journal.append(entry);
-    for (const entry of later) this.journal.append(entry);
+    if (continues) for (const entry of later) this.journal.append(entry);
     this.#horizonCursor =
       page.nextCursor !== undefined && entries[0]
         ? { firstEntryId: entries[0].id, cursor: page.nextCursor }
         : null;
     for (const entry of entries) this.#joinEntry(entry);
+    // After a rebuild, entries newer than the head held before the gap (all of
+    // them when none was held) were committed while observation was lost.
+    if (this.#rebuilt)
+      this.#joinAcrossGap(
+        entries.slice(
+          oldHead === undefined ? 0 : entries.findIndex((entry) => entry.id === oldHead) + 1,
+        ),
+      );
     this.#pageApplied = true;
     return true;
+  }
+
+  /**
+   * C2 invariant 2 across an observation gap, for `gapEntries`: page entries
+   * newer than the head held before the gap. A message that had ended
+   * unassociated before the gap, that this attempt's snapshot does not
+   * associate (it carries only the newest 256), and for which the gap holds an
+   * unassociated entry of its role, can never be joined: it becomes a typed
+   * continuity loss (C5, a tombstone without a join) rather than showing beside
+   * that entry or holding history back. One with no such entry is still
+   * waiting for durability and is kept. Gap entries that a live message ended
+   * since the gap could still claim are held as on the live path.
+   */
+  #joinAcrossGap(gapEntries: readonly NeoPiNativeObservedJournalEntry[]): void {
+    const snapshot = this.#snapshotOf;
+    if (
+      snapshot?.incarnation === this.#domain.projectionIncarnation &&
+      snapshot.attempt === this.#domain.buildAttempt
+    ) {
+      const unassociatedRoles = new Set(
+        gapEntries
+          .filter((entry) => !this.store.retiredBy(entry.id))
+          .map((entry) => entry.message?.role),
+      );
+      for (const messageId of this.#endedBeforeGap) {
+        const value = this.store.get(messageKey(messageId))?.value;
+        if (value?.class !== "message" || value.phase !== "ended") continue;
+        if (!unassociatedRoles.has(value.message.role)) continue;
+        this.store.remove(messageKey(messageId));
+        this.#resolveCandidate(messageId);
+      }
+      this.#endedBeforeGap = new Set();
+      this.#rebuilt = false;
+    }
+    for (const entry of gapEntries) this.#holdIfUnassociated(entry);
   }
 
   #acceptsReply(mark: NeoPiNativeRequestMark): boolean {
@@ -958,11 +1212,17 @@ export class NeoPiNativeProjection {
       this.#pendingJoins.clear();
       this.#rosterLive.clear();
       this.#heldEntries.clear();
+      this.#settledJobs = [];
+      this.#lastMessageId = null;
+      this.#replyMarks = { state: -1, inventory: -1, history: -1 };
+      // The previous session's pending interactions are fenced with it.
+      for (const id of this.#obligations.keys()) this.settleObligation(id, "cancelled");
       this.#pendingLeaf = null;
       this.#horizonCursor = null;
       this.#stateApplied = false;
       this.#pageApplied = false;
       this.#rosterApplied = false;
+      this.#historyApplied = false;
       this.#domain = {
         ...this.#domain,
         projectionIncarnation: this.#domain.projectionIncarnation + 1,
@@ -972,12 +1232,20 @@ export class NeoPiNativeProjection {
       this.#setIdentity({ sessionId, sessionFile, leafId });
       return "identity-changed";
     }
-    if (frame.reason === "snapshot" && Array.isArray(frame.messageEntryIds))
-      for (const pair of frame.messageEntryIds) {
-        const association = asRecord(pair);
-        if (typeof association?.messageId === "string" && typeof association.entryId === "string")
-          this.#alias(association.messageId, association.entryId);
-      }
+    if (frame.reason === "snapshot") {
+      this.#snapshotOf = {
+        incarnation: this.#domain.projectionIncarnation,
+        attempt: this.#domain.buildAttempt,
+      };
+      if (Array.isArray(frame.messageEntryIds))
+        for (const pair of frame.messageEntryIds) {
+          const association = asRecord(pair);
+          if (typeof association?.messageId === "string" && typeof association.entryId === "string")
+            this.#alias(association.messageId, association.entryId);
+        }
+      // The current leaf; the page that follows is joined against it.
+      if (held && held.leafId !== leafId) this.#identity = { ...held, leafId };
+    }
     if (!held) {
       this.#setIdentity({ sessionId, sessionFile, leafId });
       return "none";
@@ -1014,6 +1282,8 @@ export class NeoPiNativeProjection {
       else this.journal.reset();
     }
     this.journal.append(entry);
+    // A hold never outlives its entry's place in the ring.
+    this.#releaseHeldFrom(this.journal.end);
     if (navigated && this.#identity) this.#navigate({ ...this.#identity, leafId: entry.id });
     else if (this.#identity) this.#identity = { ...this.#identity, leafId: entry.id };
     this.#joinEntry(entry);
@@ -1025,10 +1295,13 @@ export class NeoPiNativeProjection {
    * C2 invariant 2: a message entry and its live copy join only once
    * `message_persisted` names them, which NeoPi sends after the entry. Until
    * then the entry is held from readers if a live message of its role has
-   * ended without one. The hold ends when the entry's alias arrives, when every
-   * candidate is associated elsewhere or retired, when a later entry joins
-   * (NeoPi persists in order, so this entry's alias would have come first), or
-   * when persistence fails.
+   * ended without one. Every hold ends, at the latest when the run ends: on the
+   * entry's own association (to any message, held or not); when every
+   * candidate is associated elsewhere or retired; when this or a later entry
+   * is associated or joined (NeoPi persists in order, so this entry's alias
+   * would have come first); when persistence fails; when the entry leaves the
+   * ring; on navigation or identity change; or at `agent_end` /
+   * `session_settled`, after which a late alias still retires the live row.
    */
   #holdIfUnassociated(entry: NeoPiNativeObservedJournalEntry): void {
     const role = entry.message?.role;
@@ -1065,9 +1338,11 @@ export class NeoPiNativeProjection {
     }
   }
 
+  /** C3.5: navigation restarts the build, so reads say `building` until its page publishes. */
   #navigate(identity: NeoPiNativeIdentity): void {
     this.#domain = { ...this.#domain, branchGeneration: this.#domain.branchGeneration + 1 };
     this.#horizonCursor = null;
+    this.#pageApplied = false;
     this.#setIdentity(identity);
   }
 
@@ -1115,12 +1390,15 @@ export class NeoPiNativeProjection {
    * id in the journal retires it.
    */
   #alias(messageId: string, entryId: string): void {
+    // This entry, and every earlier one, now has its association settled.
+    const position = this.journal.positionOf(entryId);
+    if (position >= 0) this.#releaseHeldBefore(position + 1);
     const key = messageKey(messageId);
     const held = this.store.get(key)?.value;
     if (held?.class !== "message" || (held.phase === "durable" && held.entryId === entryId)) return;
     this.store.put(key, { ...held, phase: "durable", entryId });
     this.#resolveCandidate(messageId);
-    if (this.journal.positionOf(entryId) >= 0) this.#retire(key, entryId);
+    if (position >= 0) this.#retire(key, entryId);
     else this.#pendingJoins.set(entryId, messageId);
   }
 
@@ -1133,8 +1411,14 @@ export class NeoPiNativeProjection {
     const held = record?.value;
     // The snapshot message (`snapshot: true`) is merged like any start (C3.2):
     // anything already ended, durable or joined (`joinEntryId`) is kept.
-    if ((held?.class === "message" && held.phase !== "open") || record?.joinEntryId) return;
+    if (
+      (held?.class === "message" && held.phase !== "open") ||
+      record?.joinEntryId ||
+      this.store.wasRetired(key)
+    )
+      return;
     const { message, stopOutcome } = observeNeoPiMessage(native);
+    this.#lastMessageId = messageId;
     const value: MessageValue = {
       class: "message",
       messageId,
@@ -1160,7 +1444,7 @@ export class NeoPiNativeProjection {
     if (toolCallId === undefined) return;
     const key = toolKey(toolCallId);
     const record = this.store.get(key);
-    if (record?.joinEntryId) return;
+    if (record?.joinEntryId || this.store.wasRetired(key)) return;
     const held = record?.value;
     const previous = held?.class === "tool" ? held : undefined;
     const ended = previous?.state.status === "ended";
@@ -1213,7 +1497,7 @@ export class NeoPiNativeProjection {
     }
     const key = editPreviewKey(toolCallId);
     const record = this.store.get(key);
-    if (record?.joinEntryId) return;
+    if (record?.joinEntryId || this.store.wasRetired(key)) return;
     const held = record?.value;
     if (held?.class === "editPreview") {
       if (preview.generation < held.generation) return;
@@ -1261,22 +1545,35 @@ export class NeoPiNativeProjection {
     if (!this.#inboxObserved) this.#dropAt(this.#inbox.length - 1, "not-observed");
     const limits = this.#inboxLimits;
     while (this.#inbox.length > limits.records || this.#inboxBytes > limits.bytes) {
-      if (this.#inbox[0]!.type !== "gap") this.#dropAt(0, "evicted");
-      else if (this.#inbox.length > 1) this.#mergeInto(0, 1, "evicted");
+      // Evict the oldest payload into a gap of its own reason; gaps of
+      // different reasons stay apart. Only when gaps alone exceed the bound do
+      // the two oldest merge, and that merged gap is `not-observed`.
+      const oldest = this.#inbox.findIndex((item) => item.type !== "gap");
+      if (oldest >= 0) this.#dropAt(oldest, "evicted");
+      else if (this.#inbox.length > 1) this.#mergeInto(0, 1, "not-observed");
       else break;
     }
   }
 
   /**
    * Decision 8 (a) with its amendment: while no view holds a lease nothing is
-   * retained. B5 calls this with `false` when the last lease is released (what
-   * is held is dropped into a `not-observed` gap) and `true` when one is taken.
+   * retained. B5 calls this with `false` when the last lease is released (every
+   * payload held is dropped into a `not-observed` gap) and `true` when one is
+   * taken.
    */
   setInboxObserved(observed: boolean): void {
     this.#inboxObserved = observed;
     if (observed) return;
-    for (let index = 0; index < this.#inbox.length; index++)
-      if (this.#inbox[index]!.type !== "gap") this.#dropAt(index, "not-observed");
+    for (let index = 0; index < this.#inbox.length;) {
+      if (this.#inbox[index]!.type === "gap") {
+        index++;
+        continue;
+      }
+      const length = this.#inbox.length;
+      this.#dropAt(index, "not-observed");
+      // Merged into the gap before it: the next item now sits at `index`.
+      if (this.#inbox.length === length) index++;
+    }
   }
 
   /**
@@ -1354,6 +1651,23 @@ export class NeoPiNativeProjection {
     this.#inboxBytes -= freed;
   }
 
+  /**
+   * The run is over: no hold waits past it, and an edit preview whose call
+   * never ran (aborted after its final preview) is dropped; its diagnostic and
+   * recovery are their own records (§2.11 rule 2).
+   */
+  #runEnded(): void {
+    this.#heldEntries.clear();
+    const orphans: string[] = [];
+    for (const record of this.store.values())
+      if (
+        record.value?.class === "editPreview" &&
+        this.store.get(toolKey(record.value.toolCallId))?.value?.class !== "tool"
+      )
+        orphans.push(record.key);
+    for (const key of orphans) this.store.remove(key);
+  }
+
   #run(type: string, frame: NativeRecord): void {
     const held = this.store.get(RUN_KEY)?.value;
     const run: NativeRecord = { ...(held?.class === "run" ? held.value : {}) };
@@ -1429,7 +1743,8 @@ export class NeoPiNativeProjection {
     const held = this.store.get(key)?.value;
     const entry: NativeRecord = held?.class === "roster" ? { ...held.value } : { id };
     entry.ticks = (typeof entry.ticks === "number" ? entry.ticks : 0) + 1;
-    this.#rosterLive.set(id, this.store.put(key, { class: "roster", value: entry }));
+    // A tick is a re-read trigger, not roster state: replies still apply.
+    this.store.put(key, { class: "roster", value: entry });
   }
 
   #rosterRow(
@@ -1446,17 +1761,20 @@ export class NeoPiNativeProjection {
     this.store.put(key, { class: "roster", value: entry });
   }
 
-  /** `job_lifecycle` `{event, job, runningCount}`: a settled job is final; only a fresh registration reopens its id. */
+  /**
+   * `job_lifecycle` `{event, job, runningCount}`: a settled job is final; only
+   * a fresh registration reopens its id. A frame whose job update is refused
+   * is stale, and so is its running count.
+   */
   #job(frame: NativeRecord): void {
     const job = asRecord(frame.job);
     const id = text(job?.id);
     if (job && id !== undefined) {
-      const key = `job:${id}`;
-      const held = this.store.get(key)?.value;
+      const held = this.store.get(`job:${id}`)?.value;
       const previous = held?.class === "presentation" ? asRecord(held.value.job) : undefined;
       const reopens = previous && previous.status !== "running" && job.status === "running";
-      if (!reopens || frame.event === "registered")
-        this.store.put(key, { class: "presentation", value: { job } });
+      if (reopens && frame.event !== "registered") return;
+      this.#putJob(id, job);
     }
     if (typeof frame.runningCount === "number")
       this.store.put("presentation:jobs", {
@@ -1465,16 +1783,24 @@ export class NeoPiNativeProjection {
       });
   }
 
+  /** Settled jobs are kept up to a bound, oldest leaving by tombstone. */
+  #putJob(id: string, job: NativeRecord): void {
+    const key = `job:${id}`;
+    this.store.put(key, { class: "presentation", value: { job } });
+    this.#settledJobs = this.#settledJobs.filter((held) => held !== key);
+    if (job.status === "running") return;
+    this.#settledJobs.push(key);
+    while (this.#settledJobs.length > SETTLED_JOBS) this.store.remove(this.#settledJobs.shift()!);
+  }
+
   /**
    * `command_output`, in arrival order, anchored after the last delivered
    * journal entry and the newest live message at arrival (C1 informational
-   * receipt; its durable re-read is N11a, a later stage).
+   * receipt; its durable re-read is N11a, a later stage). The newest
+   * `COMMAND_OUTPUTS` are kept.
    */
   #commandOutput(frame: NativeRecord): void {
     if (typeof frame.text !== "string" || frame.text === "") return;
-    let afterMessageId: string | null = null;
-    for (const record of this.store.values())
-      if (record.value?.class === "message") afterMessageId = record.value.messageId;
     const afterEntry = this.journal.at(this.deliverableJournalEnd - 1);
     this.store.put(`receipt:command:${this.#commandOutputs++}`, {
       class: "receipt",
@@ -1482,9 +1808,11 @@ export class NeoPiNativeProjection {
         kind: "command_output",
         text: frame.text,
         afterEntryId: afterEntry?.id ?? null,
-        afterMessageId,
+        afterMessageId: this.#lastMessageId,
       },
     });
+    if (this.#commandOutputs > COMMAND_OUTPUTS)
+      this.store.remove(`receipt:command:${this.#commandOutputs - 1 - COMMAND_OUTPUTS}`);
   }
 
   /**

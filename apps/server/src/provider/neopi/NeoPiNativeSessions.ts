@@ -616,19 +616,24 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   /** The roster's recovery authority (C1): the live inventory and, where offered, finished children. */
   const readRoster = (session: NativeSession) => {
     const { projection } = session;
+    // A NeoPi that cannot list finished children, or a failed history read, leaves
+    // the live inventory to carry the roster.
+    const history = session.native.client.capabilities.has(SUBAGENT_HISTORY_CAPABILITY)
+      ? readInto(session, { type: "get_subagent_history" }, (reply, mark) =>
+          projection.applySubagentHistoryReply(reply, mark),
+        )
+      : Effect.fail(undefined);
     const reads = [
       readInto(session, { type: "get_subagents" }, (reply, mark) =>
         projection.applySubagentsReply(reply, mark),
       ),
+      Effect.suspend(() => {
+        const mark = projection.mark();
+        return history.pipe(
+          Effect.orElseSucceed(() => projection.applySubagentHistoryReply(null, mark)),
+        );
+      }),
     ];
-    // A failed history read leaves the live inventory to carry the roster, as for a
-    // NeoPi that cannot list finished children.
-    if (session.native.client.capabilities.has(SUBAGENT_HISTORY_CAPABILITY))
-      reads.push(
-        readInto(session, { type: "get_subagent_history" }, (reply, mark) =>
-          projection.applySubagentHistoryReply(reply, mark),
-        ).pipe(Effect.orElseSucceed(() => true)),
-      );
     return Effect.all(reads, { concurrency: "unbounded" }).pipe(
       Effect.map((applied) => applied.every(Boolean)),
     );
@@ -810,6 +815,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           envelope = { ...envelope, sessionFile: current.ref.sessionFile };
         for (const observation of observations) enqueue(observation, envelope);
       },
+      // A navigation or identity change, from a frame or settled by a read, restarts the build (C3.5).
+      onFence: () => {
+        if (session) ensureBuild(session);
+      },
     });
     /** Adopts a file the owner moved to; a real identity change ends every lease (I3). */
     const followIdentity = (
@@ -914,7 +923,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           PubSub.publishUnsafe(modelUi, frame as UiRequestFrame);
         if (STATE_REFRESH_EVENTS.has(frame.type)) requestRefresh(current, "state");
         if (frame.type === "agent_end") requestRefresh(current, "jobs");
-        if (fence !== "none") ensureBuild(current);
         publishStatus(current);
         notifyChanged(current);
       },
@@ -1490,6 +1498,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     observation.released = true;
     observation.session.observations.delete(observation);
     observations.delete(observation.leaseId);
+    observation.session.projection.store.endTransfer(observation.leaseId);
     observation.interrupt?.("released");
   };
   /**
@@ -1648,7 +1657,12 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       const { session } = observation;
       const deadline = clock.currentTimeMillisUnsafe() + READ_DEADLINE_MS;
       while (true) {
-        const result = readNeoPiNativeObservation(session.projection, input.cursor, READ_LIMITS);
+        const result = readNeoPiNativeObservation(
+          session.projection,
+          input.cursor,
+          READ_LIMITS,
+          observation.leaseId,
+        );
         const remaining = deadline - clock.currentTimeMillisUnsafe();
         if (result.type === "pass" || remaining <= 0) return result;
         let wake: (() => void) | undefined;

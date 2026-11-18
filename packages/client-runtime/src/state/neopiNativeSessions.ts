@@ -1,16 +1,25 @@
-import { WS_METHODS, type NeoPiNativeSessionRef } from "@t3tools/contracts";
+import {
+  EnvironmentAuthorizationError,
+  NEOPI_NATIVE_OBSERVATION_ERROR_CODES,
+  NeoPiNativeSessionsError,
+  WS_METHODS,
+  type NeoPiNativeDemandItem,
+  type NeoPiNativeObservationLifecycle,
+  type NeoPiNativeSessionRef,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom, type AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, type Atom, type AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { request as rpcRequest, subscribe } from "../rpc/client.ts";
-import { NATIVE_JOBS_CAPABILITY } from "../neopiNativeJobs.ts";
-import { SUBAGENT_HISTORY_CAPABILITY } from "../neopiNativeSubagents.ts";
+import { request as rpcRequest } from "../rpc/client.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import {
   emptyNativeSessionFeed,
   nativeJournalPage,
@@ -27,276 +36,45 @@ import {
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
 
-/**
- * Frames after which NeoPi's `get_state` carries different telemetry: context
- * usage, cost, cache rate and output speed move with turns, compaction and any
- * journal commit (navigation included). A terminal-driven turn emits no
- * `prompt_result` to this client, so the turn and journal frames must trigger it.
- */
-const stateReconciliationEvents = new Set([
-  "model_changed",
-  "models_configuration_changed",
-  "thinking_level_changed",
-  "chat_mode_changed",
-  "mode_changed",
-  "prompt_result",
-  "agent_end",
-  "session_settled",
-  "manual_compaction_end",
-  "auto_compaction_end",
-  "advisor_cost_changed",
-  "journal_state",
-  "journal_entry",
+/** Lifecycle facts after which the server ends the watch and only an explicit route continues. */
+const TERMINAL_LIFECYCLES: ReadonlySet<NeoPiNativeObservationLifecycle> = new Set([
+  "owner-stopped",
+  "incompatible",
+  "detached",
+  "identity-changed",
 ]);
-/**
- * Minimum spacing between telemetry reads, so a burst of journal commits costs
- * one trailing read. A read is always scheduled after the last trigger.
- */
-const STATE_READ_MIN_GAP_MS = 1_000;
-/**
- * A terminal-owned session's control connection carries no `job_lifecycle`
- * frames and can miss telemetry changes made elsewhere, so a visible tab
- * re-reads state, jobs and agents on this cadence.
- */
-const TERMINAL_POLL_INTERVAL_MS = 5_000;
-const branchReconciliationEvents = new Set([
-  "journal_state",
-  "journal_entry",
-  "agent_end",
-  "prompt_result",
-]);
+/** What a visible view of a session needs until a consumer narrows or widens it. */
+export const DEFAULT_NATIVE_DEMAND: readonly NeoPiNativeDemandItem[] = [
+  { kind: "summary" },
+  { kind: "transcript" },
+  { kind: "roster" },
+];
+/** How long a released view's cached feed stays for a warm switch back; it holds no lease. */
+export const NATIVE_WARM_CACHE_MS = 5 * 60_000;
+/** Re-attach and re-read backoff: 250 ms doubling to 5 s, reset by any lease or reply. */
+const retryDelayMs = (failures: number) => Math.min(250 * 2 ** failures, 5_000);
 
-interface VisibilitySource {
-  readonly visibilityState?: string;
-  addEventListener?(type: "visibilitychange", listener: () => void): void;
-  removeEventListener?(type: "visibilitychange", listener: () => void): void;
-}
-const visibilitySource = (): VisibilitySource | undefined =>
-  (globalThis as unknown as { document?: VisibilitySource }).document;
-/** Hosts without a document (mobile, server) count as visible. */
-const tabVisible = () => visibilitySource()?.visibilityState !== "hidden";
+type LeaseOutcome =
+  | { readonly kind: "terminal" }
+  | { readonly kind: "unauthorized"; readonly reason: string }
+  | { readonly kind: "lost"; readonly leased: boolean };
 
-/** Native reads run beside the event reducer, never in its delivery path. */
-export function reconcileNativeSessionFeed<E, R, ReadE, ReadR>(
-  source: Stream.Stream<NativeSessionUpdate, E, R>,
-  read: (
-    command: Record<string, unknown> & { type: string },
-  ) => Effect.Effect<unknown, ReadE, ReadR>,
-  initial: NativeSessionFeed,
-  onFeed: (feed: NativeSessionFeed) => void,
-  options: { readonly stateReadGapMs?: number; readonly pollIntervalMs?: number } = {},
-) {
-  const stateReadGapMs = options.stateReadGapMs ?? STATE_READ_MIN_GAP_MS;
-  const pollIntervalMs = options.pollIntervalMs ?? TERMINAL_POLL_INTERVAL_MS;
-  return Stream.unwrap(
-    Effect.gen(function* () {
-      const replies = yield* Effect.acquireRelease(
-        Queue.unbounded<NativeSessionUpdate>(),
-        Queue.shutdown,
-      );
-      const stateReads = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown);
-      const branchReads = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown);
-      const subagentReads = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown);
-      const jobReads = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown);
-      let current = initial;
-      let divergentEntry = false;
-      // Subagent progress is subscribed once per connection; polls only re-read the roster.
-      let agentsSubscribed = false;
-      const needsBranch = () => {
-        const conversation = current.conversation;
-        return (
-          current.connected &&
-          conversation.needsSnapshot &&
-          conversation.identity !== null &&
-          (divergentEntry ||
-            !current.busy ||
-            conversation.identity.leafId === null ||
-            conversation.entries.some((entry) => entry.id === conversation.identity?.leafId))
-        );
-      };
-      const recovered = (operation: "state" | "branch" | "subagents" | "jobs") =>
-        Queue.offer(replies, { type: "reconciliation", operation, error: null });
-      const failed = (operation: "state" | "branch" | "subagents" | "jobs", error: unknown) =>
-        Queue.offer(replies, {
-          type: "reconciliation",
-          operation,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      yield* Stream.fromQueue(stateReads).pipe(
-        Stream.runForEach(() =>
-          Effect.gen(function* () {
-            if (!current.connected) return;
-            const state = nativeRecord(yield* read({ type: "get_state", includeDump: false }));
-            yield* Queue.offer(replies, { type: "state", state });
-            yield* recovered("state");
-          }).pipe(
-            Effect.catch((error) => failed("state", error)),
-            // Triggers that land meanwhile wait in the sliding queue and run once after the gap.
-            Effect.andThen(stateReadGapMs > 0 ? Effect.sleep(stateReadGapMs) : Effect.void),
-          ),
-        ),
-        Effect.forkScoped,
-      );
-      yield* Stream.fromQueue(branchReads).pipe(
-        Stream.runForEach(() =>
-          Effect.gen(function* () {
-            if (!needsBranch()) return;
-            const { identity, revision } = current.conversation;
-            if (!identity) return;
-            const page = nativeJournalPage(
-              yield* read({
-                type: "get_entries_page",
-                scope: "branch",
-                direction: "backward",
-                limit: 128,
-              }),
-            );
-            if (!page)
-              return yield* failed(
-                "branch",
-                new Error("NeoPi returned an invalid native branch page."),
-              );
-            yield* Queue.offer(replies, { type: "page", page, revision, identity, older: false });
-          }).pipe(Effect.catch((error) => failed("branch", error))),
-        ),
-        Effect.forkScoped,
-      );
-      yield* Stream.fromQueue(subagentReads).pipe(
-        Stream.runForEach(() =>
-          Effect.gen(function* () {
-            if (!current.connected || !current.session) return;
-            const { ref, sessionId } = current.session;
-            const epoch = current.agentsEpoch;
-            // This is the existing native owner's control connection, not a
-            // new session/stream. Control subscription levels are per peer.
-            if (!agentsSubscribed) {
-              yield* read({ type: "set_subagent_subscription", level: "progress" });
-              agentsSubscribed = true;
-            }
-            if (!current.connected || current.agentsEpoch !== epoch) return;
-            const revision = current.agentsRevision;
-            // Finished and persisted children are only in the history; a failed read leaves
-            // the live inventory to carry the roster, as for a NeoPi that cannot list them.
-            const history = current.session.capabilities.includes(SUBAGENT_HISTORY_CAPABILITY)
-              ? nativeRecord(
-                  yield* read({ type: "get_subagent_history" }).pipe(
-                    Effect.catch(() => Effect.succeed(null)),
-                  ),
-                ).subagents
-              : undefined;
-            const result = nativeRecord(yield* read({ type: "get_subagents" }));
-            if (!Array.isArray(result.subagents))
-              return yield* failed(
-                "subagents",
-                new Error("NeoPi returned an invalid subagent inventory."),
-              );
-            yield* Queue.offer(replies, {
-              type: "subagents",
-              ref,
-              sessionId,
-              epoch,
-              revision,
-              ...(Array.isArray(history) ? { history } : {}),
-              agents: result.subagents,
-            });
-            yield* recovered("subagents");
-          }).pipe(Effect.catch((error) => failed("subagents", error))),
-        ),
-        Effect.forkScoped,
-      );
-      const jobsSupported = () =>
-        current.connected &&
-        current.session?.capabilities.includes(NATIVE_JOBS_CAPABILITY) === true;
-      yield* Stream.fromQueue(jobReads).pipe(
-        Stream.runForEach(() =>
-          Effect.gen(function* () {
-            if (!jobsSupported() || !current.session) return;
-            const { ref, sessionId } = current.session;
-            const revision = current.jobs.revision;
-            const response = yield* read({ type: "get_jobs" });
-            yield* Queue.offer(replies, { type: "jobs", ref, sessionId, revision, response });
-            yield* recovered("jobs");
-          }).pipe(Effect.catch((error) => failed("jobs", error))),
-        ),
-        Effect.forkScoped,
-      );
-      const pollTerminalTelemetry = () => {
-        if (current.session?.attachment !== "terminal" || !tabVisible()) return;
-        Queue.offerUnsafe(stateReads, undefined);
-        Queue.offerUnsafe(jobReads, undefined);
-        Queue.offerUnsafe(subagentReads, undefined);
-      };
-      yield* Effect.sleep(pollIntervalMs).pipe(
-        Effect.andThen(Effect.sync(pollTerminalTelemetry)),
-        Effect.forever,
-        Effect.forkScoped,
-      );
-      // A tab that was hidden catches up the moment it is shown again.
-      yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          visibilitySource()?.addEventListener?.("visibilitychange", pollTerminalTelemetry),
-        ),
-        () =>
-          Effect.sync(() =>
-            visibilitySource()?.removeEventListener?.("visibilitychange", pollTerminalTelemetry),
-          ),
-      );
-      return Stream.merge(source, Stream.fromQueue(replies), { haltStrategy: "left" }).pipe(
-        Stream.map((event) => {
-          current = reduceNativeSessionFeed(current, event);
-          if (!current.conversation.needsSnapshot) divergentEntry = false;
-          else if (event.type === "event" && event.frame.type === "journal_entry") {
-            const entryId = nativeRecord(event.frame.entry).id;
-            if (
-              typeof entryId === "string" &&
-              event.frame.sessionId === current.conversation.identity?.sessionId &&
-              event.frame.sessionFile === current.conversation.identity?.sessionFile &&
-              !current.conversation.entries.some((entry) => entry.id === entryId)
-            )
-              divergentEntry = true;
-          }
-          onFeed(current);
-          if (event.type === "snapshot") {
-            agentsSubscribed = false;
-            Queue.offerUnsafe(subagentReads, undefined);
-            Queue.offerUnsafe(jobReads, undefined);
-          }
-          if (event.type === "event" && event.frame.type === "agent_end")
-            Queue.offerUnsafe(jobReads, undefined);
-          if (event.type === "event") {
-            if (stateReconciliationEvents.has(event.frame.type))
-              Queue.offerUnsafe(stateReads, undefined);
-            // Native uses `leaf` for both append and navigation. Active append
-            // notifications resolve through durable parent-linked entries; known
-            // ancestors and idle unknown branches need a bounded native page.
-            if (needsBranch() && branchReconciliationEvents.has(event.frame.type))
-              Queue.offerUnsafe(branchReads, undefined);
-          } else if (
-            event.type === "page" &&
-            !event.older &&
-            event.revision !== current.conversation.revision &&
-            needsBranch()
-          ) {
-            Queue.offerUnsafe(branchReads, undefined);
-          }
-          return current;
-        }),
-        // Reconciliation and cache updates still consume every raw frame;
-        // unchanged projections must not republish fresh stream-atom results.
-        Stream.changes,
-      );
-    }),
-  );
-}
+const isObservationError = Schema.is(NeoPiNativeSessionsError);
+const isAuthorizationError = Schema.is(EnvironmentAuthorizationError);
+const isUnauthorized = (error: unknown) =>
+  isAuthorizationError(error) || (isObservationError(error) && error.code === "profile_changed");
 
 export function createNativeSessionAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   const cache = new Map<string, NativeSessionFeed>();
+  /** Live observations: updates published from outside the controller (commands). */
   const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
-  const endedObservations = new Set<string>();
-  /** Sessions the user detached from; a revisit leaves them detached until `reconnect`. */
-  const detachedObservations = new Set<string>();
+  /** Requested demand per session; absent means `DEFAULT_NATIVE_DEMAND`. */
+  const demands = new Map<string, readonly NeoPiNativeDemandItem[]>();
+  const demandSignals = new Map<string, Queue.Queue<void>>();
+  /** Wakes an observation that stopped on a terminal lifecycle, after an explicit open. */
+  const restarts = new Map<string, Queue.Queue<void>>();
   const publish = (key: string, update: NativeSessionUpdate) =>
     Effect.sync(() => {
       const queue = updates.get(key);
@@ -311,169 +89,212 @@ export function createNativeSessionAtoms<R, E>(
     tag: WS_METHODS.neopiNativeSessionsList,
     staleTimeMs: 5_000,
   });
+  /**
+   * The observation controller (r12 C5). One essential `watch` per visible view
+   * is its lease; bulk state comes through one cursor `read` at a time; credit
+   * goes back for every envelope applied, so the socket reader never waits on
+   * this stream. A lost read re-reads, a lost watch re-attaches (never Open),
+   * and the feed carries on in place: the atom never fails or restarts.
+   */
   const observation = createEnvironmentSubscriptionAtomFamily(runtime, {
     label: "native-sessions:watch",
-    idleTtlMs: 5 * 60_000,
+    // A concealed view releases its lease at once; the cache stays warm without one.
+    idleTtlMs: 0,
     subscribe: (input: { ref: NeoPiNativeSessionRef }) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const supervisor = yield* EnvironmentSupervisor;
-          const key = nativeSessionKey({
-            environmentId: supervisor.target.environmentId,
-            ref: input.ref,
-          });
-          const queue = yield* Queue.unbounded<NativeSessionUpdate>();
+          const environmentId = supervisor.target.environmentId;
+          const key = nativeSessionKey({ environmentId, ref: input.ref });
+          const external = yield* Queue.unbounded<NativeSessionUpdate>();
+          const demandSignal = yield* Queue.sliding<void>(1);
+          const restart = yield* Queue.sliding<void>(1);
+          // Only the latest feed is drawn: a backlog never replays frame by frame.
+          const out = yield* Queue.sliding<NativeSessionFeed>(1);
           const handedOffKeys = new Set<string>();
+          let current = cache.get(key) ?? emptyNativeSessionFeed();
+          const apply = (update: NativeSessionUpdate) =>
+            Effect.sync(() => {
+              const wasMoved = current.movedTo != null;
+              const next = reduceNativeSessionFeed(current, update);
+              if (next === current) return;
+              current = next;
+              cache.set(key, next);
+              // The moved session's own observation starts from what is already
+              // known, so its transcript does not flash empty.
+              if (next.movedTo && !wasMoved) {
+                const movedKey = nativeSessionKey({ environmentId, ref: next.movedTo });
+                if (!updates.has(movedKey)) {
+                  handedOffKeys.add(movedKey);
+                  cache.set(movedKey, { ...next, movedTo: null, connected: false });
+                }
+              }
+              Queue.offerUnsafe(out, next);
+            });
           yield* Effect.acquireRelease(
-            Effect.sync(() => updates.set(key, queue)),
+            Effect.sync(() => {
+              updates.set(key, external);
+              demandSignals.set(key, demandSignal);
+              restarts.set(key, restart);
+            }),
             () =>
-              Effect.sync(() => {
-                if (updates.get(key) !== queue) return;
+              Effect.suspend(() => {
+                if (updates.get(key) !== external) return Effect.void;
                 updates.delete(key);
-                cache.delete(key);
-                endedObservations.delete(key);
-                // Unobserved move handoffs live only as long as their source.
-                // A mounted destination owns its own feed and must stay intact.
-                for (const movedKey of handedOffKeys)
-                  if (!updates.has(movedKey)) {
-                    cache.delete(movedKey);
-                    endedObservations.delete(movedKey);
-                  }
+                demandSignals.delete(key);
+                restarts.delete(key);
+                const evict = () => {
+                  if (!updates.has(key)) cache.delete(key);
+                  // Unobserved move handoffs live only as long as their source.
+                  for (const movedKey of handedOffKeys)
+                    if (!updates.has(movedKey)) cache.delete(movedKey);
+                };
+                return Effect.sleep(NATIVE_WARM_CACHE_MS).pipe(
+                  Effect.andThen(Effect.sync(evict)),
+                  Effect.forkDetach,
+                  Effect.asVoid,
+                );
               }),
           );
-          return SubscriptionRef.changes(supervisor.session).pipe(
-            Stream.switchMap((session) => {
-              if (Option.isNone(session))
-                return Stream.succeed({ type: "disconnected" } as const).pipe(
-                  Stream.map((event) => {
-                    const feed = reduceNativeSessionFeed(
-                      cache.get(key) ?? emptyNativeSessionFeed(),
-                      event,
-                    );
-                    cache.set(key, feed);
-                    return feed;
-                  }),
-                );
-              const remote = Stream.unwrap(
-                rpcRequest(WS_METHODS.neopiNativeSessionsOpen, input.ref).pipe(
-                  Effect.as(subscribe(WS_METHODS.neopiNativeSessionsWatch, input)),
-                ),
-              ).pipe(
-                Stream.catch((error) => {
-                  endedObservations.add(key);
-                  return Stream.fromIterable<NativeSessionUpdate>([
-                    { type: "disconnected" },
-                    { type: "reconciliation", operation: "state", error: error.message },
-                  ]);
-                }),
-                // The server closing the watch without a `closed` event still ends this
-                // observation; a revisit must reopen it rather than reuse the dead feed.
-                (source) =>
-                  Stream.concat(
-                    source,
-                    Stream.fromEffect(Effect.sync(() => endedObservations.add(key))).pipe(
-                      Stream.drain,
-                    ),
-                  ),
+
+          const read = (leaseId: string) =>
+            Effect.gen(function* () {
+              let readId = 0;
+              let failures = 0;
+              while (true) {
+                readId++;
+                // The reducer applies a reply only while the feed still holds this cursor.
+                const sent = current.observation.cursor;
+                const reply = yield* rpcRequest(WS_METHODS.neopiNativeSessionsRead, {
+                  leaseId,
+                  readId,
+                  cursor: sent,
+                }).pipe(Effect.result);
+                if (Result.isSuccess(reply)) {
+                  failures = 0;
+                  yield* apply({ type: "read", sent, result: reply.success });
+                  continue;
+                }
+                const error = reply.failure;
+                const code = isObservationError(error) ? error.code : undefined;
+                // The lease is gone; its watch is ending and re-attach takes over.
+                if (code === NEOPI_NATIVE_OBSERVATION_ERROR_CODES.leaseUnknown) return;
+                // A newer read superseded this one: the next id reads again at once.
+                if (code === NEOPI_NATIVE_OBSERVATION_ERROR_CODES.staleRead) continue;
+                yield* Effect.sleep(retryDelayMs(failures++));
+              }
+            });
+
+          const demand = (leaseId: string) =>
+            Effect.gen(function* () {
+              let generation = 0;
+              const send = Effect.suspend(() =>
+                rpcRequest(WS_METHODS.neopiNativeSessionsSetDemand, {
+                  leaseId,
+                  generation: ++generation,
+                  demand: demands.get(key) ?? DEFAULT_NATIVE_DEMAND,
+                }).pipe(Effect.ignore),
               );
-              return reconcileNativeSessionFeed(
-                Stream.merge(
-                  // A remounted observer may have missed lifecycle frames while
-                  // idle. Cached running status is unverified until inventory.
-                  Stream.concat(
-                    Stream.succeed<NativeSessionUpdate>({ type: "disconnected" }),
-                    remote,
+              yield* send;
+              yield* Stream.fromQueue(demandSignal).pipe(Stream.runForEach(() => send));
+            });
+
+          /** One watch stream: one lease. Resolves when the stream ends or fails. */
+          const lease = (session: RpcSession) =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                let leased = false;
+                let terminal = false;
+                let applied = 0;
+                const credit = yield* Queue.sliding<string>(1);
+                // One credit call in flight, always carrying the latest cumulative count.
+                yield* Stream.fromQueue(credit).pipe(
+                  Stream.runForEach((leaseId) =>
+                    rpcRequest(WS_METHODS.neopiNativeSessionsCredit, {
+                      leaseId,
+                      applied,
+                    }).pipe(Effect.ignore),
                   ),
-                  Stream.fromQueue(queue),
-                  { haltStrategy: "left" },
-                ).pipe(
-                  Stream.tap((event) =>
-                    Effect.sync(() => {
-                      // A move leaves this observation on the old file, but the
-                      // owner keeps talking on it (`/wt` prints its summary after
-                      // relocating). Hand those frames to the moved file's feed
-                      // until that feed has its own connection.
-                      const moved = cache.get(key)?.movedTo;
-                      if (!moved || event.type !== "event") return;
-                      const movedKey = nativeSessionKey({
-                        environmentId: supervisor.target.environmentId,
-                        ref: moved,
-                      });
-                      if (!cache.get(movedKey)?.connected)
-                        publish(movedKey, event).pipe(Effect.runSync);
+                  Effect.forkScoped,
+                );
+                let leaseId: string | null = null;
+                return yield* session.client[WS_METHODS.neopiNativeSessionsWatch]({
+                  ref: input.ref,
+                }).pipe(
+                  Stream.runForEach((envelope) =>
+                    Effect.gen(function* () {
+                      yield* apply(envelope);
+                      applied++;
+                      if (envelope.type === "leased") {
+                        leased = true;
+                        leaseId = envelope.leaseId;
+                        yield* Effect.forkScoped(read(envelope.leaseId));
+                        yield* Effect.forkScoped(demand(envelope.leaseId));
+                      }
+                      if (envelope.type === "lifecycle" && TERMINAL_LIFECYCLES.has(envelope.state))
+                        terminal = true;
+                      if (leaseId !== null) Queue.offerUnsafe(credit, leaseId);
                     }),
                   ),
-                  Stream.takeUntil((event) => {
-                    if (event.type === "closed") {
-                      endedObservations.add(key);
-                      if (event.code === "detached") detachedObservations.add(key);
-                      return true;
-                    }
-                    if (event.type === "snapshot") {
-                      endedObservations.delete(key);
-                      detachedObservations.delete(key);
-                    }
-                    // Another session id on a different file is a new owner. The same
-                    // session on a different file is a move, which the feed follows.
-                    return (
-                      event.type === "event" &&
-                      event.frame.type === "journal_state" &&
-                      typeof event.frame.sessionFile === "string" &&
-                      event.frame.sessionFile !== input.ref.sessionFile &&
-                      event.frame.sessionId !== cache.get(key)?.session?.sessionId
-                    );
-                  }),
-                ),
-                (command) =>
-                  rpcRequest(WS_METHODS.neopiNativeSessionsRequest, { ref: input.ref, command }),
-                cache.get(key) ?? emptyNativeSessionFeed(),
-                (feed) => {
-                  const wasMoved = cache.get(key)?.movedTo != null;
-                  cache.set(key, feed);
-                  // The moved session's own observation starts from what is
-                  // already known, so the transcript does not flash empty.
-                  if (feed.movedTo && !wasMoved) {
-                    const movedKey = nativeSessionKey({
-                      environmentId: supervisor.target.environmentId,
-                      ref: feed.movedTo,
-                    });
-                    if (!updates.has(movedKey)) {
-                      handedOffKeys.add(movedKey);
-                      cache.set(movedKey, { ...feed, movedTo: null, connected: false });
-                    }
-                  }
-                },
-              );
-            }),
+                  Effect.map((): LeaseOutcome =>
+                    terminal ? { kind: "terminal" } : { kind: "lost", leased },
+                  ),
+                  Effect.catch((error) =>
+                    Effect.succeed<LeaseOutcome>(
+                      isUnauthorized(error)
+                        ? { kind: "unauthorized", reason: String(error.message) }
+                        : terminal
+                          ? { kind: "terminal" }
+                          : { kind: "lost", leased },
+                    ),
+                  ),
+                );
+              }),
+            );
+
+          /** Keeps a lease on one socket session; re-attaches in place, never opens. */
+          const attach = (session: RpcSession) =>
+            Effect.gen(function* () {
+              let failures = 0;
+              while (true) {
+                yield* apply({ type: "observer", phase: "attaching" });
+                const outcome = yield* lease(session);
+                if (outcome.kind === "lost") {
+                  yield* apply({ type: "disconnected" });
+                  yield* apply({ type: "observer", phase: "transport-lost" });
+                  failures = outcome.leased ? 0 : failures + 1;
+                  yield* Effect.sleep(retryDelayMs(failures));
+                  continue;
+                }
+                if (outcome.kind === "unauthorized") {
+                  yield* apply({ type: "disconnected" });
+                  yield* apply({ type: "observer", phase: "unauthorized", reason: outcome.reason });
+                }
+                // Stopped, detached, incompatible, moved or unauthorized: wait for an explicit route.
+                yield* Queue.take(restart);
+                failures = 0;
+              }
+            });
+
+          yield* Stream.fromQueue(external).pipe(Stream.runForEach(apply), Effect.forkScoped);
+          yield* SubscriptionRef.changes(supervisor.session).pipe(
+            Stream.switchMap((session) =>
+              Stream.fromEffect(
+                Option.isSome(session)
+                  ? attach(session.value)
+                  : apply({ type: "disconnected" }).pipe(
+                      Effect.andThen(apply({ type: "observer", phase: "transport-lost" })),
+                    ),
+              ),
+            ),
+            Stream.runDrain,
+            Effect.forkScoped,
           );
+          Queue.offerUnsafe(out, current);
+          return Stream.fromQueue(out);
         }),
       ),
   });
-  const mountedWatch = Atom.family((key: string) => {
-    const target = JSON.parse(key) as Parameters<typeof observation>[0];
-    const source = observation(target);
-    const sessionKey = nativeSessionKey({
-      environmentId: target.environmentId,
-      ref: target.input.ref,
-    });
-    return Atom.make((get) => {
-      const current = get.once(source);
-      // Forward updates without recalculating this mount boundary: a close or
-      // failure must not itself reopen the native owner.
-      get.subscribe(source, (value) => get.setSelf(value));
-      if (
-        endedObservations.has(sessionKey) &&
-        !detachedObservations.has(sessionKey) &&
-        AsyncResult.isSuccess(current) &&
-        !current.value.connected
-      )
-        get.refresh(source);
-      return get.once(source);
-    }).pipe(Atom.setIdleTTL(0));
-  });
-  // Only the mount boundary expires immediately. The observation stays warm
-  // for ordinary workspace switching; closed or failed sources restart on remount.
-  const watch = (target: Parameters<typeof observation>[0]) => mountedWatch(JSON.stringify(target));
   const request = createEnvironmentRpcCommand(runtime, {
     label: "native-sessions:request",
     tag: WS_METHODS.neopiNativeSessionsRequest,
@@ -490,7 +311,7 @@ export function createNativeSessionAtoms<R, E>(
         const agentsRevision = cachedFeed?.agentsRevision ?? 0;
         const value = yield* rpcRequest(WS_METHODS.neopiNativeSessionsRequest, input);
         if (input.command.type === "get_jobs") {
-          // A panel-initiated read folds into the feed like the reconciler's own.
+          // A panel-initiated read folds into the feed.
           const session = cache.get(key)?.session;
           if (session)
             yield* publish(key, {
@@ -501,6 +322,20 @@ export function createNativeSessionAtoms<R, E>(
               response: value,
             });
           yield* publish(key, { type: "reconciliation", operation: "jobs", error: null });
+        }
+        if (input.command.type === "get_subagents") {
+          // Model, effort and fast changes emit no lifecycle frame; a command-driven re-read folds them in.
+          const feed = cache.get(key);
+          const agents = nativeRecord(value).subagents;
+          if (feed?.session && Array.isArray(agents))
+            yield* publish(key, {
+              type: "subagents",
+              ref: feed.session.ref,
+              sessionId: feed.session.sessionId,
+              epoch: cachedFeed?.agentsEpoch ?? feed.agentsEpoch,
+              revision: agentsRevision,
+              agents,
+            });
         }
         if (input.command.type === "get_state") {
           yield* publish(key, { type: "state", state: nativeRecord(value) });
@@ -521,20 +356,6 @@ export function createNativeSessionAtoms<R, E>(
               page,
               revision,
               older: typeof input.command.cursor === "string",
-            });
-        }
-        if (input.command.type === "get_subagents") {
-          // Model, effort and fast changes emit no lifecycle frame; a command-driven re-read folds them in.
-          const feed = cache.get(key);
-          const agents = nativeRecord(value).subagents;
-          if (feed?.session && Array.isArray(agents))
-            yield* publish(key, {
-              type: "subagents",
-              ref: feed.session.ref,
-              sessionId: feed.session.sessionId,
-              epoch: cachedFeed?.agentsEpoch ?? feed.agentsEpoch,
-              revision: agentsRevision,
-              agents,
             });
         }
         return value;
@@ -566,13 +387,24 @@ export function createNativeSessionAtoms<R, E>(
           registry.refresh(list({ environmentId: target.environmentId, input: {} })),
         ),
     }),
-    watch,
+    watch: observation,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
     /**
-     * Opens the session again after its owner is gone or the user detached, and restarts the
-     * observation. The server attaches to a live terminal owner when there is one and otherwise
-     * starts NeoCode's own, so this is also how a quit terminal is taken over. Rejects with the
-     * open failure; otherwise resolves once the feed has a live owner, or after `timeoutMs`.
+     * Sets what the session's views need (C4 demand). A live lease sends it at
+     * once under a new generation; a later lease starts from it.
+     */
+    setDemand: (target: NativeSessionTarget, demand: readonly NeoPiNativeDemandItem[]) => {
+      const key = nativeSessionKey(target);
+      demands.set(key, demand);
+      const signal = demandSignals.get(key);
+      if (signal) Queue.offerUnsafe(signal, undefined);
+    },
+    /**
+     * The explicit route back for an owner-stopped or detached session: opens it
+     * (the server attaches to a live terminal owner when there is one and
+     * otherwise starts NeoCode's own, so this is also how a quit terminal is
+     * taken over), then wakes the observation. Rejects with the open failure;
+     * otherwise resolves once the feed has a live owner, or after `timeoutMs`.
      */
     reconnect: async (
       registry: AtomRegistry.AtomRegistry,
@@ -584,9 +416,9 @@ export function createNativeSessionAtoms<R, E>(
         input: target.ref,
       });
       if (result._tag === "Failure") throw Cause.squash(result.cause);
-      detachedObservations.delete(nativeSessionKey(target));
-      const atom = watch({ environmentId: target.environmentId, input: { ref: target.ref } });
-      registry.refresh(atom);
+      const restart = restarts.get(nativeSessionKey(target));
+      if (restart) Queue.offerUnsafe(restart, undefined);
+      const atom = observation({ environmentId: target.environmentId, input: { ref: target.ref } });
       await new Promise<void>((resolve) => {
         let unsubscribe: (() => void) | undefined;
         let done = false;

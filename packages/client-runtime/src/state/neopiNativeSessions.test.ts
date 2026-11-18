@@ -1,41 +1,40 @@
 import { describe, expect, it } from "@effect/vitest";
-import { vi } from "vitest";
 import {
   EnvironmentId,
-  WS_METHODS,
+  NeoPiNativeSessionsError,
   ProviderInstanceId,
-  type NeoPiJournalEntry,
-  type NeoPiJournalPage,
-  type NeoPiNativeSessionRef,
+  WS_METHODS,
+  type NeoPiNativeCursor,
+  type NeoPiNativeEntity,
+  type NeoPiNativeEssentialEnvelope,
+  type NeoPiNativeInboxRecord,
+  type NeoPiNativeObservationDomain,
+  type NeoPiNativeSessionsCreditInput,
+  type NeoPiNativeSessionsReadInput,
+  type NeoPiNativeSessionsReadResult,
+  type NeoPiNativeSessionsSetDemandInput,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
+  NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
+  nativeObservationStatus,
   reduceNativeSessionFeed,
   type NativeSession,
   type NativeSessionFeed,
-  type NativeSessionUpdate,
 } from "../neopiNativeSessions.ts";
-import { nativeStatusFacts } from "../neopiNativeStatus.ts";
-import { projectTranscript } from "../neopiTranscript.ts";
-import { createNativeSessionAtoms, reconcileNativeSessionFeed } from "./neopiNativeSessions.ts";
-
-class StateReadError extends Schema.TaggedError<StateReadError>()("StateReadError", {
-  message: Schema.String,
-}) {}
+import { DEFAULT_NATIVE_DEMAND, createNativeSessionAtoms } from "./neopiNativeSessions.ts";
 
 const ref = {
   providerInstanceId: ProviderInstanceId.make("neopi"),
@@ -45,129 +44,174 @@ const session: NativeSession = {
   ref,
   sessionId: "session",
   cwd: "/workspace",
-  attachment: "terminal",
+  attachment: "owned",
   capabilities: [],
   state: {},
 };
-const user: NeoPiJournalEntry = {
-  id: "user",
-  parentId: null,
-  timestamp: "2026-10-28T00:00:00Z",
-  type: "message",
-  message: { role: "user", content: "Question" },
-};
-const identity = (leafId: string | null) => ({
-  sessionId: session.sessionId,
-  sessionFile: ref.sessionFile,
-  leafId,
+const domain = (
+  overrides: Partial<NeoPiNativeObservationDomain> = {},
+): NeoPiNativeObservationDomain => ({
+  serverIncarnation: "server-1",
+  ownerEpoch: 1,
+  projectionIncarnation: 1,
+  buildAttempt: 1,
+  branchGeneration: 0,
+  ...overrides,
 });
-const page = (entries: readonly NeoPiJournalEntry[]): NeoPiJournalPage => ({
-  ...identity(entries.at(-1)?.id ?? null),
-  entries,
-  totalEntries: entries.length,
+const cursorAt = (epoch: NeoPiNativeObservationDomain, base: number): NeoPiNativeCursor => ({
+  epoch,
+  base,
+  pass: null,
+  inboxSeq: 0,
+  journalAt: null,
 });
-const initial = (busy = false, entries: readonly NeoPiJournalEntry[] = [user]) =>
-  reduceNativeSessionFeed(emptyNativeSessionFeed(), {
-    type: "snapshot",
-    session: { ...session, state: { isStreaming: busy } },
-    journal: page(entries),
-  });
-const event = (frame: Record<string, unknown> & { type: string }): NativeSessionUpdate => ({
-  type: "event",
-  frame,
+/** A pass answered completely in one reply. */
+const pass = (input: {
+  readonly epoch: NeoPiNativeObservationDomain;
+  readonly watermark: number;
+  readonly kind?: "full" | "incremental";
+  readonly entities?: readonly NeoPiNativeEntity[];
+  readonly inbox?: readonly NeoPiNativeInboxRecord[];
+}): NeoPiNativeSessionsReadResult => ({
+  type: "pass",
+  passId: `pass-${input.watermark}`,
+  kind: input.kind ?? "full",
+  baseCursor: cursorAt(input.epoch, 0),
+  coveredThrough: input.watermark,
+  continuation: cursorAt(input.epoch, input.watermark),
+  complete: true,
+  promoted: false,
+  entities: input.entities ?? [],
+  tombstones: [],
+  segments: [],
+  inbox: input.inbox ?? [],
+  journal: null,
 });
-const nextFeed = (
-  feeds: Queue.Queue<NativeSessionFeed>,
-  predicate: (feed: NativeSessionFeed) => boolean,
-) =>
-  Stream.fromQueue(feeds).pipe(
-    Stream.filter(predicate),
-    Stream.runHead,
-    Effect.map(Option.getOrThrow),
-  );
-const harness = <E, R>(
-  read: (command: Record<string, unknown> & { type: string }) => Effect.Effect<unknown, E, R>,
-  seed = initial(),
-  options: Parameters<typeof reconcileNativeSessionFeed>[4] = { stateReadGapMs: 0 },
-) =>
-  Effect.gen(function* () {
-    const events = yield* Queue.unbounded<NativeSessionUpdate>();
-    const feeds = yield* Queue.unbounded<NativeSessionFeed>();
-    const reduced = yield* Queue.unbounded<NativeSessionFeed>();
-    yield* reconcileNativeSessionFeed(
-      Stream.fromQueue(events).pipe(Stream.takeUntil((update) => update.type === "closed")),
-      read,
-      seed,
-      (feed) => {
-        Queue.offerUnsafe(reduced, feed);
-      },
-      options,
-    ).pipe(
-      Stream.runForEach((feed) => Queue.offer(feeds, feed)),
-      Effect.forkScoped,
-    );
-    return { events, feeds, reduced };
-  });
+const live = (messageId: string, content: string, revision: number): NeoPiNativeEntity => ({
+  key: `message:${messageId}`,
+  ordinal: 1,
+  revision,
+  value: {
+    class: "message",
+    messageId,
+    phase: "open",
+    entryId: null,
+    message: { role: "assistant", content },
+  },
+});
 
-const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function* () {
-  const subscriptions = yield* Queue.unbounded<{
-    readonly events: Queue.Queue<NativeSessionUpdate, StateReadError>;
-    readonly detached: Deferred.Deferred<void>;
-  }>();
-  const active = new Set<Queue.Queue<NativeSessionUpdate, StateReadError>>();
+type Item =
+  | { readonly type: "envelope"; readonly envelope: NeoPiNativeEssentialEnvelope }
+  | { readonly type: "fail"; readonly error: NeoPiNativeSessionsError }
+  | { readonly type: "end" };
+interface FakeLease {
+  readonly id: string;
+  readonly items: Queue.Queue<Item>;
+  readonly applied: SubscriptionRef.SubscriptionRef<number>;
+  readonly released: Deferred.Deferred<void>;
+  readonly push: (...envelopes: readonly NeoPiNativeEssentialEnvelope[]) => Effect.Effect<void>;
+}
+interface FakeRead {
+  readonly input: NeoPiNativeSessionsReadInput;
+  readonly reply: Deferred.Deferred<NeoPiNativeSessionsReadResult, NeoPiNativeSessionsError>;
+  readonly interrupted: Deferred.Deferred<void>;
+}
+
+/**
+ * A server per the observation contract: every envelope takes one credit and
+ * the stream never runs more than `creditWindow` ahead of applied credit.
+ */
+const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
+  options: { readonly creditWindow?: number } = {},
+) {
+  const creditWindow = options.creditWindow ?? 4;
+  const leases = yield* Queue.unbounded<FakeLease>();
+  const reads = yield* Queue.unbounded<FakeRead>();
+  const demands = yield* Queue.unbounded<NeoPiNativeSessionsSetDemandInput>();
+  const byId = new Map<string, FakeLease>();
+  let leaseCount = 0;
+  let revision = 0;
   let opens = 0;
-  let closes = 0;
   let prompts = 0;
   const client = {
-    [WS_METHODS.neopiNativeSessionsOpen]: (targetRef: NeoPiNativeSessionRef) =>
+    [WS_METHODS.neopiNativeSessionsOpen]: () =>
       Effect.sync(() => {
         opens++;
-        return { ...session, ref: targetRef };
-      }),
-    [WS_METHODS.neopiNativeSessionsClose]: () =>
-      Effect.gen(function* () {
-        closes++;
-        for (const events of active)
-          yield* Queue.offer(events, {
-            type: "closed",
-            reason: "The native connection was explicitly closed.",
-          });
-        return { closed: true };
+        return session;
       }),
     [WS_METHODS.neopiNativeSessionsRequest]: (input: {
-      readonly command: Record<string, unknown> & { type: string };
+      readonly command: { readonly type: string };
     }) =>
       Effect.sync(() => {
-        if (input.command.type === "get_subagents") return { subagents: [] };
-        if (input.command.type === "prompt") {
-          prompts++;
-          return { userEntryId: "new-turn" };
-        }
+        if (input.command.type === "prompt") prompts++;
         return {};
       }),
-    [WS_METHODS.neopiNativeSessionsWatch]: (input: { ref: NeoPiNativeSessionRef }) =>
+    [WS_METHODS.neopiNativeSessionsWatch]: () =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const events = yield* Queue.unbounded<NativeSessionUpdate, StateReadError>();
-          const detached = yield* Deferred.make<void>();
+          const id = `lease-${++leaseCount}`;
+          const items = yield* Queue.unbounded<Item>();
+          const applied = yield* SubscriptionRef.make(0);
+          const released = yield* Deferred.make<void>();
+          const lease: FakeLease = {
+            id,
+            items,
+            applied,
+            released,
+            push: (...envelopes) =>
+              Queue.offerAll(
+                items,
+                envelopes.map((envelope) => ({ type: "envelope" as const, envelope })),
+              ).pipe(Effect.asVoid),
+          };
           yield* Effect.acquireRelease(
-            Effect.sync(() => active.add(events)),
+            Effect.sync(() => byId.set(id, lease)),
             () =>
-              Effect.sync(() => active.delete(events)).pipe(
-                Effect.andThen(Deferred.succeed(detached, undefined)),
+              Effect.sync(() => byId.delete(id)).pipe(
+                Effect.andThen(Deferred.succeed(released, undefined)),
               ),
           );
-          yield* Queue.offer(subscriptions, { events, detached });
-          return Stream.concat(
-            Stream.succeed<NativeSessionUpdate>({
-              type: "snapshot",
-              session: { ...session, ref: input.ref },
-              journal: { ...page([user]), sessionFile: input.ref.sessionFile },
-            }),
-            Stream.fromQueue(events).pipe(Stream.takeUntil((update) => update.type === "closed")),
+          yield* lease.push(
+            { type: "leased", leaseId: id, domain: domain(), creditWindow, readDeadlineMs: 1_000 },
+            { type: "session", revision: ++revision, session },
+            { type: "lifecycle", revision: ++revision, state: "observing" },
+          );
+          yield* Queue.offer(leases, lease);
+          let sent = 0;
+          return Stream.fromQueue(items).pipe(
+            Stream.takeWhile((item) => item.type !== "end"),
+            Stream.mapEffect((item) =>
+              item.type === "fail"
+                ? Effect.fail(item.error)
+                : SubscriptionRef.changes(applied).pipe(
+                    Stream.filter((count) => sent - count < creditWindow),
+                    Stream.runHead,
+                    Effect.as(item.envelope),
+                    Effect.tap(() => Effect.sync(() => sent++)),
+                  ),
+            ),
           );
         }),
       ),
+    [WS_METHODS.neopiNativeSessionsCredit]: (input: NeoPiNativeSessionsCreditInput) =>
+      Effect.suspend(() => {
+        const lease = byId.get(input.leaseId);
+        return lease ? SubscriptionRef.set(lease.applied, input.applied) : Effect.void;
+      }),
+    [WS_METHODS.neopiNativeSessionsRead]: (input: NeoPiNativeSessionsReadInput) =>
+      Effect.gen(function* () {
+        const reply = yield* Deferred.make<
+          NeoPiNativeSessionsReadResult,
+          NeoPiNativeSessionsError
+        >();
+        const interrupted = yield* Deferred.make<void>();
+        yield* Queue.offer(reads, { input, reply, interrupted });
+        return yield* Deferred.await(reply).pipe(
+          Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+        );
+      }),
+    [WS_METHODS.neopiNativeSessionsSetDemand]: (input: NeoPiNativeSessionsSetDemandInput) =>
+      Queue.offer(demands, input).pipe(Effect.as({ outcome: "applied" as const })),
   } as unknown as WsRpcProtocolClient;
   const connection = { client } as RpcSession;
   const environmentId = EnvironmentId.make("native-remote");
@@ -183,27 +227,8 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
   const atoms = createNativeSessionAtoms(
     Atom.runtime(Layer.succeed(EnvironmentRegistry, environments)),
   );
-  // Normal work uses microtasks; tests can drain disposal deterministically
-  // without advancing the old five-minute retention period.
-  const scheduled = new Set<() => void>();
-  const flush = () => {
-    while (scheduled.size > 0) scheduled.values().next().value!();
-  };
   const registry = yield* Effect.acquireRelease(
-    Effect.sync(() =>
-      AtomRegistry.make({
-        scheduleTask: (f) => {
-          const task = () => {
-            if (scheduled.delete(task)) f();
-          };
-          scheduled.add(task);
-          queueMicrotask(task);
-          return () => {
-            scheduled.delete(task);
-          };
-        },
-      }),
-    ),
+    Effect.sync(() => AtomRegistry.make()),
     (registry) => Effect.sync(() => registry.dispose()),
   );
   const target = { environmentId, ref };
@@ -222,113 +247,28 @@ const makeAtomHarness = Effect.fn("NativeSessionAtomsTest.makeHarness")(function
     watch,
     target,
     observe,
-    flush,
     connection,
     sessionRef,
-    subscriptions,
-    counts: () => ({ opens, closes, prompts, active: active.size }),
+    leases,
+    reads,
+    /** The next read of one lease; reads of released leases are skipped. */
+    readOf: (leaseId: string) =>
+      Stream.fromQueue(reads).pipe(
+        Stream.filter((read) => read.input.leaseId === leaseId),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow),
+      ),
+    demands,
+    nextRevision: () => ++revision,
+    counts: () => ({ opens, prompts, active: byId.size }),
   };
 });
 
-describe("native session observation lifetime", () => {
-  it.effect("releases inactive feed history when the warm observation expires", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-        const h = yield* makeAtomHarness();
-        const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        yield* Queue.offer(first.events, event({ type: "command_output", text: "Warm output" }));
-        yield* h.observe((feed) => feed.commandOutputs.length === 1);
-        unmount();
-        h.flush();
-        expect(h.atoms.cached(h.target)?.commandOutputs).toHaveLength(1);
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5 * 60_000 + 1));
-        yield* Deferred.await(first.detached);
-        expect(h.atoms.cached(h.target)).toBeUndefined();
-        expect(h.counts().closes).toBe(0);
-
-        const remount = h.registry.mount(h.watch);
-        yield* Queue.take(h.subscriptions);
-        const reopened = yield* h.observe((feed) => feed.connected);
-        expect(reopened.conversation.entries).toEqual([user]);
-        expect(reopened.commandOutputs).toEqual([]);
-        remount();
-      }),
-    ).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers()))),
-  );
-
-  it.effect("expires an unobserved move handoff with its source observation", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-        const h = yield* makeAtomHarness();
-        const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        const movedRef = { ...ref, sessionFile: "/sessions/moved.jsonl" };
-        yield* Queue.offer(
-          first.events,
-          event({ type: "journal_state", reason: "identity", ...identity(user.id), ...movedRef }),
-        );
-        yield* h.observe((feed) => feed.movedTo?.sessionFile === movedRef.sessionFile);
-        const moved = { ...h.target, ref: movedRef };
-        expect(h.atoms.cached(moved)?.conversation.entries).toEqual([user]);
-        unmount();
-        h.flush();
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5 * 60_000 + 1));
-        yield* Deferred.await(first.detached);
-        expect(h.atoms.cached(h.target)).toBeUndefined();
-        expect(h.atoms.cached(moved)).toBeUndefined();
-      }),
-    ).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers()))),
-  );
-
-  it.effect("keeps a mounted move destination when the source observation expires", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-        const h = yield* makeAtomHarness();
-        const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        const movedRef = { ...ref, sessionFile: "/sessions/mounted-move.jsonl" };
-        yield* Queue.offer(
-          first.events,
-          event({ type: "journal_state", reason: "identity", ...identity(user.id), ...movedRef }),
-        );
-        yield* h.observe((feed) => feed.movedTo?.sessionFile === movedRef.sessionFile);
-        const moved = { ...h.target, ref: movedRef };
-        const movedWatch = h.atoms.watch({
-          environmentId: moved.environmentId,
-          input: { ref: movedRef },
-        });
-        const unmountMoved = h.registry.mount(movedWatch);
-        yield* Queue.take(h.subscriptions);
-        const connected = yield* AtomRegistry.toStream(h.registry, movedWatch).pipe(
-          Stream.filter(AsyncResult.isSuccess),
-          Stream.map((result) => result.value),
-          Stream.filter((feed) => feed.connected),
-          Stream.runHead,
-          Effect.map(Option.getOrThrow),
-        );
-        expect(connected.session?.ref).toEqual(movedRef);
-        unmount();
-        h.flush();
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5 * 60_000 + 1));
-        yield* Deferred.await(first.detached);
-        expect(h.atoms.cached(h.target)).toBeUndefined();
-        expect(h.atoms.cached(moved)?.connected).toBe(true);
-        unmountMoved();
-      }),
-    ).pipe(Effect.ensuring(Effect.sync(() => vi.useRealTimers()))),
-  );
-
+describe("native observation controller", () => {
   it.effect("does not create orphan feeds for commands without an observation", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* makeAtomHarness();
+        const h = yield* makeHarness();
         const result = yield* Effect.promise(() =>
           h.atoms.request.run(h.registry, {
             environmentId: h.target.environmentId,
@@ -341,946 +281,313 @@ describe("native session observation lifetime", () => {
     ),
   );
 
-  it.effect("clears a jobs reconciliation failure after a successful panel retry", () =>
+  it.effect("stale cursor and demand release", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* makeAtomHarness();
+        const h = yield* makeHarness();
         const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        yield* Queue.offer(first.events, {
-          type: "reconciliation",
-          operation: "jobs",
-          error: "Inventory unavailable",
+        const lease = yield* Queue.take(h.leases);
+        const firstDemand = yield* Queue.take(h.demands);
+        expect(firstDemand).toEqual({
+          leaseId: lease.id,
+          generation: 1,
+          demand: DEFAULT_NATIVE_DEMAND,
         });
-        yield* h.observe((feed) => feed.reconciliationError?.operation === "jobs");
-        const result = yield* Effect.promise(() =>
-          h.atoms.request.run(h.registry, {
-            environmentId: h.target.environmentId,
-            input: { ref, command: { type: "get_jobs" } },
-          }),
+
+        const first = yield* Queue.take(h.reads);
+        expect(first.input).toMatchObject({ leaseId: lease.id, readId: 1, cursor: null });
+        const epochA = domain();
+        yield* Deferred.succeed(
+          first.reply,
+          pass({ epoch: epochA, watermark: 5, entities: [live("m1", "Before", 5)] }),
         );
-        expect(result._tag).toBe("Success");
-        const recovered = yield* h.observe((feed) => feed.reconciliationError === null);
-        expect(recovered.error).toBeNull();
+        yield* h.observe((feed) => feed.conversation.pending[0]?.message.content === "Before");
+
+        // A superseded read is re-read under a newer id with the same cursor.
+        const second = yield* Queue.take(h.reads);
+        expect(second.input).toMatchObject({ readId: 2, cursor: cursorAt(epochA, 5) });
+        yield* Deferred.fail(
+          second.reply,
+          new NeoPiNativeSessionsError({ message: "stale", code: "stale_read" }),
+        );
+        const third = yield* Queue.take(h.reads);
+        expect(third.input).toMatchObject({ readId: 3, cursor: cursorAt(epochA, 5) });
+
+        // The held cursor went stale (a new build): the full pass rebases in place.
+        const epochB = domain({ buildAttempt: 2 });
+        yield* Deferred.succeed(
+          third.reply,
+          pass({ epoch: epochB, watermark: 2, entities: [live("m1", "After", 2)] }),
+        );
+        const rebased = yield* h.observe(
+          (feed) => feed.conversation.pending[0]?.message.content === "After",
+        );
+        expect(rebased.conversation.pending).toHaveLength(1);
+        const fourth = yield* Queue.take(h.reads);
+        expect(fourth.input).toMatchObject({ readId: 4, cursor: cursorAt(epochB, 2) });
+
+        const child = [{ kind: "child" as const, childId: "child", runToken: "run" }];
+        h.atoms.setDemand(h.target, child);
+        expect(yield* Queue.take(h.demands)).toEqual({
+          leaseId: lease.id,
+          generation: 2,
+          demand: child,
+        });
+
+        // Concealing the last view releases the lease at once and cancels its read.
         unmount();
+        yield* Deferred.await(lease.released);
+        yield* Deferred.await(fourth.interrupted);
+        expect(h.counts().active).toBe(0);
+        expect(yield* Queue.size(h.reads)).toBe(0);
+        expect(yield* Queue.size(h.demands)).toBe(0);
+        // The warm cache holds the feed, without a lease.
+        expect(h.atoms.cached(h.target)?.conversation.pending[0]?.message.content).toBe("After");
       }),
     ),
   );
 
   it.effect(
-    "reopens an explicitly closed canonical ref with cached history and command output",
+    "socket stays responsive (Pong, unrelated requests) while bulk application is held",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
-          const h = yield* makeAtomHarness();
+          const h = yield* makeHarness({ creditWindow: 4 });
           const unmount = h.registry.mount(h.watch);
-          const first = yield* Queue.take(h.subscriptions);
-          yield* h.observe((feed) => feed.connected);
-          yield* Queue.offer(
-            first.events,
-            event({ type: "command_output", text: "Retained native command output" }),
+          const lease = yield* Queue.take(h.leases);
+          // The bulk read is held for the whole test.
+          const held = yield* Queue.take(h.reads);
+          const count = 40;
+          yield* lease.push(
+            ...Array.from({ length: count }, (_, index) => ({
+              type: "obligation-opened" as const,
+              revision: h.nextRevision(),
+              id: `approval-${index}`,
+              request: { type: "tool_approval_request", id: `approval-${index}` },
+            })),
           );
-          const before = yield* h.observe((feed) => feed.commandOutputs.length === 1);
-          const closed = yield* Effect.promise(() =>
-            h.atoms.close.run(h.registry, {
-              environmentId: h.target.environmentId,
-              input: { ref },
-            }),
-          );
-          expect(closed._tag).toBe("Success");
-          const stopped = yield* h.observe((feed) => !feed.connected && feed.error !== null);
-          expect(stopped.error).toBe("The native connection was explicitly closed.");
-          expect(stopped.conversation.entries).toEqual([user]);
-          expect(stopped.commandOutputs).toEqual(before.commandOutputs);
-          yield* Deferred.await(first.detached);
-          expect(h.counts().opens).toBe(1);
-
-          unmount();
-          h.flush();
-          expect(h.atoms.cached(h.target)?.conversation.entries).toEqual([user]);
-          expect(h.atoms.cached(h.target)?.commandOutputs).toEqual(before.commandOutputs);
-
-          const remount = h.registry.mount(h.watch);
-          const second = yield* Queue.take(h.subscriptions);
-          expect(second.events).not.toBe(first.events);
-          const reopened = yield* h.observe((feed) => feed.connected);
-          expect(reopened.error).toBeNull();
-          expect(reopened.conversation.entries).toEqual([user]);
-          expect(reopened.commandOutputs).toEqual(before.commandOutputs);
-          expect(reopened.session?.ref).toEqual(ref);
+          // Ten times the credit window arrives only if credit returns per envelope.
+          const feed = yield* h.observe((feed) => feed.dialogs.length === count);
+          expect(feed.dialogs.at(-1)?.id).toBe(`approval-${count - 1}`);
           const reply = yield* Effect.promise(() =>
             h.atoms.request.run(h.registry, {
               environmentId: h.target.environmentId,
-              input: { ref, command: { type: "prompt", message: "After reopen" } },
+              input: { ref, command: { type: "prompt", message: "Still here" } },
             }),
           );
-          expect(reply).toMatchObject({ _tag: "Success", value: { userEntryId: "new-turn" } });
-          yield* Queue.offer(
-            second.events,
-            event({
-              type: "message_update",
-              messageId: "new-live",
-              message: { role: "assistant", content: "Live after reopen" },
-            }),
-          );
-          const live = yield* h.observe(
-            (feed) => feed.conversation.pending[0]?.message.content === "Live after reopen",
-          );
-          expect(live.connected).toBe(true);
-          expect(live.commandOutputs).toEqual(before.commandOutputs);
-          expect(h.counts()).toEqual({ opens: 2, closes: 1, prompts: 1, active: 1 });
-          remount();
+          expect(reply._tag).toBe("Success");
+          expect(h.counts().prompts).toBe(1);
+          expect(yield* Deferred.isDone(held.reply)).toBe(false);
+          expect(yield* Queue.size(h.reads)).toBe(0);
+          unmount();
         }),
       ),
   );
 
-  it.effect("recovers a failed observer when the same connected session is reopened", () =>
+  it.effect("draft, attachments, terminals, layout and scroll survive every transition", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const h = yield* makeAtomHarness();
-        const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        yield* Queue.offer(
-          first.events,
-          event({ type: "command_output", text: "Before observer failure" }),
+        const h = yield* makeHarness();
+        // Views stay mounted only while the atom never leaves a successful value.
+        const results: AsyncResult.AsyncResult<NativeSessionFeed, unknown>[] = [];
+        const unmount = h.registry.subscribe(h.watch, (value) => results.push(value), {
+          immediate: true,
+        });
+        const first = yield* Queue.take(h.leases);
+        const read = yield* Queue.take(h.reads);
+        const epoch = domain();
+        yield* Deferred.succeed(
+          read.reply,
+          pass({ epoch, watermark: 3, entities: [live("m1", "Kept", 3)] }),
         );
-        const before = yield* h.observe((feed) => feed.commandOutputs.length === 1);
+        const kept = (feed: NativeSessionFeed) =>
+          feed.conversation.pending[0]?.message.content === "Kept";
+        yield* h.observe((feed) => kept(feed) && feed.connected);
 
-        yield* Queue.fail(first.events, new StateReadError({ message: "Native observer failed." }));
-        const failed = yield* h.observe((feed) => !feed.connected && feed.error !== null);
-        yield* Deferred.await(first.detached);
-        expect(failed.error).toContain("Native observer failed.");
-        expect(failed.conversation.entries).toEqual([user]);
-        expect(failed.commandOutputs).toEqual(before.commandOutputs);
-        expect(h.counts()).toEqual({ opens: 1, closes: 0, prompts: 0, active: 0 });
-        expect(yield* SubscriptionRef.get(h.sessionRef)).toEqual(Option.some(h.connection));
+        // A lost watch re-attaches to the same owner and resumes from the held cursor.
+        yield* Queue.offer(first.items, {
+          type: "fail",
+          error: new NeoPiNativeSessionsError({ message: "socket closed" }),
+        });
+        const lost = yield* h.observe((feed) => feed.observer.phase === "transport-lost");
+        expect(kept(lost)).toBe(true);
+        const second = yield* Queue.take(h.leases);
+        const resumed = yield* h.readOf(second.id);
+        expect(resumed.input).toMatchObject({ leaseId: second.id, cursor: cursorAt(epoch, 3) });
+        yield* h.observe((feed) => feed.connected && feed.observer.phase === "observing");
 
-        unmount();
-        h.flush();
-        const opened = yield* Effect.promise(() =>
-          h.atoms.open.run(h.registry, { environmentId: h.target.environmentId, input: ref }),
-        );
-        expect(opened).toMatchObject({ _tag: "Success", value: { ref } });
-        const remount = h.registry.mount(h.watch);
-        yield* Effect.yieldNow;
-        const reopened = yield* AtomRegistry.getResult(h.registry, h.watch);
-        expect(reopened.connected).toBe(true);
-        expect(reopened.error).toBeNull();
-        expect(reopened.conversation.entries).toEqual([user]);
-        expect(reopened.commandOutputs).toEqual(before.commandOutputs);
-
-        const second = yield* Queue.take(h.subscriptions);
-        yield* Queue.offer(
-          second.events,
-          event({
-            type: "message_update",
-            messageId: "recovered-live",
-            message: { role: "assistant", content: "Delivered after observer recovery" },
-          }),
-        );
-        const live = yield* h.observe(
-          (feed) =>
-            feed.conversation.pending[0]?.message.content === "Delivered after observer recovery",
-        );
-        expect(live.connected).toBe(true);
-        expect(h.counts()).toEqual({ opens: 3, closes: 0, prompts: 0, active: 1 });
-        remount();
-      }),
-    ),
-  );
-
-  it.effect("keeps a running observation warm through switch-away and switch-back", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const h = yield* makeAtomHarness();
-        const unmount = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        yield* Queue.offer(first.events, event({ type: "agent_start" }));
-        yield* h.observe((feed) => feed.busy);
-
-        unmount();
-        h.flush();
-        expect(h.counts()).toEqual({ opens: 1, closes: 0, prompts: 0, active: 1 });
-        const reply = {
-          ...user,
-          id: "background-reply",
-          parentId: user.id,
-          message: { role: "assistant", content: "Delivered while elsewhere" },
-        };
-        yield* Queue.offerAll(first.events, [
-          event({ type: "journal_state", reason: "leaf", ...identity(reply.id) }),
-          event({ type: "journal_entry", ...identity(reply.id), entry: reply }),
-          event({ type: "command_output", text: "Background command output" }),
-        ]);
-
-        const remount = h.registry.mount(h.watch);
-        const returned = yield* h.observe(
-          (feed) => feed.busy && feed.commandOutputs[0]?.text === "Background command output",
-        );
-        expect(returned.connected).toBe(true);
-        expect(returned.conversation.entries).toEqual([user, reply]);
-        expect(returned.error).toBeNull();
-        // No second open/watch or snapshot is needed: the background stream
-        // delivered the durable reply and command output through the same peer.
-        expect(h.counts()).toEqual({ opens: 1, closes: 0, prompts: 0, active: 1 });
-        expect(yield* Deferred.isDone(first.detached)).toBe(false);
-        yield* Queue.offer(first.events, event({ type: "agent_end" }));
-        const settled = yield* h.observe((feed) => !feed.busy);
-        expect(settled.conversation.entries).toEqual([user, reply]);
-        remount();
-      }),
-    ),
-  );
-
-  it.effect("shares active observers and reconnects the environment without a native close", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const h = yield* makeAtomHarness();
-        const firstObserver = h.registry.mount(h.watch);
-        const secondObserver = h.registry.mount(h.watch);
-        const first = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        firstObserver();
-        h.flush();
-        expect(h.counts()).toEqual({ opens: 1, closes: 0, prompts: 0, active: 1 });
-
+        // A dropped socket session and its replacement.
         yield* SubscriptionRef.set(h.sessionRef, Option.none());
-        const offline = yield* h.observe((feed) => !feed.connected);
-        expect(offline.conversation.entries).toEqual([user]);
-        yield* Deferred.await(first.detached);
-        yield* SubscriptionRef.set(h.sessionRef, Option.some({ ...h.connection }));
-        const second = yield* Queue.take(h.subscriptions);
-        yield* h.observe((feed) => feed.connected);
-        expect(h.counts()).toEqual({ opens: 2, closes: 0, prompts: 0, active: 1 });
+        yield* h.observe((feed) => !feed.connected);
+        yield* SubscriptionRef.set(h.sessionRef, Option.some(h.connection));
+        const third = yield* Queue.take(h.leases);
+        const pending = yield* h.readOf(third.id);
 
-        secondObserver();
-        h.flush();
-        expect(h.counts()).toEqual({ opens: 2, closes: 0, prompts: 0, active: 1 });
-        // The underlying five-minute observation remains warm. Disposing the
-        // client registry still must not invoke the native owner's close RPC.
-        h.registry.dispose();
-        yield* Deferred.await(second.detached);
-        expect(h.counts()).toEqual({ opens: 2, closes: 0, prompts: 0, active: 0 });
-      }),
-    ),
-  );
-});
-
-describe("native feed reconciliation lifetime", () => {
-  it.effect("publishes meaningful feed changes but not intervening child streaming deltas", () =>
-    Effect.gen(function* () {
-      const ignored = ["message_start", "message_update", "tool_execution_update"].map((type) =>
-        event({ type: "subagent_event", payload: { id: "child", event: { type } } }),
-      );
-      const settled = ["message_end", "tool_execution_end", "agent_end"].map((type) =>
-        event({ type: "subagent_event", payload: { id: "child", event: { type } } }),
-      );
-      const updates = [
-        event({ type: "command_output", text: "Visible result" }),
-        ...ignored,
-        settled[0]!,
-        ...ignored,
-        settled[1]!,
-        ...ignored,
-        settled[2]!,
-        ...ignored,
-        event({ type: "queue_update", steering: ["Next"], followUp: [], liveSteered: 0 }),
-        event({ type: "agent_start" }),
-        event({
-          type: "message_update",
-          messageId: "main",
-          message: { role: "assistant", content: "Parent reply" },
-        }),
-      ];
-      let reductions = 0;
-      const feeds = yield* reconcileNativeSessionFeed(
-        Stream.fromIterable(updates),
-        () => Effect.never,
-        initial(),
-        () => {
-          reductions++;
-        },
-      ).pipe(Stream.runCollect);
-      expect(reductions).toBe(updates.length);
-      expect(feeds).toHaveLength(7);
-      expect(feeds.map((feed) => feed.agentTicks.child ?? 0)).toEqual([0, 1, 2, 3, 3, 3, 3]);
-      expect(feeds[0]?.commandOutputs[0]?.text).toBe("Visible result");
-      expect(feeds[4]?.queue.steering).toEqual(["Next"]);
-      expect(feeds[5]?.busy).toBe(true);
-      expect(feeds[6]?.conversation.pending[0]?.message.content).toBe("Parent reply");
-    }),
-  );
-
-  it.effect("reconciles state after an ignored control frame without publishing that frame", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const { events, feeds } = yield* harness(() =>
-          Effect.succeed({ model: { id: "reconciled" } }),
-        );
-        yield* Queue.offer(events, event({ type: "command_output", text: "Before model change" }));
-        yield* nextFeed(feeds, (feed) => feed.commandOutputs.length === 1);
-        yield* Queue.offer(events, event({ type: "model_changed" }));
-        const next = yield* Queue.take(feeds);
-        expect(next.session?.state.model).toEqual({ id: "reconciled" });
-        expect(next.commandOutputs[0]?.text).toBe("Before model change");
-      }),
-    ),
-  );
-
-  it.effect(
-    "delivers raw updates while get_state is blocked and coalesces subsequent state reads",
-    () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const release = yield* Deferred.make<void>();
-          const calls = yield* Queue.unbounded<number>();
-          let count = 0;
-          const read = Effect.gen(function* () {
-            const call = ++count;
-            yield* Queue.offer(calls, call);
-            yield* Deferred.await(release);
-            return { model: { id: `model-${call}` } };
-          });
-          const { events, feeds } = yield* harness(() => read, initial(true));
-          yield* Queue.offer(events, event({ type: "model_changed" }));
-          expect(yield* Queue.take(calls)).toBe(1);
-          yield* Queue.offerAll(events, [
-            event({ type: "thinking_level_changed" }),
-            event({ type: "mode_changed" }),
-            event({ type: "models_configuration_changed" }),
-            event({
-              type: "message_update",
-              messageId: "live",
-              message: { role: "assistant", content: "Visible before state reply" },
-            }),
-          ]);
-          const streaming = yield* nextFeed(
-            feeds,
-            (feed) =>
-              feed.conversation.pending[0]?.message.content === "Visible before state reply",
-          );
-          expect(streaming.conversation.entries).toEqual([user]);
-          expect(streaming.conversation.pending).toEqual([
-            {
-              messageId: "live",
-              message: { role: "assistant", content: "Visible before state reply" },
-            },
-          ]);
-          yield* Deferred.succeed(release, undefined);
-          expect(yield* Queue.take(calls)).toBe(2);
-          const refreshed = yield* nextFeed(
-            feeds,
-            (feed) => (feed.session?.state.model as { id?: string } | undefined)?.id === "model-2",
-          );
-          expect(refreshed.conversation.pending).toEqual(streaming.conversation.pending);
-          expect(count).toBe(2);
-        }),
-      ),
-  );
-
-  it.effect(
-    "keeps a failed state read nonfatal and clears its error on a successful reconciliation",
-    () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          let calls = 0;
-          const { events, feeds } = yield* harness(() =>
-            Effect.suspend(() =>
-              ++calls === 1
-                ? Effect.fail(new StateReadError({ message: "State temporarily unavailable" }))
-                : Effect.succeed({ model: { id: "recovered" } }),
-            ),
-          );
-          yield* Queue.offer(events, event({ type: "model_changed" }));
-          const failed = yield* nextFeed(
-            feeds,
-            (feed) => feed.error === "State temporarily unavailable",
-          );
-          expect(failed.conversation.entries).toEqual([user]);
-          yield* Queue.offer(
-            events,
-            event({
-              type: "message_update",
-              messageId: "live",
-              message: { role: "assistant", content: "Continues after failure" },
-            }),
-          );
-          const live = yield* nextFeed(
-            feeds,
-            (feed) => feed.conversation.pending[0]?.message.content === "Continues after failure",
-          );
-          expect(live.connected).toBe(true);
-          expect(live.error).toBe("State temporarily unavailable");
-          yield* Queue.offer(events, event({ type: "prompt_result", status: "success" }));
-          const recovered = yield* nextFeed(
-            feeds,
-            (feed) =>
-              feed.error === null &&
-              (feed.session?.state.model as { id?: string } | undefined)?.id === "recovered",
-          );
-          expect(recovered.conversation.pending).toEqual(live.conversation.pending);
-          expect(recovered.reconciliationError).toBeNull();
-        }),
-      ),
-  );
-
-  it.effect("does not resnapshot ordinary active appends or their settlement", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const reads: string[] = [];
-        const { events, feeds } = yield* harness(
-          (command) =>
-            Effect.sync(() => {
-              reads.push(command.type);
-              return {};
-            }),
-          initial(true),
-        );
-        const reply = {
-          ...user,
-          id: "reply",
-          parentId: user.id,
-          message: { role: "assistant", content: "Durable reply" },
-        };
-        yield* Queue.offerAll(events, [
-          event({ type: "journal_state", reason: "leaf", ...identity(reply.id) }),
-          event({ type: "journal_entry", ...identity(reply.id), entry: reply }),
-          event({ type: "agent_end" }),
-        ]);
-        const settled = yield* nextFeed(
-          feeds,
-          (feed) => !feed.busy && feed.conversation.entries.at(-1)?.id === reply.id,
-        );
-        expect(settled.conversation.entries).toEqual([user, reply]);
-        expect(settled.conversation.needsSnapshot).toBe(false);
-        expect(reads.filter((type) => type !== "get_state")).toEqual([]);
-      }),
-    ),
-  );
-
-  it.effect("hydrates an unknown idle branch without blanking the cached transcript", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const old = {
-          ...user,
-          id: "old",
-          parentId: user.id,
-          message: { role: "assistant", content: "Old branch" },
-        };
-        const branch = {
-          ...user,
-          id: "branch",
-          parentId: user.id,
-          message: { role: "assistant", content: "Native branch" },
-        };
-        const started = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<NeoPiJournalPage>();
-        const { events, feeds } = yield* harness(
-          () =>
-            Effect.gen(function* () {
-              yield* Deferred.succeed(started, undefined);
-              return yield* Deferred.await(release);
-            }),
-          initial(false, [user, old]),
-        );
-        yield* Queue.offer(
-          events,
-          event({ type: "journal_state", reason: "leaf", ...identity(branch.id) }),
-        );
-        yield* Deferred.await(started);
-        const hydrating = yield* nextFeed(feeds, (feed) => feed.conversation.needsSnapshot);
-        expect(hydrating.conversation.entries).toEqual([user, old]);
-        yield* Deferred.succeed(release, { ...page([user, branch]), nextCursor: "branch-cursor" });
-        const hydrated = yield* nextFeed(feeds, (feed) => !feed.conversation.needsSnapshot);
-        expect(hydrated.conversation.entries).toEqual([user, branch]);
-        expect(hydrated.conversation.cursor).toBe("branch-cursor");
-        expect(hydrated.conversation.cursorLeaf).toBe(branch.id);
-      }),
-    ),
-  );
-
-  it.effect("hydrates a known ancestor move even if the previous stream was busy", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const old = { ...user, id: "old", parentId: user.id };
-        const { events, feeds } = yield* harness(
-          () => Effect.succeed(page([user])),
-          initial(true, [user, old]),
-        );
-        yield* Queue.offer(
-          events,
-          event({ type: "journal_state", reason: "leaf", ...identity(user.id) }),
-        );
-        const moved = yield* nextFeed(
-          feeds,
-          (feed) =>
-            !feed.conversation.needsSnapshot && feed.conversation.entries.at(-1)?.id === user.id,
-        );
-        expect(moved.conversation.entries).toEqual([user]);
-        expect(moved.conversation.identity?.leafId).toBe(user.id);
-      }),
-    ),
-  );
-
-  it.effect("does not roll newer durable appends back when an older branch read completes", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const first = { ...user, id: "first", parentId: user.id };
-        const latest = { ...user, id: "latest", parentId: first.id };
-        const started = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<NeoPiJournalPage>();
-        const { events, feeds, reduced } = yield* harness(() =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(started, undefined);
-            return yield* Deferred.await(release);
+        // A projection rebuild: the full pass rebases in place.
+        yield* Deferred.succeed(
+          pending.reply,
+          pass({
+            epoch: domain({ projectionIncarnation: 2 }),
+            watermark: 1,
+            entities: [live("m1", "Kept", 1)],
           }),
         );
-        yield* Queue.offer(
-          events,
-          event({ type: "journal_state", reason: "leaf", ...identity(first.id) }),
+        const rebased = yield* h.observe(
+          (feed) => feed.observation.domain?.projectionIncarnation === 2,
         );
-        yield* Deferred.await(started);
-        yield* Queue.offerAll(events, [
-          event({ type: "journal_entry", ...identity(first.id), entry: first }),
-          event({ type: "journal_state", reason: "leaf", ...identity(latest.id) }),
-          event({ type: "journal_entry", ...identity(latest.id), entry: latest }),
-          event({ type: "agent_start" }),
-        ]);
-        const durable = yield* nextFeed(feeds, (feed) => feed.busy);
-        expect(durable.conversation.entries).toEqual([user, first, latest]);
-        yield* Queue.takeAll(reduced);
-        yield* Deferred.succeed(release, { ...page([user, first]), nextCursor: "stale-cursor" });
-        const afterReply = yield* Queue.take(reduced);
-        expect(afterReply.conversation).toBe(durable.conversation);
-        expect(afterReply.conversation.identity?.leafId).toBe(latest.id);
-        expect(afterReply.conversation.cursor).not.toBe("stale-cursor");
-        expect(afterReply).toBe(durable);
-        expect(yield* Queue.takeAll(feeds)).toEqual([]);
-      }),
-    ),
-  );
+        expect(kept(rebased)).toBe(true);
 
-  it.effect(
-    "hydrates divergent durable ancestry during a stream and retains messages received while reading",
-    () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const old = { ...user, id: "old", parentId: user.id };
-          const branch = { ...user, id: "branch", parentId: user.id };
-          const started = yield* Deferred.make<void>();
-          const release = yield* Deferred.make<NeoPiJournalPage>();
-          const { events, feeds } = yield* harness(
-            () =>
-              Effect.gen(function* () {
-                yield* Deferred.succeed(started, undefined);
-                return yield* Deferred.await(release);
-              }),
-            initial(true, [user, old]),
-          );
-          yield* Queue.offerAll(events, [
-            event({ type: "journal_state", reason: "leaf", ...identity(branch.id) }),
-            event({ type: "journal_entry", ...identity(branch.id), entry: branch }),
-          ]);
-          yield* Deferred.await(started);
-          yield* Queue.offer(
-            events,
-            event({
-              type: "message_update",
-              messageId: "branch-live",
-              message: { role: "assistant", content: "Branch stream" },
-            }),
-          );
-          const streaming = yield* nextFeed(
-            feeds,
-            (feed) => feed.conversation.pending[0]?.message.content === "Branch stream",
-          );
-          expect(streaming.conversation.entries).toEqual([user, old]);
-          yield* Deferred.succeed(release, page([user, branch]));
-          const hydrated = yield* nextFeed(feeds, (feed) => !feed.conversation.needsSnapshot);
-          expect(hydrated.conversation.entries).toEqual([user, branch]);
-          expect(hydrated.conversation.pending).toEqual(streaming.conversation.pending);
-          expect(hydrated.busy).toBe(true);
-        }),
-      ),
-  );
-
-  it.effect("interrupts blocked reconciliation when the canonical feed closes", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const started = yield* Deferred.make<void>();
-        const stopped = yield* Deferred.make<void>();
-        const { events, feeds } = yield* harness(() =>
-          Deferred.succeed(started, undefined).pipe(
-            Effect.andThen(Effect.never),
-            Effect.ensuring(Deferred.succeed(stopped, undefined)),
-          ),
+        // The owner's successor.
+        yield* third.push({ type: "lifecycle", revision: h.nextRevision(), state: "reconnecting" });
+        yield* h.observe((feed) => feed.ownerLoss === "reconnecting");
+        yield* third.push(
+          { type: "session", revision: h.nextRevision(), session },
+          { type: "lifecycle", revision: h.nextRevision(), state: "observing" },
         );
-        yield* Queue.offer(events, event({ type: "model_changed" }));
-        yield* Deferred.await(started);
-        yield* Queue.offer(events, { type: "closed", reason: "Native owner closed" });
-        const closed = yield* nextFeed(
-          feeds,
-          (feed) => !feed.connected && feed.error === "Native owner closed",
+        const successor = yield* h.observe((feed) => feed.connected && feed.ownerLoss === null);
+        expect(kept(successor)).toBe(true);
+
+        // The owner stops: cached state stays and nothing reopens it automatically.
+        yield* third.push({
+          type: "lifecycle",
+          revision: h.nextRevision(),
+          state: "owner-stopped",
+          reason: "The terminal quit.",
+        });
+        yield* Queue.offer(third.items, { type: "end" });
+        const stopped = yield* h.observe((feed) => feed.ownerLoss === "orphaned");
+        expect(stopped.connected).toBe(false);
+        expect(kept(stopped)).toBe(true);
+        yield* Deferred.await(third.released);
+        expect(h.counts()).toMatchObject({ opens: 0, active: 0 });
+
+        const firstSuccess = results.findIndex(AsyncResult.isSuccess);
+        expect(firstSuccess).toBeGreaterThanOrEqual(0);
+        expect(results.slice(firstSuccess).every((result) => AsyncResult.isSuccess(result))).toBe(
+          true,
         );
-        expect(closed.conversation.entries).toEqual([user]);
-        yield* Deferred.await(stopped);
-      }),
-    ),
-  );
-
-  it.effect(
-    "reconciles active inventory beside live frames and retains completion across reconnect",
-    () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const started = yield* Deferred.make<void>();
-          const release = yield* Deferred.make<unknown>();
-          let inventories = 0;
-          const { events, feeds } = yield* harness((command) => {
-            if (command.type === "set_subagent_subscription")
-              return Effect.succeed({ level: "progress" });
-            if (command.type === "get_subagents")
-              return Effect.gen(function* () {
-                inventories++;
-                if (inventories > 1) return { subagents: [] };
-                yield* Deferred.succeed(started, undefined);
-                return yield* Deferred.await(release);
-              });
-            return Effect.succeed({});
-          });
-          const reconnect: NativeSessionUpdate = {
-            type: "snapshot",
-            session,
-            journal: page([user]),
-          };
-          yield* Queue.offer(events, reconnect);
-          yield* Deferred.await(started);
-          const payload = { id: "worker", agent: "scout", index: 0, parentToolCallId: "task" };
-          yield* Queue.offerAll(events, [
-            event({ type: "subagent_lifecycle", payload: { ...payload, status: "started" } }),
-            event({
-              type: "subagent_progress",
-              payload: { ...payload, progress: { id: "worker", status: "running", tokens: 90 } },
-            }),
-            event({
-              type: "message_update",
-              messageId: "live",
-              message: { role: "assistant", content: "Visible while inventory is blocked" },
-            }),
-            event({ type: "subagent_lifecycle", payload: { ...payload, status: "completed" } }),
-          ]);
-          const completed = yield* nextFeed(
-            feeds,
-            (feed) => feed.agents[0]?.status === "completed",
-          );
-          expect(completed.conversation.pending[0]?.message.content).toBe(
-            "Visible while inventory is blocked",
-          );
-          expect(completed.agents[0]?.usage?.totalTokens).toBe(90);
-          yield* Deferred.succeed(release, {
-            subagents: [
-              { ...payload, status: "running" },
-              { id: "discovered", agent: "task", index: 1, status: "running" },
-            ],
-          });
-          const hydrated = yield* nextFeed(feeds, (feed) =>
-            feed.agents.some((agent) => agent.id === "discovered"),
-          );
-          expect(hydrated.agents.map((agent) => [agent.id, agent.status])).toEqual([
-            ["worker", "completed"],
-            ["discovered", "running"],
-          ]);
-          yield* Queue.offer(events, { type: "disconnected" });
-          const disconnected = yield* nextFeed(feeds, (feed) => !feed.connected);
-          // Losing the stream does not stop the owner's agents.
-          expect(disconnected.agents.map((agent) => agent.status)).toEqual([
-            "completed",
-            "running",
-          ]);
-          yield* Queue.offer(events, reconnect);
-          const refreshed = yield* nextFeed(
-            feeds,
-            (feed) => feed.connected && feed.agentsRevision > disconnected.agentsRevision + 1,
-          );
-          expect(refreshed.agents.map((agent) => [agent.id, agent.status])).toEqual([
-            ["worker", "completed"],
-            ["discovered", "interrupted"],
-          ]);
-          expect(refreshed.agents[0]?.usage?.totalTokens).toBe(90);
-          expect(refreshed.conversation.pending).toEqual(completed.conversation.pending);
-        }),
-      ),
-  );
-
-  it.effect("loads the whole roster once NeoPi advertises its history", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const requested: string[] = [];
-        const history = [
-          {
-            id: "0-Finished",
-            kind: "sub",
-            status: "parked",
-            agent: "scout",
-            description: "Map the protocol",
-            createdAt: 1_000,
-            lastActivity: 5_000,
-            metrics: { tokens: 300, tools: 4 },
-          },
-          { id: "1-Killed", kind: "sub", status: "aborted", createdAt: 2_000, lastActivity: 3_000 },
-        ];
-        const { events, feeds } = yield* harness((command) => {
-          requested.push(command.type);
-          if (command.type === "get_subagent_history")
-            return Effect.succeed({ subagents: history });
-          if (command.type === "get_subagents") return Effect.succeed({ subagents: [] });
-          return Effect.succeed({});
-        });
-        yield* Queue.offer(events, {
-          type: "snapshot",
-          session: { ...session, capabilities: ["subagent_history"] },
-          journal: page([user]),
-        });
-        const loaded = yield* nextFeed(feeds, (feed) => feed.agents.length === 2);
-        expect(loaded.agents.map((agent) => [agent.id, agent.status])).toEqual([
-          ["0-Finished", "completed"],
-          ["1-Killed", "cancelled"],
-        ]);
-        expect(loaded.agents[0]?.usage?.totalTokens).toBe(300);
-        expect(requested).toContain("get_subagent_history");
-      }),
-    ),
-  );
-
-  it.effect("keeps the live inventory alone for a NeoPi without history", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const requested: string[] = [];
-        const { events, feeds } = yield* harness((command) => {
-          requested.push(command.type);
-          if (command.type === "get_subagents")
-            return Effect.succeed({
-              subagents: [{ id: "live", agent: "task", index: 0, status: "running" }],
-            });
-          return Effect.succeed({});
-        });
-        yield* Queue.offer(events, { type: "snapshot", session, journal: page([user]) });
-        yield* nextFeed(feeds, (feed) => feed.agents.length === 1);
-        expect(requested).not.toContain("get_subagent_history");
-      }),
-    ),
-  );
-
-  it.effect("polls jobs for a terminal-attached session and settles on zero", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        let reads = 0;
-        const job = { id: "bg_1", type: "bash", label: "sleep 9", status: "running", startedAt: 1 };
-        const { events, feeds } = yield* harness((command) => {
-          if (command.type === "get_subagents") return Effect.succeed({ subagents: [] });
-          if (command.type !== "get_jobs") return Effect.succeed({});
-          reads++;
-          return Effect.succeed(
-            reads === 1
-              ? { running: [job], recent: [], runningCount: 1 }
-              : {
-                  running: [],
-                  recent: [{ ...job, status: "completed", finishedAt: 2 }],
-                  runningCount: 0,
-                },
-          );
-        });
-        yield* Queue.offer(events, {
-          type: "snapshot",
-          session: { ...session, attachment: "terminal", capabilities: ["background_jobs"] },
-          journal: page([user]),
-        });
-        yield* nextFeed(feeds, (feed) => feed.jobs.runningCount === 1);
-        // No job_lifecycle frame reaches a terminal attachment: only the poll can learn it ended.
-        yield* TestClock.adjust("5 seconds");
-        const settled = yield* nextFeed(feeds, (feed) => feed.jobs.runningCount === 0);
-        expect(settled.jobs.entries.map((entry) => entry.status)).toEqual(["completed"]);
+        unmount();
       }),
     ),
   );
 });
 
-describe("live telemetry reconciliation", () => {
-  const telemetry = (tokens: number, cost = 0.01) => ({
-    contextUsage: { tokens, contextWindow: 1_000, percent: tokens / 10 },
-    sessionUsage: { cost, input: 10, cacheRead: 90 },
-  });
-  const reader =
-    (current: { tokens: number; cost?: number }) =>
-    (command: Record<string, unknown> & { type: string }) =>
-      Effect.sync(() => {
-        if (command.type === "get_state") return telemetry(current.tokens, current.cost);
-        if (command.type === "get_subagents") return { subagents: [] };
-        return {};
+describe("native inbox bound", () => {
+  it("keeps a tool that streams forever within the inbox bound and marks what it cut", () => {
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    const total = NATIVE_INBOX_LIMIT * 4;
+    for (let seq = 1; seq <= total; seq++)
+      feed = reduceNativeSessionFeed(feed, {
+        type: "read",
+        sent: feed.observation.cursor,
+        result: pass({
+          epoch,
+          watermark: seq,
+          kind: seq === 1 ? "full" : "incremental",
+          inbox: [
+            {
+              type: "tool_stream_update",
+              seq,
+              toolCallId: "bash-1",
+              toolName: "bash",
+              update: { chunk: seq },
+            },
+          ],
+        }),
       });
-  const contextTokens = (feed: NativeSessionFeed) =>
-    nativeStatusFacts(feed.session?.state ?? {}).context?.tokens ?? null;
+    const inbox = feed.observation.inbox;
+    expect(inbox.length).toBeLessThanOrEqual(NATIVE_INBOX_LIMIT);
+    const gap = inbox[0];
+    expect(gap?.type).toBe("gap");
+    if (gap?.type !== "gap") return;
+    const kept = inbox.slice(1);
+    expect(gap).toMatchObject({ reason: "evicted", fromSeq: 1, toSeq: kept[0]!.seq - 1 });
+    expect(gap.toolStreams).toEqual([
+      { toolCallId: "bash-1", toolName: "bash", updates: total - kept.length },
+    ]);
+    expect(kept.every((record, index) => record.seq === gap.toSeq + 1 + index)).toBe(true);
+    expect(kept.at(-1)?.seq).toBe(total);
+  });
+});
 
-  it.effect("refreshes context usage when a terminal-run compaction commits", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const current = { tokens: 30_786 };
-        const { events, feeds } = yield* harness(reader(current));
-        const compaction = {
-          ...user,
-          id: "compaction",
-          parentId: user.id,
-          type: "compaction",
-          summary: "<context-window-rollover>\nKept the plan.\n</context-window-rollover>",
-          tokensBefore: 30_786,
-          tokensAfter: 28_909,
-        };
-        current.tokens = 28_909;
-        yield* Queue.offerAll(events, [
-          event({ type: "manual_compaction_start" }),
-          event({ type: "journal_state", reason: "leaf", ...identity(compaction.id) }),
-          event({ type: "journal_entry", ...identity(compaction.id), entry: compaction }),
-          event({ type: "manual_compaction_end", result: { tokensBefore: 30_786 } }),
-        ]);
-        const refreshed = yield* nextFeed(feeds, (feed) => contextTokens(feed) === 28_909);
-        expect(nativeStatusFacts(refreshed.session?.state ?? {}).context?.percent).toBeCloseTo(
-          2_890.9,
-        );
-        expect(refreshed.conversation.entries.at(-1)).toEqual(compaction);
-        expect(
-          projectTranscript(
-            {
-              entries: refreshed.conversation.entries,
-              pending: refreshed.conversation.pending,
-              leafId: refreshed.conversation.identity?.leafId ?? null,
-            },
-            { debug: false },
-          ).at(-1),
-        ).toMatchObject({
-          kind: "divider",
-          text: "Context compacted · 31k → 29k tokens",
-          summary: "Kept the plan.",
-        });
-      }),
-    ),
-  );
+describe("native projection mapping", () => {
+  const child = (revision: number, status: string): NeoPiNativeEntity => ({
+    key: "roster:child",
+    ordinal: 1,
+    revision,
+    value: {
+      class: "roster",
+      value: {
+        id: "child",
+        runToken: "run",
+        inventory: { id: "child", status, runToken: "run" },
+        ticks: revision,
+      },
+    },
+  });
+  const output: NeoPiNativeEntity = {
+    key: "receipt:command:1",
+    ordinal: 2,
+    revision: 2,
+    value: {
+      class: "receipt",
+      value: { kind: "command_output", text: "Printed", afterEntryId: null, afterMessageId: null },
+    },
+  };
+  const read = (feed: NativeSessionFeed, result: NeoPiNativeSessionsReadResult) =>
+    reduceNativeSessionFeed(feed, { type: "read", sent: feed.observation.cursor, result });
 
-  it.effect("refreshes cost and cache rate when a terminal-run turn ends", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const current = { tokens: 100, cost: 0.5 };
-        const { events, feeds } = yield* harness(reader(current));
-        yield* Queue.offer(events, event({ type: "agent_end" }));
-        const settled = yield* nextFeed(
-          feeds,
-          (feed) => nativeStatusFacts(feed.session?.state ?? {}).cost?.amount === 0.5,
-        );
-        expect(nativeStatusFacts(settled.session?.state ?? {}).cacheHitPercent).toBe(90);
-      }),
-    ),
-  );
+  it("keeps children and command output through a rebuild and drops a removed child", () => {
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = read(
+      feed,
+      pass({ epoch: domain(), watermark: 2, entities: [child(1, "running"), output] }),
+    );
+    expect(feed.agents.map((agent) => [agent.id, agent.status])).toEqual([["child", "running"]]);
+    expect(feed.agentTicks).toEqual({ child: 1 });
+    expect(feed.commandOutputs.map((item) => item.text)).toEqual(["Printed"]);
 
-  it.effect("re-reads state on branch navigation", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const current = { tokens: 700 };
-        const { events, feeds } = yield* harness(reader(current));
-        yield* Queue.offer(
-          events,
-          event({ type: "journal_state", reason: "leaf", ...identity(user.id) }),
-        );
-        yield* nextFeed(feeds, (feed) => contextTokens(feed) === 700);
-      }),
-    ),
-  );
+    // A rebuilt projection holds the child again but not the live-only receipt.
+    const rebuilt = domain({ projectionIncarnation: 2 });
+    feed = read(feed, pass({ epoch: rebuilt, watermark: 3, entities: [child(3, "running")] }));
+    expect(feed.agents[0]?.status).toBe("running");
+    expect(feed.agents[0]?.native.disconnected).toBe(false);
+    expect(feed.agentTicks).toEqual({ child: 3 });
+    expect(feed.commandOutputs.map((item) => item.text)).toEqual(["Printed"]);
 
-  it.effect("polls a visible terminal-attached session without waiting for frames", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const current = { tokens: 100 };
-        const { events, feeds } = yield* harness(reader(current), initial(), {
-          stateReadGapMs: 0,
-          pollIntervalMs: 5_000,
-        });
-        // A processed frame proves the poll fiber is sleeping before the clock moves.
-        yield* Queue.offer(events, event({ type: "queue_update" }));
-        yield* Queue.take(feeds);
-        current.tokens = 250;
-        yield* TestClock.adjust("5 seconds");
-        yield* nextFeed(feeds, (feed) => contextTokens(feed) === 250);
-      }),
-    ),
-  );
+    // A full pass that no longer holds the child removes it, never marks it interrupted.
+    feed = read(feed, pass({ epoch: rebuilt, watermark: 4 }));
+    expect(feed.agents).toEqual([]);
+  });
+});
 
-  it.effect("does not poll while the tab is hidden", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const target = globalThis as unknown as { document?: unknown };
-        const previous = target.document;
-        target.document = { visibilityState: "hidden" };
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            if (previous === undefined) delete target.document;
-            else target.document = previous;
-          }),
-        );
-        let stateReads = 0;
-        const { events, feeds } = yield* harness(
-          (command) =>
-            Effect.sync(() => {
-              if (command.type === "get_state") stateReads++;
-              return command.type === "get_subagents" ? { subagents: [] } : {};
-            }),
-          initial(),
-          { stateReadGapMs: 0, pollIntervalMs: 5_000 },
-        );
-        yield* Queue.offer(events, event({ type: "queue_update" }));
-        yield* Queue.take(feeds);
-        yield* TestClock.adjust("20 seconds");
-        yield* Effect.yieldNow;
-        expect(stateReads).toBe(0);
-      }),
-    ),
-  );
-
-  it.effect("spaces a burst of journal commits into trailing reads", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        let stateReads = 0;
-        const { events, feeds } = yield* harness(
-          (command) =>
-            Effect.sync(() => {
-              if (command.type === "get_state") stateReads++;
-              return {};
-            }),
-          initial(),
-          { stateReadGapMs: 1_000, pollIntervalMs: 60_000 },
-        );
-        const entries = ["a", "b", "c", "d"].map((id, index, all) => ({
-          ...user,
-          id,
-          parentId: index === 0 ? user.id : all[index - 1]!,
-        }));
-        for (const entry of entries)
-          yield* Queue.offer(
-            events,
-            event({ type: "journal_entry", ...identity(entry.id), entry }),
-          );
-        yield* nextFeed(feeds, (feed) => feed.conversation.entries.at(-1)?.id === "d");
-        // Four commits cost at most a leading and one trailing read, however they interleave.
-        yield* TestClock.adjust("1 second");
-        yield* Effect.yieldNow;
-        expect(stateReads).toBeGreaterThanOrEqual(1);
-        expect(stateReads).toBeLessThanOrEqual(2);
-        const settled = stateReads;
-        yield* TestClock.adjust("5 seconds");
-        yield* Effect.yieldNow;
-        expect(stateReads).toBeLessThanOrEqual(2);
-        expect(stateReads).toBeGreaterThanOrEqual(settled);
-      }),
-    ),
-  );
+describe("native observation status", () => {
+  it("is catching up while attaching, building or in a full pass, and not after it", () => {
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    expect(nativeObservationStatus(feed)).toEqual({ phase: "attaching", catchingUp: true });
+    feed = reduceNativeSessionFeed(feed, { type: "lifecycle", revision: 2, state: "building" });
+    expect(nativeObservationStatus(feed).catchingUp).toBe(true);
+    feed = reduceNativeSessionFeed(feed, { type: "lifecycle", revision: 3, state: "observing" });
+    expect(nativeObservationStatus(feed)).toEqual({ phase: "rebasing", catchingUp: true });
+    feed = reduceNativeSessionFeed(feed, {
+      type: "read",
+      sent: null,
+      result: pass({ epoch, watermark: 3 }),
+    });
+    expect(nativeObservationStatus(feed)).toEqual({ phase: "observing", catchingUp: false });
+  });
 });

@@ -367,6 +367,7 @@ export class NeoPiNativeJournalTail {
   #entries: NeoPiNativeObservedJournalEntry[] = [];
   #offset = 0;
   #start = 0;
+  #origin = 0;
   readonly #positions = new Map<string, number>();
 
   readonly capacity: number;
@@ -378,6 +379,11 @@ export class NeoPiNativeJournalTail {
   /** Absolute position of the oldest retained entry. */
   get start(): number {
     return this.#start;
+  }
+
+  /** Absolute position where the tail last restarted; equal to `start` while nothing was evicted. */
+  get origin(): number {
+    return this.#origin;
   }
 
   /** One past the absolute position of the newest entry. */
@@ -429,6 +435,7 @@ export class NeoPiNativeJournalTail {
     this.#offset = 0;
     this.#positions.clear();
     this.#start = end;
+    this.#origin = end;
   }
 }
 

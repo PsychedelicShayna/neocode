@@ -865,6 +865,29 @@ describe("NeoPiNativeCursor", () => {
       assert.equal(reply.journal?.entries.length, 3);
     });
 
+    it("a reader that held an empty history receives every later entry, in order", () => {
+      const { sessionId, projection } = built();
+      const mirror = new Mirror();
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 100_000 });
+      let parent: string | null = null;
+      for (let n = 0; n < 5; n++) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: {
+            id: `e${n}`,
+            parentId: parent,
+            type: "custom",
+            timestamp: "t",
+            data: "y".repeat(150),
+          },
+        });
+        parent = `e${n}`;
+      }
+      mirror.drain(projection, { scanSteps: 100, replyBytes: 500 });
+      assert.deepEqual([...mirror.entryIds], ["e0", "e1", "e2", "e3", "e4"]);
+    });
+
     it("record only: one journal entry larger than the reply budget is sent whole", () => {
       const { sessionId, projection } = built();
       projection.fold({

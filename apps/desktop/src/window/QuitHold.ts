@@ -37,9 +37,16 @@ export interface QuitShortcutOptions {
   readonly quit: () => void;
 }
 
-export function makeQuitShortcutHandler(
-  options: QuitShortcutOptions,
-): (event: { preventDefault: () => void }, input: QuitHoldKeyInput) => void {
+export interface QuitShortcutHandler {
+  (event: { preventDefault: () => void }, input: QuitHoldKeyInput): void;
+  /**
+   * Forgets a first press and its hint, as any other key would, so the next
+   * press starts over. A hold already committed to quitting still quits.
+   */
+  readonly cancelPendingPress: () => void;
+}
+
+export function makeQuitShortcutHandler(options: QuitShortcutOptions): QuitShortcutHandler {
   const modifierKey = options.platform === "darwin" ? "meta" : "control";
   let watchdog: NodeJS.Timeout | undefined;
   let holding = false;
@@ -99,7 +106,7 @@ export function makeQuitShortcutHandler(
     watchdog = setTimeout(quitNow, quietPeriodMs);
   };
 
-  return (event, input) => {
+  const handle = (event: { preventDefault: () => void }, input: QuitHoldKeyInput) => {
     const key = input.key.toLowerCase();
     if (input.type === "keyUp") {
       if (key === "q") {
@@ -218,4 +225,12 @@ export function makeQuitShortcutHandler(
       },
     );
   };
+
+  return Object.assign(handle, {
+    cancelPendingPress: () => {
+      if (quitOnRelease) return;
+      lastPressAt = 0;
+      release();
+    },
+  });
 }

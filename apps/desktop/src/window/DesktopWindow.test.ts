@@ -99,6 +99,7 @@ function makeFakeBrowserWindow() {
     replaceMisspelling: vi.fn(),
     send: vi.fn(),
     setBackgroundThrottling: vi.fn(),
+    setIgnoreMenuShortcuts: vi.fn(),
     setWindowOpenHandler: vi.fn(),
   };
 
@@ -148,6 +149,7 @@ function makeFakeBrowserWindow() {
     setZoomLevel: webContents.setZoomLevel,
     setWindowButtonPosition: window.setWindowButtonPosition,
     setBackgroundThrottling: webContents.setBackgroundThrottling,
+    setIgnoreMenuShortcuts: webContents.setIgnoreMenuShortcuts,
     setAutoHideCursor: window.setAutoHideCursor,
     setFullScreen: window.setFullScreen,
     setOpacity: window.setOpacity,
@@ -201,17 +203,20 @@ const electronThemeLayer = Layer.succeed(ElectronTheme.ElectronTheme, {
   onUpdated: () => Effect.void,
 } satisfies ElectronTheme.ElectronTheme["Service"]);
 
-const desktopEnvironmentLayer = DesktopEnvironment.layer(environmentInput).pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      NodeServices.layer,
-      DesktopConfig.layerTest({
-        T3CODE_PORT: "3773",
-        VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
-      }),
+const makeDesktopEnvironmentLayer = (platform: NodeJS.Platform) =>
+  DesktopEnvironment.layer({ ...environmentInput, platform }).pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        DesktopConfig.layerTest({
+          T3CODE_PORT: "3773",
+          VITE_DEV_SERVER_URL: "http://127.0.0.1:5733",
+        }),
+      ),
     ),
-  ),
-);
+  );
+
+const desktopEnvironmentLayer = makeDesktopEnvironmentLayer(environmentInput.platform);
 
 const desktopWindowBoundsEquivalence = Schema.toEquivalence(
   DesktopAppSettings.DesktopWindowBoundsSchema,
@@ -233,6 +238,7 @@ function makeTestLayer(input: {
   readonly onPopupTemplate?: (input: ElectronMenu.ElectronMenuTemplateInput) => Effect.Effect<void>;
   readonly previewZoomReapplies?: number[];
   readonly onReveal?: (window: Electron.BrowserWindow) => void;
+  readonly platform?: NodeJS.Platform;
 }) {
   let desktopSettings = input.desktopSettings ?? DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS;
   const desktopAppSettingsLayer = Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
@@ -294,7 +300,9 @@ function makeTestLayer(input: {
     Layer.provide(
       Layer.mergeAll(
         desktopAssetsLayer,
-        desktopEnvironmentLayer,
+        input.platform === undefined
+          ? desktopEnvironmentLayer
+          : makeDesktopEnvironmentLayer(input.platform),
         desktopAppSettingsLayer,
         desktopClientSettingsLayer,
         desktopServerExposureLayer,
@@ -982,6 +990,176 @@ describe("DesktopWindow", () => {
         prevented = false;
         beforeInput(event, { ...input, meta: false });
         assert.isFalse(prevented);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it("leaves every Ctrl chord to a focused terminal on Linux and Windows only", () => {
+    const key = (
+      key: string,
+      modifiers: { control?: boolean; meta?: boolean },
+      repeat = false,
+    ) => ({
+      type: "keyDown",
+      key,
+      control: modifiers.control ?? false,
+      meta: modifiers.meta ?? false,
+      alt: false,
+      shift: false,
+      isAutoRepeat: repeat,
+    });
+    const shellKeeps = { quitShortcut: true, drop: false, ignoreMenuShortcuts: false };
+    const terminalOwns = { quitShortcut: false, drop: false, ignoreMenuShortcuts: true };
+
+    for (const platform of ["linux", "win32"] as const) {
+      const focused = { platform, terminalInputFocused: true };
+      const unfocused = { platform, terminalInputFocused: false };
+      assert.deepStrictEqual(
+        DesktopWindow.resolveShellKeyHandling(key("q", { control: true }), focused),
+        terminalOwns,
+      );
+      // Held Ctrl+W deletes words in the shell; every repeat must reach it.
+      assert.deepStrictEqual(
+        DesktopWindow.resolveShellKeyHandling(key("w", { control: true }, true), focused),
+        terminalOwns,
+      );
+      assert.deepStrictEqual(
+        DesktopWindow.resolveShellKeyHandling(key("q", { control: true }), unfocused),
+        shellKeeps,
+      );
+      assert.deepStrictEqual(
+        DesktopWindow.resolveShellKeyHandling(key("w", { control: true }, true), unfocused),
+        { quitShortcut: true, drop: true, ignoreMenuShortcuts: false },
+      );
+      assert.deepStrictEqual(
+        DesktopWindow.resolveShellKeyHandling(key("w", { control: true }), unfocused),
+        shellKeeps,
+      );
+    }
+
+    // A macOS terminal never receives Cmd chords, so the shell keeps them.
+    const macFocused = { platform: "darwin" as const, terminalInputFocused: true };
+    assert.deepStrictEqual(
+      DesktopWindow.resolveShellKeyHandling(key("w", { meta: true }, true), macFocused),
+      { quitShortcut: true, drop: true, ignoreMenuShortcuts: false },
+    );
+    assert.deepStrictEqual(
+      DesktopWindow.resolveShellKeyHandling(key("w", { control: true }, true), macFocused),
+      shellKeeps,
+    );
+  });
+
+  it.effect("stops leaving keys to the terminal once its page reloads or crashes", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        platform: "linux",
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const listener = (name: string) => {
+          const found = fakeWindow.webContentsListeners.get(name);
+          if (!found) throw new Error(`${name} listener was not registered`);
+          return found;
+        };
+        const beforeInput = listener("before-input-event");
+        const heldCloseIsPrevented = () => {
+          let prevented = false;
+          beforeInput(
+            { preventDefault: () => (prevented = true) },
+            {
+              type: "keyDown",
+              key: "w",
+              control: true,
+              meta: false,
+              alt: false,
+              shift: false,
+              isAutoRepeat: true,
+            },
+          );
+          return prevented;
+        };
+        const ignoresMenuShortcuts = () =>
+          fakeWindow.setIgnoreMenuShortcuts.mock.calls.at(-1)?.[0] === true;
+
+        DesktopWindow.setTerminalInputFocused(fakeWindow.window.webContents, true);
+        assert.isFalse(heldCloseIsPrevented());
+        assert.isTrue(ignoresMenuShortcuts());
+
+        listener("did-navigate")({}, "t3code-dev://app/");
+        assert.isTrue(heldCloseIsPrevented());
+        assert.isFalse(ignoresMenuShortcuts());
+
+        DesktopWindow.setTerminalInputFocused(fakeWindow.window.webContents, true);
+        assert.isFalse(heldCloseIsPrevented());
+        listener("render-process-gone")({}, { reason: "killed", exitCode: 0 });
+        assert.isTrue(heldCloseIsPrevented());
+        assert.isFalse(ignoresMenuShortcuts());
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("decides the quit guard and menu shortcuts together for each key", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        platform: "linux",
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const beforeInput = fakeWindow.webContentsListeners.get("before-input-event");
+        if (!beforeInput)
+          return yield* Effect.die("before-input-event listener was not registered");
+        const quitKey = (type: "keyDown" | "keyUp") => {
+          let prevented = false;
+          beforeInput(
+            { preventDefault: () => (prevented = true) },
+            {
+              type,
+              key: "q",
+              control: true,
+              meta: false,
+              alt: false,
+              shift: false,
+              isAutoRepeat: false,
+            },
+          );
+          return prevented;
+        };
+        const flagWrites = () => fakeWindow.setIgnoreMenuShortcuts.mock.calls.map(([v]) => v);
+        const webContents = fakeWindow.window.webContents;
+
+        // Ctrl+Q typed into the terminal: the program gets it and, for this
+        // key, the menu's Quit accelerator is off.
+        DesktopWindow.setTerminalInputFocused(webContents, true);
+        assert.isFalse(quitKey("keyDown"));
+        assert.deepStrictEqual(flagWrites(), [true]);
+
+        // The user leaves the terminal; the report lands while that Ctrl+Q is
+        // still on its way back from the page. It must not re-arm the menu
+        // for it, and its keyup must not either.
+        DesktopWindow.setTerminalInputFocused(webContents, false);
+        assert.deepStrictEqual(flagWrites(), [true]);
+        assert.isFalse(quitKey("keyUp"));
+        assert.deepStrictEqual(flagWrites(), [true]);
+
+        // The next Ctrl+Q sees the terminal gone: the quit guard takes it.
+        assert.isTrue(quitKey("keyDown"));
+        assert.deepStrictEqual(flagWrites(), [true, false]);
       }).pipe(Effect.provide(layer));
     }),
   );

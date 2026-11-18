@@ -51,6 +51,7 @@ import {
   pickProjectFavicon,
   pickThemeFiles,
   setTheme,
+  setTerminalInputFocused,
   showContextMenu,
 } from "./methods/window.ts";
 import {
@@ -134,6 +135,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(openSystemSettings);
   yield* ipc.handle(checkSystemPermission);
   yield* ipc.handle(pasteAsText);
+  yield* ipc.handle(setTerminalInputFocused);
   yield* ipc.handle(probeRemoteEditors);
   yield* ipc.handle(getUpdateState);
   yield* ipc.handle(setUpdateChannel);

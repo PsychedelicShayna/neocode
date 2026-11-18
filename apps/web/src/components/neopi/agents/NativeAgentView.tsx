@@ -305,6 +305,11 @@ export function NativeAgentView({
           <span className="text-sm text-muted-foreground">This agent is no longer listed.</span>
         )}
       </header>
+      {source.rosterWarning ? (
+        <p role="status" className="shrink-0 px-3 py-2 text-xs text-muted-foreground">
+          {source.rosterWarning}
+        </p>
+      ) : null}
       {error ? (
         <p role="alert" className="shrink-0 px-4 py-1 text-xs text-destructive-foreground">
           {error}

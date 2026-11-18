@@ -792,6 +792,16 @@ export class GhosttyTerminalSurface {
     this.requestRender();
   }
 
+  /**
+   * The bytes this key's press and then its release send the program under
+   * the terminal's current modes; the release is empty unless the program
+   * asked for key releases (Kitty report-event-types).
+   */
+  encodeKeyPressAndRelease(event: KeyboardEvent): string {
+    if (this.disposed) return "";
+    return this.core.encodeKey(event) + this.core.encodeKey(event, "release");
+  }
+
   resetAndWrite(data: string): void {
     if (this.disposed) return;
     this.lastMouseMotionData = "";

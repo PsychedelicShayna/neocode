@@ -60,9 +60,12 @@ import { isTerminalUrl, resolvePathLinkTarget } from "../terminal-links";
 import {
   isTerminalClearShortcut,
   terminalDeleteShortcutData,
+  terminalKeybindingRules,
   terminalNavigationShortcutData,
+  type TerminalKeybindingCommand,
 } from "../keybindings";
 import { createTerminalFocusEscape } from "~/terminal/terminalFocusEscape";
+import { terminalFontSizePatch } from "~/terminal/terminalFontSize";
 import {
   DEFAULT_THREAD_TERMINAL_HEIGHT,
   MAX_TERMINALS_PER_GROUP,
@@ -70,10 +73,10 @@ import {
 } from "../types";
 import { readLocalApi } from "~/localApi";
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
-import { useClientSettings } from "../hooks/useSettings";
+import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings";
 import { useLocalStorage } from "../hooks/useLocalStorage";
 import { useAttachedTerminalSession } from "../state/terminalSessions";
-import { serverEnvironment } from "../state/server";
+import { primaryServerKeybindingsAtom, serverEnvironment } from "../state/server";
 import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
@@ -417,6 +420,21 @@ export function TerminalViewport({
     }),
   );
   const terminalFontRef = useRef({ family: terminalFontFamily, size: terminalFontSize });
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
+  const readTerminalKeybindingRules = useEffectEvent(() => terminalKeybindingRules(keybindings));
+  const codeFontSize = useClientSettings((settings) => settings.fontSizeCode);
+  const terminalFontSizeSetting = useClientSettings((settings) => settings.fontSizeTerminal);
+  const updateClientSettings = useUpdateClientSettings();
+  const changeTerminalFontSize = useEffectEvent(
+    (command: Exclude<TerminalKeybindingCommand, "terminal.leaveFocus">) => {
+      const patch = terminalFontSizePatch(command, {
+        advanced: advancedTypography,
+        code: codeFontSize,
+        terminal: terminalFontSizeSetting,
+      });
+      if (patch) void updateClientSettings(patch);
+    },
+  );
   const terminalSession = useAttachedTerminalSession({
     environmentId,
     terminal: {
@@ -502,12 +520,18 @@ export function TerminalViewport({
 
     const setup = async (): Promise<(() => void) | null> => {
       // Every byte of user input leaves through focusEscape.send.
-      const focusEscape = createTerminalFocusEscape({
+      const focusEscape = createTerminalFocusEscape<KeyboardEvent>({
         write: (data) => handleData(data),
-        // Blur rather than focus the terminal's owner: focus anywhere inside
-        // the owner still counts as terminal focus for keybinding `when`
-        // clauses, which would keep GUI shortcuts from resolving.
-        leave: () => {
+        encode: (event) => terminalRef.current?.encodeKeyPressAndRelease(event) ?? "",
+        rules: () => readTerminalKeybindingRules(),
+        run: (command) => {
+          if (command !== "terminal.leaveFocus") {
+            changeTerminalFontSize(command);
+            return;
+          }
+          // Blur rather than focus the terminal's owner: focus anywhere inside
+          // the owner still counts as terminal focus for keybinding `when`
+          // clauses, which would keep GUI shortcuts from resolving.
           const activeElement = document.activeElement;
           if (activeElement instanceof HTMLElement && mount.contains(activeElement)) {
             activeElement.blur();

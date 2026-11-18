@@ -31,7 +31,33 @@ import {
   GhosttyTerminalSurface,
   type GhosttyTerminalSurfaceOptions,
 } from "./surface";
+import type { ResolvedKeybindingsConfig } from "@t3tools/contracts";
+import {
+  compileResolvedKeybindingsConfig,
+  DEFAULT_RESOLVED_KEYBINDINGS,
+  mergeWithDefaultKeybindings,
+} from "@t3tools/shared/keybindings";
+
+import { terminalKeybindingRules } from "../../keybindings";
 import { createTerminalFocusEscape } from "../terminalFocusEscape";
+
+// The escape as the drawer builds it: a held key is written by the real
+// surface's encoder.
+function defaultFocusEscape(
+  program: string[],
+  keybindings: ResolvedKeybindingsConfig = DEFAULT_RESOLVED_KEYBINDINGS,
+) {
+  const state = { left: 0, surface: null as GhosttyTerminalSurface | null };
+  const escape = createTerminalFocusEscape<KeyboardEvent>({
+    write: (data) => program.push(data),
+    encode: (event) => state.surface?.encodeKeyPressAndRelease(event) ?? "",
+    rules: () => terminalKeybindingRules(keybindings),
+    run: (command) => {
+      if (command === "terminal.leaveFocus") state.left += 1;
+    },
+  });
+  return { escape, state };
+}
 
 vi.mock("./vendor/ghostty-vt.wasm?url", async () => ({
   default: (await import("./vendor/ghostty-vt.wasm?inline")).default,
@@ -254,14 +280,8 @@ describe("GhosttyTerminalSurface visibility", () => {
   it("sends a held Ctrl+Backslash ahead of IME, AltGr and pasted text", async () => {
     const harness = createHarness();
     const program: string[] = [];
-    let left = 0;
-    const escape = createTerminalFocusEscape({
-      write: (data) => program.push(data),
-      leave: () => {
-        left += 1;
-      },
-    });
-    await harness.create({ onData: escape.send, beforeKey: escape.beforeKey });
+    const { escape, state } = defaultFocusEscape(program);
+    state.surface = await harness.create({ onData: escape.send, beforeKey: escape.beforeKey });
     const dispatch = (type: string, fields: Record<string, unknown> = {}) =>
       harness.input.dispatchEvent(Object.assign(new Event(type, { cancelable: true }), fields));
     const ctrlBackslash = (fields: Record<string, unknown> = {}) =>
@@ -299,33 +319,28 @@ describe("GhosttyTerminalSurface visibility", () => {
     ctrlBackslash();
     dispatch("paste", { clipboardData: { getData: () => "ls" } });
     expect(program).toEqual(["\x1c日本", "\x1c@", "\x1cls"]);
-    expect(left).toBe(0);
+    expect(state.left).toBe(0);
 
     // A repeat with nothing held is an ordinary key, so one fresh press after
     // it only starts the escape.
     ctrlBackslash({ repeat: true });
     ctrlBackslash();
     expect(program.slice(3)).toEqual(["\x1c"]);
-    expect(left).toBe(0);
+    expect(state.left).toBe(0);
     ctrlBackslash();
-    expect(left).toBe(1);
+    expect(state.left).toBe(1);
   });
 
   it("keeps a held Ctrl+Backslash held when the terminal replies to a query", async () => {
     const harness = createHarness();
     const program: string[] = [];
-    let left = 0;
-    const escape = createTerminalFocusEscape({
-      write: (data) => program.push(data),
-      leave: () => {
-        left += 1;
-      },
-    });
+    const { escape, state } = defaultFocusEscape(program);
     const surface = await harness.create({
       onData: escape.send,
       onReply: (data) => program.push(data),
       beforeKey: escape.beforeKey,
     });
+    state.surface = surface;
     const ctrlBackslash = () =>
       harness.input.dispatchEvent(
         Object.assign(new Event("keydown", { cancelable: true }), {
@@ -347,7 +362,40 @@ describe("GhosttyTerminalSurface visibility", () => {
     surface.write("\x1b[6n");
     ctrlBackslash();
     expect(program).toEqual(["\x1b[1;1R"]);
-    expect(left).toBe(1);
+    expect(state.left).toBe(1);
+  });
+
+  it("replays a held key's release to a program that asked for releases", async () => {
+    const harness = createHarness();
+    const program: string[] = [];
+    const { escape, state } = defaultFocusEscape(
+      program,
+      mergeWithDefaultKeybindings(
+        compileResolvedKeybindingsConfig([
+          { key: "ctrl+j k", command: "terminal.leaveFocus", when: "terminalFocus" },
+        ]),
+      ),
+    );
+    const surface = await harness.create({ onData: escape.send, beforeKey: escape.beforeKey });
+    state.surface = surface;
+    const key = (type: string, fields: Record<string, unknown>) =>
+      harness.input.dispatchEvent(
+        Object.assign(new Event(type, { cancelable: true }), {
+          altKey: false,
+          metaKey: false,
+          shiftKey: false,
+          repeat: false,
+          isComposing: false,
+          getModifierState: () => false,
+          ...fields,
+        }),
+      );
+    // Kitty keyboard protocol: disambiguate (1) and report event types (2).
+    surface.write("\x1b[>3u");
+    key("keydown", { key: "j", code: "KeyJ", keyCode: 74, ctrlKey: true });
+    key("keyup", { key: "j", code: "KeyJ", keyCode: 74, ctrlKey: true });
+    key("keydown", { key: "x", code: "KeyX", keyCode: 88, ctrlKey: true });
+    expect(program).toEqual(["\x1b[106;5u\x1b[106;5:3u", "\x1b[120;5u"]);
   });
 
   it("keeps the selection on reveal and applies a hidden selection clear", async () => {

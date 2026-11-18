@@ -12,6 +12,7 @@ import {
   KeybindingsConfigError,
   KeybindingShortcut,
   KeybindingWhenNode,
+  keybindingRuleSteps,
   MAX_KEYBINDINGS_COUNT,
   ResolvedKeybindingRule,
   ResolvedKeybindingsConfig,
@@ -45,10 +46,13 @@ import { writeFileStringAtomically } from "./atomicWrite.ts";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import {
   DEFAULT_KEYBINDINGS,
+  RETIRED_TERMINAL_FOCUS_DEFAULT_KEYBINDINGS,
   mergeWithDefaultKeybindings,
   compileResolvedKeybindingRule,
   compileResolvedKeybindingsConfig,
   parseKeybindingShortcut,
+  parseKeybindingSteps,
+  parseKeybindingWhenExpression,
 } from "@t3tools/shared/keybindings";
 
 export {
@@ -57,6 +61,15 @@ export {
   compileResolvedKeybindingsConfig,
   parseKeybindingShortcut,
 };
+
+/** Default commands added together with the retired-defaults migration. */
+const MIGRATION_MARKER_COMMANDS: ReadonlySet<KeybindingRule["command"]> = new Set([
+  "terminal.leaveFocus",
+  "terminal.fontSize.increase",
+  "terminal.fontSize.decrease",
+  "terminal.fontSize.reset",
+  "exLine.open",
+]);
 
 export const ResolvedKeybindingFromConfig = KeybindingRule.pipe(
   Schema.decodeTo(
@@ -76,7 +89,7 @@ export const ResolvedKeybindingFromConfig = KeybindingRule.pipe(
 
       encode: (resolved) =>
         Effect.gen(function* () {
-          const key = encodeShortcut(resolved.shortcut);
+          const key = encodeKeybindingSteps(keybindingRuleSteps(resolved));
           if (!key) {
             return yield* Effect.fail(
               new SchemaIssue.InvalidValue({
@@ -104,10 +117,34 @@ function isSameKeybindingRule(left: KeybindingRule, right: KeybindingRule): bool
   );
 }
 
+function canonicalRuleKey(rule: KeybindingRule): string {
+  const steps = parseKeybindingSteps(rule.key);
+  return (steps && encodeKeybindingSteps(steps)) ?? rule.key;
+}
+
+function canonicalRuleWhen(rule: KeybindingRule): string | undefined {
+  if (rule.when === undefined) return undefined;
+  const ast = parseKeybindingWhenExpression(rule.when);
+  return ast ? encodeWhenAst(ast) : rule.when;
+}
+
+/**
+ * Whether two rules are the same binding however their text is spaced or
+ * spelled. Settings sends a rule back as it shows it (`ctrl+g h`, `esc`),
+ * which need not match the file's text (`ctrl+g  h`, `escape`).
+ */
+function isEquivalentKeybindingRule(left: KeybindingRule, right: KeybindingRule): boolean {
+  return (
+    left.command === right.command &&
+    canonicalRuleKey(left) === canonicalRuleKey(right) &&
+    canonicalRuleWhen(left) === canonicalRuleWhen(right)
+  );
+}
+
 function keybindingShortcutContext(rule: KeybindingRule): string | null {
-  const parsed = parseKeybindingShortcut(rule.key);
-  if (!parsed) return null;
-  const encoded = encodeShortcut(parsed);
+  const steps = parseKeybindingSteps(rule.key);
+  if (!steps) return null;
+  const encoded = encodeKeybindingSteps(steps);
   if (!encoded) return null;
   return `${encoded}\u0000${rule.when ?? ""}`;
 }
@@ -149,6 +186,16 @@ function encodeShortcut(shortcut: KeybindingShortcut): string | null {
   if (shortcut.key !== "+" && shortcut.key.includes("+")) return null;
   const key = shortcut.key === " " ? "space" : shortcut.key;
   return [...modifiers, key].join("+");
+}
+
+function encodeKeybindingSteps(steps: ReadonlyArray<KeybindingShortcut>): string | null {
+  const encoded: string[] = [];
+  for (const step of steps) {
+    const key = encodeShortcut(step);
+    if (!key) return null;
+    encoded.push(key);
+  }
+  return encoded.join(" ");
 }
 
 function encodeWhenAst(node: KeybindingWhenNode): string {
@@ -469,7 +516,28 @@ const make = Effect.gen(function* () {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
-      const customConfig = runtimeConfig.keybindings;
+      // Files written before `terminal.leaveFocus` existed still hold the
+      // retired terminal-focus defaults, which can no longer fire in a terminal.
+      // Drop exact copies of them once: backfill below then adds the commands
+      // introduced with that change, which mark the file as migrated, and the
+      // retired commands have no defaults left for backfill to restore. Any
+      // other rule, including the user's own rules for those commands, is kept.
+      // The marker is inferred, not stored: a file migrates again only if the
+      // user deletes every rule for all of those commands (backfill restores
+      // them on each start) and has re-added an exact copy of a retired default.
+      const savedConfig = runtimeConfig.keybindings;
+      const migratesRetiredDefaults = !savedConfig.some((entry) =>
+        MIGRATION_MARKER_COMMANDS.has(entry.command),
+      );
+      const customConfig = migratesRetiredDefaults
+        ? savedConfig.filter(
+            (entry) =>
+              !RETIRED_TERMINAL_FOCUS_DEFAULT_KEYBINDINGS.some((retired) =>
+                isSameKeybindingRule(entry, retired),
+              ),
+          )
+        : savedConfig;
+      const removedRetiredDefaults = customConfig.length !== savedConfig.length;
       const existingCommands = new Set(customConfig.map((entry) => entry.command));
       const missingDefaults: KeybindingRule[] = [];
       const shortcutConflictWarnings: Array<{
@@ -506,7 +574,7 @@ const make = Effect.gen(function* () {
           reason: "shortcut context already used by existing rule",
         });
       }
-      if (missingDefaults.length === 0) {
+      if (missingDefaults.length === 0 && !removedRetiredDefaults) {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
@@ -535,7 +603,7 @@ const make = Effect.gen(function* () {
           commands: skippedDefaults.map((rule) => rule.command),
         });
       }
-      if (defaultsToAppend.length === 0) {
+      if (defaultsToAppend.length === 0 && !removedRetiredDefaults) {
         yield* Cache.invalidate(resolvedConfigCache, resolvedConfigCacheKey);
         return;
       }
@@ -626,10 +694,11 @@ const make = Effect.gen(function* () {
             ...customConfig.filter((entry) => {
               if (replaceTarget) {
                 return (
-                  !isSameKeybindingRule(entry, replaceTarget) && !isSameKeybindingRule(entry, rule)
+                  !isEquivalentKeybindingRule(entry, replaceTarget) &&
+                  !isEquivalentKeybindingRule(entry, rule)
                 );
               }
-              return !isSameKeybindingRule(entry, rule);
+              return !isEquivalentKeybindingRule(entry, rule);
             }),
             rule,
           ];
@@ -663,7 +732,9 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const customConfig = yield* loadWritableCustomKeybindingsConfig();
           const target = keybindingRuleFromRemoveInput(input);
-          const nextConfig = customConfig.filter((entry) => !isSameKeybindingRule(entry, target));
+          const nextConfig = customConfig.filter(
+            (entry) => !isEquivalentKeybindingRule(entry, target),
+          );
           yield* writeConfigAtomically(nextConfig);
           const nextResolved = mergeWithDefaultKeybindings(
             compileResolvedKeybindingsConfig(nextConfig),

@@ -1,6 +1,7 @@
 import {
   KeybindingRule as KeybindingRuleSchema,
   type KeybindingCommand,
+  keybindingRuleSteps,
   type KeybindingRule,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
@@ -47,20 +48,20 @@ export function keybindingValueForCommand(
     const binding = keybindings[index];
     if (!binding || binding.command !== command) continue;
 
-    const parts: string[] = [];
-    if (binding.shortcut.modKey) parts.push("mod");
-    if (binding.shortcut.ctrlKey) parts.push("ctrl");
-    if (binding.shortcut.metaKey) parts.push("meta");
-    if (binding.shortcut.altKey) parts.push("alt");
-    if (binding.shortcut.shiftKey) parts.push("shift");
-    const keyToken =
-      binding.shortcut.key === " "
-        ? "space"
-        : binding.shortcut.key === "escape"
-          ? "esc"
-          : binding.shortcut.key;
-    parts.push(keyToken);
-    return parts.join("+");
+    return keybindingRuleSteps(binding)
+      .map((shortcut) => {
+        const parts: string[] = [];
+        if (shortcut.modKey) parts.push("mod");
+        if (shortcut.ctrlKey) parts.push("ctrl");
+        if (shortcut.metaKey) parts.push("meta");
+        if (shortcut.altKey) parts.push("alt");
+        if (shortcut.shiftKey) parts.push("shift");
+        parts.push(
+          shortcut.key === " " ? "space" : shortcut.key === "escape" ? "esc" : shortcut.key,
+        );
+        return parts.join("+");
+      })
+      .join(" ");
   }
   return null;
 }

@@ -1,8 +1,10 @@
 import {
   type KeybindingCommand,
+  keybindingRuleSteps,
   type KeybindingShortcut,
   type KeybindingWhenNode,
   MODEL_PICKER_JUMP_KEYBINDING_COMMANDS,
+  type ResolvedKeybindingRule,
   type ResolvedKeybindingsConfig,
   THREAD_JUMP_KEYBINDING_COMMANDS,
   type ModelPickerJumpKeybindingCommand,
@@ -10,7 +12,8 @@ import {
 } from "@t3tools/contracts";
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
-import { isTerminalInputFocused } from "./lib/terminalFocus";
+import { isEditableFocused } from "./lib/editableFocus";
+import { getTerminalFocusOwner, isTerminalInputFocused } from "./lib/terminalFocus";
 
 export interface ShortcutEventLike {
   getModifierState?: (key: "AltGraph") => boolean;
@@ -21,6 +24,12 @@ export interface ShortcutEventLike {
   ctrlKey: boolean;
   shiftKey: boolean;
   altKey: boolean;
+  /** Called for a keypress that begins a bound sequence, which no other handler should act on. */
+  preventDefault?: () => void;
+  /** An auto-repeat of a held key: it never starts or completes a sequence. */
+  repeat?: boolean;
+  /** Present on React's synthetic events: the browser event they wrap. */
+  nativeEvent?: unknown;
 }
 
 export interface ShortcutModifierStateLike {
@@ -126,7 +135,7 @@ function matchesShortcutModifiers(
   );
 }
 
-function matchesShortcut(
+export function matchesShortcut(
   event: ShortcutEventLike,
   shortcut: KeybindingShortcut,
   platform = navigator.platform,
@@ -197,11 +206,18 @@ export function shortcutConflictKey(
   ].join("|");
 }
 
-function findEffectiveShortcutForCommand(
+function stepsConflictKey(
+  steps: ReadonlyArray<KeybindingShortcut>,
+  platform = navigator.platform,
+): string {
+  return steps.map((step) => shortcutConflictKey(step, platform)).join(" ");
+}
+
+function findEffectiveStepsForCommand(
   keybindings: ResolvedKeybindingsConfig,
   command: KeybindingCommand,
   options?: ShortcutMatchOptions,
-): KeybindingShortcut | null {
+): ReadonlyArray<KeybindingShortcut> | null {
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
   const claimedShortcuts = new Set<string>();
@@ -211,42 +227,214 @@ function findEffectiveShortcutForCommand(
     if (!binding) continue;
     if (!matchesWhenClause(binding.whenAst, context)) continue;
 
-    const conflictKey = shortcutConflictKey(binding.shortcut, platform);
+    const steps = keybindingRuleSteps(binding);
+    const conflictKey = stepsConflictKey(steps, platform);
     if (claimedShortcuts.has(conflictKey)) {
       continue;
     }
 
     claimedShortcuts.add(conflictKey);
     if (binding.command === command) {
-      return binding.shortcut;
+      return steps;
     }
   }
 
   return null;
 }
 
+const MODIFIER_KEYS: Readonly<Record<string, true>> = {
+  Control: true,
+  Shift: true,
+  Alt: true,
+  Meta: true,
+  AltGraph: true,
+};
+
+/** Whether the keydown is a bare modifier, which never ends or breaks a sequence. */
+export function isModifierKeyEvent(event: Pick<ShortcutEventLike, "key">): boolean {
+  return MODIFIER_KEYS[event.key] === true;
+}
+
+interface PageFocus {
+  readonly editableFocus: boolean;
+  readonly terminalFocus: boolean;
+}
+
+function readPageFocus(): PageFocus {
+  if (typeof document === "undefined") return { editableFocus: false, terminalFocus: false };
+  return {
+    editableFocus: isEditableFocused(),
+    terminalFocus: getTerminalFocusOwner() !== null,
+  };
+}
+
+type SequenceRule = Extract<ResolvedKeybindingRule, { readonly sequence: unknown }>;
+
+/**
+ * Sequence state shared by every caller. Several listeners resolve the same
+ * keydown, each with its own context, so state advances once per keydown
+ * (keyed by the browser event): every listener sees the same held chord and
+ * the same page focus, read once from the page rather than from a caller's
+ * context, which may omit it.
+ */
+let sequenceKeydown: unknown = null;
+let sequenceKeydownFocus: PageFocus = { editableFocus: false, terminalFocus: false };
+/** Rules the previous keydown armed: the only ones this keydown may complete. */
+let sequenceKeydownHeld: ReadonlyArray<SequenceRule> = [];
+/** Rules this keydown arms, in priority order, across all its listeners. */
+let sequenceKeydownArmed: SequenceRule[] = [];
+
+/**
+ * Any focus change cancels a first chord before its second: nothing armed so
+ * far carries over to the next keydown. A keydown already being resolved
+ * keeps what it holds, so its listeners still agree.
+ */
+function dropArmedSequences(): void {
+  sequenceKeydownArmed = [];
+}
+
+let focusWatchedDocument: Document | null = null;
+
+function watchFocusChanges(): void {
+  if (typeof document === "undefined" || document === focusWatchedDocument) return;
+  if (typeof document.addEventListener !== "function") return;
+  focusWatchedDocument = document;
+  document.addEventListener("focusin", dropArmedSequences, true);
+  document.addEventListener("focusout", dropArmedSequences, true);
+  document.defaultView?.addEventListener("blur", dropArmedSequences);
+}
+
+/** Moves the state to this keydown: what the previous keydown armed is now held. */
+function advanceSequence(event: ShortcutEventLike): PageFocus {
+  watchFocusChanges();
+  const identity = event.nativeEvent ?? event;
+  if (identity !== sequenceKeydown) {
+    sequenceKeydown = identity;
+    sequenceKeydownFocus = readPageFocus();
+    sequenceKeydownHeld = sequenceKeydownArmed;
+    sequenceKeydownArmed = [];
+  }
+  return sequenceKeydownFocus;
+}
+
+/** A key that types a character into a focused field, which a sequence must never take. */
+function typesText(event: ShortcutEventLike): boolean {
+  return !event.ctrlKey && !event.metaKey && !event.altKey && event.key.length === 1;
+}
+
 /**
  * The command bound to this keypress, or null. A focused terminal takes every
  * key for the program running in it, so nothing resolves while it has focus;
  * this is read from the page, whatever the caller's context claims.
+ *
+ * A keypress that begins a two-chord sequence resolves to null, is prevented
+ * and arms exactly the sequence rules eligible at that moment. The next
+ * keypress completes one of those if it still applies and matches the second
+ * chord. Any other keypress, or a focus change in between, drops the held
+ * chord. There is no timeout. Sequence rules see `editableFocus` and
+ * `terminalFocus` as the page reports them, so every listener agrees, and a
+ * plain character typed into a field never begins a sequence.
  */
 export function resolveShortcutCommand(
   event: ShortcutEventLike,
   keybindings: ResolvedKeybindingsConfig,
   options?: ShortcutMatchOptions,
 ): KeybindingCommand | null {
+  if (event.type !== undefined && event.type !== "keydown") return null;
+  if (isModifierKeyEvent(event)) return null;
+  const focus = advanceSequence(event);
   if (isTerminalInputFocused()) return null;
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
+  const sequenceContext = {
+    ...context,
+    editableFocus: focus.editableFocus,
+    terminalFocus: focus.terminalFocus,
+  };
 
+  if (event.repeat) {
+    // Holding the first chord down keeps it held, as the terminal escape does.
+    const stillHeld = sequenceKeydownHeld.filter((binding) =>
+      matchesShortcut(event, binding.sequence[0], platform),
+    );
+    if (stillHeld.length > 0) {
+      for (const rule of stillHeld) {
+        if (!sequenceKeydownArmed.includes(rule)) sequenceKeydownArmed.push(rule);
+      }
+      event.preventDefault?.();
+      return null;
+    }
+  } else {
+    for (const binding of sequenceKeydownHeld) {
+      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
+      if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
+      return binding.command;
+    }
+  }
+
+  const armable = (binding: ResolvedKeybindingRule | undefined): binding is SequenceRule =>
+    binding !== undefined &&
+    "sequence" in binding &&
+    matchesWhenClause(binding.whenAst, sequenceContext) &&
+    matchesShortcut(event, binding.sequence[0], platform);
+  const mayBeginSequence = !(focus.editableFocus && typesText(event));
   for (let index = keybindings.length - 1; index >= 0; index -= 1) {
     const binding = keybindings[index];
     if (!binding) continue;
+    if ("sequence" in binding) {
+      if (event.repeat || !mayBeginSequence || !armable(binding)) continue;
+      for (let armed = index; armed >= 0; armed -= 1) {
+        const rule = keybindings[armed];
+        if (armable(rule) && !sequenceKeydownArmed.includes(rule)) sequenceKeydownArmed.push(rule);
+      }
+      event.preventDefault?.();
+      return null;
+    }
     if (!matchesWhenClause(binding.whenAst, context)) continue;
     if (!matchesShortcut(event, binding.shortcut, platform)) continue;
     return binding.command;
   }
   return null;
+}
+
+/**
+ * Commands a focused terminal still acts on, as terminal emulators own them
+ * rather than pass them to the program: leaving the terminal and its font size.
+ */
+export const TERMINAL_KEYBINDING_COMMANDS = [
+  "terminal.leaveFocus",
+  "terminal.fontSize.increase",
+  "terminal.fontSize.decrease",
+  "terminal.fontSize.reset",
+] as const satisfies ReadonlyArray<KeybindingCommand>;
+export type TerminalKeybindingCommand = (typeof TERMINAL_KEYBINDING_COMMANDS)[number];
+
+export function isTerminalKeybindingCommand(
+  command: KeybindingCommand,
+): command is TerminalKeybindingCommand {
+  return (TERMINAL_KEYBINDING_COMMANDS as ReadonlyArray<KeybindingCommand>).includes(command);
+}
+
+export type TerminalKeybindingRule = ResolvedKeybindingRule & {
+  readonly command: TerminalKeybindingCommand;
+};
+
+/**
+ * The terminal-owned rules that apply while a terminal has focus, most
+ * recent first, so the first match wins as it does for every other rule.
+ */
+export function terminalKeybindingRules(
+  keybindings: ResolvedKeybindingsConfig,
+): ReadonlyArray<TerminalKeybindingRule> {
+  const context = resolveContext({ context: { terminalFocus: true, terminalOpen: true } });
+  const rules: TerminalKeybindingRule[] = [];
+  for (let index = keybindings.length - 1; index >= 0; index -= 1) {
+    const binding = keybindings[index];
+    if (!binding || !isTerminalKeybindingCommand(binding.command)) continue;
+    if (!matchesWhenClause(binding.whenAst, context)) continue;
+    rules.push({ ...binding, command: binding.command });
+  }
+  return rules;
 }
 
 export function formatShortcutKeyLabel(key: string): string {
@@ -284,6 +472,14 @@ export function formatShortcutLabel(
   return parts.join("+");
 }
 
+/** A rule's chords as one label, a sequence's chords separated by a space. */
+export function formatKeybindingStepsLabel(
+  steps: ReadonlyArray<KeybindingShortcut>,
+  platform = navigator.platform,
+): string {
+  return steps.map((step) => formatShortcutLabel(step, platform)).join(" ");
+}
+
 export function shortcutLabelForCommand(
   keybindings: ResolvedKeybindingsConfig,
   command: KeybindingCommand | null,
@@ -295,8 +491,8 @@ export function shortcutLabelForCommand(
       ? ({ platform: options } satisfies ResolvedShortcutLabelOptions)
       : options;
   const platform = resolvePlatform(resolvedOptions);
-  const shortcut = findEffectiveShortcutForCommand(keybindings, command, resolvedOptions);
-  return shortcut ? formatShortcutLabel(shortcut, platform) : null;
+  const steps = findEffectiveStepsForCommand(keybindings, command, resolvedOptions);
+  return steps ? formatKeybindingStepsLabel(steps, platform) : null;
 }
 
 export function threadJumpCommandForIndex(index: number): ThreadJumpKeybindingCommand | null {
@@ -334,9 +530,11 @@ export function shouldShowThreadJumpHintsForModifiers(
   const platform = resolvePlatform(options);
 
   for (const command of THREAD_JUMP_KEYBINDING_COMMANDS) {
-    const shortcut = findEffectiveShortcutForCommand(keybindings, command, options);
-    if (!shortcut) continue;
-    if (matchesShortcutModifiers(modifiers, shortcut, platform)) {
+    const steps = findEffectiveStepsForCommand(keybindings, command, options);
+    const first = steps?.[0];
+    // Holding a modifier previews single-chord jumps only.
+    if (first === undefined || steps?.length !== 1) continue;
+    if (matchesShortcutModifiers(modifiers, first, platform)) {
       return true;
     }
   }

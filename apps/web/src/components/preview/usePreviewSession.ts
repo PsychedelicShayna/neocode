@@ -47,7 +47,14 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
 
     const reconcileSessions = (result: Atom.Type<typeof sessionsAtom>) => {
       if (!AsyncResult.isSuccess(result)) return;
-      reconcilePreviewServerSessions(threadRef, result.value);
+      // A list computed before an event already applied here is discarded as
+      // older. Until one list has landed, fetch again rather than staying unlisted.
+      if (
+        !reconcilePreviewServerSessions(threadRef, result.value) &&
+        !readThreadPreviewState(threadRef).listed
+      ) {
+        get.refresh(sessionsAtom);
+      }
     };
 
     const applyLatestEvent = (result: Atom.Type<typeof eventsAtom>) => {
@@ -72,6 +79,9 @@ const previewSessionSyncAtom = Atom.family((threadKey: string) => {
     get.subscribe(sessionsAtom, (result) => {
       reconcileSessions(result);
     });
+    // A plain subscription leaves the lazy query unstarted, and refreshing an
+    // unstarted query does not start it either; mounting starts the fetch.
+    get.mount(sessionsAtom);
     get.subscribe(eventsAtom, (result) => {
       eventsVersion += 1;
       applyLatestEvent(result);

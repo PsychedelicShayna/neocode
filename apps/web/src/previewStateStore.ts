@@ -343,12 +343,20 @@ export function updatePreviewServerSnapshot(
 /**
  * Replace the local session index from an authoritative preview.list result.
  * Missing tabs are removed while the current active tab is preserved whenever
- * it still exists in the server result.
+ * it still exists in the server result. Returns false when the result was
+ * discarded as older than state already applied from events.
  */
-export function reconcilePreviewServerSessions(ref: WorkspaceRef, result: PreviewListResult): void {
+export function reconcilePreviewServerSessions(
+  ref: WorkspaceRef,
+  result: PreviewListResult,
+): boolean {
+  let applied = true;
   updateThreadPreviewState(ref, (current) => {
     const sameServer = current.serverEpoch === result.serverEpoch;
-    if (sameServer && result.revision < current.serverRevision) return current;
+    if (sameServer && result.revision < current.serverRevision) {
+      applied = false;
+      return current;
+    }
     const resourceId = workspaceResourceId(ref);
     const snapshots = result.sessions.filter((snapshot) => snapshot.threadId === resourceId);
     const sessions: Record<string, PreviewSessionSnapshot> = {};
@@ -392,6 +400,7 @@ export function reconcilePreviewServerSessions(ref: WorkspaceRef, result: Previe
       listed: true,
     };
   });
+  return applied;
 }
 
 function isPreviewStateEqual(

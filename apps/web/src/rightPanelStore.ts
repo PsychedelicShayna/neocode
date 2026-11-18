@@ -168,9 +168,9 @@ interface RightPanelStoreState {
   closeSurfacesToRight: (ref: WorkspaceRef, surfaceId: string) => void;
   closeAllSurfaces: (ref: WorkspaceRef) => void;
   /**
-   * Match browser surfaces to the workspace's preview sessions. A no-op until
-   * the session list is authoritative (`listed`), so tabs are never dropped
-   * against a list that has not loaded yet.
+   * Match browser surfaces to the workspace's preview sessions. Newly seen tabs
+   * are always added; tabs missing from the sessions are removed only once the
+   * session list is authoritative (`listed`), never against one still loading.
    */
   reconcileBrowserSurfaces: (
     ref: WorkspaceRef,
@@ -791,7 +791,6 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       reconcileBrowserSurfaces: (ref, preview) =>
         set((state) =>
           automaticUpdate(state, workspaceKey(ref), (current) => {
-            if (!preview.listed) return current;
             const tabIds = Object.keys(preview.sessions);
             // Keep every surviving tab where it is, so a dragged order outlives
             // preview updates. Newly seen browser tabs take the blank tab's slot
@@ -801,12 +800,14 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const added = tabIds
               .filter((tabId) => !knownIds.has(`browser:${tabId}`))
               .map((tabId) => browserSurface(tabId));
+            if (!preview.listed && added.length === 0) return current;
             const placeholderIndex = current.surfaces.findIndex(
               (surface) => surface.id === "browser:new",
             );
             const surfaces = current.surfaces.flatMap((surface, index) => {
               if (surface.kind !== "preview" || validIds.has(surface.id)) return [surface];
-              return index === placeholderIndex ? added : [];
+              if (index === placeholderIndex && added.length > 0) return added;
+              return preview.listed ? [] : [surface];
             });
             if (placeholderIndex < 0) surfaces.push(...added);
             const activeStillExists = surfaces.some(

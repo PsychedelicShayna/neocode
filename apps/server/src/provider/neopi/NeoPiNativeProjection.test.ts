@@ -31,6 +31,7 @@ const published = (capacity = { tombstones: 1000, journal: 512 }) => {
     leafId: null,
   });
   projection.applyStateReply({ sessionId }, projection.mark());
+  projection.applySubagentsReply({ subagents: [] }, projection.mark());
   projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
   return projection;
 };
@@ -215,6 +216,7 @@ describe("NeoPiNativeProjection", () => {
       message: assistant("final"),
     });
     projection.applyStateReply({ sessionId }, mark);
+    projection.applySubagentsReply({ subagents: [] }, mark);
     projection.applyJournalPage({ sessionId, entries: [] }, mark);
     assert.isTrue(projection.published);
     let served = servedMessage(projection, messageId);
@@ -416,5 +418,458 @@ describe("NeoPiNativeProjection", () => {
       projection.fold({ type: "journal_entry", sessionId, entry: entry("e4", "e2") }),
       "navigated",
     );
+  });
+
+  describe("B2 review", () => {
+    const tailIds = (projection: NeoPiNativeProjection) => {
+      const ids: string[] = [];
+      for (let position = projection.journal.start; position < projection.journal.end; position++)
+        ids.push(projection.journal.at(position)!.id);
+      return ids;
+    };
+
+    it("4 a delayed build page cannot roll the head back after the ring turned over", () => {
+      const projection = published({ tombstones: 10, journal: 2 });
+      const mark = projection.mark();
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e2", "e1") });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e3", "e2") });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e4", "e3") });
+      assert.deepEqual(tailIds(projection), ["e3", "e4"]);
+      assert.isTrue(
+        projection.applyJournalPage(
+          { sessionId, entries: [entry("e0", null), entry("e1", "e0")] },
+          mark,
+        ),
+      );
+      assert.deepEqual(tailIds(projection), ["e3", "e4"]);
+      assert.equal(projection.journal.head?.id, "e4");
+    });
+
+    it("5 a move to an evicted leaf, or to no leaf, is a navigation", () => {
+      const projection = published({ tombstones: 10, journal: 2 });
+      for (const [id, parent] of [
+        ["e1", null],
+        ["e2", "e1"],
+        ["e3", "e2"],
+      ] as const) {
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: id,
+        });
+        assert.equal(
+          projection.fold({ type: "journal_entry", sessionId, entry: entry(id, parent) }),
+          "none",
+        );
+      }
+      assert.equal(
+        projection.domain.branchGeneration,
+        0,
+        "appends announced by leaf never navigate",
+      );
+      const generation = projection.domain.branchGeneration;
+      assert.equal(
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: "e1",
+        }),
+        "none",
+      );
+      assert.equal(projection.fold({ type: "agent_start" }), "navigated");
+      assert.equal(projection.domain.branchGeneration, generation + 1);
+      assert.deepEqual(tailIds(projection), []);
+      assert.equal(projection.identity?.leafId, "e1");
+      // A caller with no further frame settles it directly.
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e5", "e1") });
+      projection.fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: "gone",
+      });
+      assert.equal(projection.settlePendingLeaf(), "navigated");
+      assert.equal(
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: null,
+        }),
+        "navigated",
+      );
+      assert.deepEqual(tailIds(projection), []);
+    });
+
+    it("6 an earlier build attempt's replies never publish a later attempt", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.beginBuildAttempt();
+      const first = projection.mark();
+      projection.beginBuildAttempt();
+      assert.isFalse(projection.applyStateReply({ sessionId }, first));
+      assert.isFalse(projection.applyJournalPage({ sessionId, entries: [] }, first));
+      assert.isFalse(projection.published);
+      const second = projection.mark();
+      projection.applyStateReply({ sessionId }, second);
+      projection.applySubagentsReply({ subagents: [] }, second);
+      assert.isFalse(projection.published);
+      projection.applyJournalPage({ sessionId, entries: [] }, second);
+      assert.isTrue(projection.published);
+    });
+  });
+
+  describe("decision 8 inbox bound", () => {
+    let clock = 0;
+    const bounded = (records: number, bytes: number) => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+        inboxLimits: { records, bytes },
+        now: () => ++clock,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.applyStateReply({ sessionId }, projection.mark());
+      projection.applySubagentsReply({ subagents: [] }, projection.mark());
+      projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
+      return projection;
+    };
+    const stream = (toolCallId: string, n: number) => ({
+      type: "tool_stream_update",
+      toolCallId,
+      toolName: "ext",
+      update: { n },
+    });
+    const gaps = (reply: ReturnType<typeof readNeoPiNativeObservation>) =>
+      reply.type === "pass" ? reply.inbox.filter((record) => record.type === "gap") : [];
+
+    it("holds under a tool that streams forever, and evicts nothing but inbox records", () => {
+      const projection = bounded(8, 2_000);
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("kept") });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e1", null) });
+      projection.fold({ type: "extension_ui_request", id: "ask-1", method: "ask", questions: [] });
+      for (let n = 0; n < 20_000; n++) {
+        projection.fold(stream("forever", n));
+        assert.isAtMost(projection.inbox.length, 8);
+        assert.isAtMost(projection.inboxBytes, 2_000);
+      }
+      assert.equal(projection.store.get("message:m")?.value?.class, "message");
+      assert.equal(projection.journal.head?.id, "e1");
+      assert.isTrue(projection.obligations.has("ask-1"));
+      assert.equal(projection.inbox.filter((record) => record.type === "gap").length, 1);
+    });
+
+    it("a reader behind the eviction receives one merged gap, once, with kinds, interval and time span", () => {
+      const projection = bounded(4, 100_000);
+      const reader = readNeoPiNativeObservation(projection, null, WIDE);
+      assert.equal(reader.type, "pass");
+      if (reader.type !== "pass") return;
+      const start = clock;
+      projection.fold({ type: "notice", level: "info", message: "retrying" });
+      projection.fold(stream("call-a", 1));
+      projection.fold(stream("call-a", 2));
+      projection.fold(stream("call-b", 1));
+      // Two evictions before the reader reads: adjacent, so one gap.
+      projection.fold(stream("call-c", 1));
+      projection.fold(stream("call-c", 2));
+      const behind = readNeoPiNativeObservation(projection, reader.continuation, WIDE);
+      assert.deepEqual(gaps(behind), [
+        {
+          type: "gap",
+          seq: 3,
+          reason: "evicted",
+          fromSeq: 1,
+          toSeq: 3,
+          firstReceivedAt: start + 1,
+          lastReceivedAt: start + 3,
+          notices: 1,
+          toolStreams: [{ toolCallId: "call-a", toolName: "ext", updates: 2 }],
+          toolStreamsTruncated: false,
+        },
+      ]);
+      assert.equal(behind.type === "pass" ? behind.inbox.length : 0, 4);
+      const again = readNeoPiNativeObservation(
+        projection,
+        behind.type === "pass" ? behind.continuation : null,
+        WIDE,
+      );
+      assert.deepEqual(gaps(again), [], "the gap is delivered once");
+    });
+
+    it("records dropped while unobserved reach the next viewer as one not-observed gap covering exactly them", () => {
+      const projection = bounded(64, 100_000);
+      projection.fold(stream("seen", 1));
+      const first = readNeoPiNativeObservation(projection, null, WIDE);
+      assert.equal(first.type, "pass");
+      if (first.type !== "pass") return;
+      // The last watcher detaches; B5 drives this hook.
+      projection.setInboxObserved(false);
+      projection.pruneInbox(first.continuation.inboxSeq);
+      projection.fold(stream("call-x", 1));
+      projection.fold({ type: "notice", level: "warning", message: "stopped auto-recovery" });
+      projection.setInboxObserved(true);
+      projection.fold(stream("after", 1));
+      const attached = readNeoPiNativeObservation(projection, null, WIDE);
+      assert.equal(attached.type, "pass");
+      if (attached.type !== "pass") return;
+      assert.deepEqual(
+        attached.inbox.map((record) =>
+          record.type === "gap"
+            ? [
+                record.reason,
+                record.fromSeq,
+                record.toSeq,
+                record.notices,
+                record.toolStreams.map((s) => s.toolCallId),
+              ]
+            : [record.type, record.seq],
+        ),
+        [
+          ["not-observed", 2, 3, 1, ["call-x"]],
+          ["tool_stream_update", 4],
+        ],
+      );
+    });
+  });
+
+  describe("parity with today's feed", () => {
+    const value = (projection: NeoPiNativeProjection, key: string) => {
+      const held = projection.store.get(key)?.value;
+      return held && "value" in held ? held.value : undefined;
+    };
+
+    it("the first build publishes only with the roster, complete from inventory and history", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      const mark = projection.mark();
+      // A child that starts during the build is newer than the inventory read.
+      projection.fold({
+        type: "subagent_lifecycle",
+        payload: {
+          id: "late",
+          runToken: "r9",
+          status: "started",
+          agent: "task",
+          agentSource: "bundled",
+          index: 3,
+        },
+      });
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applyJournalPage({ sessionId, entries: [] }, mark);
+      assert.isFalse(projection.published, "no Agents view without the inventory");
+      projection.applySubagentHistoryReply(
+        {
+          subagents: [
+            { id: "done", status: "parked" },
+            { id: "running", status: "running" },
+          ],
+        },
+        mark,
+      );
+      projection.applySubagentsReply(
+        {
+          subagents: [
+            { id: "running", status: "running", index: 1 },
+            { id: "late", status: "running" },
+          ],
+        },
+        mark,
+      );
+      assert.isTrue(projection.published);
+      assert.deepEqual(value(projection, "roster:done"), {
+        id: "done",
+        ticks: 0,
+        history: { id: "done", status: "parked" },
+        // Not in the live inventory: finished, not interrupted.
+        inventory: null,
+      });
+      assert.deepEqual(value(projection, "roster:running"), {
+        id: "running",
+        ticks: 0,
+        history: { id: "running", status: "running" },
+        inventory: { id: "running", status: "running", index: 1 },
+      });
+      const late = value(projection, "roster:late");
+      assert.equal(late?.runToken, "r9");
+      assert.isUndefined(
+        late?.inventory,
+        "the older inventory row does not overwrite the newer frame",
+      );
+      projection.fold({
+        type: "subagent_event",
+        payload: { id: "running", event: { type: "message_end" } },
+      });
+      projection.fold({
+        type: "subagent_event",
+        payload: { id: "running", event: { type: "message_update" } },
+      });
+      assert.equal(value(projection, "roster:running")?.ticks, 1);
+    });
+
+    it("folds jobs from frames and the inventory, keeping the newer of the two", () => {
+      const projection = published();
+      const mark = projection.mark();
+      projection.fold({
+        type: "job_lifecycle",
+        event: "registered",
+        job: { id: "j1", status: "running" },
+        runningCount: 1,
+      });
+      projection.fold({
+        type: "job_lifecycle",
+        event: "updated",
+        job: { id: "j1", status: "completed" },
+        runningCount: 0,
+      });
+      projection.fold({
+        type: "job_lifecycle",
+        event: "updated",
+        job: { id: "j1", status: "running" },
+        runningCount: 1,
+      });
+      assert.deepEqual(value(projection, "job:j1"), { job: { id: "j1", status: "completed" } });
+      projection.applyJobsReply(
+        {
+          running: [
+            { id: "j1", status: "running" },
+            { id: "j2", status: "running" },
+          ],
+          recent: [],
+          runningCount: 2,
+        },
+        mark,
+      );
+      assert.deepEqual(value(projection, "job:j1"), { job: { id: "j1", status: "completed" } });
+      assert.deepEqual(value(projection, "job:j2"), { job: { id: "j2", status: "running" } });
+      assert.deepEqual(value(projection, "presentation:jobs"), { runningCount: 1 });
+      projection.applyJobsReply({ running: [], recent: [], runningCount: 0 }, projection.mark());
+      assert.isNull(projection.store.get("job:j2")?.value, "aged out of both lists");
+    });
+
+    it("keeps the whole get_state record, and live frames in its field shapes", () => {
+      const projection = published();
+      projection.applyStateReply(
+        {
+          sessionId,
+          contextUsage: { percent: 12 },
+          sessionUsage: { cost: 1.5 },
+          sessionName: "fix it",
+          fastModeEnabled: true,
+          isCompacting: false,
+          systemPrompt: ["very long"],
+          dumpTools: [],
+        },
+        projection.mark(),
+      );
+      assert.deepEqual(value(projection, "setting:state"), {
+        property: "state",
+        value: {
+          sessionId,
+          contextUsage: { percent: 12 },
+          sessionUsage: { cost: 1.5 },
+          sessionName: "fix it",
+          fastModeEnabled: true,
+          isCompacting: false,
+        },
+      });
+      projection.fold({
+        type: "thinking_level_changed",
+        thinkingLevel: "high",
+        configured: "auto",
+      });
+      projection.fold({ type: "queue_update", steering: ["a"], followUp: [], liveSteered: 0 });
+      assert.deepEqual(value(projection, "setting:thinkingLevel"), {
+        property: "thinkingLevel",
+        value: "high",
+      });
+      assert.deepEqual(value(projection, "setting:queue"), {
+        property: "queue",
+        value: { steering: ["a"], followUp: [], liveSteered: 0 },
+      });
+    });
+
+    it("folds command output, dictation, editor text, notify and prompt results as the feed shows them", () => {
+      const projection = published();
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("e1", null) });
+      projection.fold({ type: "message_start", messageId: "m1", message: assistant("x") });
+      projection.fold({ type: "command_output", text: "first" });
+      projection.fold({ type: "command_output", text: "" });
+      projection.fold({ type: "command_output", text: "second" });
+      assert.deepEqual(value(projection, "receipt:command:0"), {
+        kind: "command_output",
+        text: "first",
+        afterEntryId: "e1",
+        afterMessageId: "m1",
+      });
+      assert.equal(value(projection, "receipt:command:1")?.text, "second");
+      projection.fold({ type: "dictation_state", captureId: "c1", state: "recording" });
+      projection.fold({ type: "dictation_transcript", captureId: "c1", text: "hello" });
+      projection.fold({ type: "dictation_transcript", captureId: "old", text: "straggler" });
+      projection.fold({ type: "dictation_end", captureId: "c1", text: "hello world" });
+      projection.fold({ type: "dictation_transcript", captureId: "c1", text: "late" });
+      assert.deepEqual(value(projection, "presentation:dictation"), {
+        captureId: "c1",
+        phase: "ended",
+        text: "hello world",
+        error: null,
+      });
+      projection.fold({
+        type: "extension_ui_request",
+        id: "u1",
+        method: "set_editor_text",
+        text: "draft",
+      });
+      projection.fold({
+        type: "extension_ui_request",
+        id: "u2",
+        method: "notify",
+        message: "saved",
+      });
+      assert.deepEqual(value(projection, "presentation:editorText"), { id: "u1", text: "draft" });
+      assert.equal(value(projection, "presentation:notify")?.message, "saved");
+      projection.fold({ type: "prompt_result", status: "error", error: { message: "no model" } });
+      assert.deepEqual(value(projection, "presentation:promptResult"), {
+        status: "error",
+        error: "no model",
+      });
+      projection.fold({ type: "prompt_result", status: "ok" });
+      assert.deepEqual(value(projection, "presentation:promptResult"), {
+        status: "ok",
+        error: null,
+      });
+    });
   });
 });

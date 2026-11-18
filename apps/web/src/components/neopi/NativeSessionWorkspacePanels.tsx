@@ -20,6 +20,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import type { ComposerImageAttachment } from "~/composerDraftStore";
 import { requestConfirmDialog } from "~/confirmDialog";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
@@ -67,6 +68,7 @@ import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
 import { closeNativeTerminal } from "./closeNativeTerminal";
 import { ExLine } from "./ExLine";
+import { ExLineAnchorContext } from "./ExLineAnchor";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
 import { useNativePendingFiles } from "./useNativePendingFiles";
 import { useNativeWorkspaceKeys } from "./useNativeWorkspaceKeys";
@@ -202,6 +204,7 @@ export function NativeSessionWorkspacePanels({
   const panelControllers = useRef(new Map<string, NativeSessionTerminalHandle>());
   const [exLineOpen, setExLineOpen] = useState(false);
   const exLineInputRef = useRef<HTMLInputElement>(null);
+  const [statusBarRow, setStatusBarRow] = useState<HTMLDivElement | null>(null);
   const sheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   const activeSurface =
     panel.surfaces.find((surface) => surface.id === panel.activeSurfaceId) ??
@@ -736,7 +739,7 @@ export function NativeSessionWorkspacePanels({
           data-workspace-file-drag-active={dragActive || undefined}
         >
           <div className="flex min-h-0 flex-1 flex-col" inert={agentViewActive}>
-            {children}
+            <ExLineAnchorContext value={setStatusBarRow}>{children}</ExLineAnchorContext>
           </div>
           <NativeAgentOverlay target={target} viewKey={key} cwd={cwd} />
           {miniPlayer ? (
@@ -768,14 +771,23 @@ export function NativeSessionWorkspacePanels({
         ) : (
           tabs
         )}
-        {/* Laid over the foot of the workspace, which stays on screen with the panel maximised or the Agent Hub open. */}
-        {exLineOpen ? (
-          <ExLine
-            inputRef={exLineInputRef}
-            activePanelSurfaceIsTerminal={panel.isOpen && activeSurface?.kind === "terminal"}
-            onClose={() => setExLineOpen(false)}
-          />
-        ) : null}
+        {exLineOpen
+          ? (() => {
+              const line = (
+                <ExLine
+                  inputRef={exLineInputRef}
+                  activePanelSurfaceIsTerminal={panel.isOpen && activeSurface?.kind === "terminal"}
+                  onClose={() => setExLineOpen(false)}
+                />
+              );
+              // Over the status bar's row, wherever the drawer puts it. A maximised
+              // panel hides that row and the Agent Hub makes it inert; then the line
+              // is laid over the foot of the workspace, which stays on screen.
+              const statusBarShown =
+                statusBarRow !== null && !agentViewActive && !(maximized && panel.isOpen && !sheet);
+              return statusBarShown ? createPortal(line, statusBarRow) : line;
+            })()
+          : null}
       </div>
     </div>
   );

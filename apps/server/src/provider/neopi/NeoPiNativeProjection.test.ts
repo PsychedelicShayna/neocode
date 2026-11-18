@@ -1170,6 +1170,23 @@ describe("NeoPiNativeProjection", () => {
       );
     });
 
+    it("a live terminal lifecycle clears the unobserved mark and takes the live outcome", () => {
+      const projection = published();
+      projection.store.put("roster:c", {
+        class: "roster",
+        value: { id: "c", runToken: "r", ticks: 0, unobserved: { since: 1 } },
+      });
+      projection.fold({
+        type: "subagent_lifecycle",
+        payload: { id: "c", runToken: "r", status: "failed" },
+      });
+      const value = projection.store.get("roster:c")?.value;
+      assert.deepEqual(
+        value?.class === "roster" ? [value.value.unobserved, value.value.lifecycle] : [],
+        [undefined, { id: "c", runToken: "r", status: "failed" }],
+      );
+    });
+
     it("a child marked unobserved stays until inventory or history lists it", () => {
       const projection = published();
       projection.store.put("roster:c", {

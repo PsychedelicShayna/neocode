@@ -231,25 +231,27 @@ even when its shell is quiet. Reconnect the environment before trying again.
 
 ## Command line
 
-In a native session, `ctrl+;` (`exLine.open`) opens a one-line command line in
-place of the status bar, like Vim's `:`. From a focused terminal, leave it first
+In a native session, `ctrl+;` (`exLine.open`) opens a one-line command line along
+the bottom edge of the workspace, like Vim's `:`. It works with the right panel
+maximized or the Agent Hub open. From a focused terminal, leave it first
 with `ctrl+\ ctrl+\`, then press `ctrl+;`. Type a command and press Enter to run
 it; Escape closes the line and returns the keyboard to where it was. If a command
 is unknown or cannot run right now, the line says why and stays open. Up and Down
 recall earlier commands until the app restarts.
 
-| Command   | Does                                                                                     |
-| --------- | ---------------------------------------------------------------------------------------- |
-| `:split`  | Split the terminal (`terminal.split`)                                                    |
-| `:vsplit` | Split the terminal vertically (`terminal.splitVertical`)                                 |
-| `:new`    | Open a new terminal (`terminal.new`)                                                     |
-| `:q`      | Close the terminal you used last, or the active right-panel tab when no terminal is open |
-| `:ene`    | Start a new thread (`chat.new`)                                                          |
-| `:b name` | Switch to an open session tab whose title or agent name contains `name`                  |
+| Command   | Does                                                                                            |
+| --------- | ----------------------------------------------------------------------------------------------- |
+| `:split`  | Split the terminal (`terminal.split`)                                                           |
+| `:vsplit` | Split the terminal vertically (`terminal.splitVertical`)                                        |
+| `:new`    | Open a new terminal (`terminal.new`)                                                            |
+| `:q`      | Close the terminal you focused last, or else the active right-panel tab if it is not a terminal |
+| `:ene`    | Start a new thread (`chat.new`)                                                                 |
+| `:b name` | Switch to an open session tab whose title or agent name contains `name`                         |
 
 After `:b` and a space, the matching sessions appear above the line. Tab,
 Shift+Tab and the arrow keys move the pick; nothing changes until you press Enter.
-Terminal commands act on the terminal you focused last.
+Terminal commands act on the terminal you focused last, and closing one asks for
+confirmation as its close button does.
 
 Any command ID from **Settings → Keybindings** that the open session handles also
 works by name, for example `:rightPanel.toggle` or `:agents.hub.toggle`. Commands

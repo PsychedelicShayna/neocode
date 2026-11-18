@@ -359,7 +359,7 @@ describe("server reader and client reducer, paired", () => {
     append("A");
     const losses: readonly NativeSessionUpdate[] = [
       { type: "disconnected" },
-      { type: "closed", code: "detached", reason: "bye" },
+      { type: "lifecycle", state: "detached", reason: "bye" },
     ];
     for (const loss of losses) {
       const viewer = new Viewer(loss.type);
@@ -423,10 +423,11 @@ describe("server reader and client reducer, paired", () => {
     const covers = (viewer: Viewer, through: number, reasons: Record<number, string>) => {
       const seen = new Map<number, string>();
       for (const record of viewer.feed.observation.inbox)
-        if (record.type === "gap")
+        if (record.type === "gap" || record.type === "trimmed")
           for (let seq = record.fromSeq; seq <= record.toSeq; seq++) {
-            if (!seen.has(seq)) seen.set(seq, record.reason);
+            if (!seen.has(seq)) seen.set(seq, record.type === "gap" ? record.reason : "trimmed");
           }
+        else if (record.type === "older-details-trimmed") continue;
         else {
           assert.notEqual(
             seen.get(record.seq),

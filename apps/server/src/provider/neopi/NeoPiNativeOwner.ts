@@ -167,8 +167,9 @@ export const makeNeoPiThreadNativeRef = Effect.fn("NeoPiNativeOwner.nativeRef")(
         },
         sessionId: binding.expected.sessionId,
         runtime: binding.source.nativeOwner
-          ? ((yield* Effect.scoped(binding.source.nativeOwner(threadId)))?.ownership ?? "none")
-          : "none",
+          ? ((yield* Effect.scoped(binding.source.nativeOwner(threadId)))?.ownership ??
+            ("none" as const))
+          : ("none" as const),
       };
     }).pipe(
       Effect.catch((cause) =>
@@ -202,7 +203,9 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
       const project = yield* snapshots.getProjectShellById(thread.value.projectId);
       if (Option.isNone(project)) return undefined;
       const cwd = thread.value.worktreePath ?? project.value.workspaceRoot;
-      const catalog = yield* readNeoPiNativeOwnerCatalog(source, cwd, expected.sessionFile);
+      const catalog = yield* readNeoPiNativeOwnerCatalog(source, cwd, expected.sessionFile).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      );
       let instanceId: string | undefined;
       for (const row of catalog.sessions) {
         if (

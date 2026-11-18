@@ -1,8 +1,8 @@
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { CheckIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { queryInstalledFontFamilies } from "../../appearanceFonts";
-import { filterInstalledMonospaceFonts } from "../../installedMonospaceFonts";
+import { scanInstalledMonospaceFonts } from "../../installedMonospaceFonts";
 import {
   Combobox,
   ComboboxEmpty,
@@ -141,34 +141,42 @@ export function FontFamilyPicker({
     if (nextOpen) setQuery("");
   };
 
-  const [monospaceResult, setMonospaceResult] = useState<{
+  const [monospaceScan, setMonospaceScan] = useState<{
     source: readonly string[];
     families: readonly string[];
+    done: boolean;
   } | null>(null);
+  const readSavedFamily = useEffectEvent(() => selectedFamily);
   useEffect(() => {
     // A closed picker must not measure every installed face during the
     // Appearance mount. Stop scanning when it closes or the page unmounts.
+    // Every open rescans: known families come back sorted from the cache, so
+    // only the first scan ever shows appended runs.
     if (!open || !requireMonospace || enumeration.status !== "granted") return;
     const source = enumeration.families;
-    if (monospaceResult?.source === source) return;
     const controller = new AbortController();
-    void filterInstalledMonospaceFonts(source, controller.signal).then((families) => {
-      if (!controller.signal.aborted) setMonospaceResult({ source, families });
+    void scanInstalledMonospaceFonts(source, controller.signal, {
+      saved: readSavedFamily(),
+      onProgress: (families) => {
+        if (!controller.signal.aborted) setMonospaceScan({ source, families, done: false });
+      },
+    }).then((families) => {
+      if (!controller.signal.aborted) setMonospaceScan({ source, families, done: true });
     });
     return () => controller.abort();
-  }, [open, requireMonospace, enumeration, monospaceResult]);
+  }, [open, requireMonospace, enumeration]);
 
+  const currentScan =
+    enumeration.status === "granted" && monospaceScan?.source === enumeration.families
+      ? monospaceScan
+      : null;
   const loadingMonospace =
-    requireMonospace &&
-    enumeration.status === "granted" &&
-    monospaceResult?.source !== enumeration.families;
+    requireMonospace && enumeration.status === "granted" && currentScan?.done !== true;
   const families =
     enumeration.status !== "granted"
       ? EMPTY_FONT_FAMILIES
       : requireMonospace
-        ? monospaceResult?.source === enumeration.families
-          ? monospaceResult.families
-          : EMPTY_FONT_FAMILIES
+        ? (currentScan?.families ?? EMPTY_FONT_FAMILIES)
         : enumeration.families;
 
   const items = useMemo(() => {

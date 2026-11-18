@@ -30,7 +30,6 @@ import {
   type PreviewAnnotationPayload,
   ProviderInstanceId,
   type ServerProvider,
-  type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
   type ThreadId,
   type ThreadLinkedPullRequest,
@@ -797,7 +796,6 @@ interface PersistentThreadTerminalDrawerProps {
   splitVerticalShortcutLabel: string | undefined;
   newShortcutLabel: string | undefined;
   closeShortcutLabel: string | undefined;
-  keybindings: ResolvedKeybindingsConfig;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
 }
 
@@ -811,7 +809,6 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   splitVerticalShortcutLabel,
   newShortcutLabel,
   closeShortcutLabel,
-  keybindings,
   onAddTerminalContext,
 }: PersistentThreadTerminalDrawerProps) {
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
@@ -1155,7 +1152,6 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
           splitVerticalShortcutLabel={visible ? splitVerticalShortcutLabel : undefined}
           newShortcutLabel={visible ? newShortcutLabel : undefined}
           closeShortcutLabel={visible ? closeShortcutLabel : undefined}
-          keybindings={keybindings}
           onActiveTerminalChange={activateTerminal}
           onCloseTerminal={closeTerminal}
           onHeightChange={setTerminalHeight}
@@ -1174,7 +1170,6 @@ interface PersistentThreadTerminalPanelProps {
   surface: Extract<RightPanelSurface, { kind: "terminal" }>;
   launchContext: PersistentTerminalLaunchContext | null;
   focusRequestId: number;
-  keybindings: ResolvedKeybindingsConfig;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   onSplitTerminal: () => void;
   onSplitTerminalVertical: () => void;
@@ -1193,7 +1188,6 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
   surface,
   launchContext,
   focusRequestId,
-  keybindings,
   onAddTerminalContext,
   onSplitTerminal,
   onSplitTerminalVertical,
@@ -1334,7 +1328,6 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       onAddTerminalContext={onAddTerminalContext}
       terminalLabelsById={terminalLabelsById}
       terminalLaunchLocationsById={terminalLaunchLocationsById}
-      keybindings={keybindings}
     />
   );
 });
@@ -9265,7 +9258,6 @@ export default function ChatView(props: ChatViewProps) {
         surface={renderedRightPanelSurface}
         launchContext={activeTerminalLaunchContext ?? null}
         focusRequestId={terminalFocusRequestId}
-        keybindings={keybindings}
         onAddTerminalContext={addTerminalContextToDraft}
         onSplitTerminal={splitPanelTerminal}
         onSplitTerminalVertical={splitPanelTerminalVertical}
@@ -9942,7 +9934,6 @@ export default function ChatView(props: ChatViewProps) {
             splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
             newShortcutLabel={newTerminalShortcutLabel ?? undefined}
             closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
-            keybindings={keybindings}
             onAddTerminalContext={addTerminalContextToDraft}
           />
         ))}

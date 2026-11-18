@@ -1,4 +1,5 @@
 import { isMacPlatform } from "../../lib/utils";
+import { TERMINAL_INPUT_CLASS_NAME } from "../../lib/terminalFocus";
 import { SELECTION_MULTI_CLICK_INTERVAL_MS } from "../../lib/selectionActions";
 import { collectWrappedTerminalLinkLine, extractTerminalLinks } from "../../terminal-links";
 import {
@@ -554,7 +555,14 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly font?: GhosttyTerminalFont;
   /** Read after font and WASM loading. Hosts can supply a getter for the latest value. */
   readonly visible?: boolean;
+  /** Input from the user: keys, IME commits, AltGr text, pastes, mouse and wheel. */
   readonly onData: (data: string) => void;
+  /**
+   * The terminal's own replies to the program's queries (cursor position,
+   * device attributes and the like). Defaults to `onData`; a host that treats
+   * user input specially passes this to keep replies out of that path.
+   */
+  readonly onReply?: (data: string) => void;
   readonly onResize: (cols: number, rows: number) => void;
   readonly onSelectionChange: () => void;
   readonly beforeKey: (event: KeyboardEvent) => boolean;
@@ -694,7 +702,7 @@ export class GhosttyTerminalSurface {
     canvas.setAttribute("aria-hidden", "true");
 
     const input = document.createElement("textarea");
-    input.className = "t3-ghostty-input";
+    input.className = TERMINAL_INPUT_CLASS_NAME;
     input.setAttribute("aria-label", "Terminal input");
     input.autocapitalize = "off";
     input.autocomplete = "off";
@@ -740,7 +748,7 @@ export class GhosttyTerminalSurface {
       metrics.width,
       metrics.height,
       options.theme,
-      options.onData,
+      options.onReply ?? options.onData,
     );
     const surface = new GhosttyTerminalSurface(
       mount,

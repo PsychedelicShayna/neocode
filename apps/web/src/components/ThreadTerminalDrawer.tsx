@@ -23,11 +23,7 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-react";
-import {
-  type ContextMenuItem,
-  type ProviderInstanceId,
-  type ResolvedKeybindingsConfig,
-} from "@t3tools/contracts";
+import { type ContextMenuItem, type ProviderInstanceId } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import * as Schema from "effect/Schema";
 import {
@@ -62,15 +58,11 @@ import { type GhosttyColor, type GhosttyTheme } from "~/terminal/ghostty/core";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import { isTerminalUrl, resolvePathLinkTarget } from "../terminal-links";
 import {
-  isDiffToggleShortcut,
   isTerminalClearShortcut,
-  isTerminalNewShortcut,
-  isTerminalSplitShortcut,
-  isTerminalSplitVerticalShortcut,
-  isTerminalToggleShortcut,
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
 } from "../keybindings";
+import { createTerminalFocusEscape } from "~/terminal/terminalFocusEscape";
 import {
   DEFAULT_THREAD_TERMINAL_HEIGHT,
   MAX_TERMINALS_PER_GROUP,
@@ -86,7 +78,6 @@ import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { useAtomCommand } from "../state/use-atom-command";
-import { preventTerminalCloseShortcut } from "../lib/terminalCloseShortcut";
 import {
   resolveTerminalFontPreference,
   resolveTerminalFontSizePreference,
@@ -349,7 +340,6 @@ interface TerminalViewportProps {
   visible: boolean;
   resizeEpoch: number;
   drawerHeight: number;
-  keybindings: ResolvedKeybindingsConfig;
 }
 
 interface TerminalLaunchLocation {
@@ -374,7 +364,6 @@ export function TerminalViewport({
   visible,
   resizeEpoch,
   drawerHeight,
-  keybindings,
 }: TerminalViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<GhosttyTerminalSurface | null>(null);
@@ -404,7 +393,6 @@ export function TerminalViewport({
   // popup that was superseded (but whose menu promise has not settled yet)
   // cannot be mistaken for the active flow.
   const openSelectionMenuRequestIdRef = useRef<number | null>(null);
-  const keybindingsRef = useRef(keybindings);
   const runtimeEnvKey = useMemo(() => runtimeEnvSignature(runtimeEnv), [runtimeEnv]);
   const handleSessionExited = useEffectEvent(() => {
     onSessionExited();
@@ -489,10 +477,6 @@ export function TerminalViewport({
     version: terminalVersion,
   };
 
-  useEffect(() => {
-    keybindingsRef.current = keybindings;
-  }, [keybindings]);
-
   useLayoutEffect(() => {
     visibleRef.current = visible;
     terminalRef.current?.setVisible(visible);
@@ -517,6 +501,19 @@ export function TerminalViewport({
     let selectionActions: ReturnType<typeof observeSelectionActions> | null = null;
 
     const setup = async (): Promise<(() => void) | null> => {
+      // Every byte of user input leaves through focusEscape.send.
+      const focusEscape = createTerminalFocusEscape({
+        write: (data) => handleData(data),
+        // Blur rather than focus the terminal's owner: focus anywhere inside
+        // the owner still counts as terminal focus for keybinding `when`
+        // clauses, which would keep GUI shortcuts from resolving.
+        leave: () => {
+          const activeElement = document.activeElement;
+          if (activeElement instanceof HTMLElement && mount.contains(activeElement)) {
+            activeElement.blur();
+          }
+        },
+      });
       const setupFont = terminalFontRef.current;
       const terminalOptions: GhosttyTerminalSurfaceOptions = {
         theme: terminalThemeFromApp(mount),
@@ -524,10 +521,13 @@ export function TerminalViewport({
         get visible() {
           return visibleRef.current;
         },
-        onData: (data) => handleData(data),
+        onData: (data) => focusEscape.send(data),
+        // Query replies are not the user's input: they must not release a held
+        // Ctrl+Backslash, so they skip the escape.
+        onReply: (data) => handleData(data),
         onResize: (cols, rows) => void resizeTerminal(cols, rows),
         onSelectionChange: () => handleSelectionChange(),
-        beforeKey: (event) => handleBeforeKey(event),
+        beforeKey: (event) => focusEscape.beforeKey(event) && handleBeforeKey(event),
         onLinkActivate: (text, event) => handleLinkActivate(text, event),
         // The surface listens from construction, so a right-click can land
         // while `create` is still awaiting WASM — before the handler below it
@@ -547,6 +547,10 @@ export function TerminalViewport({
       terminal.setTheme(terminalThemeFromApp(mount));
       setupTerminal = terminal;
       terminalRef.current = terminal;
+      // A held Ctrl+Backslash belongs to the focus that pressed it; leaving the
+      // terminal any other way drops it without sending anything.
+      mount.addEventListener("focusout", focusEscape.reset);
+      setupCleanups.push(() => mount.removeEventListener("focusout", focusEscape.reset));
       // Client settings hydrate asynchronously; a font preference that landed
       // while the surface was loading found terminalRef null, so its setFont
       // was dropped. Re-apply whatever is current once the terminal exists.
@@ -771,21 +775,6 @@ export function TerminalViewport({
       };
 
       function handleBeforeKey(event: KeyboardEvent): boolean {
-        const currentKeybindings = keybindingsRef.current;
-        const options = { context: { terminalFocus: true, terminalOpen: true } };
-        if (preventTerminalCloseShortcut(event, currentKeybindings)) {
-          return false;
-        }
-        if (
-          isTerminalToggleShortcut(event, currentKeybindings, options) ||
-          isTerminalSplitShortcut(event, currentKeybindings, options) ||
-          isTerminalSplitVerticalShortcut(event, currentKeybindings, options) ||
-          isTerminalNewShortcut(event, currentKeybindings, options) ||
-          isDiffToggleShortcut(event, currentKeybindings, options)
-        ) {
-          return false;
-        }
-
         const navigationData = terminalNavigationShortcutData(event);
         if (navigationData !== null) {
           event.preventDefault();
@@ -1032,7 +1021,6 @@ interface ThreadTerminalDrawerProps {
   onCloseTerminal: (terminalId: string) => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext?: (selection: TerminalContextSelection) => void;
-  keybindings: ResolvedKeybindingsConfig;
   /** Prefer server-provided tab titles when present (e.g. active subprocess name). */
   terminalLabelsById?: ReadonlyMap<string, string>;
   /** Prefer per-session launch locations when the server already knows a terminal. */
@@ -1092,7 +1080,6 @@ export default function ThreadTerminalDrawer({
   onCloseTerminal,
   onHeightChange,
   onAddTerminalContext,
-  keybindings,
   terminalLabelsById,
   terminalLaunchLocationsById,
 }: ThreadTerminalDrawerProps) {
@@ -1569,7 +1556,6 @@ export default function ThreadTerminalDrawer({
                           visible={visible}
                           resizeEpoch={resizeEpoch}
                           drawerHeight={drawerHeight}
-                          keybindings={keybindings}
                         />
                       </div>
                     </div>
@@ -1598,7 +1584,6 @@ export default function ThreadTerminalDrawer({
                   visible={visible}
                   resizeEpoch={resizeEpoch}
                   drawerHeight={drawerHeight}
-                  keybindings={keybindings}
                 />
               </div>
             )}

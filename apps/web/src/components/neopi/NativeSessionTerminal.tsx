@@ -1,6 +1,5 @@
 import { workspaceKey, workspaceResourceId } from "@t3tools/client-runtime/environment";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
-import type { ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
 import {
   useCallback,
@@ -36,7 +35,6 @@ export interface NativeSessionTerminalProps {
   readonly cwd: string;
   readonly visible?: boolean;
   readonly mode?: "drawer" | "panel";
-  readonly keybindings: ResolvedKeybindingsConfig;
   readonly focusRequestId?: number;
   readonly onAddTerminalContext?: (selection: TerminalContextSelection) => void;
   readonly splitShortcutLabel?: string | undefined;
@@ -57,7 +55,6 @@ function NativeSessionTerminalBody({
   cwd,
   visible = true,
   mode = "drawer",
-  keybindings,
   focusRequestId = 0,
   onAddTerminalContext,
   surface,
@@ -239,7 +236,6 @@ function NativeSessionTerminalBody({
         {...(onAddTerminalContext ? { onAddTerminalContext } : {})}
         terminalLabelsById={labels}
         terminalLaunchLocationsById={locations}
-        keybindings={keybindings}
         {...shortcutLabels}
       />
     </div>

@@ -591,7 +591,6 @@ export function NativeSessionWorkspacePanels({
                 mode="panel"
                 surface={surface}
                 visible={active(surface)}
-                keybindings={keybindings}
                 onAddTerminalContext={onAddTerminalContext}
                 {...(activeSurface?.id === surface.id ? { controllerRef: panelRef } : {})}
               />
@@ -710,7 +709,6 @@ export function NativeSessionWorkspacePanels({
             <NativeSessionTerminal
               target={target}
               cwd={cwd}
-              keybindings={keybindings}
               visible={terminalUi.terminalOpen}
               onAddTerminalContext={onAddTerminalContext}
               controllerRef={drawerRef}

@@ -31,6 +31,7 @@ import {
   GhosttyTerminalSurface,
   type GhosttyTerminalSurfaceOptions,
 } from "./surface";
+import { createTerminalFocusEscape } from "../terminalFocusEscape";
 
 vi.mock("./vendor/ghostty-vt.wasm?url", async () => ({
   default: (await import("./vendor/ghostty-vt.wasm?inline")).default,
@@ -96,6 +97,7 @@ describe("GhosttyTerminalSurface visibility", () => {
     }
 
     const canvas = new TerminalTestElement();
+    const input = new TerminalTestElement();
     const mount = new TerminalTestElement();
     const context = {
       canvas,
@@ -116,7 +118,8 @@ describe("GhosttyTerminalSurface visibility", () => {
       }),
     };
     vi.stubGlobal("document", {
-      createElement: (tag: string) => (tag === "canvas" ? canvas : new TerminalTestElement()),
+      createElement: (tag: string) =>
+        tag === "canvas" ? canvas : tag === "textarea" ? input : new TerminalTestElement(),
       fonts: Object.assign(new EventTarget(), { load: async () => [], add() {} }),
     });
     vi.stubGlobal(
@@ -149,6 +152,7 @@ describe("GhosttyTerminalSurface visibility", () => {
 
     return {
       mount,
+      input,
       frames,
       paint,
       requestFrame,
@@ -245,6 +249,105 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(harness.renderedSnapshot.rowData[0]?.text).toContain("hidden");
     expect(harness.paint.mock.calls).toContainEqual(["fillRect", [84, 4, 8, 16]]);
     expect(harness.frames.size).toBe(0);
+  });
+
+  it("sends a held Ctrl+Backslash ahead of IME, AltGr and pasted text", async () => {
+    const harness = createHarness();
+    const program: string[] = [];
+    let left = 0;
+    const escape = createTerminalFocusEscape({
+      write: (data) => program.push(data),
+      leave: () => {
+        left += 1;
+      },
+    });
+    await harness.create({ onData: escape.send, beforeKey: escape.beforeKey });
+    const dispatch = (type: string, fields: Record<string, unknown> = {}) =>
+      harness.input.dispatchEvent(Object.assign(new Event(type, { cancelable: true }), fields));
+    const ctrlBackslash = (fields: Record<string, unknown> = {}) =>
+      dispatch("keydown", {
+        key: "\\",
+        code: "Backslash",
+        keyCode: 220,
+        ctrlKey: true,
+        altKey: false,
+        metaKey: false,
+        shiftKey: false,
+        repeat: false,
+        isComposing: false,
+        getModifierState: () => false,
+        ...fields,
+      });
+
+    ctrlBackslash();
+    dispatch("compositionstart");
+    dispatch("compositionend", { data: "日本" });
+    ctrlBackslash();
+    dispatch("keydown", {
+      key: "@",
+      code: "KeyQ",
+      keyCode: 81,
+      ctrlKey: true,
+      altKey: true,
+      metaKey: false,
+      shiftKey: false,
+      repeat: false,
+      isComposing: false,
+      getModifierState: (modifier: string) => modifier === "AltGraph",
+    });
+    dispatch("input", { data: "@", inputType: "insertText", isComposing: false });
+    ctrlBackslash();
+    dispatch("paste", { clipboardData: { getData: () => "ls" } });
+    expect(program).toEqual(["\x1c日本", "\x1c@", "\x1cls"]);
+    expect(left).toBe(0);
+
+    // A repeat with nothing held is an ordinary key, so one fresh press after
+    // it only starts the escape.
+    ctrlBackslash({ repeat: true });
+    ctrlBackslash();
+    expect(program.slice(3)).toEqual(["\x1c"]);
+    expect(left).toBe(0);
+    ctrlBackslash();
+    expect(left).toBe(1);
+  });
+
+  it("keeps a held Ctrl+Backslash held when the terminal replies to a query", async () => {
+    const harness = createHarness();
+    const program: string[] = [];
+    let left = 0;
+    const escape = createTerminalFocusEscape({
+      write: (data) => program.push(data),
+      leave: () => {
+        left += 1;
+      },
+    });
+    const surface = await harness.create({
+      onData: escape.send,
+      onReply: (data) => program.push(data),
+      beforeKey: escape.beforeKey,
+    });
+    const ctrlBackslash = () =>
+      harness.input.dispatchEvent(
+        Object.assign(new Event("keydown", { cancelable: true }), {
+          key: "\\",
+          code: "Backslash",
+          keyCode: 220,
+          ctrlKey: true,
+          altKey: false,
+          metaKey: false,
+          shiftKey: false,
+          repeat: false,
+          isComposing: false,
+          getModifierState: () => false,
+        }),
+      );
+
+    ctrlBackslash();
+    // Shells and TUIs ask for the cursor position all the time.
+    surface.write("\x1b[6n");
+    ctrlBackslash();
+    expect(program).toEqual(["\x1b[1;1R"]);
+    expect(left).toBe(1);
   });
 
   it("keeps the selection on reveal and applies a hidden selection clear", async () => {

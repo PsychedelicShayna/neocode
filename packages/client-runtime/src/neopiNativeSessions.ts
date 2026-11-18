@@ -831,26 +831,18 @@ function foldNativeInbox(records: readonly NeoPiNativeInboxRecord[], at: number)
   };
 }
 
-/** Keeps the inbox within `NATIVE_INBOX_LIMIT`, leaving gaps where it cut. */
+/**
+ * Keeps the inbox within `NATIVE_INBOX_LIMIT` by cutting from the front; the
+ * cut records become one leading `evicted` gap, so nothing is dropped silently.
+ * Dedupe and gap arithmetic live in `inboxSeq`/`inboxLedger`, which this never touches.
+ */
 export function boundNativeInbox(observation: NativeObservation, at: number): NativeObservation {
-  const { inbox, inboxStart } = observation;
+  const { inbox } = observation;
   if (inbox.length <= NATIVE_INBOX_LIMIT) return observation;
-  // Room for up to two folded gaps: the previous projection's and this one's.
-  const cut = inbox.length - NATIVE_INBOX_LIMIT + 2;
-  const older = inbox.slice(0, Math.min(cut, inboxStart));
-  const current = inbox.slice(inboxStart, Math.max(cut, inboxStart));
-  const olderGap = older.length > 0 ? [foldNativeInbox(older, at)] : [];
-  const retainedOlder = inbox.slice(older.length, inboxStart);
-  const currentGap = current.length > 0 ? [foldNativeInbox(current, at)] : [];
+  const cut = inbox.length - NATIVE_INBOX_LIMIT + 1;
   return {
     ...observation,
-    inbox: [
-      ...olderGap,
-      ...retainedOlder,
-      ...currentGap,
-      ...inbox.slice(inboxStart + current.length),
-    ],
-    inboxStart: olderGap.length + retainedOlder.length,
+    inbox: [foldNativeInbox(inbox.slice(0, cut), at), ...inbox.slice(cut)],
   };
 }
 

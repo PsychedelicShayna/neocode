@@ -72,7 +72,7 @@ const pass = (input: {
   readonly kind?: "full" | "incremental";
   readonly entities?: readonly NeoPiNativeEntity[];
   readonly inbox?: readonly NeoPiNativeInboxRecord[];
-}): NeoPiNativeSessionsReadResult => ({
+}): Extract<NeoPiNativeSessionsReadResult, { type: "pass" }> => ({
   type: "pass",
   passId: `pass-${input.watermark}`,
   kind: input.kind ?? "full",

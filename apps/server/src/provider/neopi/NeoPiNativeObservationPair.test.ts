@@ -253,6 +253,72 @@ describe("server reader and client reducer, paired", () => {
     converged(b, projection);
   });
 
+  it("a NeoPi flush with reads in between stays one branch and never rebuilds (verifier's stall)", () => {
+    const { projection, append, setParent } = owner();
+    append("u");
+    const a = new Viewer("A");
+    const b = new Viewer("B");
+    a.drain(projection);
+    b.drain(projection);
+    const generation = projection.domain.branchGeneration;
+    // Three turns, each: streamed messages, then one flush in NeoPi's order.
+    let parent = "u";
+    for (let turn = 0; turn < 3; turn++) {
+      const ids = [`t${turn}-a`, `t${turn}-b`, `t${turn}-c`];
+      for (const id of ids) {
+        for (let n = 0; n < 5; n++) {
+          projection.fold({
+            type: "message_update",
+            messageId: id,
+            message: assistant(`${id} ${n}`),
+          });
+          a.read(projection);
+        }
+        projection.fold({ type: "message_end", messageId: id, message: assistant(id) });
+      }
+      projection.fold({
+        type: "journal_state",
+        reason: "leaf",
+        sessionId,
+        sessionFile,
+        leafId: ids[2],
+      });
+      for (const id of ids) {
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          sessionFile,
+          entry: entry(id, parent, assistant(id)),
+        });
+        a.read(projection);
+        b.read(projection);
+        visible(a, projection);
+        visible(b, projection);
+        projection.fold({
+          type: "message_persisted",
+          sessionId,
+          sessionFile,
+          messageId: id,
+          entryId: id,
+        });
+        parent = id;
+      }
+      setParent(parent);
+    }
+    assert.equal(
+      projection.domain.branchGeneration,
+      generation,
+      "no navigation in a linear session",
+    );
+    assert.isTrue(projection.published);
+    for (const viewer of [a, b]) {
+      assert.equal(viewer.feed.observation.domain?.branchGeneration, generation);
+      viewer.drain(projection);
+      converged(viewer, projection);
+      assert.deepEqual(viewer.feed.conversation.pending, [], `${viewer.name}: no live row left`);
+    }
+  });
+
   it("a rebuild after the session moved to a sibling branch shows the new branch", () => {
     const { projection, append } = owner();
     append("A");

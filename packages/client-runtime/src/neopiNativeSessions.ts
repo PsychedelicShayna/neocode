@@ -1,12 +1,20 @@
-import type {
-  EnvironmentId,
-  NeoPiJournalEntry,
-  NeoPiJournalPage,
-  NeoPiNativeSessionRef,
-  ServerProviderSlashCommand,
-  WS_METHODS,
+import {
+  NeoPiNativeEntity,
+  type EnvironmentId,
+  type NeoPiJournalEntry,
+  type NeoPiJournalPage,
+  type NeoPiNativeCursor,
+  type NeoPiNativeEntityValue,
+  type NeoPiNativeInboxRecord,
+  type NeoPiNativeObservationDomain,
+  type NeoPiNativeSessionRef,
+  type NeoPiNativeSessionsReadResult,
+  type ServerProviderSlashCommand,
+  type WS_METHODS,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type { EnvironmentRpcSuccess, EnvironmentRpcStreamValue } from "./rpc/client.ts";
 import {
   emptyNativeConversation,
@@ -47,6 +55,8 @@ export type NativeSessionEvent = EnvironmentRpcStreamValue<
 export type NativeSessionUpdate =
   | NativeSessionEvent
   | { type: "disconnected" }
+  /** One reply of the observation cursor read, applied by `applyNativeRead`. */
+  | { type: "read"; result: NeoPiNativeSessionsReadResult }
   | { type: "state"; state: Record<string, unknown> }
   | {
       type: "page";
@@ -221,6 +231,39 @@ function reduceNativeDictation(
     };
   return current;
 }
+/** One projection key as the client holds it. */
+export interface NativeObservedEntity {
+  readonly ordinal: number;
+  /** -1 once its identity domain was replaced: older than anything the new domain sends. */
+  readonly revision: number;
+  readonly value: NeoPiNativeEntityValue;
+}
+export interface NativeObservation {
+  readonly domain: NeoPiNativeObservationDomain | null;
+  /** Send with the next read; null before the first. A `full` pass in it means catching up. */
+  readonly cursor: NeoPiNativeCursor | null;
+  /** By opaque key. Messages also feed the conversation; other classes are read by key. */
+  readonly entities: ReadonlyMap<string, NativeObservedEntity>;
+  /** The pass whose returned keys are being accumulated, until it completes. */
+  readonly passId: string | null;
+  readonly returned: ReadonlySet<string>;
+  /** Oversized values in transit, by key, at one revision. */
+  readonly segments: ReadonlyMap<
+    string,
+    { readonly revision: number; readonly parts: ReadonlyArray<string | undefined> }
+  >;
+  /** Live-only records without a reducer, in order. */
+  readonly inbox: readonly NeoPiNativeInboxRecord[];
+}
+export const emptyNativeObservation = (): NativeObservation => ({
+  domain: null,
+  cursor: null,
+  entities: new Map(),
+  passId: null,
+  returned: new Set(),
+  segments: new Map(),
+  inbox: [],
+});
 export type NativeOwnerLoss = "reconnecting" | "orphaned" | "detached";
 export interface NativeSessionFeed {
   readonly session: NativeSession | null;
@@ -244,6 +287,8 @@ export interface NativeSessionFeed {
   readonly jobs: NativeJobs;
   /** Accumulated agent working time for this session while this client watched it. */
   readonly activity: NativeActivity;
+  /** Keyed projection state from cursor reads (`applyNativeRead`). */
+  readonly observation: NativeObservation;
   readonly editor: { readonly id: string; readonly text: string } | null;
   readonly dictation: NativeDictation | null;
   /**
@@ -282,6 +327,7 @@ export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   agentTicks: {},
   jobs: EMPTY_NATIVE_JOBS,
   activity: EMPTY_NATIVE_ACTIVITY,
+  observation: emptyNativeObservation(),
   editor: null,
   dictation: null,
   movedTo: null,
@@ -320,11 +366,168 @@ function retainNativePending(
   };
 }
 
+const decodeSegmentedEntity = Schema.decodeUnknownOption(Schema.fromJsonString(NeoPiNativeEntity));
+/**
+ * Applies one cursor-read reply in place; a rebase is a full pass in a new
+ * domain or after falling behind, never a reset. Until a full pass completes,
+ * held entities stay visible and absence means nothing; at completion, held
+ * keys it did not return at or below its watermark are removed. Live rows
+ * retire only once their identified durable entry is present; a row the
+ * authority no longer holds and cannot identify becomes a continuity loss.
+ */
+export function applyNativeRead(
+  feed: NativeSessionFeed,
+  result: NeoPiNativeSessionsReadResult,
+): NativeSessionFeed {
+  if (result.type !== "pass") return feed;
+  const held = feed.observation;
+  const domain = result.continuation.epoch;
+  const was = held.domain;
+  const ownerChanged =
+    was !== null &&
+    (was.serverIncarnation !== domain.serverIncarnation || was.ownerEpoch !== domain.ownerEpoch);
+  const sameProjection =
+    was !== null && !ownerChanged && was.projectionIncarnation === domain.projectionIncarnation;
+  // Only appended to since the loaded history was read.
+  const continuous = sameProjection && was.branchGeneration === domain.branchGeneration;
+  const replaced = was !== null && !(continuous && was.buildAttempt === domain.buildAttempt);
+  const entities = new Map(held.entities);
+  if (replaced)
+    for (const [key, entity] of entities) entities.set(key, { ...entity, revision: -1 });
+  const returned = new Set(
+    replaced || result.promoted || result.passId !== held.passId ? [] : held.returned,
+  );
+  const segments = new Map(replaced ? [] : held.segments);
+  const removed: NeoPiNativeEntityValue[] = [];
+  let conversation = feed.conversation;
+  let commandOutputs = feed.commandOutputs;
+  if (!conversation.identity && feed.session)
+    conversation = reduceNativeConversation(conversation, {
+      type: "identity",
+      identity: {
+        sessionId: feed.session.sessionId,
+        sessionFile: feed.session.ref.sessionFile,
+        leafId: null,
+      },
+    });
+  // History first: a navigation drops the abandoned branch's rows, never the new
+  // branch's live messages from this same reply, and the previous owner's
+  // identified rows retire on entries this reply brings.
+  const journal = result.journal;
+  if (journal && conversation.identity) {
+    const identity = { ...conversation.identity, leafId: journal.leafId };
+    if (journal.continuity === "horizon")
+      conversation = reduceNativeConversation(conversation, {
+        type: "horizon",
+        identity,
+        entries: journal.entries,
+        nextCursor: journal.nextCursor,
+        continuous,
+      });
+    else
+      for (const entry of journal.entries)
+        conversation = reduceNativeConversation(conversation, { type: "entry", identity, entry });
+  }
+  if (ownerChanged) {
+    // Output anchored to a retired live row keeps its place on that row's entry.
+    const persisted = conversation.persisted;
+    commandOutputs = commandOutputs.map((output) => {
+      const entryId = output.afterMessageId ? persisted.get(output.afterMessageId) : undefined;
+      return entryId ? { ...output, afterEntryId: entryId, afterMessageId: null } : output;
+    });
+    conversation = reduceNativeConversation(conversation, { type: "owner_changed" });
+  }
+  const accept = (entity: NeoPiNativeEntity) => {
+    returned.add(entity.key);
+    const previous = entities.get(entity.key);
+    if (previous && previous.revision >= entity.revision) return;
+    entities.set(entity.key, entity);
+    const value = entity.value;
+    if (value.class !== "message") return;
+    conversation = reduceNativeConversation(conversation, {
+      type: "message",
+      messageId: value.messageId,
+      message: value.message,
+      ...(value.stopOutcome ? { stopOutcome: value.stopOutcome } : {}),
+    });
+    if (value.entryId !== null && conversation.identity)
+      conversation = reduceNativeConversation(conversation, {
+        type: "persisted",
+        identity: conversation.identity,
+        messageId: value.messageId,
+        entryId: value.entryId,
+      });
+  };
+  for (const entity of result.entities) accept(entity);
+  for (const segment of result.segments) {
+    const prior = segments.get(segment.key);
+    if (prior && prior.revision > segment.revision) continue;
+    const parts =
+      prior?.revision === segment.revision
+        ? [...prior.parts]
+        : Array.from<string | undefined>({ length: segment.count });
+    parts[segment.index] = segment.data;
+    if (parts.some((part) => part === undefined)) {
+      segments.set(segment.key, { revision: segment.revision, parts });
+      continue;
+    }
+    segments.delete(segment.key);
+    Option.map(decodeSegmentedEntity(parts.join("")), accept);
+  }
+  for (const tombstone of result.tombstones) {
+    const previous = entities.get(tombstone.key);
+    if (!previous || previous.revision >= tombstone.revision) continue;
+    entities.delete(tombstone.key);
+    removed.push(previous.value);
+  }
+  const completed = result.continuation.pass === null;
+  if (completed && result.kind === "full")
+    for (const [key, entity] of entities)
+      if (!returned.has(key) && entity.revision <= result.coveredThrough) {
+        entities.delete(key);
+        removed.push(entity.value);
+      }
+  const unresolved = new Set(
+    removed.flatMap((value) => (value.class === "message" ? [value.messageId] : [])),
+  );
+  if (completed && result.kind === "full") {
+    // A completed full pass holds every live message the authority knows.
+    const live = new Set<string>();
+    for (const { value } of entities.values())
+      if (value.class === "message") live.add(value.messageId);
+    for (const row of conversation.pending)
+      if (!live.has(row.messageId)) unresolved.add(row.messageId);
+  }
+  if (unresolved.size > 0)
+    conversation = reduceNativeConversation(conversation, {
+      type: "unresolved",
+      messageIds: unresolved,
+    });
+  // Inbox sequence numbers belong to one projection.
+  const lastSeq = sameProjection ? (held.inbox.at(-1)?.seq ?? -1) : -1;
+  const inbox = result.inbox.filter((record) => record.seq > lastSeq);
+  return {
+    ...feed,
+    conversation,
+    commandOutputs,
+    observation: {
+      domain,
+      cursor: result.continuation,
+      entities,
+      passId: completed ? null : result.passId,
+      returned: completed ? new Set() : returned,
+      segments,
+      inbox: inbox.length > 0 ? [...held.inbox, ...inbox] : held.inbox,
+    },
+  };
+}
+
 /** Cache is a projection of the canonical native file, never a second session journal. */
 export function reduceNativeSessionFeed(
   feed: NativeSessionFeed,
   event: NativeSessionUpdate,
 ): NativeSessionFeed {
+  if (event.type === "read") return applyNativeRead(feed, event.result);
   if (event.type === "reconciliation") {
     if (event.error !== null)
       return {
@@ -468,18 +671,19 @@ export function reduceNativeSessionFeed(
       // Pending UI replays independently and may precede the next snapshot.
       // Retire stale requests here so that snapshot cannot erase a live replay.
       dialogs: [],
-      agents: disconnectNativeSubagents(
-        feed.agents,
-        feed.agentsRevision + 1,
-        DateTime.formatIso(DateTime.nowUnsafe()),
-      ),
-      agentsRevision: feed.agentsRevision + 1,
       agentsEpoch: feed.agentsEpoch + 1,
-      agentsKnown: false,
       activity: closeNativeActivity(feed.activity, nowMs()),
       ...(event.type === "closed"
         ? {
             busy: false,
+            // Losing the stream is not losing the owner: only a close stops its agents.
+            agents: disconnectNativeSubagents(
+              feed.agents,
+              feed.agentsRevision + 1,
+              DateTime.formatIso(DateTime.nowUnsafe()),
+            ),
+            agentsRevision: feed.agentsRevision + 1,
+            agentsKnown: false,
             queue: EMPTY_NATIVE_QUEUE,
             error: ownerLoss === null ? event.reason : null,
             // The owner is gone, so no end frame is coming for a live capture.
@@ -511,16 +715,12 @@ export function reduceNativeSessionFeed(
       session: event.session,
       conversation,
       commandOutputs: sameFile ? feed.commandOutputs : [],
-      agents: sameFile
-        ? disconnectNativeSubagents(
-            feed.agents,
-            feed.agentsRevision + 1,
-            DateTime.formatIso(DateTime.nowUnsafe()),
-          )
-        : [],
+      // The roster is replaced by key when the inventory is read again; a
+      // rebuild implies no interruption.
+      agents: sameFile ? feed.agents : [],
       agentsRevision: feed.agentsRevision + 1,
       agentsEpoch: feed.agentsEpoch + 1,
-      agentsKnown: false,
+      agentsKnown: sameFile && feed.agentsKnown,
       jobs: sameFile ? feed.jobs : EMPTY_NATIVE_JOBS,
       activity: observeNativeActivity(
         sameFile ? closeNativeActivity(feed.activity, nowMs()) : EMPTY_NATIVE_ACTIVITY,
@@ -751,10 +951,21 @@ export function nativeTranscriptRows(
   debug: boolean,
 ): readonly NativeTranscriptRow[] {
   const outputs = new Map<string | null, NativeCommandOutput[]>();
+  // Output follows its live row until that row retires onto its durable entry;
+  // a lost row's output stays after the entry its content now reads from.
+  const live = new Set(feed.conversation.pending.map((message) => message.messageId));
+  const lost = new Map(
+    feed.conversation.losses.map((loss) => [loss.messageId, loss.afterEntryId] as const),
+  );
   for (const output of feed.commandOutputs) {
-    const anchor = output.afterMessageId
-      ? (feed.conversation.persisted.get(output.afterMessageId) ?? `live:${output.afterMessageId}`)
-      : output.afterEntryId;
+    const messageId = output.afterMessageId;
+    const anchor =
+      messageId === null
+        ? output.afterEntryId
+        : live.has(messageId)
+          ? `live:${messageId}`
+          : (feed.conversation.persisted.get(messageId) ??
+            (lost.has(messageId) ? (lost.get(messageId) ?? null) : `live:${messageId}`));
     const group = outputs.get(anchor);
     if (group) group.push(output);
     else outputs.set(anchor, [output]);

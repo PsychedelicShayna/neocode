@@ -3,19 +3,26 @@ import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
   type NeoPiJournalPage,
+  type NeoPiNativeEntity,
+  type NeoPiNativeJournalSlice,
+  type NeoPiNativeObservationDomain,
+  type NeoPiNativeTombstone,
 } from "@t3tools/contracts";
+import { nativeConversationGaps } from "./neopiConversation.ts";
 import {
   emptyNativeSessionFeed,
   deferNativeEditorText,
   executeNativeSessionCommand,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
+  nativeRecord,
   nativeSessionKey,
   nativeSlashArgument,
   nativeSlashCommands,
   nativeTranscriptEntries,
   nativeTranscriptRows,
   reduceNativeSessionFeed,
+  type NativeSessionFeed,
   type NativeSession,
 } from "./neopiNativeSessions.ts";
 
@@ -1152,7 +1159,8 @@ describe("canonical native client projection", () => {
       expect(feed.agents).toBe(original);
     }
     feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    expect(feed.agents[0]?.status).toBe("interrupted");
+    // Losing the stream does not stop the owner's agents.
+    expect(feed.agents).toBe(original);
     feed = reduceNativeSessionFeed(feed, {
       type: "snapshot",
       session,
@@ -1170,7 +1178,7 @@ describe("canonical native client projection", () => {
       agents: [{ id: "stale-worker", status: "running" }],
     });
     expect(feed.agents.map((agent) => agent.id)).toEqual(["worker"]);
-    expect(feed.agents[0]?.status).toBe("interrupted");
+    expect(feed.agents).toBe(original);
     feed = reduceNativeSessionFeed(feed, {
       type: "event",
       frame: {
@@ -1503,7 +1511,7 @@ describe("native slash commands", () => {
 });
 
 describe("subagent roster knowledge", () => {
-  it("is unknown until the live inventory is read, and unknown again whenever the roster resets", () => {
+  it("is unknown until the live inventory is read, and unknown again when the owner closes", () => {
     let feed = initial();
     expect(feed.agentsKnown).toBe(false);
     feed = reduceNativeSessionFeed(feed, {
@@ -1516,6 +1524,433 @@ describe("subagent roster knowledge", () => {
     });
     expect(feed.agentsKnown).toBe(true);
     expect(feed.agents).toEqual([]);
-    expect(reduceNativeSessionFeed(feed, { type: "disconnected" }).agentsKnown).toBe(false);
+    // A lost stream keeps the last roster; only a close resets it.
+    expect(reduceNativeSessionFeed(feed, { type: "disconnected" }).agentsKnown).toBe(true);
+    expect(
+      reduceNativeSessionFeed(feed, { type: "closed", reason: "gone", code: "owner_exited" })
+        .agentsKnown,
+    ).toBe(false);
+  });
+});
+
+describe("observation rebase", () => {
+  const domain = (
+    overrides: Partial<NeoPiNativeObservationDomain> = {},
+  ): NeoPiNativeObservationDomain => ({
+    serverIncarnation: "server-1",
+    ownerEpoch: 1,
+    projectionIncarnation: 1,
+    buildAttempt: 1,
+    branchGeneration: 1,
+    ...overrides,
+  });
+  const cursorAt = (epoch: NeoPiNativeObservationDomain, base: number) => ({
+    epoch,
+    base,
+    pass: null,
+    inboxSeq: 0,
+    journalAt: null,
+  });
+  /** One read reply; `done` completes the pass at `watermark`. */
+  const read = (input: {
+    epoch: NeoPiNativeObservationDomain;
+    passId: string;
+    kind?: "incremental" | "full";
+    watermark: number;
+    done?: boolean;
+    entities?: readonly NeoPiNativeEntity[];
+    tombstones?: readonly NeoPiNativeTombstone[];
+    journal?: NeoPiNativeJournalSlice;
+  }) => {
+    const kind = input.kind ?? "full";
+    const done = input.done ?? true;
+    return {
+      type: "read" as const,
+      result: {
+        type: "pass" as const,
+        passId: input.passId,
+        kind,
+        baseCursor: cursorAt(input.epoch, 0),
+        coveredThrough: input.watermark,
+        continuation: {
+          ...cursorAt(input.epoch, done ? input.watermark : 0),
+          pass: done
+            ? null
+            : {
+                kind,
+                passId: input.passId,
+                watermark: input.watermark,
+                lastOrdinal: 1000,
+                afterOrdinal: 1,
+                segment: null,
+              },
+        },
+        complete: false,
+        promoted: false,
+        entities: input.entities ?? [],
+        tombstones: input.tombstones ?? [],
+        segments: [],
+        inbox: [],
+        journal: input.journal ?? null,
+      },
+    };
+  };
+  const journalEntry = (
+    id: string,
+    parentId: string | null,
+    content: unknown = id,
+  ): NeoPiJournalEntry => ({
+    id,
+    parentId,
+    type: "message",
+    timestamp: "2026-11-18T00:00:00Z",
+    message: { role: "assistant", content },
+  });
+  const chain = (ids: readonly string[], parentId: string | null) =>
+    ids.map((id, index) => journalEntry(id, index ? ids[index - 1]! : parentId));
+  const horizon = (
+    entries: readonly NeoPiJournalEntry[],
+    nextCursor?: string,
+  ): NeoPiNativeJournalSlice => ({
+    continuity: "horizon",
+    leafId: entries.at(-1)?.id ?? null,
+    entries,
+    ...(nextCursor ? { nextCursor } : {}),
+  });
+  let ordinal = 0;
+  const message = (
+    messageId: string,
+    revision: number,
+    entryId: string | null,
+    content: unknown = "live text",
+  ): NeoPiNativeEntity => ({
+    key: `message:${messageId}`,
+    ordinal: (ordinal += 1),
+    revision,
+    value: {
+      class: "message",
+      messageId,
+      phase: entryId === null ? "open" : "durable",
+      entryId,
+      message: { role: "assistant", content },
+    },
+  });
+  const roster = (id: string, revision: number, status = "running"): NeoPiNativeEntity => ({
+    key: `roster:${id}`,
+    ordinal: id.charCodeAt(0),
+    revision,
+    value: { class: "roster", value: { id, status } },
+  });
+  const observing = (): NativeSessionFeed => ({
+    ...emptyNativeSessionFeed(),
+    session,
+    connected: true,
+  });
+  const ids = (feed: NativeSessionFeed) => feed.conversation.entries.map((entry) => entry.id);
+  const older = (feed: NativeSessionFeed, entries: readonly NeoPiJournalEntry[], next?: string) =>
+    reduceNativeSessionFeed(feed, {
+      type: "page",
+      older: true,
+      revision: feed.conversation.revision,
+      page: {
+        sessionId: session.sessionId,
+        sessionFile: ref.sessionFile,
+        leafId: feed.conversation.cursorLeaf,
+        entries,
+        totalEntries: 100,
+        ...(next ? { nextCursor: next } : {}),
+      },
+    });
+
+  it("keeps the history being read and leaves a placeholder for a gap larger than one page", () => {
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(
+      observing(),
+      read({
+        epoch,
+        passId: "p1",
+        watermark: 5,
+        journal: horizon(chain(["e0", "e1", "e2"], null)),
+      }),
+    );
+    // The viewport sits on e1 while the view falls behind by more than a page.
+    const viewport = feed.conversation.entries[1];
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch,
+        passId: "p2",
+        watermark: 40,
+        journal: horizon(chain(["e9", "e10"], "e8"), "before-e9"),
+      }),
+    );
+    expect(ids(feed)).toEqual(["e0", "e1", "e2", "e9", "e10"]);
+    expect(feed.conversation.entries[1]).toBe(viewport);
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["e9"]);
+    expect(feed.conversation.cursor).toBe("before-e9");
+
+    // On demand, page by page, the placeholder fills and closes where it joins.
+    feed = older(feed, chain(["e6", "e7", "e8"], "e5"), "before-e6");
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["e6"]);
+    feed = older(feed, chain(["e2", "e3", "e4", "e5"], "e1"));
+    expect(ids(feed)).toEqual(["e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"]);
+    expect(nativeConversationGaps(feed.conversation).size).toBe(0);
+    expect(feed.conversation.entries[1]).toBe(viewport);
+
+    // A navigation keeps only the shared ancestry; no placeholder joins branches.
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch: domain({ branchGeneration: 2 }),
+        passId: "p3",
+        watermark: 50,
+        journal: horizon([journalEntry("e1", "e0"), journalEntry("x2", "e1")]),
+      }),
+    );
+    expect(ids(feed)).toEqual(["e0", "e1", "x2"]);
+  });
+
+  it("keeps a live row and its output anchor until the durable entry joins, across a rebuild", () => {
+    const toolCall = [{ type: "toolCall", id: "tool-1", name: "read" }];
+    const toolAt = (revision: number, status: string): NeoPiNativeEntity => ({
+      key: "tool:tool-1",
+      ordinal: 900,
+      revision,
+      value: { class: "tool", toolCallId: "tool-1", coverage: "since-build", state: { status } },
+    });
+    const tool = toolAt(6, "running");
+    const user = journalEntry("u", null);
+    let feed = reduceNativeSessionFeed(
+      observing(),
+      read({
+        epoch: domain(),
+        passId: "p1",
+        watermark: 6,
+        journal: horizon([user]),
+        entities: [message("m1", 5, null, toolCall), tool],
+      }),
+    );
+    feed = reduceNativeSessionFeed(feed, {
+      type: "event",
+      frame: { type: "command_output", text: "output after the reply" },
+    });
+    const replyRows = (value: NativeSessionFeed) =>
+      nativeTranscriptRows(value, false).flatMap((row) =>
+        row.kind === "entry" && row.entry.message !== undefined
+          ? [row.entry.id]
+          : row.kind === "command"
+            ? ["command"]
+            : [],
+      );
+    expect(replyRows(feed)).toEqual(["u", "live:m1", "command"]);
+
+    // The observation connection was replaced: revisions restart in a new domain.
+    const rebuilt = domain({ projectionIncarnation: 2 });
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch: rebuilt,
+        passId: "q",
+        watermark: 4,
+        done: false,
+        entities: [message("m1", 3, "r", toolCall)],
+      }),
+    );
+    // The alias alone retires nothing; the tool is not dropped mid-pass.
+    expect(replyRows(feed)).toEqual(["u", "live:m1", "command"]);
+    expect(feed.observation.entities.get("tool:tool-1")?.value).toEqual(tool.value);
+
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch: rebuilt,
+        passId: "q",
+        watermark: 4,
+        journal: horizon([user, journalEntry("r", "u", toolCall)]),
+        entities: [toolAt(4, "done")],
+      }),
+    );
+    expect(replyRows(feed)).toEqual(["u", "r", "command"]);
+    expect(feed.conversation.losses).toEqual([]);
+    expect(feed.conversation.entries.at(-1)?.message).toEqual({
+      role: "assistant",
+      content: toolCall,
+    });
+    expect(feed.observation.entities.get("tool:tool-1")?.revision).toBe(4);
+  });
+
+  it("does not show agents as interrupted when the stream is lost or the view rebuilds", () => {
+    let feed = reduceNativeSessionFeed(initial(), {
+      type: "subagents",
+      ref,
+      sessionId: session.sessionId,
+      epoch: initial().agentsEpoch,
+      revision: initial().agentsRevision,
+      agents: [{ id: "worker", status: "running", agent: "scout", index: 0 }],
+    });
+    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
+    feed = reduceNativeSessionFeed(feed, {
+      type: "snapshot",
+      session,
+      journal: {
+        sessionId: session.sessionId,
+        sessionFile: ref.sessionFile,
+        leafId: user.id,
+        entries: [user],
+        totalEntries: 1,
+      },
+    });
+    expect(feed.agents.map((agent) => [agent.status, agent.native.disconnected])).toEqual([
+      ["running", false],
+    ]);
+
+    // Read path: the roster is replaced by key only when the rebase pass completes.
+    let observed = reduceNativeSessionFeed(
+      observing(),
+      read({
+        epoch: domain(),
+        passId: "p1",
+        watermark: 9,
+        entities: [roster("a", 8), roster("b", 9)],
+      }),
+    );
+    const successor = domain({ projectionIncarnation: 2 });
+    observed = reduceNativeSessionFeed(
+      observed,
+      read({
+        epoch: successor,
+        passId: "q",
+        watermark: 3,
+        done: false,
+        entities: [roster("a", 2, "running")],
+      }),
+    );
+    expect([...observed.observation.entities.keys()]).toEqual(["roster:a", "roster:b"]);
+    expect(observed.observation.entities.get("roster:b")?.value).toEqual(roster("b", 9).value);
+    observed = reduceNativeSessionFeed(
+      observed,
+      read({ epoch: successor, passId: "q", watermark: 3 }),
+    );
+    expect([...observed.observation.entities.keys()]).toEqual(["roster:a"]);
+  });
+
+  it("applies a multi-part rebase without deleting by absence or regressing a newer revision", () => {
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(
+      observing(),
+      read({
+        epoch,
+        passId: "p1",
+        watermark: 10,
+        journal: horizon([journalEntry("u", null)]),
+        entities: [roster("a", 10), roster("b", 9), message("m1", 8, null, "body")],
+      }),
+    );
+    // Behind the tombstone horizon: a full pass in the same domain, every key changing.
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch,
+        passId: "p2",
+        watermark: 30,
+        done: false,
+        entities: [roster("a", 25), message("m1", 26, "r", "body")],
+      }),
+    );
+    expect([...feed.observation.entities.keys()]).toEqual(["roster:a", "roster:b", "message:m1"]);
+    expect(feed.conversation.pending.map((row) => row.messageId)).toEqual(["m1"]);
+    // A value older than one already held does not regress it.
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch,
+        passId: "p2",
+        watermark: 30,
+        done: false,
+        entities: [roster("a", 20, "stale")],
+        journal: horizon([journalEntry("u", null), journalEntry("r", "u", "body")]),
+      }),
+    );
+    expect(feed.observation.entities.get("roster:a")?.revision).toBe(25);
+    // The durable entry joined with its alias: the body shows exactly once.
+    expect(
+      nativeTranscriptEntries(feed.conversation, false).filter(
+        (entry) => nativeRecord(entry.message).content === "body",
+      ),
+    ).toHaveLength(1);
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({ epoch, passId: "p2", watermark: 30, entities: [roster("c", 31)] }),
+    );
+    // Completion removes `b`, which the pass did not return; never `a` or `c`.
+    expect([...feed.observation.entities.keys()].sort()).toEqual([
+      "message:m1",
+      "roster:a",
+      "roster:c",
+    ]);
+  });
+
+  it("turns rows it cannot identify into continuity losses, never matching identical text", () => {
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(
+      observing(),
+      read({ epoch, passId: "p1", watermark: 1, journal: horizon([journalEntry("u", null)]) }),
+    );
+    // More live rows than the 256 recovery mappings, all with the same text.
+    for (let index = 0; index < 300; index += 1)
+      feed = reduceNativeSessionFeed(feed, {
+        type: "event",
+        frame: { type: "message_end", messageId: `m${index}`, message: { content: "same" } },
+      });
+    feed = reduceNativeSessionFeed(feed, {
+      type: "event",
+      frame: { type: "command_output", text: "after the last row" },
+    });
+    const durable = chain(
+      Array.from({ length: 300 }, (_, index) => `d${index}`),
+      "u",
+    ).map((entry) => ({ ...entry, message: { content: "same" } }));
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch: domain({ projectionIncarnation: 2 }),
+        passId: "q",
+        watermark: 4,
+        journal: horizon([journalEntry("u", null), ...durable]),
+      }),
+    );
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toHaveLength(300);
+    expect(new Set(feed.conversation.losses.map((loss) => loss.afterEntryId))).toEqual(
+      new Set(["d299"]),
+    );
+    expect(nativeTranscriptRows(feed, false).at(-1)).toMatchObject({ kind: "command" });
+  });
+
+  it("never carries the previous owner's message ids into the successor's", () => {
+    let feed = reduceNativeSessionFeed(
+      observing(),
+      read({
+        epoch: domain(),
+        passId: "p1",
+        watermark: 3,
+        journal: horizon([journalEntry("u", null)]),
+        entities: [message("saved", 2, "s", "saved"), message("m1", 3, null, "old owner")],
+      }),
+    );
+    feed = reduceNativeSessionFeed(
+      feed,
+      read({
+        epoch: domain({ ownerEpoch: 2, projectionIncarnation: 2 }),
+        passId: "q",
+        watermark: 2,
+        journal: horizon([journalEntry("u", null), journalEntry("s", "u", "saved")]),
+        entities: [message("m1", 2, null, "new owner")],
+      }),
+    );
+    expect(feed.conversation.pending.map((row) => row.message.content)).toEqual(["new owner"]);
+    // The identified row retired on its entry; the unidentified one reads from history.
+    expect(feed.conversation.losses).toEqual([{ messageId: "m1", afterEntryId: "s" }]);
+    expect(feed.conversation.persisted.size).toBe(0);
   });
 });

@@ -271,22 +271,31 @@ describe("native main conversation", () => {
     expect(state.entries.map((value) => value.id)).toEqual(["a", "b", "c"]);
   });
 
-  it("clears process-local stream identities on reconnect without emitting a send", () => {
+  it("keeps a live row across a reconnect until its identified durable entry is present", () => {
     let state = reduceNativeConversation(initial(), {
       type: "message",
       messageId: "msg-1",
       message: { role: "assistant", content: "unsaved" },
     });
     state = reduceNativeConversation(state, { type: "disconnect" });
-    expect(state.pending).toEqual([]);
     expect(state.needsSnapshot).toBe(true);
     state = reduceNativeConversation(state, { type: "snapshot", page: page() });
+    expect(state.pending.map((row) => row.messageId)).toEqual(["msg-1"]);
+    const next = { ...identity, leafId: "c" };
     state = reduceNativeConversation(state, {
-      type: "message",
+      type: "persisted",
+      identity: next,
       messageId: "msg-1",
-      message: { role: "user", content: "new process" },
+      entryId: "c",
     });
-    expect(state.pending[0]?.message.content).toBe("new process");
+    expect(state.pending.map((row) => row.messageId)).toEqual(["msg-1"]);
+    state = reduceNativeConversation(state, {
+      type: "entry",
+      identity: next,
+      entry: entry("c", "b"),
+    });
+    expect(state.pending).toEqual([]);
+    expect(state.entries.map((value) => value.id)).toEqual(["a", "b", "c"]);
   });
 
   it("reduces all frames before consumers observe the latest subscription value", () => {

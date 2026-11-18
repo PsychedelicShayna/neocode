@@ -995,9 +995,10 @@ describe("native feed reconciliation lifetime", () => {
           ]);
           yield* Queue.offer(events, { type: "disconnected" });
           const disconnected = yield* nextFeed(feeds, (feed) => !feed.connected);
+          // Losing the stream does not stop the owner's agents.
           expect(disconnected.agents.map((agent) => agent.status)).toEqual([
             "completed",
-            "interrupted",
+            "running",
           ]);
           yield* Queue.offer(events, reconnect);
           const refreshed = yield* nextFeed(

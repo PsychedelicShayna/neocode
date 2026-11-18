@@ -95,6 +95,7 @@ describe("NeoPiStopOutcome", () => {
       });
       projection.applyStateReply({ sessionId }, projection.mark());
       projection.applySubagentsReply({ subagents: [] }, projection.mark());
+      projection.applySubagentHistoryReply(null, projection.mark());
       // Journal page reply, then each live boundary: snapshot message, live end, journal entry.
       projection.applyJournalPage(
         {
@@ -130,10 +131,15 @@ describe("NeoPiStopOutcome", () => {
       });
       // After the entry, so the entry is not held waiting for this message's association.
       projection.fold({ type: "message_end", messageId: "live", message: refused(withN18) });
-      const reply = readNeoPiNativeObservation(projection, null, {
-        scanSteps: 100,
-        replyBytes: 1_000_000,
-      });
+      const reply = readNeoPiNativeObservation(
+        projection,
+        null,
+        {
+          scanSteps: 100,
+          replyBytes: 1_000_000,
+        },
+        "reader",
+      );
       assert.equal(reply.type, "pass");
       assert.deepEqual(leaks(reply), []);
       assert.deepEqual(leaks([...projection.store.values()].map((record) => record.value)), []);

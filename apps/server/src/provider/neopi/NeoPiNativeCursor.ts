@@ -12,7 +12,7 @@ import type {
 } from "@t3tools/contracts";
 
 import type {
-  NeoPiNativeFrozenEncoding,
+  NeoPiNativeFence,
   NeoPiNativeJournalTail,
   NeoPiNativeKeyedStore,
   NeoPiNativeStoreRecord,
@@ -20,9 +20,9 @@ import type {
 
 /**
  * The bulk cursor reader (r12 §2.3 C2). Synchronous: one call answers one
- * `read` from the projection's current state and the client-held cursor. The
- * server keeps nothing per observer between reads; the only state a read
- * writes is the shared frozen encoding of an oversized value.
+ * `read` from the projection's current state and the client-held cursor. Per
+ * reader the server keeps only the oversized value that reader is in the
+ * middle of receiving (its partly sent response), never a backlog.
  */
 
 /** What a read needs from a projection. `NeoPiNativeProjection` satisfies it. */
@@ -36,6 +36,8 @@ export interface NeoPiNativeReadSource {
   readonly horizonCursor: string | undefined;
   /** Ascending `seq`; a `gap` stands for its whole `fromSeq..toSeq` interval. */
   readonly inbox: readonly NeoPiNativeInboxRecord[];
+  /** Decides a leaf announced without its entry before anything is read (see the projection). */
+  settlePendingLeaf(): NeoPiNativeFence;
 }
 
 export interface NeoPiNativeReadLimits {
@@ -128,45 +130,7 @@ function segmentBounds(json: string, budget: number): number[] {
 }
 
 /**
- * The encoding a reader segments for `record`. Frozen encodings are shared by
- * every reader so a pass finishes "in a bounded number of reads under fair
- * service whatever the producer does" (C2 "Progress, stated exactly"): a
- * changing value does not restart a transfer, and the next pass returns the
- * newer revision. At most two are kept per key. A new one is frozen only when
- * the newest is no use to this pass, and, while the value keeps changing after
- * the pass's cut, only once some reader has finished the newest; so a transfer
- * in progress keeps its encoding until it ends. Returns undefined when this
- * pass should leave the key to the next one.
- */
-function encodingFor(
-  record: NeoPiNativeStoreRecord,
-  entityJson: string,
-  pass: NeoPiNativePass,
-  base: number,
-  segmentBudget: number,
-): NeoPiNativeFrozenEncoding | undefined {
-  const newest = record.frozen[record.frozen.length - 1];
-  const changedAfterCut = record.revision > pass.watermark;
-  const floor = pass.kind === "incremental" ? base : -1;
-  const useful =
-    newest !== undefined &&
-    newest.revision > floor &&
-    (changedAfterCut ? true : newest.revision === record.revision);
-  if (useful) return newest;
-  // Before the cut the value as of the watermark is the current one and must be sent.
-  if (changedAfterCut && newest !== undefined && !newest.completed) return undefined;
-  const frozen: NeoPiNativeFrozenEncoding = {
-    revision: record.revision,
-    json: entityJson,
-    bounds: segmentBounds(entityJson, segmentBudget),
-    completed: false,
-  };
-  record.frozen = [...record.frozen.slice(-1), frozen];
-  return frozen;
-}
-
-/**
- * Answers one read. Pass rules are r12 C2's, in order:
+ * Answers one read for `reader` (its lease id). Pass rules are r12 C2's, in order:
  *
  * - A null cursor or a cursor from another identity domain starts a full pass
  *   (a rebase); so does a pass starting with `base` older than the tombstone
@@ -197,7 +161,11 @@ export function readNeoPiNativeObservation(
   source: NeoPiNativeReadSource,
   cursor: NeoPiNativeCursor | null,
   limits: NeoPiNativeReadLimits,
+  reader: string,
 ): NeoPiNativeSessionsReadResult {
+  // A quiet move to a leaf the tail no longer holds is decided here, so the
+  // next read already serves the new branch with no further native frame.
+  source.settlePendingLeaf();
   if (!source.published) return { type: "building" };
   const { store, journal, domain } = source;
   const sameDomain = cursor !== null && sameObservationDomain(cursor.epoch, domain);
@@ -229,7 +197,11 @@ export function readNeoPiNativeObservation(
   const baseCursor: NeoPiNativeCursor = { epoch: domain, base, pass, inboxSeq, journalAt };
 
   // Journal first, at most half the reply unless one entry alone is larger.
+  // Every journal entry, key and inbox record visited is one scan step.
+  // `replyBytes` bounds the payload; the reply's framing (two cursors and the
+  // fixed fields) is added on top and bounded by the cursor's own size.
   let budget = limits.replyBytes;
+  let steps = 0;
   let journalSlice: NeoPiNativeJournalSlice | null = null;
   /** Absolute positions the reader holds after this reply, continuously: [historyStart, coveredPosition]. */
   let historyStart = journal.start;
@@ -241,9 +213,10 @@ export function readNeoPiNativeObservation(
     for (let position = atPosition + 1; position < deliverableEnd; position++) {
       const entry = journal.at(position)!;
       const bytes = encodedBytes(entry);
-      if (entries.length > 0 && used + bytes > budget / 2) break;
+      if (entries.length > 0 && (used + bytes > budget / 2 || steps >= limits.scanSteps)) break;
       entries.push(entry);
       used += bytes;
+      steps++;
     }
     coveredPosition = atPosition + entries.length;
     const last = entries[entries.length - 1];
@@ -261,9 +234,10 @@ export function readNeoPiNativeObservation(
     for (let position = deliverableEnd - 1; position >= journal.start; position--) {
       const entry = journal.at(position)!;
       const bytes = encodedBytes(entry);
-      if (entries.length > 0 && used + bytes > budget / 2) break;
+      if (entries.length > 0 && (used + bytes > budget / 2 || steps >= limits.scanSteps)) break;
       entries.push(entry);
       used += bytes;
+      steps++;
       first = position;
     }
     entries.reverse();
@@ -301,15 +275,15 @@ export function readNeoPiNativeObservation(
     ...(record.joinEntryId === null ? {} : { joinEntryId: record.joinEntryId }),
   });
   // Retirements joined to entries in this slice travel with them.
-  for (const entry of journalSlice?.entries ?? []) {
-    const record = store.retiredBy(entry.id);
-    if (!record || record.value !== null || record.removed) continue;
-    if (pass.kind === "incremental" && record.revision <= base) continue;
-    const tombstone = tombstoneOf(record);
-    tombstones.push(tombstone);
-    tombstoneKeys.add(record.key);
-    budget -= encodedBytes(tombstone);
-  }
+  for (const entry of journalSlice?.entries ?? [])
+    for (const record of store.retiredBy(entry.id) ?? []) {
+      if (record.value !== null || record.removed) continue;
+      if (pass.kind === "incremental" && record.revision <= base) continue;
+      const tombstone = tombstoneOf(record);
+      tombstones.push(tombstone);
+      tombstoneKeys.add(record.key);
+      budget -= encodedBytes(tombstone);
+    }
 
   const segmentBudget = Math.max(1, Math.floor(limits.replyBytes / 2) - 160);
   let afterOrdinal = pass.afterOrdinal;
@@ -317,7 +291,7 @@ export function readNeoPiNativeObservation(
   let completed = pass.kind === "incremental" && pass.watermark === base;
   let sent = 0;
   for (
-    let index = store.indexAfter(afterOrdinal), steps = 0;
+    let index = store.indexAfter(afterOrdinal);
     !completed && steps < limits.scanSteps;
     steps++
   ) {
@@ -366,7 +340,6 @@ export function readNeoPiNativeObservation(
     const bytes = utf8Length(json);
     const continuing = segment?.key === record.key ? segment : null;
     if (bytes <= budget && continuing === null) {
-      record.frozen = [];
       entities.push(entity);
       budget -= bytes;
       sent++;
@@ -375,20 +348,20 @@ export function readNeoPiNativeObservation(
     }
     if (sent > 0) break;
     // Browser-hop segmentation (r12 §2.7 R1): one segment per reply, cut from
-    // a frozen encoding so a changing value cannot restart the transfer forever.
-    let encoding =
-      continuing === null
-        ? undefined
-        : record.frozen.find((frozen) => frozen.revision === continuing.revision);
-    let next = encoding === undefined ? 0 : continuing!.nextIndex;
-    if (encoding === undefined) {
-      encoding = encodingFor(record, json, pass, base, segmentBudget);
-      next = 0;
-    }
-    if (encoding === undefined) {
-      advance();
-      continue;
-    }
+    // the reader's own frozen encoding, so a pass finishes "in a bounded number
+    // of reads under fair service whatever the producer does" (C2 "Progress,
+    // stated exactly"): neither a changing value nor another reader restarts
+    // the transfer, and the newer revision comes with the next pass.
+    const held = store.transferOf(reader);
+    const resumes =
+      held !== undefined &&
+      continuing !== null &&
+      held.key === record.key &&
+      held.revision === continuing.revision;
+    const encoding = resumes
+      ? held
+      : store.beginTransfer(reader, record, json, () => segmentBounds(json, segmentBudget));
+    const next = resumes ? continuing.nextIndex : 0;
     const count = encoding.bounds.length - 1;
     segments.push({
       key: record.key,
@@ -402,7 +375,7 @@ export function readNeoPiNativeObservation(
     if (next + 1 < count)
       segment = { key: record.key, revision: encoding.revision, nextIndex: next + 1 };
     else {
-      encoding.completed = true;
+      store.endTransfer(reader);
       advance();
     }
     break;
@@ -419,9 +392,10 @@ export function readNeoPiNativeObservation(
   for (let index = low; index < source.inbox.length; index++) {
     const record = source.inbox[index]!;
     const bytes = encodedBytes(record);
-    if (inbox.length > 0 && bytes > budget) break;
+    if (inbox.length > 0 && (bytes > budget || steps >= limits.scanSteps)) break;
     inbox.push(record);
     budget -= bytes;
+    steps++;
     inboxSeq = record.seq;
   }
 

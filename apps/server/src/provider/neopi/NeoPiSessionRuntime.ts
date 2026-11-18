@@ -9,6 +9,9 @@ import {
   type PromptOutcome,
   type SpawnFn,
   type HostToolCallFrame,
+  type HostToolCancelFrame,
+  type SessionEventFrame,
+  type UiRequestFrame,
 } from "effect-neopi-rpc/client";
 import type { PlanProposalResponseFrame } from "effect-neopi-rpc/schema";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
@@ -736,72 +739,91 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     const begin = Effect.gen(function* () {
       if (launch.sessionDir) yield* fs.makeDirectory(launch.sessionDir, { recursive: true });
       attached = false;
+      // The one remaining unbounded ingestion: the parser offers each frame, in wire order,
+      // to these runtime-local queues and the existing handlers drain them. Handlers await
+      // replies on this connection, so they cannot be made synchronous, and bounding the
+      // queues would need flow control NeoPi does not offer.
       const connect = (args: ReadonlyArray<string>) =>
-        makeClient({
-          spawn: input.spawn,
-          command: launch.command,
-          args,
-          cwd: launch.cwd,
-          env: launch.env,
-          // Event handlers await replies on this connection (turn boundaries,
-          // state refreshes). Backpressuring stdout here can strand those
-          // replies behind queued events. Window observers have their own budgets.
-          ...(input.requestTimeoutMs === undefined
-            ? {}
-            : { requestTimeoutMs: input.requestTimeoutMs }),
-          onTransportReady: (transport) =>
-            Effect.gen(function* () {
-              earlyUi = transport;
-              yield* transport.transportReady.pipe(
-                Effect.flatMap((ready) => {
-                  attached =
-                    ready.capabilities?.includes(NEOPI_CAPABILITIES.controlAttached) === true;
-                  return emit({ ...ready, type: "ready" });
-                }),
-                Effect.ignore,
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-              yield* Stream.runForEach(transport.events, handleEvent).pipe(
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-              yield* Stream.runForEach(transport.uiRequests, (frame) =>
-                Effect.gen(function* () {
-                  if (typeof frame.loginId === "string") {
-                    if (frame.method === "input" || frame.method === "confirm")
-                      modelsAuthUi.add(frame.id);
+        Effect.gen(function* () {
+          const inboundEvents = yield* Queue.unbounded<SessionEventFrame>();
+          const inboundUi = yield* Queue.unbounded<UiRequestFrame>();
+          const inboundHost = yield* Queue.unbounded<HostToolCallFrame | HostToolCancelFrame>();
+          return yield* makeClient({
+            sink: {
+              event: (frame) => {
+                Queue.offerUnsafe(inboundEvents, frame);
+              },
+              uiRequest: (frame) => {
+                Queue.offerUnsafe(inboundUi, frame);
+              },
+              hostToolCall: (call) => {
+                Queue.offerUnsafe(inboundHost, call);
+              },
+            },
+            spawn: input.spawn,
+            command: launch.command,
+            args,
+            cwd: launch.cwd,
+            env: launch.env,
+            // Event handlers await replies on this connection (turn boundaries,
+            // state refreshes); the sink never backpressures stdout.
+            ...(input.requestTimeoutMs === undefined
+              ? {}
+              : { requestTimeoutMs: input.requestTimeoutMs }),
+            onTransportReady: (transport) =>
+              Effect.gen(function* () {
+                earlyUi = transport;
+                yield* transport.transportReady.pipe(
+                  Effect.flatMap((ready) => {
+                    attached =
+                      ready.capabilities?.includes(NEOPI_CAPABILITIES.controlAttached) === true;
+                    return emit({ ...ready, type: "ready" });
+                  }),
+                  Effect.ignore,
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
+                yield* Stream.runForEach(Stream.fromQueue(inboundEvents), handleEvent).pipe(
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
+                yield* Stream.runForEach(Stream.fromQueue(inboundUi), (frame) =>
+                  Effect.gen(function* () {
+                    if (typeof frame.loginId === "string") {
+                      if (frame.method === "input" || frame.method === "confirm")
+                        modelsAuthUi.add(frame.id);
+                      if (frame.method === "cancel" && typeof frame.targetId === "string")
+                        modelsAuthUi.delete(frame.targetId);
+                      yield* emit(frame);
+                      return;
+                    }
+                    if (attached && !active) return;
+                    if (activeUiMethods.has(frame.method)) {
+                      if (
+                        (yield* SubscriptionRef.get(state)) === "failed" ||
+                        (yield* SubscriptionRef.get(state)) === "stopping"
+                      ) {
+                        yield* emit({
+                          type: "extension_ui_request",
+                          id: frame.id,
+                          method: "cancel",
+                          targetId: frame.id,
+                          ...(active ? { turnId: active.id } : {}),
+                        });
+                      } else uiPending.add(frame.id);
+                    }
                     if (frame.method === "cancel" && typeof frame.targetId === "string")
-                      modelsAuthUi.delete(frame.targetId);
-                    yield* emit(frame);
-                    return;
-                  }
-                  if (attached && !active) return;
-                  if (activeUiMethods.has(frame.method)) {
-                    if (
-                      (yield* SubscriptionRef.get(state)) === "failed" ||
-                      (yield* SubscriptionRef.get(state)) === "stopping"
-                    ) {
-                      yield* emit({
-                        type: "extension_ui_request",
-                        id: frame.id,
-                        method: "cancel",
-                        targetId: frame.id,
-                        ...(active ? { turnId: active.id } : {}),
-                      });
-                    } else uiPending.add(frame.id);
-                  }
-                  if (frame.method === "cancel" && typeof frame.targetId === "string")
-                    uiPending.delete(frame.targetId);
-                  yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
-                }),
-              ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
-              yield* pumpHost(transport).pipe(
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-            }),
-        }).pipe(Effect.provideService(Scope.Scope, scope));
+                      uiPending.delete(frame.targetId);
+                    yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
+                  }),
+                ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
+                yield* pumpHost({
+                  hostToolCalls: Stream.fromQueue(inboundHost),
+                  hostToolResult: transport.hostToolResult,
+                }).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
+              }),
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+        });
       const peer = yield* connect(launch.args).pipe(
         Effect.catchIf(
           (error) =>

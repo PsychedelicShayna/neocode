@@ -214,6 +214,8 @@ const INCOMPATIBLE_OWNER_CODES: ReadonlySet<string> = new Set([
 const CANDIDATE_FRAME_LIMIT = 4096;
 /** How long a leaf announcement may wait for its journal entry before it counts as a navigation. */
 const PENDING_LEAF_SETTLE = Duration.seconds(2);
+/** A refused lowering of the owner's subagent level is retried this many times, at the build backoff. */
+const LEVEL_LOWERING_RETRIES = 8;
 /** How long a lease may hold a closed session without taking its terminal envelope. */
 const CLOSED_LEASE_GRACE = Duration.seconds(5);
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
@@ -412,8 +414,8 @@ interface Observation {
   readId: number;
   /** The inbox position the client acknowledged with its last read; pruning waits for every lease. */
   inboxSeq: number;
-  /** The inbox position of the last reply sent, under that reply's domain: what an acknowledgement may cover. */
-  delivered: { readonly epoch: NeoPiNativeObservationDomain; readonly inboxSeq: number } | null;
+  /** The highest inbox position of any record actually sent to this lease: what an acknowledgement may cover. */
+  sentInboxSeq: number;
   /** Ends or re-checks the read currently waiting on this lease. */
   interrupt: ((why: "changed" | "superseded" | "released") => void) | null;
   released: boolean;
@@ -534,14 +536,31 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }
       return;
     }
-    const state: NeoPiNativeObservationLifecycle =
+    // Only an established absence ends a lease as owner-stopped. A code that is neither
+    // absence nor one of the other named endings fails the stream with that code: the
+    // client reattaches through discovery rather than being told the owner stopped.
+    const state: NeoPiNativeObservationLifecycle | null =
       code === "detached"
         ? "detached"
         : code === "identity_conflict" || code === "session_changed"
           ? "identity-changed"
-          : code === "owner_incompatible"
+          : code !== undefined && INCOMPATIBLE_OWNER_CODES.has(code)
             ? "incompatible"
-            : "owner-stopped";
+            : code === "owner_incompatible"
+              ? "incompatible"
+              : code === undefined ||
+                  code === "owner_exited" ||
+                  code === "no_owner" ||
+                  code === "closed"
+                ? "owner-stopped"
+                : null;
+    if (state === null) {
+      for (const observation of session.observations) {
+        observation.failure = fail(reason, code);
+        observation.wake?.();
+      }
+      return;
+    }
     broadcast(session, lifecycle(session, state, reason));
   };
   const finish = (session: NativeSession, reason: string, code?: string) =>
@@ -915,41 +934,55 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       Effect.gen(function* () {
         const level = demanded;
         const native = session.native;
-        const applied = yield* native.client
-          .request({ type: "set_subagent_subscription", level })
-          .pipe(Effect.result);
-        // A reply from a replaced connection or an earlier epoch changes nothing.
-        if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
-        if (applied._tag === "Failure") {
+        // A raise is asked once and a refusal is shown. A lowering is the owner's
+        // subscription cost with no one watching, so a refused one is retried at a
+        // bounded rate until the owner changes or the demand returns.
+        const lowering = SUBAGENT_LEVEL_RANK[level] < SUBAGENT_LEVEL_RANK[held];
+        let delayMs = BUILD_RETRY_MIN_MS;
+        for (let attempt = 0; ; attempt++) {
+          const applied = yield* native.client
+            .request({ type: "set_subagent_subscription", level })
+            .pipe(Effect.result);
+          // A reply from a replaced connection or an earlier epoch changes nothing.
+          if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
+          if (applied._tag === "Success") {
+            session.subagentLevel = { epoch, level };
+            session.refusal = null;
+            store.remove(SUBAGENT_FAULT_KEY);
+            notifyChanged(session);
+            // A build in progress may have read the roster before the level rose: the
+            // re-read is owed and runs once the projection publishes.
+            if (SUBAGENT_LEVEL_RANK[level] > SUBAGENT_LEVEL_RANK[held]) {
+              session.refreshes.add("roster");
+              if (session.projection.published) startRefresh(session);
+            }
+            return;
+          }
+          if (lowering && attempt < LEVEL_LOWERING_RETRIES && demandedLevel(session) === level) {
+            yield* Effect.sleep(Duration.millis(delayMs));
+            delayMs = Math.min(delayMs * 2, BUILD_RETRY_MAX_MS);
+            if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
+            if (demandedLevel(session) !== level) return;
+            continue;
+          }
           // The owner keeps the level it had, which is what `subagentLevel` still says;
           // the same request is not repeated until the demand or the owner changes. A
-          // refused raise is a visible fault, not silence: the Agents view would otherwise
-          // show a build-time roster.
+          // refused raise is a visible fault, not silence: the Agents view would
+          // otherwise show a build-time roster.
           session.refusal = { epoch, level };
           if (level !== "off") {
-            const message = nativeError(applied.failure).message;
             store.put(SUBAGENT_FAULT_KEY, {
               class: "fault",
               value: {
                 source: "subagent-subscription",
                 level: "error",
                 requestedLevel: level,
-                message,
+                message: nativeError(applied.failure).message,
               },
             });
             notifyChanged(session);
           }
           return;
-        }
-        session.subagentLevel = { epoch, level };
-        session.refusal = null;
-        store.remove(SUBAGENT_FAULT_KEY);
-        notifyChanged(session);
-        // A build in progress may have read the roster before the level rose: the re-read
-        // is owed and runs once the projection publishes.
-        if (SUBAGENT_LEVEL_RANK[level] > SUBAGENT_LEVEL_RANK[held]) {
-          session.refreshes.add("roster");
-          if (session.projection.published) startRefresh(session);
         }
       }).pipe(
         Effect.ensuring(
@@ -1950,6 +1983,19 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             // holds is stale: the first lease starts a new incarnation and builds again.
             if (session.bulkStale) {
               session.bulkStale = false;
+              // A message that was open when watching stopped may have gone on streaming,
+              // ended or been persisted unseen, so its held body cannot be served. It is
+              // dropped; if the owner is still streaming it, the build's snapshot message
+              // brings back its current body before the projection publishes.
+              // Children and jobs that finished unseen are the same: they would otherwise
+              // stay "running". The build rereads the live inventory, history and jobs.
+              for (const record of Array.from(projection.store.values()))
+                if (
+                  (record.value?.class === "message" && record.value.phase === "open") ||
+                  record.key.startsWith("roster:") ||
+                  record.key.startsWith("job:")
+                )
+                  projection.store.remove(record.key);
               const obsolete = session.attempt;
               session.attempt = null;
               if (obsolete) spawnIn(session, Fiber.interrupt(obsolete));
@@ -2094,7 +2140,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           readId: -1,
           owner,
           inboxSeq: 0,
-          delivered: null,
+          sentInboxSeq: 0,
           interrupt: null,
           released: false,
           demand: null,
@@ -2216,35 +2262,32 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               observation.leaseId,
             )
           : ({ type: "building" } as const);
+        // A viewer's cursor position is only a claim. It acknowledges what this server
+        // actually sent that lease: records in earlier replies, never the echo of its own
+        // input and never a position beyond them (decision 8 (b)).
+        if (
+          session &&
+          input.cursor &&
+          sameObservationDomain(input.cursor.epoch, session.projection.domain)
+        ) {
+          observation.inboxSeq = Math.max(
+            observation.inboxSeq,
+            Math.min(input.cursor.inboxSeq, observation.sentInboxSeq),
+          );
+          pruneAcknowledged(session);
+        }
         if (session && result.type === "pass") {
-          // The inbox position a viewer may acknowledge is the one this server sent it.
-          observation.delivered = {
-            epoch: result.continuation.epoch,
-            inboxSeq: result.continuation.inboxSeq,
-          };
-          // A reader the journal ring overran got what the ring holds; the native horizon
-          // is fetched afresh so the next one starts from it (C3.4).
+          const last = result.inbox.at(-1);
+          if (last) observation.sentInboxSeq = Math.max(observation.sentInboxSeq, last.seq);
+          // A reader the journal ring overran got what the ring holds, and the placeholder
+          // behind it is filled by the client's own paging. The server refreshes its native
+          // horizon for readers that start afterwards; it does not push it to this one.
           if (
             result.journal?.continuity === "horizon" &&
             input.cursor?.journalAt != null &&
             sameObservationDomain(input.cursor.epoch, session.projection.domain)
           )
             requestRefresh(session, "page");
-        }
-        // The cursor's inbox position is the viewer's acknowledgement, capped at what was sent.
-        const acknowledged = observation.delivered;
-        if (
-          session &&
-          acknowledged &&
-          input.cursor &&
-          sameObservationDomain(input.cursor.epoch, session.projection.domain) &&
-          sameObservationDomain(input.cursor.epoch, acknowledged.epoch)
-        ) {
-          observation.inboxSeq = Math.max(
-            observation.inboxSeq,
-            Math.min(input.cursor.inboxSeq, acknowledged.inboxSeq),
-          );
-          pruneAcknowledged(session);
         }
         const remaining = deadline - clock.currentTimeMillisUnsafe();
         if (result.type === "pass" || remaining <= 0) return result;
@@ -2256,12 +2299,18 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         };
         let wakeUp: (why: "changed" | "superseded" | "released") => void = () => {};
         const woken = yield* Effect.callback<"changed" | "superseded" | "released">((resume) => {
+          // Everything captured at the scan is judged again here: a newer read or a
+          // release may have come in, the lease may have been attached to a session, and
+          // that session may have changed since. Nothing is registered over a newer read.
+          if (observation.released) return resume(Effect.succeed("released"));
+          if (observation.readId !== input.readId) return resume(Effect.succeed("superseded"));
+          const current = observation.session;
+          if (current !== session || (current && current.changeCount !== scanned))
+            return resume(Effect.succeed("changed"));
           wakeUp = (why) => resume(Effect.succeed(why));
           wake = () => resume(Effect.succeed("changed"));
           session?.changed.add(wake);
           observation.interrupt = waiting;
-          // A change that landed between the scan and this registration woke no one.
-          if (session && session.changeCount !== scanned) wake();
         }).pipe(
           Effect.timeoutOption(Duration.millis(remaining)),
           Effect.ensuring(

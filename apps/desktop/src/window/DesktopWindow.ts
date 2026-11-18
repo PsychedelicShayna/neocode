@@ -33,16 +33,40 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import { makeQuitShortcutHandler } from "./QuitHold.ts";
 
 const TITLEBAR_HEIGHT = 40;
+// Windows draws its caption buttons 32 points tall at 100% scale; an overlay
+// shorter than that leaves them hit-testing below the strip at deep zoom-out.
+const TITLEBAR_MIN_OVERLAY_HEIGHT = 32;
+// Blink renders page zoom clamped to these factors (blink page_zoom.h), while
+// the browser keeps whatever level it was handed.
+const MIN_PAGE_ZOOM_FACTOR = 0.25;
+const MAX_PAGE_ZOOM_FACTOR = 5;
+// Electron's zoom factor is 1.2 to the power of the zoom level.
+const MIN_PAGE_ZOOM_LEVEL = Math.log(MIN_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+const MAX_PAGE_ZOOM_LEVEL = Math.log(MAX_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+
+/**
+ * The View menu's next zoom level: the Electron menu roles' half-level step,
+ * held to the range Blink renders so steps past it are not silently swallowed.
+ */
+export function nextMainZoomLevel(level: number, direction: MainWindowZoomDirection): number {
+  if (direction === "reset") return 0;
+  return Math.min(
+    MAX_PAGE_ZOOM_LEVEL,
+    Math.max(MIN_PAGE_ZOOM_LEVEL, level + (direction === "in" ? 0.5 : -0.5)),
+  );
+}
 
 /**
  * The overlay's height is in window points, which do not follow page zoom,
  * while the renderer lays its title bar out in `env(titlebar-area-height)` CSS
- * pixels. Scaling by the zoom keeps that strip TITLEBAR_HEIGHT CSS pixels tall,
- * so a zoomed-in UI does not crowd its two-line tabs into a shorter strip.
- * Rounds up (past float noise) so the strip never ends up below its height.
+ * pixels. Scaling by the rendered zoom keeps that strip TITLEBAR_HEIGHT CSS
+ * pixels tall, so a zoomed-in UI does not crowd its two-line tabs into a
+ * shorter strip. Rounds up past float noise so the strip never ends up below
+ * its height, and never undercuts the native caption buttons.
  */
 export function titleBarOverlayHeight(zoomFactor: number): number {
-  return Math.ceil(TITLEBAR_HEIGHT * zoomFactor - 0.01);
+  const rendered = Math.min(MAX_PAGE_ZOOM_FACTOR, Math.max(MIN_PAGE_ZOOM_FACTOR, zoomFactor));
+  return Math.max(TITLEBAR_MIN_OVERLAY_HEIGHT, Math.ceil(TITLEBAR_HEIGHT * rendered - 1e-9));
 }
 
 function syncTitleBarOverlayHeight(window: Electron.BrowserWindow): void {
@@ -1098,10 +1122,7 @@ export const make = Effect.gen(function* () {
         return;
       }
       const webContents = window.value.webContents;
-      // Same step size as the Electron zoomIn/zoomOut menu roles.
-      webContents.setZoomLevel(
-        direction === "reset" ? 0 : webContents.getZoomLevel() + (direction === "in" ? 0.5 : -0.5),
-      );
+      webContents.setZoomLevel(nextMainZoomLevel(webContents.getZoomLevel(), direction));
       // Chromium zooms per origin, so every app window took the new level.
       for (const appWindow of windowBoundsFlushes.keys()) {
         if (environment.platform === "darwin") syncMacosWindowButtons(appWindow);

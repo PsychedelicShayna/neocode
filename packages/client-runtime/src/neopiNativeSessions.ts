@@ -11,7 +11,6 @@ import {
   type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionsReadResult,
-  type NeoPiNativeSessionsStreamEvent,
   type ServerProviderSlashCommand,
   type WS_METHODS,
 } from "@t3tools/contracts";
@@ -27,7 +26,6 @@ import {
   type NativeConversation,
   type NativeIdentity,
 } from "./neopiConversation.ts";
-import { applyNativeConversationEvent } from "./state/neopiConversation.ts";
 import {
   disconnectNativeSubagents,
   mergeNativeSubagentHistory,
@@ -35,12 +33,7 @@ import {
   snapshotNativeSubagents,
   type NativeSubagent,
 } from "./neopiNativeSubagents.ts";
-import {
-  EMPTY_NATIVE_JOBS,
-  reduceNativeJobs,
-  snapshotNativeJobs,
-  type NativeJobs,
-} from "./neopiNativeJobs.ts";
+import { EMPTY_NATIVE_JOBS, snapshotNativeJobs, type NativeJobs } from "./neopiNativeJobs.ts";
 import {
   EMPTY_NATIVE_ACTIVITY,
   closeNativeActivity,
@@ -54,13 +47,10 @@ const nowMs = () => DateTime.toEpochMillis(DateTime.nowUnsafe());
 export type NativeSession = EnvironmentRpcSuccess<typeof WS_METHODS.neopiNativeSessionsOpen>;
 export type NativeSessionList = EnvironmentRpcSuccess<typeof WS_METHODS.neopiNativeSessionsList>;
 export type NativeSessionUpdate =
-  /**
-   * The old raw watch events, which the watch no longer sends. They stay until
-   * the parity sign-off removes them with their reducer branches.
-   */
-  | NeoPiNativeSessionsStreamEvent
   /** One envelope of the essential `watch` stream (the lease). */
   | NeoPiNativeEssentialEnvelope
+  /** The client sent an answer to dialog `id`; it leaves before the server settles it. */
+  | { type: "answered"; id: string }
   /** The observation controller's own state; see `NativeObserver`. */
   | { type: "observer"; phase: NativeObserverPhase; reason?: string }
   | { type: "disconnected" }
@@ -208,43 +198,6 @@ export interface NativeDictation {
   readonly error: string | null;
 }
 const DICTATION_PHASES: ReadonlySet<unknown> = new Set(["starting", "recording", "transcribing"]);
-const SETTLED_CHILD_EVENTS: ReadonlySet<unknown> = new Set([
-  "message_end",
-  "tool_execution_end",
-  "agent_end",
-]);
-/**
- * NeoPi runs one capture at a time and always opens it with a state frame, so a
- * new capture id replaces the old one there. Any other frame for a different id,
- * or for a capture that already ended, is a straggler.
- */
-function reduceNativeDictation(
-  current: NativeDictation | null,
-  frame: Readonly<Record<string, unknown>>,
-): NativeDictation | null {
-  const captureId = frame.captureId;
-  if (typeof captureId !== "string") return current;
-  const same = current?.captureId === captureId;
-  if (same && current.phase === "ended") return current;
-  if (frame.type === "dictation_state" && DICTATION_PHASES.has(frame.state))
-    return {
-      captureId,
-      phase: frame.state as NativeDictation["phase"],
-      text: same ? current.text : "",
-      error: null,
-    };
-  if (current !== null && !same) return current;
-  if (frame.type === "dictation_transcript" && typeof frame.text === "string")
-    return { captureId, phase: current?.phase ?? "recording", text: frame.text, error: null };
-  if (frame.type === "dictation_end")
-    return {
-      captureId,
-      phase: "ended",
-      text: typeof frame.text === "string" ? frame.text : "",
-      error: typeof frame.error === "string" && frame.error ? frame.error : null,
-    };
-  return current;
-}
 /** One projection key as the client holds it. */
 export interface NativeObservedEntity {
   readonly ordinal: number;
@@ -1500,296 +1453,17 @@ export function reduceNativeSessionFeed(
         }
       : next;
   }
-  if (event.type === "reconnecting")
-    // The session stays connected to the server, which is waiting for the owner's
-    // successor: sends are held there. Nothing the old owner was doing continues.
-    return {
-      // The old owner's outstanding read must not apply to its successor.
-      ...invalidateNativeReads(feed),
-      ownerLoss: "reconnecting",
-      busy: false,
-      queue: EMPTY_NATIVE_QUEUE,
-      dialogs: [],
-      agents: disconnectNativeSubagents(
-        feed.agents,
-        feed.agentsRevision + 1,
-        DateTime.formatIso(DateTime.nowUnsafe()),
-      ),
-      agentsRevision: feed.agentsRevision + 1,
-      agentsEpoch: feed.agentsEpoch + 1,
-      activity: closeNativeActivity(feed.activity, nowMs()),
-      error: null,
-      dictation:
-        feed.dictation && feed.dictation.phase !== "ended"
-          ? { ...feed.dictation, phase: "ended" as const, error: event.reason }
-          : feed.dictation,
-    };
-  if (event.type === "disconnected" || event.type === "closed") {
-    // A detach and an exited terminal are states of their own, not failures: the
-    // composer offers the way back instead of an error.
-    const ownerLoss: NativeOwnerLoss | null =
-      event.type === "closed"
-        ? event.code === "detached"
-          ? "detached"
-          : event.code === "owner_exited"
-            ? "orphaned"
-            : null
-        : feed.ownerLoss === "reconnecting"
-          ? null
-          : feed.ownerLoss;
-    return {
-      ...invalidateNativeReads(feed),
-      connected: false,
-      ownerLoss,
-      // Pending UI replays independently and may precede the next snapshot.
-      // Retire stale requests here so that snapshot cannot erase a live replay.
-      dialogs: [],
-      agentsEpoch: feed.agentsEpoch + 1,
-      activity: closeNativeActivity(feed.activity, nowMs()),
-      ...(event.type === "closed"
-        ? {
-            busy: false,
-            // Losing the stream is not losing the owner: only a close stops its agents.
-            agents: disconnectNativeSubagents(
-              feed.agents,
-              feed.agentsRevision + 1,
-              DateTime.formatIso(DateTime.nowUnsafe()),
-            ),
-            agentsRevision: feed.agentsRevision + 1,
-            agentsKnown: false,
-            queue: EMPTY_NATIVE_QUEUE,
-            error: ownerLoss === null ? event.reason : null,
-            // The owner is gone, so no end frame is coming for a live capture.
-            dictation:
-              feed.dictation && feed.dictation.phase !== "ended"
-                ? { ...feed.dictation, phase: "ended" as const, error: event.reason }
-                : feed.dictation,
-          }
-        : {}),
-    };
-  }
-  if (event.type === "snapshot") {
-    const page = nativeJournalPage(event.journal);
-    const previous = feed.conversation;
-    const sameFile =
-      feed.session?.ref.sessionFile === event.session.ref.sessionFile &&
-      feed.session.ref.providerInstanceId === event.session.ref.providerInstanceId &&
-      feed.session.sessionId === event.session.sessionId;
-    const conversation = page
-      ? retainNativePending(
-          previous,
-          reduceNativeConversation(previous, { type: "snapshot", page }),
-        )
-      : sameFile
-        ? previous
-        : emptyNativeConversation();
-    return {
-      ...feed,
-      session: event.session,
-      conversation,
-      commandOutputs: sameFile ? feed.commandOutputs : [],
-      // The roster is replaced by key when the inventory is read again; a
-      // rebuild implies no interruption.
-      agents: sameFile ? feed.agents : [],
-      agentsRevision: feed.agentsRevision + 1,
-      agentsEpoch: feed.agentsEpoch + 1,
-      agentsKnown: sameFile && feed.agentsKnown,
-      jobs: sameFile ? feed.jobs : EMPTY_NATIVE_JOBS,
-      activity: observeNativeActivity(
-        sameFile ? closeNativeActivity(feed.activity, nowMs()) : EMPTY_NATIVE_ACTIVITY,
-        event.session.state,
-        event.session.state.isStreaming === true,
-        nowMs(),
-      ),
-      connected: true,
-      movedTo: null,
-      busy: event.session.state.isStreaming === true,
-      queue: nativePromptQueue(event.session.state.queuedMessages) ?? EMPTY_NATIVE_QUEUE,
-      error: null,
-      ownerLoss: null,
-      reconciliationError: null,
-    };
-  }
-  const frame = event.frame;
-  if (
-    frame.type === "journal_state" &&
-    typeof frame.sessionFile === "string" &&
-    feed.session &&
-    frame.sessionFile !== feed.session.ref.sessionFile
-  ) {
-    if (frame.reason === "identity" && frame.sessionId === feed.session.sessionId) {
-      // The same session moved to a new file: the transcript, queue and dialogs
-      // still belong to it, so follow the move instead of treating it as a new owner.
-      const ref = { ...feed.session.ref, sessionFile: frame.sessionFile };
-      const identity = feed.conversation.identity;
-      return {
-        ...feed,
-        session: { ...feed.session, ref },
-        conversation: identity
-          ? { ...feed.conversation, identity: { ...identity, sessionFile: frame.sessionFile } }
-          : feed.conversation,
-        movedTo: ref,
-      };
-    }
-    // This cache and its command target belong to the old file. Do not relabel
-    // its transcript or silently follow a terminal owner's file switch.
-    return {
-      ...feed,
-      connected: false,
-      busy: false,
-      queue: EMPTY_NATIVE_QUEUE,
-      dialogs: [],
-      editor: null,
-      agents: [],
-      jobs: EMPTY_NATIVE_JOBS,
-      activity: EMPTY_NATIVE_ACTIVITY,
-      agentsRevision: feed.agentsRevision + 1,
-      agentsEpoch: feed.agentsEpoch + 1,
-      agentsKnown: false,
-      error:
-        "The native owner changed session. Select its new native file before sending commands.",
-    };
-  }
-  const projected = applyNativeConversationEvent(
-    { conversation: feed.conversation, busy: feed.busy, connection: null },
-    { type: "native", event: frame },
-  );
-  const busy = projected.busy ?? feed.busy;
-  let next: NativeSessionFeed =
-    projected.conversation === feed.conversation && busy === feed.busy
-      ? feed
-      : { ...feed, conversation: projected.conversation, busy };
-  if (frame.type === "subagent_lifecycle" || frame.type === "subagent_progress") {
-    const agents = reduceNativeSubagents(
-      next.agents,
-      frame,
-      next.agentsRevision + 1,
-      DateTime.formatIso(DateTime.nowUnsafe()),
-    );
-    if (agents !== next.agents) next = { ...next, agents, agentsRevision: next.agentsRevision + 1 };
-  }
-  if (frame.type === "subagent_event") {
-    const payload = nativeRecord(frame.payload);
-    const id = payload.id;
-    // Streaming deltas would repaint the whole workspace; only settled steps are worth a re-read.
-    if (typeof id === "string" && SETTLED_CHILD_EVENTS.has(nativeRecord(payload.event).type))
-      next = { ...next, agentTicks: { ...next.agentTicks, [id]: (next.agentTicks[id] ?? 0) + 1 } };
-  }
-  if (frame.type === "job_lifecycle") {
-    const jobs = reduceNativeJobs(next.jobs, frame);
-    if (jobs !== next.jobs) next = { ...next, jobs };
-  }
-  if (frame.type === "agent_start" || frame.type === "agent_end") {
-    const at = nowMs();
-    next = {
-      ...next,
-      // A new turn starts clean: the last prompt's failure does not outlive it.
-      // A failed state or branch read stays until that read recovers.
-      ...(frame.type === "agent_start" && !next.reconciliationError ? { error: null } : {}),
-      activity:
-        frame.type === "agent_start"
-          ? openNativeActivity(next.activity, at)
-          : closeNativeActivity(next.activity, at),
-    };
-  }
-  if (
-    frame.type === "journal_state" &&
-    typeof frame.sessionId === "string" &&
-    next.session &&
-    frame.sessionFile === next.session.ref.sessionFile
-  )
-    next = {
-      ...next,
-      session: { ...next.session, sessionId: frame.sessionId },
-      ...(frame.sessionId !== next.session.sessionId
-        ? {
-            busy: false,
-            queue: EMPTY_NATIVE_QUEUE,
-            dialogs: [],
-            editor: null,
-            commandOutputs: [],
-            agents: [],
-            agentsRevision: next.agentsRevision + 1,
-            jobs: EMPTY_NATIVE_JOBS,
-            activity: EMPTY_NATIVE_ACTIVITY,
-            agentsEpoch: next.agentsEpoch + 1,
-            agentsKnown: false,
-          }
-        : {}),
-    };
-  if (frame.type === "command_output" && typeof frame.text === "string" && frame.text)
-    next = {
-      ...next,
-      commandOutputs: [
-        ...next.commandOutputs,
-        {
-          id: `command:${next.commandOutputs.length}`,
-          text: frame.text,
-          // The announced leaf may precede its page. Anchor to loaded history so
-          // the result is visible now and keeps its position through reconnects.
-          afterEntryId: next.conversation.entries.at(-1)?.id ?? null,
-          afterMessageId: next.conversation.pending.at(-1)?.messageId ?? null,
-        },
-      ],
-    };
-  if (frame.type === "available_commands_update")
-    next = { ...next, commandsRevision: next.commandsRevision + 1 };
-  if (
-    (frame.type === "tool_approval_request" || frame.type === "plan_proposal_request") &&
-    typeof frame.id === "string"
-  )
-    next = {
-      ...next,
-      dialogs: [...next.dialogs.filter((dialog) => dialog.id !== frame.id), frame],
-    };
-  if (frame.type === "tool_approval_cancel" && typeof frame.targetId === "string")
-    next = { ...next, dialogs: next.dialogs.filter((dialog) => dialog.id !== frame.targetId) };
-  if (frame.type === "plan_proposal_cancel" && typeof frame.id === "string")
-    next = { ...next, dialogs: next.dialogs.filter((dialog) => dialog.id !== frame.id) };
-  if (frame.type === "extension_ui_request" && typeof frame.id === "string") {
-    const method = frame.method;
-    if (["select", "confirm", "input", "editor", "ask"].includes(String(method)))
-      next = {
-        ...next,
-        dialogs: [...next.dialogs.filter((dialog) => dialog.id !== frame.id), frame],
-      };
-    else if (method === "cancel")
-      next = { ...next, dialogs: next.dialogs.filter((dialog) => dialog.id !== frame.targetId) };
-    else if (method === "set_editor_text" && typeof frame.text === "string")
-      next = { ...next, editor: { id: frame.id, text: frame.text } };
-    else if (method === "notify" && typeof frame.message === "string")
-      next = { ...next, notices: { ...next.notices, notification: frame.message } };
-    else if (method === "setStatus" && typeof frame.statusKey === "string")
-      next = {
-        ...next,
-        notices: {
-          ...next.notices,
-          [frame.statusKey]: typeof frame.statusText === "string" ? frame.statusText : "",
-        },
-      };
-    else if (method === "setWidget" && typeof frame.widgetKey === "string")
-      next = {
-        ...next,
-        notices: {
-          ...next.notices,
-          [frame.widgetKey]: Array.isArray(frame.widgetLines) ? frame.widgetLines.join("\n") : "",
-        },
-      };
-  }
-  if (frame.type.startsWith("dictation_")) {
-    const dictation = reduceNativeDictation(next.dictation, frame);
-    if (dictation !== next.dictation) next = { ...next, dictation };
-  }
-  if (frame.type === "queue_update")
-    next = { ...next, queue: nativePromptQueue(frame) ?? next.queue };
-  if (frame.type === "prompt_result" && frame.status === "error")
-    next = {
-      ...next,
-      error: String(nativeRecord(frame.error).message ?? "Native command failed."),
-    };
-  if (frame.type === "prompt_result" && frame.status !== "error" && !next.reconciliationError)
-    next = { ...next, error: null };
-  return next;
+  // `disconnected`: the controller lost the watch or the socket. Losing the
+  // stream is not losing the owner, so agents and the transcript stay.
+  return {
+    ...invalidateNativeReads(feed),
+    connected: false,
+    ownerLoss: feed.ownerLoss === "reconnecting" ? null : feed.ownerLoss,
+    // Open obligations are re-sent as `obligation-opened` on the next lease.
+    dialogs: [],
+    agentsEpoch: feed.agentsEpoch + 1,
+    activity: closeNativeActivity(feed.activity, nowMs()),
+  };
 }
 
 export function nativeTranscriptEntries(

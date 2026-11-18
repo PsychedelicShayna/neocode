@@ -27,6 +27,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
+  NATIVE_INBOX_GAP_LIMIT,
   NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
   nativeObservationStatus,
@@ -332,12 +333,31 @@ describe("native observation controller", () => {
         const fourth = yield* Queue.take(h.reads);
         expect(fourth.input).toMatchObject({ readId: 4, cursor: cursorAt(epochB, 2) });
 
-        const child = [{ kind: "child" as const, childId: "child", runToken: "run" }];
-        h.atoms.setDemand(h.target, child);
+        // Two child views hold demand; each release withdraws only its own.
+        const childA = { kind: "child" as const, childId: "a", runToken: "run-a" };
+        const childB = { kind: "child" as const, childId: "b", runToken: "run-b" };
+        const releaseA = h.atoms.holdDemand(h.target, [childA]);
         expect(yield* Queue.take(h.demands)).toEqual({
           leaseId: lease.id,
           generation: 2,
-          demand: child,
+          demand: [...DEFAULT_NATIVE_DEMAND, childA],
+        });
+        const releaseB = h.atoms.holdDemand(h.target, [childB]);
+        expect((yield* Queue.take(h.demands)).demand).toEqual([
+          ...DEFAULT_NATIVE_DEMAND,
+          childA,
+          childB,
+        ]);
+        releaseA();
+        releaseA();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          generation: 4,
+          demand: [...DEFAULT_NATIVE_DEMAND, childB],
+        });
+        releaseB();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          generation: 5,
+          demand: DEFAULT_NATIVE_DEMAND,
         });
 
         // Concealing the last view releases the lease at once and cancels its read.
@@ -479,44 +499,77 @@ describe("native observation controller", () => {
 });
 
 describe("native inbox bound", () => {
-  it("keeps a tool that streams forever within the inbox bound and marks what it cut", () => {
-    const epoch = domain();
+  it("keeps a tool that streams forever within bounds, server gaps exact, cuts as trimmed", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
       revision: 1,
       session,
     });
-    const total = NATIVE_INBOX_LIMIT * 4;
-    for (let seq = 1; seq <= total; seq++)
-      feed = applyRead(
-        feed,
-        pass({
-          epoch,
-          watermark: seq,
-          kind: seq === 1 ? "full" : "incremental",
-          inbox: [
-            {
-              type: "tool_stream_update",
-              seq,
-              toolCallId: "bash-1",
-              toolName: "bash",
-              update: { chunk: seq },
-            },
-          ],
-        }),
-      );
+    const serverGaps: NeoPiNativeInboxRecord[] = [];
+    const perProjection = NATIVE_INBOX_LIMIT * 3;
+    // Two projections: sequence numbers restart with the second.
+    for (const incarnation of [1, 2]) {
+      const epoch = domain({ projectionIncarnation: incarnation });
+      for (let seq = 1; seq <= perProjection; seq++) {
+        const record: NeoPiNativeInboxRecord =
+          seq % 10 === 0
+            ? {
+                type: "gap",
+                seq,
+                reason: "evicted",
+                fromSeq: seq,
+                toSeq: seq,
+                firstReceivedAt: seq,
+                lastReceivedAt: seq,
+                notices: 1,
+                toolStreams: [],
+                toolStreamsTruncated: false,
+              }
+            : {
+                type: "tool_stream_update",
+                seq,
+                toolCallId: `bash-${incarnation}`,
+                toolName: "bash",
+                update: { chunk: seq },
+              };
+        if (record.type === "gap") serverGaps.push(record);
+        feed = applyRead(
+          feed,
+          pass({
+            epoch,
+            watermark: seq,
+            kind: seq === 1 ? "full" : "incremental",
+            inbox: [record],
+          }),
+        );
+      }
+    }
     const inbox = feed.observation.inbox;
-    expect(inbox.length).toBeLessThanOrEqual(NATIVE_INBOX_LIMIT);
-    const gap = inbox[0];
-    expect(gap?.type).toBe("gap");
-    if (gap?.type !== "gap") return;
-    const kept = inbox.slice(1);
-    expect(gap).toMatchObject({ reason: "evicted", fromSeq: 1, toSeq: kept[0]!.seq - 1 });
-    expect(gap.toolStreams).toEqual([
-      { toolCallId: "bash-1", toolName: "bash", updates: total - kept.length },
-    ]);
-    expect(kept.every((record, index) => record.seq === gap.toSeq + 1 + index)).toBe(true);
-    expect(kept.at(-1)?.seq).toBe(total);
+    const raw = inbox.filter((item) => item.type === "tool_stream_update");
+    const gaps = inbox.filter((item) => item.type !== "tool_stream_update");
+    expect(raw.length).toBe(NATIVE_INBOX_LIMIT);
+    expect(gaps.length).toBeLessThanOrEqual(NATIVE_INBOX_GAP_LIMIT);
+    // Past the gap bound the oldest entries become one marker that claims nothing.
+    expect(inbox[0]).toEqual({ type: "older-details-trimmed" });
+    // Server gaps are kept exactly as received.
+    const kept = gaps.filter((item) => item.type === "gap");
+    expect(kept.length).toBeGreaterThan(0);
+    for (const gap of kept) expect(serverGaps).toContainEqual(gap);
+    // Each trimmed gap covers exactly cut records of one projection, never across a server gap.
+    const trimmed = gaps.filter((item) => item.type === "trimmed");
+    expect(trimmed.length).toBeGreaterThan(0);
+    for (const gap of trimmed) {
+      expect(gap.toSeq - gap.fromSeq + 1).toBe(gap.toolStreams[0]!.updates);
+      expect(gap.lastReceivedAt).toBeGreaterThanOrEqual(gap.firstReceivedAt);
+      expect(gap.toolStreams.map((stream) => stream.toolCallId)).toEqual([
+        gap.projection === trimmed.at(-1)!.projection ? "bash-2" : "bash-1",
+      ]);
+    }
+    // The newest trimmed gap ends right before the oldest record still held, or
+    // before the server gap that separates them.
+    const edge = raw[0]!.seq - trimmed.at(-1)!.toSeq;
+    expect(edge === 1 || (edge === 2 && (raw[0]!.seq - 1) % 10 === 0)).toBe(true);
+    expect(trimmed.at(-1)!.projection).toBe(raw[0]!.projection);
   });
 });
 
@@ -640,6 +693,144 @@ describe("native projection mapping", () => {
     expect(stopped.connected).toBe(false);
   });
 
+  describe("membership during an unfinished full pass", () => {
+    const rosterKey = (id: string, revision: number): NeoPiNativeEntity => ({
+      key: `roster:${id}`,
+      ordinal: revision,
+      revision,
+      value: {
+        class: "roster",
+        value: { id, runToken: "run", inventory: { id, status: "running", runToken: "run" } },
+      },
+    });
+    const toolKey = (id: string, revision: number): NeoPiNativeEntity => ({
+      key: `tool:${id}`,
+      ordinal: revision,
+      revision,
+      value: {
+        class: "tool",
+        toolCallId: id,
+        coverage: "since-build",
+        state: { status: "running" },
+      },
+    });
+    /** One reply of a full pass that continues, with `passId` and `watermark`. */
+    const partial = (input: {
+      readonly epoch: NeoPiNativeObservationDomain;
+      readonly passId: string;
+      readonly watermark: number;
+      readonly entities: readonly NeoPiNativeEntity[];
+      readonly promoted?: boolean;
+    }): NeoPiNativeSessionsReadResult => {
+      const base = pass({
+        epoch: input.epoch,
+        watermark: input.watermark,
+        entities: input.entities,
+      });
+      return {
+        ...base,
+        passId: input.passId,
+        promoted: input.promoted ?? false,
+        complete: false,
+        continuation: {
+          ...base.continuation,
+          base: 0,
+          pass: {
+            kind: "full",
+            passId: input.passId,
+            watermark: input.watermark,
+            lastOrdinal: 99,
+            afterOrdinal: 1,
+            segment: null,
+          },
+        },
+      };
+    };
+    const final = (epoch: NeoPiNativeObservationDomain, passId: string, watermark: number) => ({
+      ...pass({ epoch, watermark }),
+      passId,
+    });
+    /** A feed holding child `old` from a first completed pass. */
+    const holding = () =>
+      applyRead(
+        reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+          type: "session",
+          revision: 1,
+          session,
+        }),
+        pass({ epoch: domain(), watermark: 2, entities: [rosterKey("old", 2)] }),
+      );
+    const visible = (feed: NativeSessionFeed) => ({
+      agents: feed.agents.map((agent) => agent.id),
+      keys: [...feed.observation.entities.keys()].sort(),
+    });
+
+    it("shows new roster and tool keys only when the pass completes", () => {
+      const rebuilt = domain({ projectionIncarnation: 2 });
+      let feed = applyRead(
+        holding(),
+        partial({
+          epoch: rebuilt,
+          passId: "f",
+          watermark: 10,
+          entities: [
+            rosterKey("new", 5),
+            toolKey("t1", 6),
+            rosterKey("old", 7),
+            rosterKey("live", 11),
+          ],
+        }),
+      );
+      // Held `old` updates in place; `live` is newer than the watermark and shows at once.
+      expect(visible(feed)).toEqual({
+        agents: ["old", "live"],
+        keys: ["roster:live", "roster:old"],
+      });
+      feed = applyRead(feed, final(rebuilt, "f", 10));
+      expect(visible(feed)).toEqual({
+        agents: ["old", "live", "new"],
+        keys: ["roster:live", "roster:new", "roster:old", "tool:t1"],
+      });
+      expect(feed.observation.staged).toBeNull();
+    });
+
+    it("discards staged keys when the pass is promoted or its domain changes", () => {
+      const rebuilt = domain({ projectionIncarnation: 2 });
+      const staged = applyRead(
+        holding(),
+        partial({
+          epoch: rebuilt,
+          passId: "f",
+          watermark: 10,
+          entities: [rosterKey("new", 5), toolKey("t1", 6), rosterKey("old", 7)],
+        }),
+      );
+      expect(staged.observation.staged?.entities.size).toBe(2);
+
+      // Promotion: a fresh pass that never returns `new` or `t1`.
+      let promoted = applyRead(
+        staged,
+        partial({ epoch: rebuilt, passId: "g", watermark: 12, entities: [], promoted: true }),
+      );
+      expect(promoted.observation.staged).toBeNull();
+      promoted = applyRead(promoted, {
+        ...final(rebuilt, "g", 12),
+        entities: [rosterKey("old", 12)],
+      });
+      expect(visible(promoted)).toEqual({ agents: ["old"], keys: ["roster:old"] });
+
+      // Domain change mid-pass: the new domain's pass completes without them.
+      const moved = domain({ projectionIncarnation: 3 });
+      let changed = applyRead(
+        staged,
+        partial({ epoch: moved, passId: "h", watermark: 4, entities: [rosterKey("old", 3)] }),
+      );
+      expect(changed.observation.staged).toBeNull();
+      changed = applyRead(changed, final(moved, "h", 4));
+      expect(visible(changed)).toEqual({ agents: ["old"], keys: ["roster:old"] });
+    });
+  });
+
   it("maps envelopes and presentation keys into the fields web and mobile read", () => {
     const presentation = (key: string, revision: number, value: Record<string, unknown>) => ({
       key,
@@ -734,6 +925,38 @@ describe("native projection mapping", () => {
       leafId: null,
     });
     expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
+  });
+
+  it("notes a refused subagent level for the Agents view and clears it when withdrawn", () => {
+    const fault: NeoPiNativeEntity = {
+      key: "fault:subagent-subscription",
+      ordinal: 1,
+      revision: 2,
+      value: {
+        class: "fault",
+        value: {
+          source: "subagent-subscription",
+          level: "error",
+          requestedLevel: "progress",
+          message: "Owner refused",
+        },
+      },
+    };
+    const epoch = domain();
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(feed, pass({ epoch, watermark: 2, entities: [fault] }));
+    expect(feed.agentsNote).toEqual({ requestedLevel: "progress", message: "Owner refused" });
+    // Not a session error: the composer and transcript are unaffected.
+    expect(feed.error).toBeNull();
+    feed = applyRead(feed, {
+      ...pass({ epoch, watermark: 3, kind: "incremental" }),
+      tombstones: [{ key: fault.key, ordinal: 1, revision: 3 }],
+    });
+    expect(feed.agentsNote).toBeNull();
   });
 });
 

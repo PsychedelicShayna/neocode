@@ -278,14 +278,16 @@ export const NeoPiNativeInboxRecord = Schema.Union([
    * Records received and no longer retained, with no replay source; never a
    * temporary read failure. `evicted`: confirmed eviction at the inbox bound.
    * `not-observed`: dropped while no view held a lease (missing coverage);
-   * coverage must not be presented as complete across it. Adjacent gaps of
-   * one reason merge; a gap forced to absorb the other reason becomes
-   * `not-observed`. Counts are of records received in the whole interval.
+   * coverage must not be presented as complete across it. `mixed`: gaps of
+   * both reasons merged because gaps alone exceeded the bound; records were
+   * missed here, and whether a viewer fell behind or none was attached is no
+   * longer known. Adjacent gaps of one reason merge and keep it. Counts are of
+   * records received in the whole interval.
    */
   Schema.Struct({
     type: Schema.Literal("gap"),
     seq: NonNegativeInt,
-    reason: Schema.Literals(["evicted", "not-observed"]),
+    reason: Schema.Literals(["evicted", "not-observed", "mixed"]),
     fromSeq: NonNegativeInt,
     toSeq: NonNegativeInt,
     /** Server receive times (ms since epoch) of the first and last dropped record. */

@@ -2339,7 +2339,9 @@ describe("observation rebase", () => {
       feed.observation.inbox.map((record) =>
         record.type === "gap"
           ? [record.fromSeq, record.toSeq, record.reason, record.notices, record.toolStreams.length]
-          : record.seq,
+          : "seq" in record
+            ? record.seq
+            : record.type,
       );
     let feed = step(observing(), {
       epoch,

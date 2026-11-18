@@ -156,10 +156,19 @@ export function NativeSessionAgents({
   onClose: () => void;
 }) {
   const model = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
-  // Finished while no view watched: its outcome is unknown, so it never reads as interrupted.
-  const unseen = useMemo(
+  // A finish of unknown outcome never reads as interrupted: finished while no
+  // view watched, or known only from NeoPi's history, which records no outcome.
+  const finished = useMemo(
     () =>
-      new Set(agents.flatMap((agent) => (agent.native.unobservedSince !== null ? [agent.id] : []))),
+      new Map(
+        agents.flatMap((agent) =>
+          agent.native.unobservedSince !== null
+            ? [[agent.id, "finished while this session was not being watched"] as const]
+            : agent.native.outcomeUnrecorded
+              ? [[agent.id, "finished"] as const]
+              : [],
+        ),
+      ),
     [agents],
   );
   const rows = useMemo(
@@ -198,9 +207,7 @@ export function NativeSessionAgents({
             <Text className="font-t3-medium text-foreground">{agent.title}</Text>
             <Text className="text-xs text-foreground-muted">
               {[
-                unseen.has(agent.id)
-                  ? "finished while this session was not being watched"
-                  : agent.status,
+                finished.get(agent.id) ?? agent.status,
                 agent.role,
                 formatSubagentModelLabel(agent.model, agent.effort),
               ]

@@ -1323,4 +1323,89 @@ describe("NeoPiNativeProjection", () => {
       assert.deepEqual(settled, ["d:cancelled"]);
     });
   });
+
+  describe("confirmation", () => {
+    it("replies are ordered by their own requests, even with no store write between them", () => {
+      const projection = published();
+      const older = projection.mark();
+      const newer = projection.mark();
+      assert.isTrue(
+        projection.applySubagentsReply(
+          { subagents: [{ id: "c", status: "running", n: 2 }] },
+          newer,
+        ),
+      );
+      assert.isFalse(
+        projection.applySubagentsReply(
+          { subagents: [{ id: "c", status: "running", n: 1 }] },
+          older,
+        ),
+      );
+      assert.isTrue(
+        projection.applySubagentHistoryReply({ subagents: [{ id: "c", v: 2 }] }, newer),
+      );
+      assert.isFalse(
+        projection.applySubagentHistoryReply({ subagents: [{ id: "c", v: 1 }] }, older),
+      );
+      assert.isTrue(projection.applyStateReply({ sessionId, sessionName: "new" }, newer));
+      assert.isFalse(projection.applyStateReply({ sessionId, sessionName: "old" }, older));
+      assert.isTrue(projection.applyJobsReply({ running: [], recent: [], runningCount: 2 }, newer));
+      assert.isFalse(
+        projection.applyJobsReply({ running: [], recent: [], runningCount: 1 }, older),
+      );
+      const roster = projection.store.get("roster:c")?.value;
+      assert.deepEqual(
+        roster?.class === "roster" ? [roster.value.inventory, roster.value.history] : [],
+        [
+          { id: "c", status: "running", n: 2 },
+          { id: "c", v: 2 },
+        ],
+      );
+      const state = projection.store.get("setting:state")?.value;
+      const whole = state?.class === "setting" ? state.value.value : undefined;
+      assert.deepEqual(whole, { sessionId, sessionName: "new" });
+      const jobs = projection.store.get("presentation:jobs")?.value;
+      assert.deepEqual(jobs?.class === "presentation" ? jobs.value : undefined, {
+        runningCount: 2,
+      });
+    });
+
+    it("record only: the retired-key ring remembers 4,096 keys", () => {
+      const store = new NeoPiNativeProjection({ domain, tombstoneCapacity: 0, journalCapacity: 10 })
+        .store;
+      const retire = (key: string) => {
+        store.put(key, { class: "presentation", value: {} });
+        store.remove(key, `entry-${key}`);
+      };
+      retire("message:first");
+      // Join tombstones expire into the ring once more than 256 are held; after
+      // 4,096 more expirations the first key is forgotten, and a late frame for
+      // it could create a live row again.
+      for (let n = 0; n < 4_096 + 255; n++) retire(`message:${n}`);
+      assert.isTrue(store.wasRetired("message:first"));
+      retire("message:last");
+      assert.isFalse(store.wasRetired("message:first"));
+      assert.isTrue(store.wasRetired("message:0"));
+    });
+
+    it("record only: when only gaps remain, a forced merge across reasons is not-observed", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+        inboxLimits: { records: 1, bytes: 100_000 },
+      });
+      projection.fold({ type: "notice", level: "info", message: "a" });
+      projection.setInboxObserved(false); // a: a not-observed gap
+      projection.setInboxObserved(true);
+      // b is evicted into an evicted gap; two gaps over a bound of one merge.
+      projection.fold({ type: "notice", level: "info", message: "b" });
+      assert.deepEqual(
+        projection.inbox.map((record) =>
+          record.type === "gap" ? [record.reason, record.fromSeq, record.toSeq] : [],
+        ),
+        [["not-observed", 1, 2]],
+      );
+    });
+  });
 });

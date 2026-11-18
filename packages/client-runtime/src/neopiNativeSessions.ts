@@ -279,6 +279,8 @@ export interface NativeObservation {
    * completed full pass finds the branch loaded to its root without it.
    */
   readonly carried: ReadonlySet<string>;
+  /** Live rows the authority retired by a join tombstone: their entry is in its journal. */
+  readonly joined: ReadonlySet<string>;
   /** Oversized values in transit, by key, at one revision. */
   readonly segments: ReadonlyMap<
     string,
@@ -313,6 +315,7 @@ export const emptyNativeObservation = (): NativeObservation => ({
   removed: new Map(),
   unproven: new Set(),
   carried: new Set(),
+  joined: new Set(),
   segments: new Map(),
   inbox: [],
   inboxKey: null,
@@ -549,6 +552,8 @@ export function applyNativeRead(
   }
   let unproven = held.unproven;
   let carried = held.carried;
+  // A successor's journal says nothing about where the previous owner's entries sit.
+  const joined = new Set(ownerChanged ? [] : held.joined);
   if (ownerChanged) {
     const persisted = conversation.persisted;
     const losses = conversation.losses;
@@ -623,14 +628,15 @@ export function applyNativeRead(
     const value = previous.value;
     if (value.class !== "message") return;
     // Retired by its durable entry: the row stays until that entry is held.
-    if (joinEntryId !== undefined && conversation.identity)
+    if (joinEntryId !== undefined && conversation.identity) {
       conversation = reduceNativeConversation(conversation, {
         type: "persisted",
         identity: conversation.identity,
         messageId: value.messageId,
         entryId: joinEntryId,
       });
-    else unresolved.add(value.messageId);
+      joined.add(value.messageId);
+    } else unresolved.add(value.messageId);
   };
   for (const entity of result.entities) accept(entity);
   for (const segment of result.segments) {
@@ -691,6 +697,29 @@ export function applyNativeRead(
       messageIds: unresolved,
     });
     relocateLostOutputs(losses);
+  }
+  // A horizon reaching the leaf holds every entry of the branch newer than its
+  // first one, so a joined entry it lacks is in the older range: the row is
+  // history there, loaded on demand, not a live row after the newest entry.
+  if (
+    journal?.continuity === "horizon" &&
+    journal.leafId !== null &&
+    conversation.entries.at(-1)?.id === journal.leafId
+  ) {
+    const loadedNow = new Set(conversation.entries.map((entry) => entry.id));
+    const olderRows = new Set(
+      conversation.pending.flatMap((row) => {
+        const entryId = conversation.persisted.get(row.messageId);
+        return joined.has(row.messageId) && entryId !== undefined && !loadedNow.has(entryId)
+          ? [row.messageId]
+          : [];
+      }),
+    );
+    if (olderRows.size > 0)
+      conversation = reduceNativeConversation(conversation, {
+        type: "in_older_history",
+        messageIds: olderRows,
+      });
   }
   // A completed pass moved `base` past every fence at or below it.
   if (completed)
@@ -773,6 +802,9 @@ export function applyNativeRead(
       unproven: fullCompleted ? new Set() : unproven,
       carried: new Set(
         conversation.pending.flatMap((row) => (carried.has(row.messageId) ? [row.messageId] : [])),
+      ),
+      joined: new Set(
+        conversation.pending.flatMap((row) => (joined.has(row.messageId) ? [row.messageId] : [])),
       ),
       segments: completed ? new Map() : segments,
       inbox: arrived.length === 0 ? held.inbox : [...held.inbox, ...arrived],

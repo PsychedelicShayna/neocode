@@ -350,13 +350,23 @@ export function snapshotNativeSubagents(
   return result;
 }
 
-/** NeoPi's registry has no completed/failed: a finished child is parked, a killed one aborted. */
+/**
+ * NeoPi's registry status, mapped to what a live observer saw for the same child
+ * (neopi-nightly 01cf16cf72): a run that ends emits `subagent_lifecycle`
+ * `completed`/`failed`/`aborted` (task/executor.ts emitTerminal), then the
+ * keep-alive child is set `idle` and adopted for follow-ups (executor.ts:
+ * "finished and failed subagents both stay interrogable"; agent-lifecycle.ts
+ * adopt: "Take ownership of a finished subagent"); after its idle TTL it is
+ * `parked` and its session disposed. So `idle` and `parked` are both a finished
+ * run, shown as live shows it: completed. History keeps no failure detail
+ * (rpc-types.ts RpcSubagentHistoryEntry), so a run that failed reads completed
+ * once restored, for either status.
+ */
 function historyStatus(value: unknown): RuntimeSubagentStatus | null {
   switch (value) {
     case "running":
       return "running";
     case "idle":
-      return "idle";
     case "parked":
       return "completed";
     case "aborted":

@@ -213,7 +213,7 @@ describe("native subagent history roster", () => {
     expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
       ["late", "cancelled"],
       ["early", "completed"],
-      ["accepted", "idle"],
+      ["accepted", "completed"],
     ]);
     const early = agents.find((agent) => agent.id === "early")!;
     expect(early).toMatchObject({
@@ -231,6 +231,46 @@ describe("native subagent history roster", () => {
       "2026-10-28T11:02:00.000Z",
     );
     expect(deriveAgentPanelModel({ agents }).runningCount).toBe(0);
+  });
+
+  it("reads a child restored as idle the same as one whose finish was seen live", () => {
+    // From acc-prep-1's capture (native-rpc-1115712.jsonl, npi 18.18.8): a
+    // finished keep-alive child, still in memory.
+    const captured = {
+      id: "Load0",
+      kind: "sub",
+      parentId: "Main",
+      displayName: "task",
+      status: "idle",
+      live: true,
+      createdAt: 1795007174529,
+      lastActivity: 1795007188424,
+      responseAt: 1795007188429,
+      acceptedAt: 1795007188429,
+      terminalAt: 1795007188424,
+      resolvedModelIdentity: "acc-mock/transport",
+      metrics: { tokens: 0, requests: 4, tools: 3, cost: 0, durationMs: 13887 },
+      directCost: 0,
+    };
+    const [restored] = mergeNativeSubagentHistory([], [captured], 0, at);
+    expect(restored).toMatchObject({
+      status: "completed",
+      completedAt: "2026-11-18T13:06:28.424Z",
+    });
+    let observed = reduceNativeSubagents(
+      [],
+      { type: "subagent_lifecycle", payload: { id: "Load0", runToken: "r", status: "started" } },
+      1,
+      at,
+    );
+    observed = reduceNativeSubagents(
+      observed,
+      { type: "subagent_lifecycle", payload: { id: "Load0", runToken: "r", status: "completed" } },
+      2,
+      at,
+    );
+    expect(observed[0]?.status).toBe(restored?.status);
+    expect(deriveAgentPanelModel({ agents: [restored!] }).runningCount).toBe(0);
   });
 
   it("never overrides a child a frame touched after the read began, nor one still observed live", () => {
@@ -293,7 +333,7 @@ describe("native subagent history roster", () => {
     );
     expect(agents.map((agent) => [agent.id, agent.status])).toEqual([
       ["done", "completed"],
-      ["accepted", "idle"],
+      ["accepted", "completed"],
       ["working", "running"],
     ]);
     // An inventory that omits a child history called running means it is gone.

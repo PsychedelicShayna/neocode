@@ -1561,10 +1561,10 @@ export class NeoPiNativeProjection {
     while (this.#inbox.length > limits.records || this.#inboxBytes > limits.bytes) {
       // Evict the oldest payload into a gap of its own reason; gaps of
       // different reasons stay apart. Only when gaps alone exceed the bound do
-      // the two oldest merge, and that merged gap is `not-observed`.
+      // the two oldest merge; across reasons the merged gap is `mixed`.
       const oldest = this.#inbox.findIndex((item) => item.type !== "gap");
       if (oldest >= 0) this.#dropAt(oldest, "evicted");
-      else if (this.#inbox.length > 1) this.#mergeInto(0, 1, "not-observed");
+      else if (this.#inbox.length > 1) this.#mergeInto(0, 1, "mixed");
       else break;
     }
   }
@@ -1625,8 +1625,8 @@ export class NeoPiNativeProjection {
     const merged: InboxGap = {
       type: "gap",
       seq: absorbed.toSeq,
-      // Coverage unknown subsumes confirmed eviction.
-      reason: gap.reason === absorbed.reason ? gap.reason : "not-observed",
+      // Across reasons the cause is no longer known for the whole interval.
+      reason: gap.reason === absorbed.reason ? gap.reason : "mixed",
       fromSeq: gap.fromSeq,
       toSeq: absorbed.toSeq,
       firstReceivedAt: gap.firstReceivedAt,

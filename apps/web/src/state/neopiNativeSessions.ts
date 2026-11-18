@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import { createNativeSessionAtoms } from "@t3tools/client-runtime/state/neopi-native-sessions";
 import {
   emptyNativeSessionFeed,
+  type NativeObserverPhase,
   type NativeSessionFeed,
   type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
@@ -57,6 +58,23 @@ export const selectNativeSession = (target: NativeSessionTarget) =>
     target,
     tabs: openNativeSessionTab(state.tabs, target),
   }));
+/** Parked observations a retry may wake; a detach waits for Reconnect. */
+const RETRYABLE_PHASES: ReadonlySet<NativeObserverPhase> = new Set([
+  "owner-stopped",
+  "incompatible",
+  "identity-changed",
+  "unauthorized",
+]);
+/**
+ * Re-attaches (never opens) a session whose observation stopped on its owner,
+ * as clicking its already-selected tab did before: a terminal owner started
+ * again on the same file is picked up. Anything else is left alone, so no wake
+ * is left queued for a later stop.
+ */
+export function retryStoppedNativeSession(target: NativeSessionTarget) {
+  const phase = nativeSessionAtoms.cached(target)?.observer.phase;
+  if (phase !== undefined && RETRYABLE_PHASES.has(phase)) nativeSessionAtoms.retry(target);
+}
 export const closeNativeSession = (target: NativeSessionTarget) =>
   useNativeSessionSelection.setState((state) => {
     const next = closeNativeSessionTab(state.tabs, state.target, target);

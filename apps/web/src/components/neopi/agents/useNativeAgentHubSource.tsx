@@ -109,7 +109,8 @@ export function useNativeAgentHubSource({
   );
 
   // An open child view adds that child to the session's demand; the server
-  // raises NeoPi's subscription for it. Without its run token it cannot be named.
+  // raises NeoPi's subscription for it. A child known only from the inventory
+  // has no run token yet; it is held by id and re-held once its run is named.
   const openChild = useAgentViewStore((store) => {
     const view = selectAgentView(key)(store);
     return view.mode === "agent" ? view.selectedId : null;
@@ -121,10 +122,14 @@ export function useNativeAgentHubSource({
   const { environmentId } = target;
   const { providerInstanceId } = target.ref;
   useEffect(() => {
-    if (openChild === null || typeof childRunToken !== "string") return;
+    if (openChild === null) return;
     return nativeSessionAtoms.holdDemand(
       { environmentId, ref: { providerInstanceId, sessionFile } },
-      [{ kind: "child", childId: openChild, runToken: childRunToken }],
+      [
+        typeof childRunToken === "string"
+          ? { kind: "child", childId: openChild, runToken: childRunToken }
+          : { kind: "child", childId: openChild },
+      ],
     );
   }, [environmentId, providerInstanceId, sessionFile, openChild, childRunToken]);
 

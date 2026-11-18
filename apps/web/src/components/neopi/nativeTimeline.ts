@@ -96,14 +96,20 @@ function noticeText(text: string): string {
  * plus the output. Without an intent, T3's own labelling applies: a shell row
  * shows its first command line, other tools their path or pattern.
  */
-function toolWorkEntry(row: ToolRow, id: string, turnId: TurnId, running: boolean): WorkLogEntry {
+function toolWorkEntry(
+  row: ToolRow,
+  id: string,
+  turnId: TurnId,
+  running: boolean,
+  loss: string | null,
+): WorkLogEntry {
   const intent = row.call.intent ?? undefined;
   const fullCommand = toolCommand(row)?.trim();
   const command = fullCommand ? (intent ? fullCommand : firstLine(fullCommand)) : undefined;
   const changedFiles = toolChangedFiles(row);
   const itemType = ITEM_TYPE[row.call.name] ?? "dynamic_tool_call";
   const output = row.result ? boundedOutput(row.result.text) : "";
-  const detail = intent
+  const body = intent
     ? [fullCommand ? "" : (row.detail ?? ""), output].filter(Boolean).join("\n\n")
     : fullCommand
       ? [fullCommand !== command ? fullCommand : "", output].filter(Boolean).join("\n\n")
@@ -114,6 +120,9 @@ function toolWorkEntry(row: ToolRow, id: string, turnId: TurnId, running: boolea
           : row.result?.isError
             ? firstLine(row.result.text)
             : ""));
+  // The marker lives in the call's own body: a separate entry would regroup
+  // the call and fold a row the user expanded.
+  const detail = [body, loss ? `${LOSS_MARKER_LABEL}\n${loss}` : ""].filter(Boolean).join("\n\n");
   return {
     id,
     // A finished call is dated by its result, so turn durations cover the work.
@@ -241,11 +250,7 @@ function memoized(
   return entry;
 }
 
-/** A tool row's loss marker, kept while the row and the warning text hold. */
-const lossMemo = new WeakMap<
-  TranscriptRow,
-  { readonly text: string; readonly turnId: TurnId; readonly entry: TimelineEntry }
->();
+const LOSS_MARKER_LABEL = "Some live output of this call was not kept.";
 /** The merged entry for a settings change, kept while the previous entry and label hold. */
 const mergedSettingMemo = new WeakMap<
   TimelineEntry,
@@ -254,7 +259,7 @@ const mergedSettingMemo = new WeakMap<
 
 /**
  * `lossByToolCall` holds live output missing from a call's inbox stream
- * (`nativeInboxLossWarnings`); each such call gets a warning row right after it.
+ * (`nativeInboxLossWarnings`); each such call shows it in its own body.
  */
 export function projectNativeTimeline(
   rows: readonly TranscriptRow[],
@@ -340,31 +345,14 @@ export function projectNativeTimeline(
         const callId = row.call.id;
         const id = callId && !toolIds.has(callId) ? `tool:${callId}` : row.id;
         if (callId) toolIds.add(callId);
+        const losses = callId ? lossByToolCall?.get(callId) : undefined;
+        const loss = losses?.length ? losses.map((item) => item.text).join("\n\n") : null;
         // Only a call still waiting for its result shows whether the run is live.
         entries.push(
-          memoized(row, `${turnId}\n${id}`, row.result ? null : busy, () =>
-            work(toolWorkEntry(row, id, turnId, busy)),
+          memoized(row, `${turnId}\n${id}\n${loss ?? ""}`, row.result ? null : busy, () =>
+            work(toolWorkEntry(row, id, turnId, busy, loss)),
           ),
         );
-        const losses = callId ? lossByToolCall?.get(callId) : undefined;
-        if (losses?.length) {
-          const text = losses.map((loss) => loss.text).join("\n\n");
-          const hit = lossMemo.get(row);
-          if (hit && hit.text === text && hit.turnId === turnId) entries.push(hit.entry);
-          else {
-            const entry = work({
-              id: `${id}:loss`,
-              createdAt: row.result?.entry.timestamp ?? row.timestamp,
-              turnId,
-              label: "Some live output of this call was not kept",
-              detail: text,
-              tone: "info",
-              sourceActivityKind: "runtime.warning",
-            });
-            lossMemo.set(row, { text, turnId, entry });
-            entries.push(entry);
-          }
-        }
         lastAt = row.result?.entry.timestamp ?? lastAt;
         workEndedAt = lastAt;
         break;

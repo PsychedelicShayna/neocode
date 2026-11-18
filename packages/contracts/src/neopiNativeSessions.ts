@@ -416,7 +416,12 @@ export type NeoPiNativeSessionsReadResult = typeof NeoPiNativeSessionsReadResult
 
 export const NeoPiNativeDemandItem = Schema.Union([
   Schema.Struct({ kind: Schema.Literals(["summary", "transcript", "roster"]) }),
-  Schema.Struct({ kind: Schema.Literal("child"), childId: Schema.String, runToken: Schema.String }),
+  // `runToken` is absent for a child known only from the live inventory.
+  Schema.Struct({
+    kind: Schema.Literal("child"),
+    childId: Schema.String,
+    runToken: Schema.optionalKey(Schema.String),
+  }),
 ]);
 export type NeoPiNativeDemandItem = typeof NeoPiNativeDemandItem.Type;
 

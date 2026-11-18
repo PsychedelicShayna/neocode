@@ -1,4 +1,8 @@
-import type { NeoPiJournalEntry, NeoPiNativeObservationDomain } from "@t3tools/contracts";
+import {
+  TurnId,
+  type NeoPiJournalEntry,
+  type NeoPiNativeObservationDomain,
+} from "@t3tools/contracts";
 import {
   createTranscriptProjector,
   type TranscriptRow,
@@ -8,6 +12,7 @@ import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
   deriveMessagesTimelineRowsWithState,
+  type MessagesTimelineRow,
   type MessagesTimelineRowsProjection,
   type StableMessagesTimelineRowsState,
 } from "../chat/MessagesTimeline.logic";
@@ -237,18 +242,51 @@ describe("native tool disclosure across persistence", () => {
     }
   });
 
-  it("places a missing-output marker immediately at the call, not at another tool", () => {
-    const first = tool("call-a", 10);
-    const second = tool("call-b", 11);
-    const losses = new Map([["call-a", [{ text: "missing output facts" }]]]);
-    const timeline = projectNativeTimeline([user("u1", 0), first, second], true, losses);
-    expect(timeline.entries).toHaveLength(4);
-    expect(timeline.entries[2]).toMatchObject({
-      kind: "work",
-      entry: { sourceActivityKind: "runtime.warning", detail: "missing output facts" },
+  it("shows a missing-output marker inside its call without regrouping or folding the row", () => {
+    const finished = (id: string, second: number): Row<"tool"> => ({
+      ...tool(id, second),
+      result: {
+        entry: entry(`${id}:r`, "message"),
+        text: "ok",
+        images: [],
+        isError: false,
+        details: null,
+      },
     });
-    expect(timeline.entries[1]).toMatchObject({ entry: { toolCallId: "call-a" } });
-    expect(timeline.entries[3]).toMatchObject({ entry: { toolCallId: "call-b" } });
+    const rows = [
+      user("u1", 0),
+      finished("call-a", 10),
+      assistant("a1", 11),
+      finished("call-b", 12),
+    ];
+    const derive = (losses?: ReadonlyMap<string, readonly { readonly text: string }[]>) => {
+      const timeline = projectNativeTimeline(rows, false, losses);
+      return deriveMessagesTimelineRows({
+        timelineEntries: timeline.entries,
+        latestTurn: timeline.latestTurn,
+        runningTurnId: timeline.runningTurnId,
+        // The reader opened the finished turn to see its calls.
+        expandedTurnIds: new Set([TurnId.make("native:u1")]),
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+    };
+    const shape = (derived: readonly MessagesTimelineRow[]) =>
+      derived.map((row) => `${row.kind}:${row.id}`);
+    const marked = derive(new Map([["call-a", [{ text: "missing output facts" }]]]));
+    // The standalone call keeps its own row (and so the disclosure keyed by its id).
+    expect(shape(marked)).toEqual(shape(derive()));
+    const callA = marked.find((row) => row.id === "tool:call-a");
+    expect(callA?.kind === "work" && callA.groupedEntries[0]?.detail).toContain(
+      "missing output facts",
+    );
+    const callB = marked.find((row) => row.id === "tool:call-b");
+    expect(callB?.kind).toBe("work");
+    expect((callB?.kind === "work" && callB.groupedEntries[0]?.detail) || "").not.toContain(
+      "missing output facts",
+    );
   });
 });
 

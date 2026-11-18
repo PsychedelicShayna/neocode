@@ -1039,9 +1039,10 @@ const clock = (ms: number) =>
   DateTime.formatLocal(DateTime.makeUnsafe(ms), { timeStyle: "medium" });
 const LOSS_REASON: Record<NativeInboxLoss, string> = {
   evicted: "The server dropped them to stay within its limit before this view read them.",
-  "not-observed": "No view was attached while they happened, so they were not kept.",
+  "not-observed":
+    "No view of this session read them before the last one was closed or hidden, so they were not kept.",
   mixed:
-    "Records were missed in this interval. Whether the server dropped them or no view was attached is no longer known.",
+    "Records were missed in this interval. Whether the server dropped them or no view read them in time is no longer known.",
   trimmed: "This view received them, then dropped the oldest records to stay within its own limit.",
 };
 
@@ -1785,18 +1786,39 @@ export type NativeTranscriptRow =
   | { readonly kind: "entry"; readonly id: string; readonly entry: NeoPiJournalEntry }
   | { readonly kind: "command"; readonly id: string; readonly text: string };
 
+/** The first tool call id in a journal entry's message, if any. */
+function firstToolCallId(entry: NeoPiJournalEntry): string | null {
+  const content = nativeRecord(entry.message).content;
+  const call = Array.isArray(content)
+    ? content.map(nativeRecord).find((block) => block.type === "toolCall")
+    : undefined;
+  return typeof call?.id === "string" && call.id ? call.id : null;
+}
+
 /**
  * Command results are local display history, not entries in the native journal.
  * A message with tool calls is keyed by its first call id rather than its entry,
  * so its row (and what the reader expanded in it) survives the live row becoming
  * durable and any rebase; a repeated call id falls back to the entry.
+ *
+ * `previous` is the last result: a streaming message keeps the key it was shown
+ * under when it gains its first call, and that call's rows keep it afterwards.
  */
 export function nativeTranscriptRows(
   feed: Pick<NativeSessionFeed, "conversation" | "commandOutputs">,
   debug: boolean,
+  previous: readonly NativeTranscriptRow[] = [],
 ): readonly NativeTranscriptRow[] {
   const outputs = new Map<string | null, NativeCommandOutput[]>();
-  const toolKeys = new Set<string>();
+  const keys = new Set<string>();
+  const shownAs = new Map<string, string>();
+  for (const row of previous) {
+    if (row.kind !== "entry") continue;
+    if (row.entry.id.startsWith("live:")) shownAs.set(row.entry.id, row.id);
+    const callId = firstToolCallId(row.entry);
+    // A repeated call id: the first row with it holds the call's key, as below.
+    if (callId && !shownAs.has(`tool:${callId}`)) shownAs.set(`tool:${callId}`, row.id);
+  }
   // Output follows its live row until that row retires onto its durable entry.
   const live = new Set(feed.conversation.pending.map((message) => message.messageId));
   for (const output of feed.commandOutputs) {
@@ -1823,17 +1845,14 @@ export function nativeTranscriptRows(
       entry.type === "message" ||
       (entry.type === "custom_message" && entry.display !== false)
     ) {
-      const content = nativeRecord(entry.message).content;
-      const call = Array.isArray(content)
-        ? content.map(nativeRecord).find((block) => block.type === "toolCall")
-        : undefined;
-      const key = typeof call?.id === "string" && call.id ? `tool:${call.id}` : null;
-      rows.push({
-        kind: "entry",
-        id: key && !toolKeys.has(key) ? key : `entry:${entry.id}`,
-        entry,
-      });
-      if (key) toolKeys.add(key);
+      const callId = firstToolCallId(entry);
+      const tool = callId ? `tool:${callId}` : null;
+      const id =
+        [shownAs.get(entry.id), tool && shownAs.get(tool), tool].find(
+          (key): key is string => typeof key === "string" && !keys.has(key),
+        ) ?? `entry:${entry.id}`;
+      rows.push({ kind: "entry", id, entry });
+      keys.add(id);
     }
     // A command after hidden bookkeeping still appears in the right place.
     // Results on another branch stay hidden until its anchor is visible again.

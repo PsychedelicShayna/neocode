@@ -8,7 +8,7 @@ import { useEffect, useRef, type KeyboardEvent } from "react";
 import { cn } from "~/lib/utils";
 import { elapsedBetween, formatCost } from "./agentFormat";
 
-type AgentStatusKey = AgentHubAgent["status"] | "finishedUnseen";
+type AgentStatusKey = AgentHubAgent["status"] | "finishedUnseen" | "finishedUnrecorded";
 const STATUS_VISUALS: Record<AgentStatusKey, { dot: string; label: string }> = {
   pending: { dot: "bg-info", label: "Working" },
   running: { dot: "bg-info", label: "Working" },
@@ -23,12 +23,31 @@ const STATUS_VISUALS: Record<AgentStatusKey, { dot: string; label: string }> = {
     dot: "bg-muted-foreground/60",
     label: "Finished while this session was not being watched",
   },
+  // Known finished only from NeoPi's history, which records no outcome.
+  finishedUnrecorded: { dot: "bg-muted-foreground/60", label: "Finished" },
 };
-type AgentStatus = Pick<AgentHubAgent, "status" | "unobservedSince">;
-const statusKey = (agent: AgentStatus) =>
-  agent.unobservedSince !== null ? ("finishedUnseen" as const) : agent.status;
+type AgentStatus = Pick<AgentHubAgent, "status" | "unobservedSince" | "outcomeUnrecorded">;
+const statusKey = (agent: AgentStatus): AgentStatusKey =>
+  agent.unobservedSince !== null
+    ? "finishedUnseen"
+    : agent.outcomeUnrecorded
+      ? "finishedUnrecorded"
+      : agent.status;
 
 export const agentStatusLabel = (agent: AgentStatus) => STATUS_VISUALS[statusKey(agent)].label;
+
+/**
+ * A row's second line: what the agent is doing, else its task, else its status.
+ * A finish of unknown outcome always shows its status, so it is never read as
+ * whatever the agent was last doing.
+ */
+export function agentRowSummary(
+  agent: AgentStatus & Pick<AgentHubAgent, "activity" | "task">,
+): string {
+  const key = statusKey(agent);
+  if (key === "finishedUnseen" || key === "finishedUnrecorded") return STATUS_VISUALS[key].label;
+  return agent.activity ?? agent.task ?? STATUS_VISUALS[key].label;
+}
 
 export function AgentStatusDot({ agent }: { agent: AgentStatus }) {
   return (
@@ -143,7 +162,7 @@ function AgentRow({
           agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
         )}
       >
-        {agent.activity ?? agent.task ?? agentStatusLabel(agent)}
+        {agentRowSummary(agent)}
       </span>
       <span className="col-start-2 col-end-4 row-start-3 truncate text-2xs tabular-nums text-muted-foreground/70">
         {[model, agentMetricsText(agent)].filter(Boolean).join(" · ")}

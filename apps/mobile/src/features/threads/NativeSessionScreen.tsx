@@ -357,6 +357,8 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       nativeTranscriptRows(
         { conversation: feed.conversation, commandOutputs: feed.commandOutputs },
         debug,
+        // The rows last shown, so a row keeps its key (and its open toggles).
+        followRowsRef.current,
       ),
     [feed.conversation, feed.commandOutputs, debug],
   );

@@ -36,9 +36,8 @@ vi.mock("@t3tools/client-runtime/state/neopi-native-sessions", async () => {
     get(lease);
     return get(signal);
   }).pipe(Atom.setIdleTTL(0));
-  const concealed = Atom.make(() =>
-    AsyncResult.success(control.cached ?? emptyNativeSessionFeed()),
-  ).pipe(Atom.setIdleTTL(0));
+  // A concealed view only holds the cache; the hooks show `cached`.
+  const concealed = Atom.make(() => AsyncResult.initial()).pipe(Atom.setIdleTTL(0));
   control.publish = (feed) => {
     control.cached = feed;
     appAtomRegistry.set(signal, AsyncResult.success(feed));
@@ -137,24 +136,25 @@ it("keeps applying replies while visible but blurred, and releases only when act
   });
   expect(control.leases).toBe(1);
   expect(displayed).toBe("after blur:true");
-  await act(async () => {
-    renderer!.update(
-      <AppAtomRegistryProvider>
-        <View shown={false} />
-      </AppAtomRegistryProvider>,
-    );
-    await vi.runAllTimersAsync();
-  });
+  // A prop change commits its effects when `act` ends; the unsubscribed
+  // observation is released a microtask later, so drain once more.
+  const rerender = async (shown: boolean) => {
+    await act(async () => {
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <View shown={shown} />
+        </AppAtomRegistryProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+  };
+  // A collapsed panel is concealed while the page stays visible.
+  await rerender(false);
   expect(control.leases).toBe(0);
   expect(displayed).toBe("after blur:true");
-  await act(async () => {
-    renderer!.update(
-      <AppAtomRegistryProvider>
-        <View />
-      </AppAtomRegistryProvider>,
-    );
-    await vi.runAllTimersAsync();
-  });
+  await rerender(true);
   expect(control.leases).toBe(1);
   expect(displayed).toBe("after blur:true");
 });

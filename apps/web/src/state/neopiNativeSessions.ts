@@ -112,10 +112,11 @@ export function usePageVisible() {
 }
 
 /**
- * The feed atom a view reads: the session's lease while the page is visible,
- * nothing while it is hidden. A hidden view holds the cached feed instead, so it
- * keeps its place and resumes from it when shown. Panels of the visible session
- * share its one lease, so a collapsed panel never holds one of its own.
+ * The feed atom a view subscribes to: the session's lease while the view is
+ * shown and the page is visible. Otherwise it only holds the cached feed, which
+ * the view shows, so it keeps its place and resumes from it when shown. Panels
+ * of the visible session share its one lease, so a collapsed panel never holds
+ * one of its own.
  */
 function useNativeSessionFeedAtom(target: NativeSessionTarget, shown: boolean) {
   const pageVisible = usePageVisible();
@@ -125,15 +126,14 @@ function useNativeSessionFeedAtom(target: NativeSessionTarget, shown: boolean) {
 export function useNativeSession(target: NativeSessionTarget, shown = true) {
   const result = useAtomValue(useNativeSessionFeedAtom(target, shown));
   const request = useNativeSessionRequest(target);
-  const cached = nativeSessionAtoms.cached(target);
-  const feed = AsyncResult.isSuccess(result) ? result.value : (cached ?? emptyNativeSessionFeed());
+  const feed = AsyncResult.isSuccess(result)
+    ? result.value
+    : (nativeSessionAtoms.cached(target) ?? emptyNativeSessionFeed());
   return {
     feed,
     session: feed.session,
     conversation: feed.conversation,
     request,
-    // Only a view with nothing to show is loading; a resumed one shows what it held.
-    loading: AsyncResult.isInitial(result) && cached === undefined,
     error: AsyncResult.isFailure(result) ? String(Cause.squash(result.cause)) : feed.error,
   };
 }

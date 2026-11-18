@@ -5,7 +5,6 @@ import {
   NEOPI_NATIVE_OBSERVATION_ERROR_CODES,
   NeoPiJournalPage,
   NeoPiModelsError,
-  type NeoPiNativeObservationDomain,
   NeoPiNativeSessionCommand,
   NeoPiNativeSessionLive,
   NeoPiNativeSessionRecord,

@@ -1929,15 +1929,21 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* Deferred.await(reached);
         const refused = yield* service
           .request({ ref: originalRef, command: { type: "snapshot_session_journal" } })
-          .pipe(Effect.flip);
-        assert.equal(refused.code, "observation_server_owned");
+          .pipe(Effect.result);
+        assert.equal(
+          refused._tag === "Failure" ? refused.failure.code : undefined,
+          "observation_server_owned",
+        );
         const level = yield* service
           .request({
             ref: originalRef,
             command: { type: "set_subagent_subscription", level: "events" },
           })
-          .pipe(Effect.flip);
-        assert.equal(level.code, "observation_server_owned");
+          .pipe(Effect.result);
+        assert.equal(
+          level._tag === "Failure" ? level.failure.code : undefined,
+          "observation_server_owned",
+        );
         native.snapshotHook = Effect.void;
         yield* Deferred.succeed(release, undefined);
         yield* lease.pass();
@@ -2715,8 +2721,9 @@ describe("confirmation round", () => {
         const view = yield* second.pass();
         // The old prefix is never served: the body is gone or current, never stale.
         const held = bodyOf(view.entities.get("message:m"));
+        const last: unknown = Array.isArray(held) ? held.at(-1) : undefined;
         assert.isTrue(
-          held === undefined || String(Reflect.get(Object(held.at(-1)), "text")).includes("done"),
+          held === undefined || String(Reflect.get(Object(last), "text")).includes("done"),
         );
       }).pipe(Effect.scoped),
   );

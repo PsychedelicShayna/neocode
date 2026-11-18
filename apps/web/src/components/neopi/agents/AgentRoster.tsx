@@ -8,7 +8,8 @@ import { useEffect, useRef, type KeyboardEvent } from "react";
 import { cn } from "~/lib/utils";
 import { elapsedBetween, formatCost } from "./agentFormat";
 
-const STATUS_VISUALS: Record<AgentHubAgent["status"], { dot: string; label: string }> = {
+type AgentStatusKey = AgentHubAgent["status"] | "finishedUnseen";
+const STATUS_VISUALS: Record<AgentStatusKey, { dot: string; label: string }> = {
   pending: { dot: "bg-info", label: "Working" },
   running: { dot: "bg-info", label: "Working" },
   waiting: { dot: "bg-info", label: "Waiting" },
@@ -17,15 +18,23 @@ const STATUS_VISUALS: Record<AgentHubAgent["status"], { dot: string; label: stri
   failed: { dot: "bg-destructive", label: "Failed" },
   cancelled: { dot: "bg-muted-foreground/60", label: "Stopped" },
   interrupted: { dot: "bg-muted-foreground/60", label: "Disconnected" },
+  // Its outcome is unknown, so it reads as neither interrupted, failed nor completed.
+  finishedUnseen: {
+    dot: "bg-muted-foreground/60",
+    label: "Finished while this session was not being watched",
+  },
 };
+type AgentStatus = Pick<AgentHubAgent, "status" | "unobservedSince">;
+const statusKey = (agent: AgentStatus) =>
+  agent.unobservedSince !== null ? ("finishedUnseen" as const) : agent.status;
 
-export const agentStatusLabel = (status: AgentHubAgent["status"]) => STATUS_VISUALS[status].label;
+export const agentStatusLabel = (agent: AgentStatus) => STATUS_VISUALS[statusKey(agent)].label;
 
-export function AgentStatusDot({ status }: { status: AgentHubAgent["status"] }) {
+export function AgentStatusDot({ agent }: { agent: AgentStatus }) {
   return (
     <span
       aria-hidden
-      className={cn("size-1.5 shrink-0 rounded-full", STATUS_VISUALS[status].dot)}
+      className={cn("size-1.5 shrink-0 rounded-full", STATUS_VISUALS[statusKey(agent)].dot)}
     />
   );
 }
@@ -109,7 +118,7 @@ function AgentRow({
       )}
     >
       <span className="col-start-1 row-start-1 flex items-center">
-        <AgentStatusDot status={agent.status} />
+        <AgentStatusDot agent={agent} />
       </span>
       <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
         <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
@@ -134,12 +143,12 @@ function AgentRow({
           agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
         )}
       >
-        {agent.activity ?? agent.task ?? STATUS_VISUALS[agent.status].label}
+        {agent.activity ?? agent.task ?? agentStatusLabel(agent)}
       </span>
       <span className="col-start-2 col-end-4 row-start-3 truncate text-2xs tabular-nums text-muted-foreground/70">
         {[model, agentMetricsText(agent)].filter(Boolean).join(" · ")}
       </span>
-      <span className="sr-only">{STATUS_VISUALS[agent.status].label}</span>
+      <span className="sr-only">{agentStatusLabel(agent)}</span>
     </div>
   );
 }

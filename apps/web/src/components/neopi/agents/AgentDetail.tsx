@@ -126,12 +126,12 @@ export function AgentDetail({
     <div className={cn("flex flex-col gap-3 p-3", className)}>
       <header className="flex items-start gap-2">
         <span className="pt-1.5">
-          <AgentStatusDot status={agent.status} />
+          <AgentStatusDot agent={agent} />
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="text-sm font-medium [overflow-wrap:anywhere]">{agent.title}</span>
           <span className="flex items-center gap-2 text-2xs text-muted-foreground">
-            <span>{agentStatusLabel(agent.status)}</span>
+            <span>{agentStatusLabel(agent)}</span>
             <span>
               · {agent.identity.label} ({agent.identity.pronouns})
             </span>

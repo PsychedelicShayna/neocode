@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import type { ProcessExit, SessionEventFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -90,6 +91,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       refuseLevels: false,
       /** `get_entries_page` requests the owner received. */
       pages: 0,
+      /** Host-tool registrations (`set_host_tools`) sent to the owner. */
+      binds: 0,
       /** Runs inside `connect` once the connection exists (and its finalizer is registered). */
       connectHook: Effect.void as Effect.Effect<void>,
       /** Makes every connect fail with this error. */
@@ -323,6 +326,13 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
             readState: Effect.suspend(() => native.stateHook).pipe(
               Effect.andThen(Effect.sync(state)),
             ),
+            hostTools: {
+              bind: () =>
+                Effect.sync(() => {
+                  native.binds++;
+                }),
+              revoke: Effect.void,
+            },
           };
         }),
     };
@@ -342,6 +352,7 @@ const follow = Effect.fnUntraced(function* (
   service: Service,
   ref: NeoPiNativeSessionRef,
   client: string = testClient,
+  purpose?: "session" | "thread",
 ) {
   // `ended` marks the watch stream finishing, so a test waiting on an envelope fails instead of hanging.
   const envelopes = yield* Queue.unbounded<Envelope | { readonly type: "ended" }>();
@@ -349,7 +360,7 @@ const follow = Effect.fnUntraced(function* (
   let applied = 0;
   /** Every envelope delivered so far, in order. */
   const seen: Envelope[] = [];
-  const fiber = yield* service.watch({ ref }, client).pipe(
+  const fiber = yield* service.watch({ ref, ...(purpose ? { purpose } : {}) }, client).pipe(
     Stream.runForEach((envelope) =>
       Effect.gen(function* () {
         if (envelope.type === "leased") yield* Deferred.succeed(leased, envelope.leaseId);
@@ -1933,15 +1944,21 @@ describe("native observation leases and demand (r12 C4)", () => {
         yield* Deferred.await(reached);
         const refused = yield* service
           .request({ ref: originalRef, command: { type: "snapshot_session_journal" } })
-          .pipe(Effect.flip);
-        assert.equal(refused.code, "observation_server_owned");
+          .pipe(Effect.result);
+        assert.equal(
+          refused._tag === "Failure" ? refused.failure.code : undefined,
+          "observation_server_owned",
+        );
         const level = yield* service
           .request({
             ref: originalRef,
             command: { type: "set_subagent_subscription", level: "events" },
           })
-          .pipe(Effect.flip);
-        assert.equal(level.code, "observation_server_owned");
+          .pipe(Effect.result);
+        assert.equal(
+          level._tag === "Failure" ? level.failure.code : undefined,
+          "observation_server_owned",
+        );
         native.snapshotHook = Effect.void;
         yield* Deferred.succeed(release, undefined);
         yield* lease.pass();
@@ -2140,6 +2157,59 @@ describe("server wiring review round", () => {
         .pipe(Effect.flip);
       assert.equal(gone.code, "lease_unknown");
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a lease that returns no credit while obligations pile up is ended to reattach, never grown without bound",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const healthy = yield* follow(service, originalRef);
+        const stalled = yield* manualWatch(service, originalRef);
+        const leaseId = leaseOf(yield* stalled.take);
+        yield* openObligations(native, 600);
+        const ended = yield* Fiber.await(stalled.fiber);
+        assert.equal(ended._tag, "Failure");
+        const failure = Exit.isFailure(ended) ? Cause.squash(ended.cause) : undefined;
+        assert.equal(Reflect.get(Object(failure), "code"), "lease_unknown");
+        const gone = yield* service
+          .read({ leaseId, readId: 0, cursor: null }, testClient)
+          .pipe(Effect.result);
+        assert.equal(gone._tag === "Failure" ? gone.failure.code : undefined, "lease_unknown");
+        // The viewer that keeps up loses nothing, and a fresh lease lists every open one.
+        yield* stalled.settle;
+        assert.equal(
+          healthy.seen.filter((envelope) => envelope.type === "obligation-opened").length,
+          600,
+        );
+        // The join lists all 600 at once; that is not growth, so the fresh lease is not ended.
+        const again = yield* follow(service, originalRef);
+        yield* again.next("obligation-opened", (envelope) => envelope.id === "call-599");
+        yield* native.publish({ type: "host_tool_call", id: "after", toolName: "preview" });
+        yield* again.next("obligation-opened", (envelope) => envelope.id === "after");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a new lease receives every open obligation before its first lifecycle, across several credit grants",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        // Built and observed already, so the joining lease's own lifecycle is its only one.
+        const built = yield* follow(service, originalRef);
+        yield* built.next("lifecycle", observing);
+        yield* openObligations(native, 20);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        const first = lease.seen.findIndex((envelope) => envelope.type === "lifecycle");
+        const replayed = lease.seen.flatMap((envelope, index) =>
+          envelope.type === "obligation-opened" ? [index] : [],
+        );
+        assert.equal(replayed.length, 20);
+        assert.isTrue(replayed.every((index) => index < first));
+      }).pipe(Effect.scoped),
   );
 
   it.effect(
@@ -2678,6 +2748,45 @@ describe("leaf announcements (the live stall)", () => {
       assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
     }).pipe(Effect.scoped),
   );
+
+  it.effect(
+    "an entry folded live while the quiet-leaf fetch is in flight is kept once, with no navigation",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const head = yield* appender(native)(1);
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        const pages = native.pages;
+        const x = entry("live-x", head.id);
+        const a = entry("pending-a", x.id);
+        const f = frames(native, a.id);
+        // A flush announces its last entry A; nothing follows within the pause.
+        yield* native.publish(f.leaf);
+        // The owner's page still ends at the held head when it is read; X, extending
+        // that head, folds live after the page exists and before it is applied.
+        let first = true;
+        native.afterPageHook = Effect.suspend(() => {
+          if (!first) return Effect.void;
+          first = false;
+          return native.publish(f.entry(x));
+        });
+        yield* TestClock.adjust("2 seconds");
+        yield* settle;
+        assert.equal(native.pages, pages + 1);
+        const read = yield* lease.pass(built.cursor);
+        assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+        assert.deepEqual(idsOf(read.entries), ["live-x"]);
+        // The rest of the flush arrives: A joins once, on the same branch.
+        native.entries.push(x, a);
+        yield* native.publish(f.entry(a));
+        yield* settle;
+        const rest = yield* lease.pass(read.cursor);
+        assert.equal(rest.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+        assert.deepEqual(idsOf(rest.entries), ["pending-a"]);
+      }).pipe(Effect.scoped),
+  );
 });
 
 describe("confirmation round", () => {
@@ -2719,8 +2828,9 @@ describe("confirmation round", () => {
         const view = yield* second.pass();
         // The old prefix is never served: the body is gone or current, never stale.
         const held = bodyOf(view.entities.get("message:m"));
+        const last: unknown = Array.isArray(held) ? held.at(-1) : undefined;
         assert.isTrue(
-          held === undefined || String(Reflect.get(Object(held.at(-1)), "text")).includes("done"),
+          held === undefined || String(Reflect.get(Object(last), "text")).includes("done"),
         );
       }).pipe(Effect.scoped),
   );
@@ -2972,6 +3082,35 @@ describe("children after an unwatched interval (rc3-1a)", () => {
       }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "a child marked unobserved after a reopen loses the mark when its run is seen to finish live",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* watchThenClose(native, service);
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        assert.isDefined(rowOf(view, "Load0")?.unobserved);
+        yield* service.setDemand(
+          { leaseId: second.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+          testClient,
+        );
+        yield* TestClock.adjust("2 seconds");
+        const finished = spawned("Load0", "5f4a0d14-1cf6-4396-b217-ce24c2337edd");
+        yield* native.publish({
+          ...finished,
+          payload: { ...finished.payload, status: "completed" },
+        });
+        const after = yield* second.pass(view.cursor);
+        const row = rowOf(after, "Load0");
+        assert.isUndefined(row?.unobserved);
+        assert.equal(Reflect.get(Object(row?.lifecycle), "status"), "completed");
+        // The other child is still only known to have finished unseen.
+        const other = yield* second.pass();
+        assert.isDefined(rowOf(other, "Load1")?.unobserved);
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("a child the owner's history lists comes back finished, not unobserved", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();
@@ -3066,6 +3205,35 @@ describe("attach-only discovery (r12 C5)", () => {
         assert.equal(native.starts, 1);
         assert.equal(native.connections, 1);
       }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a thread view registers no host tools with the owner, across a refresh; a session view or open does",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        const thread = yield* follow(service, originalRef, testClient, "thread");
+        yield* thread.next("lifecycle", observing);
+        yield* Fiber.interrupt(thread.fiber);
+        const again = yield* follow(service, originalRef, testClient, "thread");
+        yield* again.next("lifecycle", observing);
+        assert.equal(native.binds, 0);
+        assert.deepEqual(native.levels, []);
+        // A session view joining the same attached session registers them once.
+        const session = yield* follow(service, originalRef);
+        yield* session.next("lifecycle", observing);
+        assert.equal(native.binds, 1);
+        yield* service.open(originalRef);
+        assert.equal(native.binds, 1);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("an explicit open registers host tools before any view attaches", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      yield* service.open(originalRef);
+      assert.equal(native.binds, 1);
+    }).pipe(Effect.scoped),
   );
 
   it.effect(

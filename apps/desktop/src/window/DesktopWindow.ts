@@ -33,6 +33,47 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import { makeQuitShortcutHandler } from "./QuitHold.ts";
 
 const TITLEBAR_HEIGHT = 40;
+// Windows draws its caption buttons 32 points tall at 100% scale; an overlay
+// shorter than that leaves them hit-testing below the strip at deep zoom-out.
+const TITLEBAR_MIN_OVERLAY_HEIGHT = 32;
+// Blink renders page zoom clamped to these factors (blink page_zoom.h), while
+// the browser keeps whatever level it was handed.
+const MIN_PAGE_ZOOM_FACTOR = 0.25;
+const MAX_PAGE_ZOOM_FACTOR = 5;
+// Electron's zoom factor is 1.2 to the power of the zoom level.
+const MIN_PAGE_ZOOM_LEVEL = Math.log(MIN_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+const MAX_PAGE_ZOOM_LEVEL = Math.log(MAX_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+
+/**
+ * The View menu's next zoom level: the Electron menu roles' half-level step,
+ * held to the range Blink renders so steps past it are not silently swallowed.
+ */
+export function nextMainZoomLevel(level: number, direction: MainWindowZoomDirection): number {
+  if (direction === "reset") return 0;
+  return Math.min(
+    MAX_PAGE_ZOOM_LEVEL,
+    Math.max(MIN_PAGE_ZOOM_LEVEL, level + (direction === "in" ? 0.5 : -0.5)),
+  );
+}
+
+/**
+ * The overlay's height is in window points, which do not follow page zoom,
+ * while the renderer lays its title bar out in `env(titlebar-area-height)` CSS
+ * pixels. Scaling by the rendered zoom keeps that strip TITLEBAR_HEIGHT CSS
+ * pixels tall, so a zoomed-in UI does not crowd its two-line tabs into a
+ * shorter strip. Rounds up past float noise so the strip never ends up below
+ * its height, and never undercuts the native caption buttons.
+ */
+export function titleBarOverlayHeight(zoomFactor: number): number {
+  const rendered = Math.min(MAX_PAGE_ZOOM_FACTOR, Math.max(MIN_PAGE_ZOOM_FACTOR, zoomFactor));
+  return Math.max(TITLEBAR_MIN_OVERLAY_HEIGHT, Math.ceil(TITLEBAR_HEIGHT * rendered - 1e-9));
+}
+
+function syncTitleBarOverlayHeight(window: Electron.BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  window.setTitleBarOverlay({ height: titleBarOverlayHeight(window.webContents.getZoomFactor()) });
+}
+
 // Matches --workspace-topbar-height in apps/web/src/index.css. Native macOS
 // buttons are 14 points tall and do not scale with the renderer's zoom.
 const MACOS_WORKSPACE_TOPBAR_HEIGHT = 52;
@@ -282,6 +323,7 @@ export function concealPendingQuitWindow(
 function getWindowTitleBarOptions(
   shouldUseDarkColors: boolean,
   platform: NodeJS.Platform,
+  zoomFactor: number,
 ): WindowTitleBarOptions {
   if (platform === "darwin") {
     return {
@@ -297,7 +339,7 @@ function getWindowTitleBarOptions(
     titleBarStyle: "hidden",
     titleBarOverlay: {
       color: TITLEBAR_COLOR,
-      height: TITLEBAR_HEIGHT,
+      height: titleBarOverlayHeight(zoomFactor),
       symbolColor: shouldUseDarkColors ? TITLEBAR_DARK_SYMBOL_COLOR : TITLEBAR_LIGHT_SYMBOL_COLOR,
     },
   };
@@ -314,7 +356,11 @@ function syncWindowAppearance(
     }
 
     window.setBackgroundColor(getInitialWindowBackgroundColor(shouldUseDarkColors));
-    const { titleBarOverlay } = getWindowTitleBarOptions(shouldUseDarkColors, platform);
+    const { titleBarOverlay } = getWindowTitleBarOptions(
+      shouldUseDarkColors,
+      platform,
+      window.webContents.getZoomFactor(),
+    );
     if (typeof titleBarOverlay === "object") {
       window.setTitleBarOverlay(titleBarOverlay);
     }
@@ -432,7 +478,8 @@ export const make = Effect.gen(function* () {
       backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors),
       ...iconOption,
       title: environment.displayName,
-      ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform),
+      // A fresh webContents is unzoomed; a restored zoom arrives with the load.
+      ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform, 1),
       webPreferences: {
         preload: environment.preloadPath,
         // The window boots hidden (show: false until ready-to-show), and
@@ -773,7 +820,9 @@ export const make = Effect.gen(function* () {
       clearDevelopmentLoadRetry();
       developmentLoadRetryIndex = 0;
       window.setTitle(environment.displayName);
+      // Chromium restores the origin's zoom level on every load and reload.
       if (environment.platform === "darwin") syncMacosWindowButtons(window);
+      else syncTitleBarOverlayHeight(window);
     });
     window.webContents.on(
       "did-fail-load",
@@ -1073,11 +1122,12 @@ export const make = Effect.gen(function* () {
         return;
       }
       const webContents = window.value.webContents;
-      // Same step size as the Electron zoomIn/zoomOut menu roles.
-      webContents.setZoomLevel(
-        direction === "reset" ? 0 : webContents.getZoomLevel() + (direction === "in" ? 0.5 : -0.5),
-      );
-      if (environment.platform === "darwin") syncMacosWindowButtons(window.value);
+      webContents.setZoomLevel(nextMainZoomLevel(webContents.getZoomLevel(), direction));
+      // Chromium zooms per origin, so every app window took the new level.
+      for (const appWindow of windowBoundsFlushes.keys()) {
+        if (environment.platform === "darwin") syncMacosWindowButtons(appWindow);
+        else syncTitleBarOverlayHeight(appWindow);
+      }
       // Chromium pushes the new level down to embedded guests, which would zoom
       // the previewed page along with the app UI. The preview browser keeps its
       // own zoom, so put each guest back where the preview left it.

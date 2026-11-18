@@ -722,6 +722,50 @@ describe("DesktopWindow", () => {
     assert.equal(fakeWindow.setOpacity.mock.calls.length, 0);
   });
 
+  // The overlay is sized in window points while the title bar lays out in CSS
+  // pixels; an unscaled overlay shrank the strip under app zoom and clipped the
+  // second line of the session tabs.
+  it("keeps the title bar tall enough for two-line tabs at every reachable zoom", () => {
+    // Every level the View menu can reach from a fresh window, including the
+    // off-grid levels stepped back from either clamp.
+    const reachable = new Map<string, number>([["0", 0]]);
+    const queue = [0];
+    for (let level = queue.pop(); level !== undefined; level = queue.pop()) {
+      for (const direction of ["in", "out"] as const) {
+        const next = DesktopWindow.nextMainZoomLevel(level, direction);
+        const key = next.toFixed(9);
+        if (reachable.has(key)) continue;
+        reachable.set(key, next);
+        queue.push(next);
+      }
+    }
+    const levels = [...reachable.values()];
+    // Blink renders 25% to 500%; the menu stops there instead of piling up
+    // presses that change nothing on screen.
+    assert.closeTo(1.2 ** Math.max(...levels), 5, 1e-9);
+    assert.closeTo(1.2 ** Math.min(...levels), 0.25, 1e-9);
+    assert.isBelow(
+      DesktopWindow.nextMainZoomLevel(Math.max(...levels), "out"),
+      Math.max(...levels),
+    );
+
+    for (const level of levels) {
+      const zoomFactor = 1.2 ** level;
+      const overlay = DesktopWindow.titleBarOverlayHeight(zoomFactor);
+      // Covers the native caption buttons even at deep zoom-out.
+      assert.isAtLeast(overlay, 32, `zoom level ${level}`);
+      const stripCss = overlay / zoomFactor;
+      assert.isAtLeast(stripCss, 40 - 1e-6, `zoom level ${level}`);
+      for (let interfaceSize = 12; interfaceSize <= 20; interfaceSize += 1) {
+        // Title line, agent-name line and the tab's 1px top and bottom border.
+        const labelCss = 1.625 * interfaceSize + 2;
+        assert.isAtLeast(stripCss, labelCss, `zoom level ${level}, size ${interfaceSize}`);
+      }
+    }
+    // A stale level saved past Blink's range sizes for what is rendered.
+    assert.equal(DesktopWindow.titleBarOverlayHeight(1.2 ** 12), 200);
+  });
+
   it("restores bounds only when the entire window remains on connected displays", () => {
     const persistedBounds = { x: 2040, y: 80, width: 1320, height: 880 };
     const displays = [

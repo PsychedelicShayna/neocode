@@ -7,15 +7,13 @@ import {
   type NeoPiThreadNativeRef,
   type ThreadId,
 } from "@t3tools/contracts";
-import { make as makeClient, type SessionEventFrame } from "effect-neopi-rpc/client";
+import { make as makeClient } from "effect-neopi-rpc/client";
 import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
 import type { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import type * as Stream from "effect/Stream";
-import * as Streams from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
@@ -26,13 +24,11 @@ import {
   neoPiSessionCatalogSource,
   type NeoPiSessionCatalogSource,
 } from "./NeoPiSessionCatalogSource.ts";
-import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
 export interface NeoPiNativeOwner {
   readonly ownership: "gui" | "terminal";
   readonly capabilities: ReadonlySet<string>;
-  readonly events: Stream.Stream<SessionEventFrame, NeoPiRuntimeError>;
   readonly request: (command: {
     readonly type: string;
     readonly [key: string]: unknown;
@@ -175,19 +171,18 @@ export const makeNeoPiThreadNativeRef = Effect.fn("NeoPiNativeOwner.nativeRef")(
     );
 });
 
-/** Resolve the existing writer only. History observation never starts or resumes a session. */
+/** Resolve the existing writer for tree operations only; it never starts or resumes a session. */
 export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(function* () {
   const readBinding = yield* makeNeoPiThreadBinding();
   const snapshots = yield* ProjectionSnapshotQuery;
   const fs = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   return Effect.fn("NeoPiNativeOwner.resolve")(function* (threadId: ThreadId) {
-    const scope = yield* Effect.scope;
     const binding = yield* readBinding(threadId);
     if (binding.status !== "available") return undefined;
     const { expected, source, unchanged } = binding;
-    let owner: NeoPiNativeOwner | undefined = source.observeNative
-      ? yield* source.observeNative(threadId)
+    let owner: NeoPiNativeOwner | undefined = source.nativeOwner
+      ? yield* source.nativeOwner(threadId)
       : undefined;
     if (!owner) {
       if (
@@ -213,30 +208,19 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
         }
       }
       if (!instanceId) return undefined;
-      const hub = makeNeoPiNativeEventHub();
-      const events = yield* hub.subscribe;
+      // Requests only: tree operations. Frames on this connection are dropped by the
+      // client; observation goes through NeoPiNativeSessions.
       const peer = yield* makeClient({
         spawn: spawner.spawn,
         command: source.binary,
         args: ["ctl", "pipe", instanceId, "--label", "neocode-conversation"],
         cwd,
         env: source.env,
-        eventQueueCapacity: 1,
-        onTransportReady: (transport) =>
-          Effect.gen(function* () {
-            yield* Streams.runDrain(transport.uiRequests).pipe(Effect.forkIn(scope));
-            yield* Streams.runDrain(transport.hostToolCalls).pipe(Effect.forkIn(scope));
-            yield* Streams.runForEach(transport.events, hub.publish).pipe(
-              Effect.ensuring(hub.publish({ type: "neocode_connection_closed" })),
-              Effect.forkIn(scope),
-            );
-          }),
       });
       if (!peer.capabilities.has("control_v1")) return undefined;
       owner = {
         ownership: "terminal",
         capabilities: peer.capabilities,
-        events,
         request: peer.request,
       };
     }

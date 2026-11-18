@@ -3217,12 +3217,6 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.neopiSessionsJournal, neopiSessionJournal(input), {
             "rpc.aggregate": "workspace",
           }),
-        [WS_METHODS.neopiSessionsWatchJournal]: (input) =>
-          observeRpcStream(
-            WS_METHODS.neopiSessionsWatchJournal,
-            neopiNativeConversation.watch(input.threadId),
-            { "rpc.aggregate": "workspace" },
-          ),
         [WS_METHODS.neopiSessionsNativeRef]: (input) =>
           observeRpcEffect(
             WS_METHODS.neopiSessionsNativeRef,

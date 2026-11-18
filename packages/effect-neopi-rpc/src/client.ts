@@ -70,10 +70,10 @@ export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
 /**
  * Receives peer frames in-line on the stdout parser, in wire order: each call returns before the
  * parser reads the next frame, and an event written before a reply is delivered before that
- * reply settles its request. Calls must be synchronous and must not throw. With a sink, the
- * `events`, `uiRequests`, `hostToolCalls` and `hostUriRequests` streams never emit. A sink
- * without `uiRequest` or `hostToolCall` drops those frames; one without `hostUriRequest` has
- * every host URI request answered `unsupported`. A `hostUriRequest` owner must answer each one.
+ * reply settles its request. Calls must be synchronous and must not throw. The client keeps
+ * no frame queue: frames without a handler (or every frame, without a sink) are dropped, and
+ * host URI requests without a `hostUriRequest` handler are answered `unsupported`. A
+ * `hostUriRequest` owner must answer each one.
  */
 export interface NeoPiRpcFrameSink {
   readonly event: (frame: SessionEventFrame) => void;
@@ -91,9 +91,7 @@ export interface NeoPiRpcClientOptions {
   /** Applies to command/response only, not the prompt lifecycle. Default 30s. */
   readonly requestTimeoutMs?: number;
   readonly stderrTailBytes?: number;
-  /** A consuming observer may bound stdout read-ahead. Full queues backpressure the pipe. */
-  readonly eventQueueCapacity?: number;
-  /** Replaces the event, UI, host-tool and host-URI queues; `eventQueueCapacity` then has no effect. */
+  /** Where peer frames go; without one, a request-only client drops them. */
   readonly sink?: NeoPiRpcFrameSink;
   readonly onTransportReady?: (transport: NeoPiRpcTransport) => Effect.Effect<void>;
 }
@@ -101,14 +99,7 @@ export interface NeoPiRpcClientOptions {
 /** Streams and replies available immediately after stdio is connected, before ready negotiation. */
 export type NeoPiRpcTransport = Pick<
   NeoPiRpcClient,
-  | "events"
-  | "uiRequests"
-  | "respondUi"
-  | "hostToolCalls"
-  | "hostToolResult"
-  | "hostUriRequests"
-  | "hostUriResult"
-  | "exit"
+  "respondUi" | "hostToolResult" | "hostUriResult" | "exit"
 > & { readonly transportReady: Effect.Effect<ReadyFrame, NeoPiRpcError> };
 
 export interface NeoPiRpcClient {
@@ -118,10 +109,7 @@ export interface NeoPiRpcClient {
   /** One-way protocol frame; unlike request, it has no response correlation. */
   readonly writeFrame: (frame: unknown) => Effect.Effect<void, NeoPiRpcError>;
   readonly prompt: (cmd: PromptCommand) => Effect.Effect<PromptHandle, NeoPiRpcError>;
-  readonly events: Stream.Stream<SessionEventFrame>;
-  readonly uiRequests: Stream.Stream<UiRequestFrame>;
   readonly respondUi: (response: UiResponseWire) => Effect.Effect<void, NeoPiRpcError>;
-  readonly hostToolCalls: Stream.Stream<HostToolCallFrame | HostToolCancelFrame>;
   readonly hostToolUpdate: (
     id: string,
     partialResult: AgentToolResultWire,
@@ -131,7 +119,6 @@ export interface NeoPiRpcClient {
     result: AgentToolResultWire,
     isError?: boolean,
   ) => Effect.Effect<void, NeoPiRpcError>;
-  readonly hostUriRequests: Stream.Stream<HostUriRequestFrame>;
   readonly hostUriResult: (result: HostUriResultWire) => Effect.Effect<void, NeoPiRpcError>;
   readonly stderr: Stream.Stream<string>;
   readonly exit: Deferred.Deferred<ProcessExit>;
@@ -220,20 +207,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   );
 
   const outbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
-  const events =
-    options.eventQueueCapacity === undefined
-      ? yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>()
-      : yield* Queue.bounded<SessionEventFrame, Cause.Done<void>>(options.eventQueueCapacity);
-  const uiRequests = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
-  const hostToolCalls = yield* Queue.unbounded<
-    HostToolCallFrame | HostToolCancelFrame,
-    Cause.Done<void>
-  >();
-  const hostUriRequests = yield* Queue.unbounded<HostUriRequestFrame, Cause.Done<void>>();
   const sink = options.sink;
-  // With a sink nothing is offered to the four frame queues, so they cannot accumulate.
   const publishEvent = (frame: SessionEventFrame): Effect.Effect<void> =>
-    sink ? Effect.sync(() => sink.event(frame)) : Queue.offer(events, frame).pipe(Effect.ignore);
+    Effect.sync(() => sink?.event(frame));
   const stderr = yield* Queue.sliding<string, Cause.Done<void>>(DEFAULT_STDERR_QUEUE_CAPACITY);
   const exit = yield* Deferred.make<ProcessExit>();
   const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
@@ -248,7 +224,6 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   let fatal: NeoPiRpcError | undefined;
   let closed = false;
   let promptEntryIds = false;
-  let uriListeners = 0;
   let stderrListeners = 0;
   let negotiating = false;
   const stderrTail = emptyStderrTail();
@@ -271,8 +246,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
             error: error.message,
             code: error.code,
           };
-          if (sink) sink.event(failed);
-          else Queue.offerUnsafe(events, failed);
+          sink?.event(failed);
         });
         yield* completePrompt(prompt, {
           kind: "rejected",
@@ -590,23 +564,17 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               yield* Queue.offer(startupUiChanges, undefined);
             }
           }
-          if (sink) return sink.uiRequest?.(ui);
-          return yield* Queue.offer(uiRequests, ui).pipe(Effect.ignore);
+          return sink?.uiRequest?.(ui);
         }
         case "host_tool_call":
         case "host_tool_cancel": {
           const call = frame as HostToolCallFrame | HostToolCancelFrame;
-          if (sink) return sink.hostToolCall?.(call);
-          return yield* Queue.offer(hostToolCalls, call).pipe(Effect.ignore);
+          return sink?.hostToolCall?.(call);
         }
         case "host_uri_request": {
           const uri = frame as HostUriRequestFrame;
           if (sink?.hostUriRequest) return sink.hostUriRequest(uri);
-          if (sink || uriListeners === 0) {
-            yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
-            return;
-          }
-          yield* Queue.offer(hostUriRequests, uri).pipe(Effect.ignore);
+          yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
           return;
         }
         case "agent_start":
@@ -783,10 +751,6 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
             }),
           );
         }
-        yield* endQueue(events);
-        yield* endQueue(uiRequests);
-        yield* endQueue(hostToolCalls);
-        yield* endQueue(hostUriRequests);
         yield* endQueue(stderr);
         yield* Deferred.succeed(exit, {
           code: status.code,
@@ -835,21 +799,6 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     );
 
   yield* Effect.addFinalizer(() => close());
-
-  const hostUriRequestsStream = Stream.unwrap(
-    Effect.gen(function* () {
-      yield* Effect.acquireRelease(
-        Effect.sync(() => {
-          uriListeners += 1;
-        }),
-        () =>
-          Effect.sync(() => {
-            uriListeners -= 1;
-          }),
-      );
-      return Stream.fromQueue(hostUriRequests);
-    }),
-  );
 
   const stderrStream = Stream.unwrap(
     Effect.gen(function* () {
@@ -902,12 +851,8 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     if (options.onTransportReady) {
       yield* options.onTransportReady({
         transportReady: Deferred.await(readyDeferred),
-        events: Stream.fromQueue(events),
-        uiRequests: Stream.fromQueue(uiRequests),
         respondUi,
-        hostToolCalls: Stream.fromQueue(hostToolCalls),
         hostToolResult,
-        hostUriRequests: hostUriRequestsStream,
         hostUriResult,
         exit,
       });
@@ -954,13 +899,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     request,
     writeFrame,
     prompt,
-    events: Stream.fromQueue(events),
-    uiRequests: Stream.fromQueue(uiRequests),
     respondUi,
-    hostToolCalls: Stream.fromQueue(hostToolCalls),
     hostToolUpdate,
     hostToolResult,
-    hostUriRequests: hostUriRequestsStream,
     hostUriResult,
     stderr: stderrStream,
     exit,

@@ -40,7 +40,6 @@ import { NEOPI_CAPABILITIES, neopiCompatibility } from "./NeoPiCompatibility.ts"
 import { neoPiRoleFromModelSlug } from "./NeoPiModelCatalog.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
-import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import type {
   NeoPiResumeCursor,
   NeoPiRuntimeFrame,
@@ -152,7 +151,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     input.cursor ?? { v: 1, sessionFile: "", sessionId: "", sessionDir: "", turnBoundaries: [] },
   );
   const frames = yield* Queue.unbounded<NeoPiRuntimeFrame, Cause.Done<void>>();
-  const nativeEvents = makeNeoPiNativeEventHub();
   const configurationChanges = yield* PubSub.sliding<void>(1);
   const invalidateConfiguration = PubSub.publish(configurationChanges, undefined).pipe(
     Effect.asVoid,
@@ -195,14 +193,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const emit = (frame: NeoPiRuntimeFrame) =>
     Queue.offer(frames, frame).pipe(Effect.orDie, Effect.asVoid);
   const setState = (value: NeoPiRuntimeState) =>
-    SubscriptionRef.set(state, value).pipe(
-      Effect.andThen(invalidateConfiguration),
-      Effect.andThen(() =>
-        value === "stopped" || value === "failed" || value === "stopping"
-          ? nativeEvents.publish({ type: "neocode_connection_closed", state: value })
-          : Effect.void,
-      ),
-    );
+    SubscriptionRef.set(state, value).pipe(Effect.andThen(invalidateConfiguration));
   const current = () =>
     client
       ? Effect.succeed(client)
@@ -476,10 +467,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         frame.type === "journal_entry"
       )
         yield* invalidateConfiguration;
-      // Native observers retain process-local message IDs independently of SQL
-      // turns. Only message_persisted can associate one with a durable entry.
-      const nativeFrame: { readonly type: string } = frame;
-      yield* nativeEvents.publish(nativeFrame);
       if (
         frame.type === "journal_state" ||
         frame.type === "journal_entry" ||
@@ -614,7 +601,11 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         message,
       );
     });
-  const pumpHost = (peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">) =>
+  const pumpHost = (
+    peer: Pick<NeoPiRpcTransport, "hostToolResult"> & {
+      readonly hostToolCalls: Stream.Stream<HostToolCallFrame | HostToolCancelFrame>;
+    },
+  ) =>
     Stream.runForEach(peer.hostToolCalls, (call) =>
       Effect.gen(function* () {
         if (attached) return;
@@ -1390,7 +1381,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       return generation;
     },
     subscribeConfigurationChanges: PubSub.subscribe(configurationChanges),
-    observeNative: nativeEvents.subscribe,
     nativeRequest: (command) =>
       Effect.gen(function* () {
         if (

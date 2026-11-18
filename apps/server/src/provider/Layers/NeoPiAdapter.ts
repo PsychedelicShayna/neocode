@@ -863,31 +863,19 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         );
       }),
     readThread,
-    observeNative: (threadId) =>
+    nativeOwner: (threadId) =>
       Effect.gen(function* () {
         const session = sessions.get(threadId);
-        if (!session?.runtime.observeNative || !session.runtime.nativeRequest) return undefined;
+        if (!session?.runtime.nativeRequest) return undefined;
         const runtime = session.runtime;
         const status = yield* SubscriptionRef.get(runtime.state);
         if (status === "stopped" || status === "failed") return undefined;
         const generation = runtime.processGeneration;
-        const events = (yield* session.runtime.observeNative).pipe(
-          Stream.mapError((cause) =>
-            cause instanceof NeoPiRuntimeError
-              ? cause
-              : new NeoPiRuntimeError({
-                  code: "rpc",
-                  message: cause instanceof Error ? cause.message : String(cause),
-                  cause,
-                }),
-          ),
-        );
         return {
           ownership: runtime.capabilities.has(NEOPI_CAPABILITIES.controlAttached)
             ? ("terminal" as const)
             : ("gui" as const),
           capabilities: runtime.capabilities,
-          events,
           request: (command: { readonly type: string; readonly [key: string]: unknown }) =>
             Effect.gen(function* () {
               if (sessions.get(threadId) !== session || runtime.processGeneration !== generation)

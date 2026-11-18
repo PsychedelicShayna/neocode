@@ -27,7 +27,7 @@ const UI_BACKLOG = 64;
  * `UI_BACKLOG` UI frames; with no observer nothing is kept.
  */
 export const makeNeoPiModelsConnection = Effect.fn("NeoPiModelsConnection.make")(function* (
-  options: Omit<NeoPiRpcClientOptions, "sink" | "onTransportReady" | "eventQueueCapacity">,
+  options: Omit<NeoPiRpcClientOptions, "sink" | "onTransportReady">,
 ) {
   const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);
   const ui = yield* Effect.acquireRelease(

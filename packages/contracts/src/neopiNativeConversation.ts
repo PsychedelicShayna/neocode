@@ -1,76 +1,11 @@
 import * as Schema from "effect/Schema";
 import { ThreadId } from "./baseSchemas.ts";
-import { NeoPiJournalEntry, NeoPiJournalPage } from "./neopiJournal.ts";
+import { NeoPiJournalEntry } from "./neopiJournal.ts";
 import { NeoPiNativeSessionRef } from "./neopiNativeSessions.ts";
 
 export const NeoPiNativeRecord = Schema.Record(Schema.String, Schema.Unknown);
-export const NeoPiNativeFrame = Schema.StructWithRest(Schema.Struct({ type: Schema.String }), [
-  NeoPiNativeRecord,
-]);
-const JournalIdentity = Schema.Struct({
-  sessionId: Schema.String,
-  sessionFile: Schema.NullOr(Schema.String),
-  leafId: Schema.NullOr(Schema.String),
-});
-export const NeoPiJournalNativeEvent = Schema.Union([
-  Schema.StructWithRest(
-    Schema.Struct({
-      ...JournalIdentity.fields,
-      type: Schema.Literal("journal_state"),
-      reason: Schema.Literals(["snapshot", "identity", "leaf"]),
-      // Snapshot-only bounded recovery history. Absence never means discarded output.
-      messageEntryIds: Schema.optional(
-        Schema.Array(Schema.Struct({ messageId: Schema.String, entryId: Schema.String })),
-      ),
-    }),
-    [NeoPiNativeRecord],
-  ),
-  Schema.StructWithRest(
-    Schema.Struct({
-      ...JournalIdentity.fields,
-      type: Schema.Literal("journal_entry"),
-      entry: NeoPiJournalEntry,
-    }),
-    [NeoPiNativeRecord],
-  ),
-  Schema.StructWithRest(
-    Schema.Struct({
-      ...JournalIdentity.fields,
-      type: Schema.Literal("message_persisted"),
-      messageId: Schema.String,
-      entryId: Schema.String,
-    }),
-    [NeoPiNativeRecord],
-  ),
-]);
-export type NeoPiJournalNativeEvent = typeof NeoPiJournalNativeEvent.Type;
-export const NeoPiStreamingMessageSnapshot = Schema.StructWithRest(
-  Schema.Struct({
-    ...JournalIdentity.fields,
-    type: Schema.Literal("message_start"),
-    snapshot: Schema.Literal(true),
-    messageId: Schema.String,
-    message: NeoPiNativeRecord,
-  }),
-  [NeoPiNativeRecord],
-);
-export type NeoPiStreamingMessageSnapshot = typeof NeoPiStreamingMessageSnapshot.Type;
 export const NeoPiNativeThreadInput = Schema.Struct({ threadId: ThreadId });
 export type NeoPiNativeThreadInput = typeof NeoPiNativeThreadInput.Type;
-export const NeoPiJournalConnection = Schema.Struct({
-  type: Schema.Literal("connection"),
-  status: Schema.Literals(["connected", "unavailable", "disconnected", "gap", "identity_changed"]),
-  ownership: Schema.Literals(["gui", "terminal", "stopped", "unknown"]),
-  canNavigate: Schema.Boolean,
-  reason: Schema.optional(Schema.String),
-  state: Schema.optional(NeoPiNativeRecord),
-});
-export const NeoPiJournalStreamEvent = Schema.Union([
-  NeoPiJournalConnection,
-  Schema.Struct({ type: Schema.Literal("snapshot"), page: NeoPiJournalPage }),
-  Schema.Struct({ type: Schema.Literal("native"), event: NeoPiNativeFrame }),
-]);
-export type NeoPiJournalStreamEvent = typeof NeoPiJournalStreamEvent.Type;
 export const NeoPiTreeExpected = Schema.Struct({
   expectedSessionId: Schema.String,
   expectedSessionFile: Schema.NullOr(Schema.String),

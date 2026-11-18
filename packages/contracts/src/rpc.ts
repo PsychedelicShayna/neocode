@@ -55,7 +55,6 @@ import {
 import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 import {
   NeoPiNativeThreadInput,
-  NeoPiJournalStreamEvent,
   NeoPiThreadNativeRef,
   NeoPiNavigateTreeInput,
   NeoPiResumeTreeInput,
@@ -346,7 +345,6 @@ export const WS_METHODS = {
   neopiSessionsConfiguration: "neopiSessions.configuration",
   neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
   neopiSessionsJournal: "neopiSessions.journal",
-  neopiSessionsWatchJournal: "neopiSessions.watchJournal",
   neopiSessionsNativeRef: "neopiSessions.nativeRef",
   neopiSessionsNavigateTree: "neopiSessions.navigateTree",
   neopiSessionsResumeTree: "neopiSessions.resumeTree",
@@ -962,12 +960,6 @@ const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
   error: Schema.Union([FilesystemBrowseError, EnvironmentAuthorizationError]),
 });
 
-const WsNeoPiWatchJournalRpc = Rpc.make(WS_METHODS.neopiSessionsWatchJournal, {
-  payload: NeoPiNativeThreadInput,
-  success: NeoPiJournalStreamEvent,
-  error: EnvironmentAuthorizationError,
-  stream: true,
-});
 const WsNeoPiNativeRefRpc = Rpc.make(WS_METHODS.neopiSessionsNativeRef, {
   payload: NeoPiNativeThreadInput,
   success: NeoPiThreadNativeRef,
@@ -1643,7 +1635,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiSessionsConfigurationRpc,
   WsNeoPiSessionsWatchConfigurationRpc,
   WsNeoPiSessionsJournalRpc,
-  WsNeoPiWatchJournalRpc,
   WsNeoPiNativeRefRpc,
   WsNeoPiNavigateTreeRpc,
   WsNeoPiResumeTreeRpc,

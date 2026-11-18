@@ -13,7 +13,8 @@ import type { NeoPiModelsError } from "@t3tools/contracts";
 
 /** Per-instance NeoPi/OMP JSONL RPC adapter contract. */
 export interface NeoPiAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {
-  readonly observeNative?: (
+  /** The thread's running runtime as a request target for tree operations; no frames. */
+  readonly nativeOwner?: (
     threadId: ThreadId,
   ) => Effect.Effect<NeoPiNativeOwner | undefined, never, Scope.Scope>;
   readonly readJournal?: (

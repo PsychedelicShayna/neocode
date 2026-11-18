@@ -19,7 +19,7 @@ export interface NeoPiSessionCatalogSource {
   readonly configuration?: NeoPiAdapterShape["getConfiguration"];
   readonly observeConfiguration?: NeoPiAdapterShape["observeConfiguration"];
   readonly journal?: NeoPiAdapterShape["readJournal"];
-  readonly observeNative?: NeoPiAdapterShape["observeNative"];
+  readonly nativeOwner?: NeoPiAdapterShape["nativeOwner"];
   /** True while NeoCode's own runtime for the thread is starting or running. */
   readonly hasSession?: NeoPiAdapterShape["hasSession"];
   readonly modelsConnection?: NeoPiAdapterShape["getModelsConnection"];

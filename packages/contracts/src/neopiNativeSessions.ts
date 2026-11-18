@@ -297,15 +297,17 @@ export type NeoPiNativeJournalSlice = typeof NeoPiNativeJournalSlice.Type;
 
 /**
  * A pass in progress. Its cohort is the keys with ordinal ≤ `lastOrdinal`,
- * fixed with `watermark` when the pass starts; `afterKey` is the last key sent.
- * `segment` is set while an oversized value is mid-transfer.
+ * fixed with `watermark` when the pass starts. `afterOrdinal` is the ordinal of
+ * the last key sent: ordinals are unique, and it stays a valid position even
+ * after that key's tombstone expires mid-pass. `segment` is set while an
+ * oversized value is mid-transfer.
  */
 export const NeoPiNativePass = Schema.Struct({
   kind: Schema.Literals(["incremental", "full"]),
   passId: Schema.String,
   watermark: NeoPiNativeRevision,
   lastOrdinal: NeoPiNativeOrdinal,
-  afterKey: Schema.NullOr(Schema.String),
+  afterOrdinal: Schema.NullOr(NeoPiNativeOrdinal),
   segment: Schema.NullOr(
     Schema.Struct({ key: Schema.String, revision: NeoPiNativeRevision, nextIndex: NonNegativeInt }),
   ),

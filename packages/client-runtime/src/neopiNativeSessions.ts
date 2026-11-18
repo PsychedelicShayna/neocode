@@ -705,6 +705,8 @@ export function applyNativeRead(
  * cache. Nothing in the client reads inbox records beyond this window.
  */
 export const NATIVE_INBOX_LIMIT = 512;
+/** Command output rows a feed keeps: the projection retains the newest 256 receipts. */
+export const NATIVE_COMMAND_OUTPUT_LIMIT = 256;
 /** Per-call detail one folded gap lists before it reports `toolStreamsTruncated`. */
 const NATIVE_GAP_TOOL_STREAMS = 64;
 type NativeInboxGap = Extract<NeoPiNativeInboxRecord, { type: "gap" }>;
@@ -972,7 +974,11 @@ function projectNativeEntities(
     // A completed pass holds every roster key the authority knows.
     agentsKnown: feed.agentsKnown || feed.observation.passId === null,
     agentTicks: agentTicks ?? feed.agentTicks,
-    commandOutputs: added.length > 0 ? [...feed.commandOutputs, ...added] : feed.commandOutputs,
+    // The projection keeps the newest NATIVE_COMMAND_OUTPUT_LIMIT receipts; so does the feed.
+    commandOutputs:
+      added.length > 0
+        ? [...feed.commandOutputs, ...added].slice(-NATIVE_COMMAND_OUTPUT_LIMIT)
+        : feed.commandOutputs,
   };
 }
 
@@ -1180,7 +1186,16 @@ export function reduceNativeSessionFeed(
   if (event.type === "read") {
     const next = applyNativeRead(feed, event.readId, event.result);
     if (next === feed) return feed;
-    const projected = projectNativeEntities(feed, next);
+    // `building` answers while the projection rebuilds (first build, navigation);
+    // the first pass after it means the rebuild published.
+    const phase = feed.observer.phase;
+    const observer: NativeObserver | null =
+      event.result.type === "building" && phase === "observing"
+        ? { phase: "building", reason: null }
+        : event.result.type === "pass" && phase === "building"
+          ? { phase: "observing", reason: null }
+          : null;
+    const projected = projectNativeEntities(feed, observer ? { ...next, observer } : next);
     const observation = boundNativeInbox(projected.observation, nowMs());
     return observation === projected.observation ? projected : { ...projected, observation };
   }

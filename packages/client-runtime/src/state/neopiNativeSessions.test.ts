@@ -570,6 +570,65 @@ describe("native projection mapping", () => {
     feed = applyRead(feed, pass({ epoch: rebuilt, watermark: 4 }));
     expect(feed.agents).toEqual([]);
   });
+
+  it("removes a child only when a full pass completes without it", () => {
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({ epoch: domain(), watermark: 1, entities: [child(1, "running")] }),
+    );
+    // The first reply of a rebuild's full pass does not carry the child yet.
+    const rebuilt = domain({ projectionIncarnation: 2 });
+    const partial = pass({ epoch: rebuilt, watermark: 5 });
+    feed = applyRead(feed, {
+      ...partial,
+      continuation: {
+        ...partial.continuation,
+        base: 0,
+        pass: {
+          kind: "full",
+          passId: partial.passId,
+          watermark: 5,
+          lastOrdinal: 9,
+          afterOrdinal: 0,
+          segment: null,
+        },
+      },
+    });
+    expect(feed.agents.map((agent) => [agent.id, agent.native.disconnected])).toEqual([
+      ["child", false],
+    ]);
+    feed = applyRead(feed, pass({ epoch: rebuilt, watermark: 5 }));
+    expect(feed.agents).toEqual([]);
+  });
+
+  it("stops children when the owner stops, not when the view loses its transport", () => {
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session,
+    });
+    feed = applyRead(
+      feed,
+      pass({ epoch: domain(), watermark: 1, entities: [child(1, "running")] }),
+    );
+    const lost = reduceNativeSessionFeed(reduceNativeSessionFeed(feed, { type: "disconnected" }), {
+      type: "observer",
+      phase: "transport-lost",
+    });
+    expect(lost.agents[0]?.native.disconnected).toBe(false);
+    const stopped = reduceNativeSessionFeed(feed, {
+      type: "lifecycle",
+      revision: 2,
+      state: "owner-stopped",
+    });
+    expect(stopped.agents[0]?.native.disconnected).toBe(true);
+    expect(stopped.ownerLoss).toBe("orphaned");
+  });
 });
 
 describe("native observation status", () => {
@@ -586,6 +645,11 @@ describe("native observation status", () => {
     feed = reduceNativeSessionFeed(feed, { type: "lifecycle", revision: 3, state: "observing" });
     expect(nativeObservationStatus(feed)).toEqual({ phase: "rebasing", catchingUp: true });
     feed = applyRead(feed, pass({ epoch, watermark: 3 }));
+    expect(nativeObservationStatus(feed)).toEqual({ phase: "observing", catchingUp: false });
+    // Navigation: reads answer `building` until the rebuild publishes.
+    feed = applyRead(feed, { type: "building" });
+    expect(nativeObservationStatus(feed)).toEqual({ phase: "building", catchingUp: true });
+    feed = applyRead(feed, pass({ epoch: domain({ branchGeneration: 1 }), watermark: 4 }));
     expect(nativeObservationStatus(feed)).toEqual({ phase: "observing", catchingUp: false });
   });
 });

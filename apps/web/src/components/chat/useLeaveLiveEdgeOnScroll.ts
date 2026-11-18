@@ -11,6 +11,8 @@ const SCROLL_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
 const SCROLL_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
 /** Finger travel that is a drag rather than a tap. */
 const TOUCH_SLOP_PX = 8;
+/** Without `scrollend` (Safari has lacked it), this pause in scrolling settles a gesture. */
+const SCROLL_SETTLE_MS = 150;
 
 /**
  * A gesture on `target` that scrolls the timeline itself in the direction of
@@ -92,6 +94,9 @@ export function useLeaveLiveEdgeOnScroll(
             onReturn();
           }
         };
+        // Detected once per list: Safari has lacked `scrollend`.
+        const scrollEndSupported = "onscrollend" in view;
+        let settleTimer: ReturnType<typeof setTimeout> | undefined;
         const onScroll = () => {
           const top = node.scrollTop;
           if (upward) upward.highestTop = Math.min(upward.highestTop, top);
@@ -105,6 +110,10 @@ export function useLeaveLiveEdgeOnScroll(
           )
             onLeave();
           previousTop = top;
+          if (!scrollEndSupported && upward) {
+            clearTimeout(settleTimer);
+            settleTimer = setTimeout(onScrollEnd, SCROLL_SETTLE_MS);
+          }
           if (returning && atEnd()) {
             returning = false;
             onReturn();
@@ -195,6 +204,7 @@ export function useLeaveLiveEdgeOnScroll(
         view.addEventListener("blur", onBlur);
         detach = () => {
           node.removeEventListener("scroll", onScroll);
+          clearTimeout(settleTimer);
           node.removeEventListener("scrollend", onScrollEnd);
           node.removeEventListener("wheel", onWheel);
           node.removeEventListener("pointerdown", onPointerDown);

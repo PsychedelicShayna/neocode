@@ -736,9 +736,12 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       // queues would need flow control NeoPi does not offer.
       const connect = (args: ReadonlyArray<string>) =>
         Effect.gen(function* () {
-          const inboundEvents = yield* Queue.unbounded<SessionEventFrame>();
-          const inboundUi = yield* Queue.unbounded<UiRequestFrame>();
-          const inboundHost = yield* Queue.unbounded<HostToolCallFrame | HostToolCancelFrame>();
+          const inboundEvents = yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>();
+          const inboundUi = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
+          const inboundHost = yield* Queue.unbounded<
+            HostToolCallFrame | HostToolCancelFrame,
+            Cause.Done<void>
+          >();
           return yield* makeClient({
             sink: {
               event: (frame) => {
@@ -764,6 +767,19 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
             onTransportReady: (transport) =>
               Effect.gen(function* () {
                 earlyUi = transport;
+                // The queues belong to this peer: when it exits they end, and their readers
+                // finish after draining, even if a fallback peer replaces it in this scope.
+                yield* Deferred.await(transport.exit).pipe(
+                  Effect.andThen(
+                    Effect.all([
+                      Queue.end(inboundEvents),
+                      Queue.end(inboundUi),
+                      Queue.end(inboundHost),
+                    ]),
+                  ),
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
                 yield* transport.transportReady.pipe(
                   Effect.flatMap((ready) => {
                     attached =

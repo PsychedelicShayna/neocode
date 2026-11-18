@@ -92,6 +92,14 @@ export function createNeoPiThreadObservationAtoms<R, E>(
           sessions.watch({ environmentId: thread.environmentId, input: { ref: current.ref.ref } }),
         );
     },
+    /** Re-reads only the binding, e.g. to learn whether NeoCode's own runtime still runs. */
+    refreshRef: (
+      registry: AtomRegistry.AtomRegistry,
+      thread: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId },
+    ) =>
+      registry.refresh(
+        nativeRef({ environmentId: thread.environmentId, input: { threadId: thread.threadId } }),
+      ),
   };
 }
 

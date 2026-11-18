@@ -6,7 +6,7 @@ import {
   journalEntryLabel,
   journalRecord,
 } from "@t3tools/client-runtime/neopi-journal";
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useState, type RefObject } from "react";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
@@ -44,14 +44,22 @@ export function NeoPiConversation({
   queuedMessages: ReadonlyArray<QueuedThreadMessage>;
   onEditPendingMessage: (message: QueuedThreadMessage) => void;
 }) {
-  const { conversation, connection, loading, error, refresh, loadOlder, paging, busy } =
-    useNeoPiConversation(threadRef);
+  const {
+    conversation,
+    connection,
+    loading,
+    error,
+    refresh,
+    loadOlder,
+    olderAvailable,
+    paging,
+    busy,
+  } = useNeoPiConversation(threadRef);
   const [treeOpen, setTreeOpen] = useState(false);
-  const currentConnected = useRef(false);
-  currentConnected.current = connection?.status === "connected";
   useEffect(() => {
-    // A stopped runtime is re-read too: the binding then says no NeoCode runtime runs it.
-    if (ownerStatus && ownerStatus !== "starting" && !currentConnected.current) refresh();
+    // Any change of the runtime re-reads the binding (a stop must not leave a stale "NeoCode
+    // runs it"); the watch re-attaches only when not attached, and never starts an owner.
+    if (ownerStatus && ownerStatus !== "starting") refresh();
   }, [ownerStatus, refresh]);
   const nativeDraft = useComposerDraft(
     conversation.identity ? nativeSessionDraftKey(threadRef, conversation.identity) : null,
@@ -109,9 +117,11 @@ export function NeoPiConversation({
     : connection?.ownership === "stopped"
       ? "Stopped native session · read-only history"
       : !attached
-        ? connection?.status === "disconnected"
-          ? "Reconnecting native conversation"
-          : "Native conversation unavailable"
+        ? connection?.status === "identity_changed"
+          ? "Native session changed"
+          : connection?.status === "disconnected"
+            ? "Reconnecting native conversation"
+            : "Native conversation unavailable"
         : connection.ownership === "gui"
           ? "Attached to NeoPi"
           : connection.ownership === "terminal"
@@ -146,8 +156,7 @@ export function NeoPiConversation({
         <View className="flex-row flex-wrap gap-2">
           <MaterialButton label="Session tree" tone="text" onPress={() => setTreeOpen(true)} />
           <MaterialButton label="Reconnect / refresh" tone="text" onPress={refresh} />
-          {conversation.identity &&
-          (conversation.cursor || conversation.cursorLeaf !== conversation.identity.leafId) ? (
+          {olderAvailable ? (
             <MaterialButton
               label={paging ? "Reading older entries…" : "Load older native entries"}
               disabled={paging || conversation.needsSnapshot}

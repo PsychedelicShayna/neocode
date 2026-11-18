@@ -11,6 +11,10 @@ import {
   sameNativeSession,
 } from "@t3tools/client-runtime/neopi-conversation";
 import {
+  findOlderNativePage,
+  nativeOlderHistoryAvailable,
+} from "@t3tools/client-runtime/neopi-thread-observation";
+import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
@@ -44,11 +48,24 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   const [paging, setPaging] = useState(false);
   const [pagingError, setPagingError] = useState<string | null>(null);
   const feed = observation.feed;
-  const stopped = connection?.ownership === "stopped";
-  const live = stopped ? null : (feed?.conversation ?? null);
+  const history = connection?.history ?? null;
+  const live = history === "live" ? (feed?.conversation ?? null) : null;
+  const phase = feed?.observer.phase ?? null;
   const sourceEntries = useRef<ReadonlyArray<NeoPiJournalPage["entries"][number]> | null>(null);
   const current = useRef(conversation);
   current.current = conversation;
+  // Nothing of another session is rendered or bound: the view only says the session changed.
+  useEffect(() => {
+    if (history !== "none") return;
+    sourceEntries.current = null;
+    setConversation(emptyNativeConversation());
+  }, [history]);
+  // A stop is re-read from the binding: whether NeoCode's own runtime still runs decides
+  // between "stopped" and "control plane off".
+  useEffect(() => {
+    if (phase === "owner-stopped" || phase === "incompatible")
+      threadObservationAtoms.refreshRef(appAtomRegistry, threadRef);
+  }, [phase, threadRef.environmentId, threadRef.threadId]);
   useEffect(() => {
     if (!live) return;
     const unchangedEntries = sourceEntries.current === live.entries;
@@ -114,9 +131,10 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     [read, threadRef.environmentId, threadRef.threadId],
   );
 
-  // No owner runs the session: show its history read-only. The journal read never starts one.
+  // No owner can be observed: show the session's history read-only. The journal read never
+  // starts an owner.
   useEffect(() => {
-    if (!stopped) return;
+    if (history !== "read-only") return;
     let cancelled = false;
     fetchPage(undefined, 128).then(
       (page) => {
@@ -131,7 +149,7 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     return () => {
       cancelled = true;
     };
-  }, [stopped, fetchPage]);
+  }, [history, fetchPage]);
 
   const loadOlder = useCallback(async () => {
     if (paging) return;
@@ -140,20 +158,12 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     setPaging(true);
     setPagingError(null);
     try {
-      let cursor = captured.cursor;
-      // Branch cursors are leaf-bound. Obtain a new cursor after live appends.
-      if (captured.cursorLeaf !== captured.identity.leafId)
-        cursor = (await fetchPage(undefined, 100)).nextCursor;
-      if (!cursor) return;
-      const page = await fetchPage(cursor, 100);
+      const page = await findOlderNativePage(captured, (cursor) => fetchPage(cursor, 100));
+      if (!page) return;
       setConversation((state) =>
         reduceNativeConversation(
           { ...state, cursorLeaf: captured.identity!.leafId },
-          {
-            type: "older",
-            page,
-            revision: captured.revision,
-          },
+          { type: "older", page, revision: captured.revision },
         ),
       );
     } catch (cause) {
@@ -170,9 +180,10 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     connection,
     refresh,
     loadOlder,
+    olderAvailable: nativeOlderHistoryAvailable(conversation),
     paging,
     error: observation.error ?? pagingError,
-    loading: connection === null,
-    busy: feed && !stopped ? feed.busy : null,
+    loading: connection === null && observation.error === null,
+    busy: feed && history === "live" ? feed.busy : null,
   };
 }

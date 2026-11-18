@@ -7,6 +7,10 @@ import {
   type NativeIdentity,
 } from "@t3tools/client-runtime/neopi-conversation";
 import {
+  findOlderNativePage,
+  nativeOlderHistoryAvailable,
+} from "@t3tools/client-runtime/neopi-thread-observation";
+import {
   createNeoPiConversationAtoms,
   createNeoPiThreadObservationAtoms,
   threadObservationConnection,
@@ -58,14 +62,27 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   const pagingRef = useRef(false);
   const active = useRef(true);
   const feed = observation.feed;
-  const stopped = connection?.ownership === "stopped";
-  const live = stopped ? null : (feed?.conversation ?? null);
+  const history = connection?.history ?? null;
+  const live = history === "live" ? (feed?.conversation ?? null) : null;
+  const phase = feed?.observer.phase ?? null;
   useEffect(() => {
     active.current = true;
     return () => {
       active.current = false;
     };
   }, []);
+  // Nothing of another session is rendered or bound: the view only says the session changed.
+  useEffect(() => {
+    if (history !== "none") return;
+    sourceEntries.current = null;
+    setConversation(emptyNativeConversation());
+  }, [history]);
+  // A stop is re-read from the binding: whether NeoCode's own runtime still runs decides
+  // between "stopped" and "control plane off".
+  useEffect(() => {
+    if (phase === "owner-stopped" || phase === "incompatible")
+      threadObservationAtoms.refreshRef(appAtomRegistry, threadRef);
+  }, [phase, threadRef.environmentId, threadRef.threadId]);
   useEffect(() => {
     if (!live) return;
     const unchanged = sourceEntries.current === live.entries;
@@ -105,9 +122,10 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
       };
     });
   }, [live]);
-  // No owner runs the session: show its history read-only. The journal read never starts one.
+  // No owner can be observed: show the session's history read-only. The journal read never
+  // starts an owner.
   useEffect(() => {
-    if (!stopped) return;
+    if (history !== "read-only") return;
     let cancelled = false;
     void read({
       environmentId: threadRef.environmentId,
@@ -130,7 +148,7 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     return () => {
       cancelled = true;
     };
-  }, [stopped, read, threadRef.environmentId, threadRef.threadId]);
+  }, [history, read, threadRef.environmentId, threadRef.threadId]);
   const identityKey = conversation.identity
     ? nativeSessionDraftKey(threadRef, conversation.identity)
     : null;
@@ -188,15 +206,8 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
           );
         });
       };
-      let cursor = captured.cursor;
-      if (captured.cursorLeaf !== captured.identity.leafId) {
-        const first = await fetchPage(undefined);
-        applyPage(first);
-        cursor = first.nextCursor;
-      }
-      if (!cursor || !active.current) return;
-      const page = await fetchPage(cursor);
-      applyPage(page);
+      const page = await findOlderNativePage(captured, fetchPage);
+      if (page) applyPage(page);
     } catch (cause) {
       if (active.current)
         setError(cause instanceof Error ? cause.message : "Could not read older native entries.");
@@ -208,7 +219,8 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   return {
     conversation,
     connection,
-    busy: feed && !stopped ? feed.busy : null,
+    busy: feed && history === "live" ? feed.busy : null,
+    olderAvailable: nativeOlderHistoryAvailable(conversation),
     loading: connection === null && observation.error === null,
     refresh,
     loadOlder,

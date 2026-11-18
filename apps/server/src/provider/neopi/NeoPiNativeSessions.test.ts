@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import type { ProcessExit, SessionEventFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -2142,6 +2143,38 @@ describe("server wiring review round", () => {
         .pipe(Effect.flip);
       assert.equal(gone.code, "lease_unknown");
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a lease that returns no credit while obligations pile up is ended to reattach, never grown without bound",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const healthy = yield* follow(service, originalRef);
+        const stalled = yield* manualWatch(service, originalRef);
+        const leaseId = leaseOf(yield* stalled.take);
+        yield* openObligations(native, 600);
+        const ended = yield* Fiber.await(stalled.fiber);
+        assert.equal(ended._tag, "Failure");
+        const failure = Exit.isFailure(ended) ? Cause.squash(ended.cause) : undefined;
+        assert.equal(Reflect.get(Object(failure), "code"), "lease_unknown");
+        const gone = yield* service
+          .read({ leaseId, readId: 0, cursor: null }, testClient)
+          .pipe(Effect.result);
+        assert.equal(gone._tag === "Failure" ? gone.failure.code : undefined, "lease_unknown");
+        // The viewer that keeps up loses nothing, and a fresh lease lists every open one.
+        yield* stalled.settle;
+        assert.equal(
+          healthy.seen.filter((envelope) => envelope.type === "obligation-opened").length,
+          600,
+        );
+        // The join lists all 600 at once; that is not growth, so the fresh lease is not ended.
+        const again = yield* follow(service, originalRef);
+        yield* again.next("obligation-opened", (envelope) => envelope.id === "call-599");
+        yield* native.publish({ type: "host_tool_call", id: "after", toolName: "preview" });
+        yield* again.next("obligation-opened", (envelope) => envelope.id === "after");
+      }).pipe(Effect.scoped),
   );
 
   it.effect(

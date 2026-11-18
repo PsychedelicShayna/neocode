@@ -228,6 +228,8 @@ const SETTLED_CHILD_STATUSES: ReadonlySet<string> = new Set([
   "parked",
   "idle",
 ]);
+/** Unsent essential envelopes one lease may hold; beyond it the lease ends and its client reattaches. */
+const ESSENTIAL_OUTBOX_LIMIT = 512;
 /** How long a lease may hold a closed session without taking its terminal envelope. */
 const CLOSED_LEASE_GRACE = Duration.seconds(5);
 const nativeError = (cause: unknown): NeoPiNativeSessionsError => {
@@ -418,6 +420,8 @@ interface Observation {
   session: NativeSession | null;
   /** Unsent envelopes, coalesced by kind, so their count is bounded by open obligations. */
   readonly outbox: NeoPiNativeEssentialEnvelope[];
+  /** Outbox length that ends the lease: the join's own envelopes plus `ESSENTIAL_OUTBOX_LIMIT`. */
+  outboxLimit: number;
   sent: number;
   applied: number;
   /** A terminal lifecycle is queued; the stream ends once it is sent. */
@@ -482,10 +486,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   /**
    * Queues one essential envelope on one lease. Status, session, identity and
    * non-terminal lifecycle replace their unsent predecessor, and a settle cancels
-   * its unsent open, so the outbox is bounded by the open obligations.
+   * its unsent open, so what remains is open obligations and the settlements of
+   * opens already sent. A lease that returns no credit while those pile up past
+   * the bound is ended with a failure: its client reattaches and rebuilds from a
+   * fresh lease (which lists the open obligations), instead of the outbox growing.
    */
   const enqueue = (observation: Observation, envelope: NeoPiNativeEssentialEnvelope) => {
-    if (observation.ending || observation.released) return;
+    if (observation.ending || observation.released || observation.failure) return;
     const { outbox } = observation;
     if (envelope.type === "obligation-settled") {
       const opened = outbox.findIndex(
@@ -508,6 +515,18 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           (item.type !== "lifecycle" || !TERMINAL_LIFECYCLE.has(item.state)),
       );
       if (held >= 0) outbox.splice(held, 1);
+    }
+    if (
+      outbox.length >= observation.outboxLimit &&
+      !(envelope.type === "lifecycle" && TERMINAL_LIFECYCLE.has(envelope.state))
+    ) {
+      outbox.length = 0;
+      observation.failure = fail(
+        "This view stopped taking essential updates; it must attach again.",
+        NEOPI_NATIVE_OBSERVATION_ERROR_CODES.leaseUnknown,
+      );
+      observation.wake?.();
+      return;
     }
     outbox.push(envelope);
     if (envelope.type === "lifecycle" && TERMINAL_LIFECYCLE.has(envelope.state))
@@ -2043,6 +2062,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           if (observation.released) return true;
           if (session.closed || sessions.get(file) !== session) return false;
           const { projection } = session;
+          // The join lists every open obligation however many there are; only what
+          // accumulates after it counts against the bound.
+          observation.outboxLimit = Number.POSITIVE_INFINITY;
           enqueue(observation, sessionEnvelope(session));
           const identity = projection.identity;
           if (identity?.sessionFile)
@@ -2069,6 +2091,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             enqueue(observation, { type: "status", revision: projection.store.bump(), live });
           for (const [id, { revision, request }] of projection.obligations)
             enqueue(observation, { type: "obligation-opened", revision, id, request });
+          observation.outboxLimit = observation.outbox.length + ESSENTIAL_OUTBOX_LIMIT;
           observation.session = session;
           session.observations.add(observation);
           if (session.observations.size === 1) {
@@ -2225,6 +2248,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           leaseId: NodeCrypto.randomUUID(),
           session: null,
           outbox: [],
+          outboxLimit: ESSENTIAL_OUTBOX_LIMIT,
           sent: 0,
           applied: 0,
           ending: false,

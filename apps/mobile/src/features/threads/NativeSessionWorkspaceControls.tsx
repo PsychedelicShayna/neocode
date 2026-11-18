@@ -161,11 +161,11 @@ export function NativeSessionAgents({
   const finished = useMemo(
     () =>
       new Map(
-        agents.flatMap((agent) =>
+        agents.flatMap((agent): [string, string][] =>
           agent.native.unobservedSince !== null
-            ? [[agent.id, "finished while this session was not being watched"] as const]
+            ? [[agent.id, "finished while this session was not being watched"]]
             : agent.native.outcomeUnrecorded
-              ? [[agent.id, "finished"] as const]
+              ? [[agent.id, "finished"]]
               : [],
         ),
       ),

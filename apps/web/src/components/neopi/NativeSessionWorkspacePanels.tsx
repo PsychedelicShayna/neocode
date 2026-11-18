@@ -26,8 +26,9 @@ import { requestConfirmDialog } from "~/confirmDialog";
 import { isElectron } from "~/env";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
+import { dispatchKeybindingCommand, useCommandHandlers } from "~/commandTable";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
-import { getTerminalFocusOwner } from "~/lib/terminalFocus";
+import { getLastTerminalFocusOwner, getTerminalFocusOwner } from "~/lib/terminalFocus";
 import { isPreviewFocused } from "~/lib/previewFocus";
 import { confirmTerminalClose, isTerminalCloseConfirmPending } from "~/lib/terminalCloseConfirm";
 import {
@@ -72,7 +73,6 @@ import { ThreadPreviewMiniPlayer } from "../preview/ThreadPreviewMiniPlayer";
 import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
-import { isNativeSessionCommand, type NativeSessionCommand } from "./nativeSessionShortcuts";
 import { useNativePendingFiles } from "./useNativePendingFiles";
 
 /** Escape belongs to these while one is open; it must not also interrupt the turn. */
@@ -113,7 +113,6 @@ export function NativeSessionWorkspacePanels({
   onTreeNavigated,
   onOpenModels,
   onInterrupt,
-  onNativeCommand,
   busy,
   onToggleDictation,
   dictationActive,
@@ -138,8 +137,6 @@ export function NativeSessionWorkspacePanels({
   onTreeNavigated: (result: Record<string, unknown>) => void;
   onOpenModels: () => void;
   onInterrupt: () => void;
-  /** Runs a keybinding command that only the native session implements. */
-  onNativeCommand: (command: NativeSessionCommand) => void;
   busy: boolean;
   /** Absent outside the desktop app, which has no microphone control. */
   onToggleDictation: (() => void) | undefined;
@@ -336,6 +333,118 @@ export function NativeSessionWorkspacePanels({
       }),
     [target],
   );
+  // Invoked from outside a terminal, terminal commands act on the one focused
+  // last, while it is still showing.
+  const terminalInPanel = () =>
+    getLastTerminalFocusOwner() === "right-panel" &&
+    panel.isOpen &&
+    activeSurface?.kind === "terminal";
+  const splitTerminal = (direction: "horizontal" | "vertical") => {
+    if (terminalInPanel()) {
+      panelRef.current?.splitTerminal(direction);
+      return;
+    }
+    useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+    drawerRef.current?.splitTerminal(direction);
+  };
+  useCommandHandlers("workspace", {
+    "terminal.toggle": {
+      label: "Toggle terminal",
+      available: () => true,
+      run: () =>
+        useTerminalUiStateStore.getState().setTerminalOpen(target, !terminalUi.terminalOpen),
+    },
+    "rightPanel.toggle": {
+      label: "Toggle right panel",
+      available: () => true,
+      run: () => useRightPanelStore.getState().toggleVisibility(target),
+    },
+    "rightPanel.toggleMaximized": {
+      label: "Maximize right panel",
+      available: () => true,
+      run: () => setMaximized((value) => !value),
+    },
+    "rightPanel.close": {
+      label: "Close right panel tab",
+      available: () => panel.isOpen && activeSurface !== null,
+      run: () => {
+        if (activeSurface) void closeSurfaces([activeSurface]);
+      },
+    },
+    "terminal.new": {
+      label: "New terminal",
+      available: () => cwd !== null,
+      run: () => {
+        if (terminalInPanel()) {
+          createTerminal();
+          return;
+        }
+        useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+        drawerRef.current?.newTerminal();
+      },
+    },
+    "terminal.split": {
+      label: "Split terminal",
+      available: () => cwd !== null,
+      run: () => splitTerminal("horizontal"),
+    },
+    "terminal.splitVertical": {
+      label: "Split terminal vertically",
+      available: () => cwd !== null,
+      run: () => splitTerminal("vertical"),
+    },
+    "terminal.close": {
+      label: "Close terminal",
+      available: () => terminalInPanel() || terminalUi.terminalOpen,
+      run: () => (terminalInPanel() ? panelRef : drawerRef).current?.closeActiveTerminal(),
+    },
+    "diff.toggle": {
+      label: "Toggle diff",
+      available: () => gitStatus.data?.isRepo === true,
+      run: () => useRightPanelStore.getState().toggle(target, "diff"),
+    },
+    "modelPicker.toggle": {
+      label: "Choose model",
+      available: () => true,
+      run: onOpenModels,
+    },
+    "composer.effort": {
+      label: "Choose effort",
+      available: () => true,
+      run: () => composerRef.current?.openControl("composer.effort"),
+    },
+    "composer.mode": {
+      label: "Choose access mode",
+      available: () => true,
+      run: () => composerRef.current?.openControl("composer.mode"),
+    },
+    "composer.dictation.toggle": {
+      label: "Toggle dictation",
+      available: () => onToggleDictation !== undefined,
+      run: () => onToggleDictation?.(),
+    },
+    "agents.panel.toggle": {
+      label: "Toggle agents panel",
+      available: () => true,
+      run: () => useRightPanelStore.getState().toggle(target, "agents"),
+    },
+    "agents.hub.toggle": {
+      label: "Toggle Agent Hub",
+      available: () => true,
+      run: () => useAgentViewStore.getState().dispatch(key, { type: "toggleHub" }),
+    },
+    "thread.stop": {
+      label: "Stop the running turn",
+      // The hub and an opened agent own Escape: it leaves them, never interrupts the session behind.
+      available: () =>
+        busy &&
+        !agentViewActive &&
+        !dictationActive &&
+        !composerRef.current?.isMenuOpen() &&
+        !document.querySelector(ESCAPE_OWNING_OVERLAYS),
+      run: onInterrupt,
+    },
+  });
   useEffect(() => {
     const handle = (event: KeyboardEvent) => {
       if (
@@ -366,110 +475,14 @@ export function NativeSessionWorkspacePanels({
             event.target.closest("[data-composer-rich-text]") !== null,
         },
       });
-      let action: (() => void) | null = null;
-      const terminalController =
-        terminalFocus === "right-panel" ? panelRef.current : drawerRef.current;
-      switch (command) {
-        case "terminal.toggle":
-          action = () =>
-            useTerminalUiStateStore.getState().setTerminalOpen(target, !terminalUi.terminalOpen);
-          break;
-        case "rightPanel.toggle":
-          action = () => useRightPanelStore.getState().toggleVisibility(target);
-          break;
-        case "rightPanel.toggleMaximized":
-          action = () => setMaximized((value) => !value);
-          break;
-        case "rightPanel.close":
-          if (panel.isOpen && activeSurface) action = () => void closeSurfaces([activeSurface]);
-          break;
-        case "terminal.new":
-          if (cwd)
-            action = () => {
-              if (terminalFocus === "right-panel") createTerminal();
-              else {
-                useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-                terminalController?.newTerminal();
-              }
-            };
-          break;
-        case "terminal.split":
-        case "terminal.splitVertical":
-          if (cwd)
-            action = () => {
-              if (terminalFocus !== "right-panel")
-                useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-              terminalController?.splitTerminal(
-                command === "terminal.splitVertical" ? "vertical" : "horizontal",
-              );
-            };
-          break;
-        case "terminal.close":
-          if (terminalFocus || terminalUi.terminalOpen)
-            action = () => terminalController?.closeActiveTerminal();
-          break;
-        case "diff.toggle":
-          if (gitStatus.data?.isRepo)
-            action = () => useRightPanelStore.getState().toggle(target, "diff");
-          break;
-        case "modelPicker.toggle":
-          action = onOpenModels;
-          break;
-        case "composer.effort":
-        case "composer.mode":
-          action = () => composerRef.current?.openControl(command);
-          break;
-        case "composer.dictation.toggle":
-          action = onToggleDictation ?? null;
-          break;
-        case "agents.panel.toggle":
-          action = () => useRightPanelStore.getState().toggle(target, "agents");
-          break;
-        case "agents.hub.toggle":
-          action = () => useAgentViewStore.getState().dispatch(key, { type: "toggleHub" });
-          break;
-        case "thread.stop":
-          // The hub and an opened agent own Escape: it leaves them, never interrupts the session behind.
-          if (
-            busy &&
-            !agentViewActive &&
-            !dictationActive &&
-            !event.isComposing &&
-            !composerRef.current?.isMenuOpen() &&
-            !document.querySelector(ESCAPE_OWNING_OVERLAYS)
-          )
-            action = onInterrupt;
-          break;
-        default:
-          if (isNativeSessionCommand(command)) action = () => onNativeCommand(command);
-          break;
-      }
-      if (!action) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (!event.repeat) action();
+      if (!command) return;
+      // Escape that ends an IME composition belongs to the input method.
+      if (command === "thread.stop" && event.isComposing) return;
+      dispatchKeybindingCommand(command, event, "workspace");
     };
     window.addEventListener("keydown", handle, true);
     return () => window.removeEventListener("keydown", handle, true);
-  }, [
-    target,
-    keybindings,
-    terminalUi.terminalOpen,
-    panel.isOpen,
-    activeSurface,
-    composerRef,
-    cwd,
-    createTerminal,
-    closeSurfaces,
-    gitStatus.data?.isRepo,
-    onOpenModels,
-    onNativeCommand,
-    onInterrupt,
-    busy,
-    onToggleDictation,
-    dictationActive,
-    agentViewActive,
-  ]);
+  }, [keybindings, terminalUi.terminalOpen, panel.isOpen, activeSurface, composerRef]);
 
   const openFile = (path: string) => useRightPanelStore.getState().openFile(target, path);
   const active = (surface: RightPanelSurface) => panel.isOpen && activeSurface?.id === surface.id;

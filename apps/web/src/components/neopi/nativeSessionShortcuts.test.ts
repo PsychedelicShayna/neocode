@@ -1,19 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import {
-  isNativeSessionCommand,
-  nativeRoleCycleNotice,
-  nativeThinkingCycleNotice,
-} from "./nativeSessionShortcuts";
+import { nativeRoleCycleNotice, nativeThinkingCycleNotice } from "./nativeSessionShortcuts";
 
 describe("native session shortcuts", () => {
-  it("claims only the commands the native workspace implements", () => {
-    expect(isNativeSessionCommand("composer.role.cycleBackward")).toBe(true);
-    expect(isNativeSessionCommand("transcript.tools.toggleExpand")).toBe(true);
-    expect(isNativeSessionCommand("composer.effort")).toBe(false);
-    expect(isNativeSessionCommand(null)).toBe(false);
-  });
-
   it("names the level NeoPi cycled to, and says when there is nothing to cycle", () => {
     expect(nativeThinkingCycleNotice({ level: "xhigh" })).toBe("Reasoning: Extra High");
     expect(nativeThinkingCycleNotice({ level: "auto" })).toBe("Reasoning: auto");

@@ -108,6 +108,7 @@ import {
   resolveProjectPathForDispatch,
 } from "../lib/projectPaths";
 import { onOpenCommandPalette } from "../commandPaletteBus";
+import { runCommand, useCommandHandlers } from "../commandTable";
 import { isPreviewFocused } from "../lib/previewFocus";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
@@ -476,6 +477,27 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     open: false,
     mode: "command",
     openIntent: null,
+  });
+  // Mounted with the app shell on every page, so starting a session works from
+  // the palette and the Ex line wherever they are open.
+  const createNativeSession = useCreateNativeSession();
+  useCommandHandlers("app", {
+    "chat.new": {
+      label: "New thread",
+      available: () => true,
+      run: async () => {
+        await createNativeSession();
+      },
+      repeat: true,
+    },
+    "chat.newLocal": {
+      label: "New local thread",
+      available: () => true,
+      run: async () => {
+        await createNativeSession();
+      },
+      repeat: true,
+    },
   });
   const setOpen = useCallback((open: boolean) => dispatch({ _tag: "SetOpen", open }), []);
   const toggleMode = useCallback(
@@ -1778,9 +1800,7 @@ function OpenCommandPaletteDialog(props: {
     searchTerms: ["new thread", "chat", "create", "native"],
     shortcutCommand: "chat.new",
     icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-    run: async () => {
-      await createNativeSession();
-    },
+    run: () => runCommand("chat.new"),
   });
   if (nativeTarget) {
     const surfaces = [
@@ -1810,11 +1830,7 @@ function OpenCommandPaletteDialog(props: {
         searchTerms: ["terminal", "shell", "workspace"],
         shortcutCommand: "terminal.toggle",
         icon: <TerminalSquare className={ITEM_ICON_CLASS} />,
-        run: async () => {
-          const store = useTerminalUiStateStore.getState();
-          const ui = selectThreadTerminalUiState(store.terminalUiStateByThreadKey, nativeTarget);
-          store.setTerminalOpen(nativeTarget, !ui.terminalOpen);
-        },
+        run: () => runCommand("terminal.toggle"),
       },
       {
         kind: "action",

@@ -16,6 +16,26 @@ export function isTerminalFocused(): boolean {
   return getTerminalFocusOwner() !== null;
 }
 
+let lastTerminalFocusOwner: TerminalFocusOwner | null = null;
+if (typeof document !== "undefined") {
+  document.addEventListener(
+    "focusin",
+    () => {
+      lastTerminalFocusOwner = getTerminalFocusOwner() ?? lastTerminalFocusOwner;
+    },
+    true,
+  );
+}
+
+/**
+ * The terminal that has focus, or else the one that had it last. Commands
+ * invoked from outside a terminal act on this one; the caller checks that it
+ * still exists.
+ */
+export function getLastTerminalFocusOwner(): TerminalFocusOwner | null {
+  return getTerminalFocusOwner() ?? lastTerminalFocusOwner;
+}
+
 /**
  * Whether a terminal's own keyboard input has focus, so every key belongs to
  * the program running in it. Focus on a terminal's toolbar or tab list does

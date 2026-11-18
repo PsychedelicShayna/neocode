@@ -1,3 +1,4 @@
+import { dispatchKeybindingCommand } from "../commandTable";
 import { APP_BASE_NAME } from "../branding";
 import { Outlet, createFileRoute, redirect, useLocation, useParams } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
@@ -20,7 +21,6 @@ import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
 import { useThreadSelectionStore } from "../threadSelectionStore";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { primaryServerKeybindingsAtom } from "~/state/server";
-import { useCreateNativeSession } from "../components/neopi/NativeSessionSidebar";
 import { useNativeSessionSelection } from "../state/neopiNativeSessions";
 
 function ChatRouteGlobalShortcuts() {
@@ -31,7 +31,6 @@ function ChatRouteGlobalShortcuts() {
   const nativeTarget = useNativeSessionSelection((state) => state.target);
   const routeWorkspaceRef = routeThreadRef ?? (pathname === "/" ? nativeTarget : null);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
-  const createNativeSession = useCreateNativeSession();
   const terminalOpen = useTerminalUiStateStore((state) =>
     routeWorkspaceRef
       ? selectThreadTerminalUiState(state.terminalUiStateByThreadKey, routeWorkspaceRef)
@@ -79,21 +78,9 @@ function ChatRouteGlobalShortcuts() {
         return;
       }
 
-      if (command === "chat.newLocal") {
-        event.preventDefault();
-        event.stopPropagation();
-        void createNativeSession().catch((cause) =>
-          toastManager.add({ type: "error", title: String(cause) }),
-        );
-        return;
-      }
-
-      if (command === "chat.new") {
-        event.preventDefault();
-        event.stopPropagation();
-        void createNativeSession().catch((cause) =>
-          toastManager.add({ type: "error", title: String(cause) }),
-        );
+      const ran = command ? dispatchKeybindingCommand(command, event, "app") : null;
+      if (ran) {
+        void ran.catch((cause) => toastManager.add({ type: "error", title: String(cause) }));
         return;
       }
 
@@ -147,7 +134,6 @@ function ChatRouteGlobalShortcuts() {
     };
   }, [
     clearSelection,
-    createNativeSession,
     keybindings,
     previewOpen,
     routeWorkspaceRef,

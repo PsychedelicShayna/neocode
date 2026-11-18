@@ -267,11 +267,13 @@ export const NeoPiNativeInboxRecord = Schema.Union([
 ]);
 export type NeoPiNativeInboxRecord = typeof NeoPiNativeInboxRecord.Type;
 
-/** A native journal entry after the stop-outcome filter. */
+/** A native journal entry after the stop-outcome filter; `NeoPiJournalEntry` plus the outcome. */
 export const NeoPiNativeObservedJournalEntry = Schema.StructWithRest(
   Schema.Struct({
     id: Schema.String,
     parentId: Schema.NullOr(Schema.String),
+    type: Schema.String,
+    timestamp: Schema.String,
     message: Schema.optionalKey(NeoPiNativeObservedMessage),
     stopOutcome: Schema.optionalKey(NeoPiStopOutcome),
   }),
@@ -288,20 +290,24 @@ export const NeoPiNativeJournalSlice = Schema.Struct({
   continuity: Schema.Literals(["append", "horizon"]),
   leafId: Schema.NullOr(Schema.String),
   entries: Schema.Array(NeoPiNativeObservedJournalEntry),
+  /** For `horizon`: the native page cursor for the entries before it, which fills a placeholder on demand. */
+  nextCursor: Schema.optionalKey(Schema.String),
 });
 export type NeoPiNativeJournalSlice = typeof NeoPiNativeJournalSlice.Type;
 
 /**
  * A pass in progress. Its cohort is the keys with ordinal ≤ `lastOrdinal`,
- * fixed with `watermark` when the pass starts; `afterKey` is the last key sent.
- * `segment` is set while an oversized value is mid-transfer.
+ * fixed with `watermark` when the pass starts. `afterOrdinal` is the ordinal of
+ * the last key sent: ordinals are unique, and it stays a valid position even
+ * after that key's tombstone expires mid-pass. `segment` is set while an
+ * oversized value is mid-transfer.
  */
 export const NeoPiNativePass = Schema.Struct({
   kind: Schema.Literals(["incremental", "full"]),
   passId: Schema.String,
   watermark: NeoPiNativeRevision,
   lastOrdinal: NeoPiNativeOrdinal,
-  afterKey: Schema.NullOr(Schema.String),
+  afterOrdinal: Schema.NullOr(NeoPiNativeOrdinal),
   segment: Schema.NullOr(
     Schema.Struct({ key: Schema.String, revision: NeoPiNativeRevision, nextIndex: NonNegativeInt }),
   ),
@@ -335,6 +341,11 @@ export const NeoPiNativeSessionsReadResult = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("pass"),
     passId: Schema.String,
+    /**
+     * The pass this reply belongs to. Only completing a `full` pass removes, by
+     * absence, held entities at or below the completed watermark.
+     */
+    kind: Schema.Literals(["incremental", "full"]),
     baseCursor: NeoPiNativeCursor,
     /** Revision through which the returned cohort is covered. */
     coveredThrough: NeoPiNativeRevision,

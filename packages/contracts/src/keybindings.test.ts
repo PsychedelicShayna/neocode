@@ -206,6 +206,22 @@ it.effect("parses resolved keybinding rules", () =>
   }),
 );
 
+it.effect("sends Space chords over the wire intact, alone and in a sequence", () =>
+  Effect.gen(function* () {
+    const space = { ...chord, modKey: false, ctrlKey: true, key: " " };
+    const rules = [
+      { command: "composer.dictation.toggle", shortcut: space },
+      { command: "sidebar.toggle", sequence: [{ ...chord, key: "g" }, space] },
+    ] as const;
+    const wire = yield* encodeResolvedKeybindings(rules);
+    const decoded = yield* decode(ResolvedKeybindingsConfig, wire);
+    assert.deepEqual(
+      decoded.map((rule) => keybindingRuleSteps(rule).map((step) => step.key)),
+      [[" "], ["g", " "]],
+    );
+  }),
+);
+
 it.effect("keeps sequence rules, which clients from before sequences drop", () =>
   Effect.gen(function* () {
     const payload = [

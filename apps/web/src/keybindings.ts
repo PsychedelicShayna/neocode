@@ -26,6 +26,8 @@ export interface ShortcutEventLike {
   altKey: boolean;
   /** Called for a keypress that begins a bound sequence, which no other handler should act on. */
   preventDefault?: () => void;
+  /** An auto-repeat of a held key: it never starts or completes a sequence. */
+  repeat?: boolean;
   /** Present on React's synthetic events: the browser event they wrap. */
   nativeEvent?: unknown;
 }
@@ -350,10 +352,24 @@ export function resolveShortcutCommand(
     terminalFocus: focus.terminalFocus,
   };
 
-  for (const binding of sequenceKeydownHeld) {
-    if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
-    if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
-    return binding.command;
+  if (event.repeat) {
+    // Holding the first chord down keeps it held, as the terminal escape does.
+    const stillHeld = sequenceKeydownHeld.filter((binding) =>
+      matchesShortcut(event, binding.sequence[0], platform),
+    );
+    if (stillHeld.length > 0) {
+      for (const rule of stillHeld) {
+        if (!sequenceKeydownArmed.includes(rule)) sequenceKeydownArmed.push(rule);
+      }
+      event.preventDefault?.();
+      return null;
+    }
+  } else {
+    for (const binding of sequenceKeydownHeld) {
+      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
+      if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
+      return binding.command;
+    }
   }
 
   const armable = (binding: ResolvedKeybindingRule | undefined): binding is SequenceRule =>
@@ -366,7 +382,7 @@ export function resolveShortcutCommand(
     const binding = keybindings[index];
     if (!binding) continue;
     if ("sequence" in binding) {
-      if (!mayBeginSequence || !armable(binding)) continue;
+      if (event.repeat || !mayBeginSequence || !armable(binding)) continue;
       for (let armed = index; armed >= 0; armed -= 1) {
         const rule = keybindings[armed];
         if (armable(rule) && !sequenceKeydownArmed.includes(rule)) sequenceKeydownArmed.push(rule);

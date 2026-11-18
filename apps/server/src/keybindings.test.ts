@@ -300,7 +300,34 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
       assert.isNull(
         Keybindings.compileResolvedKeybindingRule({ key: "ctrl+w h j", command: "sidebar.toggle" }),
       );
+      // A literal `+` key on either side of the chord boundary.
+      for (const [key, expected] of [
+        ["ctrl++ h", "ctrl++ h"],
+        ["ctrl+w +", "ctrl+w +"],
+        ["mod + k", "mod+k"],
+      ] as const) {
+        const rule = Keybindings.compileResolvedKeybindingRule({ key, command: "sidebar.toggle" });
+        assert.isNotNull(rule, key);
+        assert.equal((yield* encodeResolvedKeybindingFromConfig(rule!)).key, expected);
+      }
     }),
+  );
+
+  it.effect("removes a sequence saved with other whitespace, as Settings shows it", () =>
+    Effect.gen(function* () {
+      const { keybindingsConfigPath } = yield* ServerConfig.ServerConfig;
+      yield* writeKeybindingsConfig(keybindingsConfigPath, [
+        { key: "ctrl+g  h", command: "sidebar.toggle" },
+        { key: "mod+shift+r", command: "script.run-tests.run" },
+      ]);
+      const keybindings = yield* Keybindings.Keybindings;
+      yield* keybindings.removeKeybindingRule({ key: "ctrl+g h", command: "sidebar.toggle" });
+      const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
+      assert.deepEqual(
+        persisted.map(({ key, command }) => ({ key, command })),
+        [{ key: "mod+shift+r", command: "script.run-tests.run" }],
+      );
+    }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
   it.effect(

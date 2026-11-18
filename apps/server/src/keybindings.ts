@@ -52,6 +52,7 @@ import {
   compileResolvedKeybindingsConfig,
   parseKeybindingShortcut,
   parseKeybindingSteps,
+  parseKeybindingWhenExpression,
 } from "@t3tools/shared/keybindings";
 
 export {
@@ -113,6 +114,30 @@ function isSameKeybindingRule(left: KeybindingRule, right: KeybindingRule): bool
     left.command === right.command &&
     left.key === right.key &&
     (left.when ?? undefined) === (right.when ?? undefined)
+  );
+}
+
+function canonicalRuleKey(rule: KeybindingRule): string {
+  const steps = parseKeybindingSteps(rule.key);
+  return (steps && encodeKeybindingSteps(steps)) ?? rule.key;
+}
+
+function canonicalRuleWhen(rule: KeybindingRule): string | undefined {
+  if (rule.when === undefined) return undefined;
+  const ast = parseKeybindingWhenExpression(rule.when);
+  return ast ? encodeWhenAst(ast) : rule.when;
+}
+
+/**
+ * Whether two rules are the same binding however their text is spaced or
+ * spelled. Settings sends a rule back as it shows it (`ctrl+g h`, `esc`),
+ * which need not match the file's text (`ctrl+g  h`, `escape`).
+ */
+function isEquivalentKeybindingRule(left: KeybindingRule, right: KeybindingRule): boolean {
+  return (
+    left.command === right.command &&
+    canonicalRuleKey(left) === canonicalRuleKey(right) &&
+    canonicalRuleWhen(left) === canonicalRuleWhen(right)
   );
 }
 
@@ -669,10 +694,11 @@ const make = Effect.gen(function* () {
             ...customConfig.filter((entry) => {
               if (replaceTarget) {
                 return (
-                  !isSameKeybindingRule(entry, replaceTarget) && !isSameKeybindingRule(entry, rule)
+                  !isEquivalentKeybindingRule(entry, replaceTarget) &&
+                  !isEquivalentKeybindingRule(entry, rule)
                 );
               }
-              return !isSameKeybindingRule(entry, rule);
+              return !isEquivalentKeybindingRule(entry, rule);
             }),
             rule,
           ];
@@ -706,7 +732,9 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const customConfig = yield* loadWritableCustomKeybindingsConfig();
           const target = keybindingRuleFromRemoveInput(input);
-          const nextConfig = customConfig.filter((entry) => !isSameKeybindingRule(entry, target));
+          const nextConfig = customConfig.filter(
+            (entry) => !isEquivalentKeybindingRule(entry, target),
+          );
           yield* writeConfigAtomically(nextConfig);
           const nextResolved = mergeWithDefaultKeybindings(
             compileResolvedKeybindingsConfig(nextConfig),

@@ -148,7 +148,8 @@ export const KeybindingsConfig = Schema.Array(KeybindingRule).check(
 export type KeybindingsConfig = typeof KeybindingsConfig.Type;
 
 export const KeybindingShortcut = Schema.Struct({
-  key: KeybindingValue,
+  // Not trimmed: a parsed Space chord's key is " ", which trimming would empty.
+  key: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_KEYBINDING_VALUE_LENGTH)),
   metaKey: Schema.Boolean,
   ctrlKey: Schema.Boolean,
   shiftKey: Schema.Boolean,

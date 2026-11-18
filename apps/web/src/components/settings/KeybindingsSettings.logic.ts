@@ -508,13 +508,15 @@ export function keybindingFromKeyboardEvent(
  * One keypress while recording a binding. The first chord needs a modifier;
  * the press after it becomes the second chord of a sequence (`ctrl+w h`), or
  * plain Enter keeps the first chord alone. `done` ends the recording. Null
- * for a press that records nothing, such as a bare modifier.
+ * for a press that records nothing, such as a bare modifier or an
+ * auto-repeat of a held key.
  */
 export function recordKeybindingStep(
   firstStep: string | null,
-  event: RecordedKeyEvent,
+  event: RecordedKeyEvent & { readonly repeat?: boolean },
   platform: string,
 ): { readonly key: string; readonly done: boolean } | null {
+  if (event.repeat) return null;
   if (firstStep === null) {
     const chord = chordFromKeyboardEvent(event, platform, true);
     return chord ? { key: chord, done: false } : null;

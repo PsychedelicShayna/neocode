@@ -1757,6 +1757,30 @@ describe("two-chord sequences", () => {
     }
   });
 
+  it("never starts or completes a sequence by auto-repeat", () => {
+    const repeated = mergeWithDefaultKeybindings(
+      compileResolvedKeybindingsConfig([{ key: "ctrl+g ctrl+g", command: "sidebar.toggle" }]),
+    );
+    const ctrlG = (repeat: boolean) => press({ key: "g", ctrlKey: true, repeat });
+    settle();
+    // Holding Ctrl+G: its repeats keep the first chord held but never complete it.
+    assert.isNull(resolveShortcutCommand(ctrlG(false).keydown, repeated, options));
+    const held = ctrlG(true);
+    assert.isNull(resolveShortcutCommand(held.keydown, repeated, options));
+    assert.isTrue(held.prevented());
+    assert.isNull(resolveShortcutCommand(ctrlG(true).keydown, repeated, options));
+    assert.strictEqual(
+      resolveShortcutCommand(ctrlG(false).keydown, repeated, options),
+      "sidebar.toggle",
+    );
+    // A repeat with nothing held is an ordinary key: it does not begin one.
+    settle();
+    const stray = ctrlG(true);
+    assert.isNull(resolveShortcutCommand(stray.keydown, repeated, options));
+    assert.isFalse(stray.prevented());
+    assert.isNull(resolveShortcutCommand(ctrlG(false).keydown, repeated, options));
+  });
+
   it("labels a sequence with both chords", () => {
     assert.strictEqual(shortcutLabelForCommand(bindings, "sidebar.toggle", "Linux"), "Ctrl+W H");
   });

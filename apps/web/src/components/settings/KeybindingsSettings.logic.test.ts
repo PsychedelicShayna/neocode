@@ -486,6 +486,16 @@ describe("KeybindingsSettings.logic", () => {
       });
     });
 
+    it("does not take an auto-repeat of the first chord as the second", () => {
+      expect(
+        recordKeybindingStep(
+          "mod+w",
+          { ...keydown("w", { ctrlKey: true }), repeat: true },
+          "Linux",
+        ),
+      ).toBeNull();
+    });
+
     it("keeps a single chord on Enter and needs a modifier to start", () => {
       expect(recordKeybindingStep("mod+w", keydown("Enter"), "Linux")).toEqual({
         key: "mod+w",

@@ -204,14 +204,20 @@ export function parseKeybindingShortcut(value: string): KeybindingShortcut | nul
 
 /**
  * Splits a rule's `key` into its chords: one, or two separated by whitespace
- * (`ctrl+w h`). Whitespace beside a `+` stays inside its chord, so `mod + k`
- * is still one chord.
+ * (`ctrl+w h`). Whitespace beside a joining `+` stays inside its chord, so
+ * `mod + k` is still one chord, while a `+` key keeps its own place:
+ * `ctrl++ h` and `ctrl+w +` are two chords each.
  */
 function splitKeybindingSteps(value: string): string[] {
   const steps: string[] = [];
   for (const part of value.trim().split(/\s+/)) {
     const previous = steps.at(-1);
-    if (previous !== undefined && (previous.endsWith("+") || part.startsWith("+"))) {
+    const joins =
+      previous !== undefined &&
+      (parseKeybindingShortcut(previous) === null ||
+        (previous !== "+" && previous.endsWith("+") && !previous.endsWith("++")) ||
+        (part !== "+" && part.startsWith("+") && !part.startsWith("++")));
+    if (previous !== undefined && joins) {
       steps[steps.length - 1] = `${previous}${part}`;
     } else {
       steps.push(part);

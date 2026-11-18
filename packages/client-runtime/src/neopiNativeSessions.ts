@@ -11,13 +11,14 @@ import {
   type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionsReadResult,
+  type NeoPiNativeSessionsStreamEvent,
   type ServerProviderSlashCommand,
   type WS_METHODS,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import type { EnvironmentRpcSuccess, EnvironmentRpcStreamValue } from "./rpc/client.ts";
+import type { EnvironmentRpcSuccess } from "./rpc/client.ts";
 import {
   emptyNativeConversation,
   nativeConversationGaps,
@@ -52,11 +53,12 @@ const nowMs = () => DateTime.toEpochMillis(DateTime.nowUnsafe());
 
 export type NativeSession = EnvironmentRpcSuccess<typeof WS_METHODS.neopiNativeSessionsOpen>;
 export type NativeSessionList = EnvironmentRpcSuccess<typeof WS_METHODS.neopiNativeSessionsList>;
-export type NativeSessionEvent = EnvironmentRpcStreamValue<
-  typeof WS_METHODS.neopiNativeSessionsWatch
->;
 export type NativeSessionUpdate =
-  | NativeSessionEvent
+  /**
+   * The old raw watch events, which the watch no longer sends. They stay until
+   * the parity sign-off removes them with their reducer branches.
+   */
+  | NeoPiNativeSessionsStreamEvent
   /** One envelope of the essential `watch` stream (the lease). */
   | NeoPiNativeEssentialEnvelope
   /** The observation controller's own state; see `NativeObserver`. */

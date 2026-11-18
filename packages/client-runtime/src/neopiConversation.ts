@@ -58,6 +58,7 @@ export type NativeConversationAction =
    * A fresh backward page ending at the current leaf, joined to loaded history
    * by entry id. `continuous`: the branch has only been appended to since the
    * loaded history was read, so an unjoined page leaves a gap, not a new branch.
+   * Live rows are not touched: only the authority's membership retires them.
    */
   | {
       type: "horizon";
@@ -81,9 +82,13 @@ export type NativeConversationAction =
       message: Readonly<Record<string, unknown>>;
       stopOutcome?: NeoPiStopOutcome;
     }
-  /** The authority no longer holds these live messages: unidentified rows become continuity losses. */
+  /** These live rows cannot be identified with any durable entry: they become continuity losses. */
   | { type: "unresolved"; messageIds: ReadonlySet<string> }
-  /** Message ids of the previous owner are meaningless now; only durable entries already present retire rows. */
+  /**
+   * Message ids of the previous owner are meaningless now. An identified row
+   * keeps waiting for its entry under the key `durable:<entryId>`; any other
+   * row is a continuity loss.
+   */
   | { type: "owner_changed" }
   | { type: "turn_started" };
 
@@ -111,15 +116,20 @@ function retirePending(
   return kept.length === pending.length ? pending : kept;
 }
 
-/** Turns the selected rows without a durable identity into continuity losses. */
-function loseUnidentified(
+/** Turns the selected rows into continuity losses, anchored at their entry when it is loaded. */
+function loseRows(
   state: NativeConversation,
   lost: (message: NativeLiveMessage) => boolean,
 ): NativeConversation {
-  const losses = state.pending.filter(lost).map((message) => ({
-    messageId: message.messageId,
-    afterEntryId: state.persisted.get(message.messageId) ?? state.entries.at(-1)?.id ?? null,
-  }));
+  const loaded = new Set(state.entries.map((entry) => entry.id));
+  const losses = state.pending.filter(lost).map((message) => {
+    const entryId = state.persisted.get(message.messageId);
+    return {
+      messageId: message.messageId,
+      afterEntryId:
+        entryId !== undefined && loaded.has(entryId) ? entryId : (state.entries.at(-1)?.id ?? null),
+    };
+  });
   if (losses.length === 0) return state;
   const ids = new Set(losses.map((loss) => loss.messageId));
   return {
@@ -182,35 +192,43 @@ export function reduceNativeConversation(
       const { identity, entries: page } = action;
       const same = sameNativeSession(state.identity, identity);
       const loaded = same ? state.entries : [];
-      const index = new Map(loaded.map((entry, position) => [entry.id, position]));
-      // Join at the newest entry both hold; the page continues after it.
+      const held = new Map(loaded.map((entry, position) => [entry.id, position]));
+      // The page is one contiguous run to the leaf: it replaces loaded history
+      // from its oldest held entry on, filling any placeholder it covers.
       let keep = -1;
-      let from = 0;
-      for (let position = page.length - 1; position >= 0 && keep < 0; position -= 1) {
-        keep = index.get(page[position]!.id) ?? -1;
-        from = position + 1;
+      for (const entry of page) {
+        keep = held.get(entry.id) ?? -1;
+        if (keep >= 0) break;
       }
-      if (keep < 0) {
-        from = 0;
-        const parent = page[0]?.parentId;
-        keep = parent == null ? -1 : (index.get(parent) ?? -1);
-      }
-      // Unjoined on a branch only appended to: the unloaded range stays a placeholder.
-      const gap = keep < 0 && action.continuous && loaded.length > 0 && page[0]?.parentId != null;
-      const extended = loaded.length === 0 || keep === loaded.length - 1 || gap;
-      const entries = [
-        ...(keep >= 0 ? loaded.slice(0, keep + 1) : gap ? loaded : []),
-        ...page.slice(from),
-      ];
+      const parent = page[0]?.parentId;
+      const parentAt = parent == null ? -1 : (held.get(parent) ?? -1);
+      const prefix =
+        keep >= 0
+          ? loaded.slice(0, keep)
+          : parentAt >= 0
+            ? loaded.slice(0, parentAt + 1)
+            : // Unjoined on a branch only appended to: the unloaded range stays a placeholder.
+              action.continuous && parent != null
+              ? loaded
+              : [];
+      const entries =
+        page.length === 0 && action.continuous
+          ? loaded
+          : [
+              ...prefix,
+              ...page.map((entry) => {
+                const position = held.get(entry.id);
+                return position === undefined ? entry : loaded[position]!;
+              }),
+            ];
       return {
         identity,
         entries,
-        // Any other join is a navigation: the abandoned branch's live rows go with it.
-        pending: extended
+        pending: same
           ? retirePending(state.pending, state.persisted, new Set(entries.map((entry) => entry.id)))
           : [],
         persisted: same ? state.persisted : new Map(),
-        losses: extended ? state.losses : [],
+        losses: same ? state.losses : [],
         cursor: action.nextCursor,
         cursorLeaf: identity.leafId,
         revision: state.revision + 1,
@@ -343,17 +361,17 @@ export function reduceNativeConversation(
       };
     }
     case "unresolved":
-      // An identified row waits for its durable entry; only an unidentified one is lost.
-      return loseUnidentified(
-        state,
-        (message) =>
-          action.messageIds.has(message.messageId) && !state.persisted.has(message.messageId),
-      );
+      return loseRows(state, (message) => action.messageIds.has(message.messageId));
     case "owner_changed": {
-      const lost = loseUnidentified(state, () => true);
-      return state.persisted.size === 0 && lost === state
-        ? state
-        : { ...lost, persisted: new Map() };
+      const lost = loseRows(state, (message) => !state.persisted.has(message.messageId));
+      const persisted = new Map<string, string>();
+      const pending = lost.pending.map((row) => {
+        const entryId = state.persisted.get(row.messageId)!;
+        const messageId = `durable:${entryId}`;
+        persisted.set(messageId, entryId);
+        return { ...row, messageId };
+      });
+      return state.persisted.size === 0 && lost === state ? state : { ...lost, pending, persisted };
     }
   }
 }

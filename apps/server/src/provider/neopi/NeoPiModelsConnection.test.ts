@@ -51,13 +51,28 @@ const scenario = {
       on: { type: "get_models_configuration" },
       emit: [
         ...Array.from({ length: BURST }, () => ({ type: "models_configuration_changed" })),
+        // An unanswered login prompt, then a burst of UI traffic that is not this flow's.
+        {
+          type: "extension_ui_request",
+          id: "prompt",
+          method: "input",
+          title: "Code",
+          loginId: "flow",
+        },
         ...Array.from({ length: BURST }, (_, index) => ({
           type: "extension_ui_request",
           id: `ui-${index}`,
           method: "notify",
-          loginId: "flow",
+          ...(index % 2 === 0 ? { loginId: "other-flow" } : {}),
           message: `m${index}`,
         })),
+        {
+          type: "extension_ui_request",
+          id: "done",
+          method: "notify",
+          loginId: "flow",
+          message: "end",
+        },
         {
           id: "$id",
           type: "response",
@@ -101,7 +116,7 @@ const open = Effect.gen(function* () {
 });
 
 /** Subscribes, then stalls on its first item until released; everything after it queues in the subscription. */
-const stalledReader = <A>(stream: Stream.Stream<A>, gate: Deferred.Deferred<void>) =>
+const stalledReader = <A, E>(stream: Stream.Stream<A, E>, gate: Deferred.Deferred<void>) =>
   Effect.gen(function* () {
     const seen: Array<A> = [];
     const first = yield* Deferred.make<void>();
@@ -120,13 +135,13 @@ const stalledReader = <A>(stream: Stream.Stream<A>, gate: Deferred.Deferred<void
     return { seen, first };
   });
 
-it.live("keeps one change signal and a bounded UI backlog for a reader that stalled", () =>
+it.live("keeps one change signal for a stalled reader and every prompt of its login flow", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const connection = yield* open;
       const gate = yield* Deferred.make<void>();
       const changes = yield* stalledReader(connection.changes, gate);
-      const ui = yield* stalledReader(connection.ui, gate);
+      const ui = yield* stalledReader(yield* connection.loginUi("flow"), gate);
       yield* Effect.yieldNow;
       yield* connection.request({ type: "get_models_configuration" });
       yield* Deferred.await(changes.first);
@@ -135,8 +150,8 @@ it.live("keeps one change signal and a bounded UI backlog for a reader that stal
       yield* Effect.sleep(200);
       // The first signal was taken before it stalled; the rest collapsed into at most one more.
       expect(changes.seen.length).toBeLessThanOrEqual(2);
-      expect(ui.seen.length).toBeLessThanOrEqual(65);
-      expect(ui.seen.length).toBeGreaterThan(1);
+      // The unanswered prompt survives the unrelated burst; nothing else was queued for the flow.
+      expect(ui.seen.map((frame) => frame.id)).toEqual(["prompt", "done"]);
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

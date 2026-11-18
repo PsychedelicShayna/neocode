@@ -235,14 +235,15 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
           }),
         );
         const flow: AuthFlow = { connection: native, state, scope, cancel, watchers: 0 };
-        const ui = yield* Stream.toPull(native.ui).pipe(Effect.provideService(Scope.Scope, scope));
+        const ui = yield* native
+          .loginUi(flowId)
+          .pipe(Effect.flatMap(Stream.toPull), Effect.provideService(Scope.Scope, scope));
         // A server address supplied up front answers the provider's own address
         // prompt once, so the person never types it twice.
         let pendingServerUrl = input.serverUrl?.trim() || null;
         // toPull is lazy; start consuming before login can emit its first prompt.
         yield* Stream.fromPull(Effect.succeed(ui)).pipe(
           Stream.runForEach((frame) => {
-            if (frame.loginId !== flowId) return Effect.void;
             if (
               pendingServerUrl !== null &&
               frame.method === "input" &&
@@ -316,6 +317,11 @@ export const makeNativeModelsAuth = Effect.fn("makeNativeModelsAuth")(function* 
               return current;
             });
           }),
+          // A flow whose prompts overflowed is cancelled and ends with the reason, never left
+          // waiting; the login request's own completion then closes the flow scope.
+          Effect.catch((error) =>
+            cancel.pipe(Effect.ignore, Effect.andThen(settleAuth(state, "failed", error.message))),
+          ),
           Effect.forkIn(scope, { startImmediately: true, uninterruptible: false }),
         );
         const login = yield* native

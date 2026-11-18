@@ -68,6 +68,7 @@ import {
 } from "./NeoPiNativeSettlement.ts";
 import type { McpCapability } from "../../mcp/McpInvocationContext.ts";
 import { makeNeoPiNativeHostToolPump } from "./NeoPiHostToolBridge.ts";
+import { makeNeoPiLoginUi, type NeoPiLoginUi } from "./NeoPiLoginUi.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import {
@@ -368,7 +369,7 @@ interface NativeSession {
   bulkStale: boolean;
   readonly pendingUi: Map<string, SessionEventFrame>;
   readonly modelChanges: PubSub.PubSub<void>;
-  readonly modelUi: PubSub.PubSub<UiRequestFrame>;
+  readonly modelUi: NeoPiLoginUi;
   readonly openedAt: string;
   ref: NeoPiNativeSessionRef;
   sessionId: string;
@@ -1077,10 +1078,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       PubSub.unbounded<void>(),
       PubSub.shutdown,
     ).pipe(Effect.provideService(Scope.Scope, scope));
-    const modelUi = yield* Effect.acquireRelease(
-      PubSub.unbounded<UiRequestFrame>(),
-      PubSub.shutdown,
-    ).pipe(Effect.provideService(Scope.Scope, scope));
+    // Login UI goes only to the flow it belongs to: other dialogs can never displace a prompt.
+    const modelUi = makeNeoPiLoginUi();
     let session: NativeSession | undefined;
     const observations = new Set<Observation>();
     const markers: NativeMarkers = { count: 0, last: null };
@@ -1224,7 +1223,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           typeof frame.id === "string" &&
           typeof frame.method === "string"
         )
-          PubSub.publishUnsafe(modelUi, frame as UiRequestFrame);
+          modelUi.publish(frame as UiRequestFrame);
         if (STATE_REFRESH_EVENTS.has(frame.type)) requestRefresh(current, "state");
         if (frame.type === "agent_end") requestRefresh(current, "jobs");
         publishStatus(current);
@@ -2447,10 +2446,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             Effect.asVoid,
             Effect.mapError((cause) => new NeoPiRpcError({ message: cause.message })),
           ),
-        ui: Stream.unwrap(retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelUi)))).pipe(
-          Stream.catch(() => Stream.empty),
-          Stream.scoped,
-        ),
+        loginUi: (loginId) =>
+          retain(session).pipe(
+            Effect.andThen(session.modelUi.subscribe(loginId)),
+            Effect.catch(() => Effect.succeed(Stream.empty)),
+          ),
         changes: Stream.unwrap(
           retain(session).pipe(Effect.as(Stream.fromPubSub(session.modelChanges))),
         ).pipe(

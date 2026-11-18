@@ -441,13 +441,17 @@ describe("canonical native session lifecycle", () => {
       const ready = yield* Deferred.make<void>();
       const observer = yield* models.changes.pipe(Stream.runDrain, Effect.forkScoped);
       // A delivered UI frame is a receipt that the Models subscriber is attached.
-      const ui = yield* models.ui.pipe(
+      const ui = yield* (yield* models.loginUi("flow")).pipe(
         Stream.tap(() => Deferred.succeed(ready, undefined)),
         Stream.runDrain,
         Effect.forkScoped,
       );
-      yield* Effect.yieldNow;
-      yield* native.publish({ type: "extension_ui_request", id: "notice", method: "notify" });
+      yield* native.publish({
+        type: "extension_ui_request",
+        id: "notice",
+        method: "notify",
+        loginId: "flow",
+      });
       yield* Deferred.await(ready);
       yield* TestClock.adjust("1 hour");
       assert.equal(native.connections, 1);

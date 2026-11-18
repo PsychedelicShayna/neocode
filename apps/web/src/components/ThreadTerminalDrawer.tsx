@@ -501,7 +501,7 @@ export function TerminalViewport({
     let selectionActions: ReturnType<typeof observeSelectionActions> | null = null;
 
     const setup = async (): Promise<(() => void) | null> => {
-      // Every byte for the program leaves through focusEscape.send.
+      // Every byte of user input leaves through focusEscape.send.
       const focusEscape = createTerminalFocusEscape({
         write: (data) => handleData(data),
         // Blur rather than focus the terminal's owner: focus anywhere inside
@@ -522,6 +522,9 @@ export function TerminalViewport({
           return visibleRef.current;
         },
         onData: (data) => focusEscape.send(data),
+        // Query replies are not the user's input: they must not release a held
+        // Ctrl+Backslash, so they skip the escape.
+        onReply: (data) => handleData(data),
         onResize: (cols, rows) => void resizeTerminal(cols, rows),
         onSelectionChange: () => handleSelectionChange(),
         beforeKey: (event) => focusEscape.beforeKey(event) && handleBeforeKey(event),

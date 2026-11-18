@@ -42,9 +42,11 @@ function isEscapeChord(event: TerminalFocusEscapeKey): boolean {
  * mode leaves on Ctrl+Backslash followed by a second key. There is no timeout:
  * the first press is held until the next key.
  *
- * Every byte bound for the program must go through `send`, so a held press
- * goes out ahead of anything else the terminal writes (keys, IME commits,
- * AltGr text, pastes) and the next Ctrl+Backslash starts over. `beforeKey`
+ * Every byte of user input bound for the program must go through `send`, so
+ * a held press goes out ahead of anything else the user enters (keys, IME
+ * commits, AltGr text, pastes) and the next Ctrl+Backslash starts over. The
+ * terminal's own replies to program queries must bypass it: they are not the
+ * user's next key and must not release the hold. `beforeKey`
  * runs first on each keydown and returns false for a key it consumed. Call
  * `reset` when the terminal loses focus: a held press is then dropped unsent.
  */

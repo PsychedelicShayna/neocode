@@ -311,6 +311,45 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(left).toBe(1);
   });
 
+  it("keeps a held Ctrl+Backslash held when the terminal replies to a query", async () => {
+    const harness = createHarness();
+    const program: string[] = [];
+    let left = 0;
+    const escape = createTerminalFocusEscape({
+      write: (data) => program.push(data),
+      leave: () => {
+        left += 1;
+      },
+    });
+    const surface = await harness.create({
+      onData: escape.send,
+      onReply: (data) => program.push(data),
+      beforeKey: escape.beforeKey,
+    });
+    const ctrlBackslash = () =>
+      harness.input.dispatchEvent(
+        Object.assign(new Event("keydown", { cancelable: true }), {
+          key: "\\",
+          code: "Backslash",
+          keyCode: 220,
+          ctrlKey: true,
+          altKey: false,
+          metaKey: false,
+          shiftKey: false,
+          repeat: false,
+          isComposing: false,
+          getModifierState: () => false,
+        }),
+      );
+
+    ctrlBackslash();
+    // Shells and TUIs ask for the cursor position all the time.
+    surface.write("\x1b[6n");
+    ctrlBackslash();
+    expect(program).toEqual(["\x1b[1;1R"]);
+    expect(left).toBe(1);
+  });
+
   it("keeps the selection on reveal and applies a hidden selection clear", async () => {
     const harness = createHarness();
     const surface = await harness.create();

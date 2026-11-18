@@ -543,7 +543,14 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly font?: GhosttyTerminalFont;
   /** Read after font and WASM loading. Hosts can supply a getter for the latest value. */
   readonly visible?: boolean;
+  /** Input from the user: keys, IME commits, AltGr text, pastes, mouse and wheel. */
   readonly onData: (data: string) => void;
+  /**
+   * The terminal's own replies to the program's queries (cursor position,
+   * device attributes and the like). Defaults to `onData`; a host that treats
+   * user input specially passes this to keep replies out of that path.
+   */
+  readonly onReply?: (data: string) => void;
   readonly onResize: (cols: number, rows: number) => void;
   readonly onSelectionChange: () => void;
   readonly beforeKey: (event: KeyboardEvent) => boolean;
@@ -729,7 +736,7 @@ export class GhosttyTerminalSurface {
       metrics.width,
       metrics.height,
       options.theme,
-      options.onData,
+      options.onReply ?? options.onData,
     );
     const surface = new GhosttyTerminalSurface(
       mount,

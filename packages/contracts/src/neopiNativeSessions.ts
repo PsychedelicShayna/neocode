@@ -443,6 +443,16 @@ export const NeoPiNativeEssentialEnvelope = Schema.Union([
     /** How long an idle `read` waits before answering `unchanged`. */
     readDeadlineMs: NonNegativeInt,
   }),
+  /**
+   * What `open` would describe now (ref, attachment, capabilities, native state).
+   * Sent right after `leased`, and again whenever it changes: a successor owner,
+   * an adopted identity, a takeover.
+   */
+  Schema.Struct({
+    type: Schema.Literal("session"),
+    revision: NeoPiNativeRevision,
+    session: NeoPiNativeSessionsOpenResult,
+  }),
   Schema.Struct({
     type: Schema.Literal("identity"),
     revision: NeoPiNativeRevision,

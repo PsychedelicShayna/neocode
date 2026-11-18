@@ -640,6 +640,144 @@ describe("native projection mapping", () => {
     expect(stopped.connected).toBe(false);
   });
 
+  describe("membership during an unfinished full pass", () => {
+    const rosterKey = (id: string, revision: number): NeoPiNativeEntity => ({
+      key: `roster:${id}`,
+      ordinal: revision,
+      revision,
+      value: {
+        class: "roster",
+        value: { id, runToken: "run", inventory: { id, status: "running", runToken: "run" } },
+      },
+    });
+    const toolKey = (id: string, revision: number): NeoPiNativeEntity => ({
+      key: `tool:${id}`,
+      ordinal: revision,
+      revision,
+      value: {
+        class: "tool",
+        toolCallId: id,
+        coverage: "since-build",
+        state: { status: "running" },
+      },
+    });
+    /** One reply of a full pass that continues, with `passId` and `watermark`. */
+    const partial = (input: {
+      readonly epoch: NeoPiNativeObservationDomain;
+      readonly passId: string;
+      readonly watermark: number;
+      readonly entities: readonly NeoPiNativeEntity[];
+      readonly promoted?: boolean;
+    }): NeoPiNativeSessionsReadResult => {
+      const base = pass({
+        epoch: input.epoch,
+        watermark: input.watermark,
+        entities: input.entities,
+      });
+      return {
+        ...base,
+        passId: input.passId,
+        promoted: input.promoted ?? false,
+        complete: false,
+        continuation: {
+          ...base.continuation,
+          base: 0,
+          pass: {
+            kind: "full",
+            passId: input.passId,
+            watermark: input.watermark,
+            lastOrdinal: 99,
+            afterOrdinal: 1,
+            segment: null,
+          },
+        },
+      };
+    };
+    const final = (epoch: NeoPiNativeObservationDomain, passId: string, watermark: number) => ({
+      ...pass({ epoch, watermark }),
+      passId,
+    });
+    /** A feed holding child `old` from a first completed pass. */
+    const holding = () =>
+      applyRead(
+        reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+          type: "session",
+          revision: 1,
+          session,
+        }),
+        pass({ epoch: domain(), watermark: 2, entities: [rosterKey("old", 2)] }),
+      );
+    const visible = (feed: NativeSessionFeed) => ({
+      agents: feed.agents.map((agent) => agent.id),
+      keys: [...feed.observation.entities.keys()].sort(),
+    });
+
+    it("shows new roster and tool keys only when the pass completes", () => {
+      const rebuilt = domain({ projectionIncarnation: 2 });
+      let feed = applyRead(
+        holding(),
+        partial({
+          epoch: rebuilt,
+          passId: "f",
+          watermark: 10,
+          entities: [
+            rosterKey("new", 5),
+            toolKey("t1", 6),
+            rosterKey("old", 7),
+            rosterKey("live", 11),
+          ],
+        }),
+      );
+      // Held `old` updates in place; `live` is newer than the watermark and shows at once.
+      expect(visible(feed)).toEqual({
+        agents: ["old", "live"],
+        keys: ["roster:live", "roster:old"],
+      });
+      feed = applyRead(feed, final(rebuilt, "f", 10));
+      expect(visible(feed)).toEqual({
+        agents: ["old", "live", "new"],
+        keys: ["roster:live", "roster:new", "roster:old", "tool:t1"],
+      });
+      expect(feed.observation.staged).toBeNull();
+    });
+
+    it("discards staged keys when the pass is promoted or its domain changes", () => {
+      const rebuilt = domain({ projectionIncarnation: 2 });
+      const staged = applyRead(
+        holding(),
+        partial({
+          epoch: rebuilt,
+          passId: "f",
+          watermark: 10,
+          entities: [rosterKey("new", 5), toolKey("t1", 6), rosterKey("old", 7)],
+        }),
+      );
+      expect(staged.observation.staged?.entities.size).toBe(2);
+
+      // Promotion: a fresh pass that never returns `new` or `t1`.
+      let promoted = applyRead(
+        staged,
+        partial({ epoch: rebuilt, passId: "g", watermark: 12, entities: [], promoted: true }),
+      );
+      expect(promoted.observation.staged).toBeNull();
+      promoted = applyRead(promoted, {
+        ...final(rebuilt, "g", 12),
+        entities: [rosterKey("old", 12)],
+      });
+      expect(visible(promoted)).toEqual({ agents: ["old"], keys: ["roster:old"] });
+
+      // Domain change mid-pass: the new domain's pass completes without them.
+      const moved = domain({ projectionIncarnation: 3 });
+      let changed = applyRead(
+        staged,
+        partial({ epoch: moved, passId: "h", watermark: 4, entities: [rosterKey("old", 3)] }),
+      );
+      expect(changed.observation.staged).toBeNull();
+      changed = applyRead(changed, final(moved, "h", 4));
+      expect(visible(changed)).toEqual({ agents: ["old"], keys: ["roster:old"] });
+    });
+  });
+
   it("maps envelopes and presentation keys into the fields web and mobile read", () => {
     const presentation = (key: string, revision: number, value: Record<string, unknown>) => ({
       key,

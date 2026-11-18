@@ -271,6 +271,15 @@ export interface NativeObservation {
   /** The pass whose returned keys are being accumulated, until it completes. */
   readonly passId: string | null;
   readonly returned: ReadonlySet<string>;
+  /**
+   * Roster and tool keys first seen in the unfinished full pass `passId`, held
+   * back until it completes (r12 C2: "membership (roster, tools) is reconciled
+   * only at a pass-completion boundary"). Discarded if that pass is abandoned.
+   */
+  readonly staged: {
+    readonly passId: string;
+    readonly entities: ReadonlyMap<string, NativeObservedEntity>;
+  } | null;
   /** Revision at which each removed key was removed; an older value never brings it back. */
   readonly removed: ReadonlyMap<string, number>;
   /**
@@ -315,6 +324,7 @@ export const emptyNativeObservation = (): NativeObservation => ({
   entities: new Map(),
   passId: null,
   returned: new Set(),
+  staged: null,
   removed: new Map(),
   unproven: new Set(),
   carried: new Set(),
@@ -761,6 +771,8 @@ export function applyNativeRead(
       entities,
       passId: completed ? null : result.passId,
       returned: completed ? new Set() : returned,
+      // Membership staging is decided by `stageNativeMembership` after this reply.
+      staged: held.staged,
       removed,
       unproven: fullCompleted ? new Set() : unproven,
       carried: new Set(
@@ -845,6 +857,55 @@ export function boundNativeInbox(observation: NativeObservation, at: number): Na
   return {
     ...observation,
     inbox: [foldNativeInbox(inbox.slice(0, cut), at), ...inbox.slice(cut)],
+  };
+}
+
+/**
+ * r12 C2 (4): "membership (roster, tools) is reconciled only at a
+ * pass-completion boundary"; "only a completed pass replaces membership, and
+ * the previous visible membership stays until then." During an unfinished full
+ * pass a roster or tool key the view did not hold is staged; a held key is
+ * updated in place; a key newer than the pass watermark is a live update and
+ * shows at once. Completion admits what is staged; a promotion, a new pass or
+ * a domain change discards it.
+ */
+function stageNativeMembership(
+  before: NativeObservation,
+  after: NativeObservation,
+  result: NeoPiNativeSessionsReadResult,
+): NativeObservation {
+  if (result.type !== "pass") return after;
+  const prior = before.staged;
+  const staged = new Map(
+    prior && !result.promoted && prior.passId === result.passId ? prior.entities : [],
+  );
+  for (const tombstone of result.tombstones) staged.delete(tombstone.key);
+  const entities = new Map(after.entities);
+  const pass = result.continuation.pass;
+  if (result.kind === "full" && pass === null) {
+    for (const [key, entity] of staged)
+      if (!entities.has(key) && (after.removed.get(key) ?? -1) < entity.revision)
+        entities.set(key, entity);
+    return staged.size === 0 && after.staged === null
+      ? after
+      : { ...after, entities, staged: null };
+  }
+  if (result.kind !== "full" || pass === null) return { ...after, staged: null };
+  for (const [key, entity] of after.entities) {
+    if (before.entities.has(key)) continue;
+    const kind = entity.value.class;
+    if (kind !== "roster" && kind !== "tool") continue;
+    if (entity.revision > pass.watermark) {
+      staged.delete(key);
+      continue;
+    }
+    entities.delete(key);
+    staged.set(key, entity);
+  }
+  return {
+    ...after,
+    entities,
+    staged: staged.size > 0 ? { passId: result.passId, entities: staged } : null,
   };
 }
 
@@ -1246,7 +1307,12 @@ export function reduceNativeSessionFeed(
         : event.result.type === "pass" && phase === "building"
           ? { phase: "observing", reason: null }
           : null;
-    const projected = projectNativeEntities(feed, observer ? { ...next, observer } : next);
+    const staged = {
+      ...next,
+      observation: stageNativeMembership(feed.observation, next.observation, event.result),
+      ...(observer ? { observer } : {}),
+    };
+    const projected = projectNativeEntities(feed, staged);
     const observation = boundNativeInbox(projected.observation, nowMs());
     return observation === projected.observation ? projected : { ...projected, observation };
   }

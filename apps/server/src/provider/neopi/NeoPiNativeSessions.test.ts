@@ -2680,6 +2680,45 @@ describe("leaf announcements (the live stall)", () => {
       assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
     }).pipe(Effect.scoped),
   );
+
+  it.effect(
+    "an entry folded live while the quiet-leaf fetch is in flight is kept once, with no navigation",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const head = yield* appender(native)(1);
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        const pages = native.pages;
+        const x = entry("live-x", head.id);
+        const a = entry("pending-a", x.id);
+        const f = frames(native, a.id);
+        // A flush announces its last entry A; nothing follows within the pause.
+        yield* native.publish(f.leaf);
+        // The owner's page still ends at the held head when it is read; X, extending
+        // that head, folds live after the page exists and before it is applied.
+        let first = true;
+        native.afterPageHook = Effect.suspend(() => {
+          if (!first) return Effect.void;
+          first = false;
+          return native.publish(f.entry(x));
+        });
+        yield* TestClock.adjust("2 seconds");
+        yield* settle;
+        assert.equal(native.pages, pages + 1);
+        const read = yield* lease.pass(built.cursor);
+        assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+        assert.deepEqual(idsOf(read.entries), ["live-x"]);
+        // The rest of the flush arrives: A joins once, on the same branch.
+        native.entries.push(x, a);
+        yield* native.publish(f.entry(a));
+        yield* settle;
+        const rest = yield* lease.pass(read.cursor);
+        assert.equal(rest.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+        assert.deepEqual(idsOf(rest.entries), ["pending-a"]);
+      }).pipe(Effect.scoped),
+  );
 });
 
 describe("confirmation round", () => {

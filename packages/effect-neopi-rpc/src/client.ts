@@ -71,14 +71,15 @@ export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
  * Receives peer frames in-line on the stdout parser, in wire order: each call returns before the
  * parser reads the next frame, and an event written before a reply is delivered before that
  * reply settles its request. Calls must be synchronous and must not throw. With a sink, the
- * `events`, `uiRequests`, `hostToolCalls` and `hostUriRequests` streams never emit, and every
- * host URI request reaches `hostUriRequest`, whose owner must answer it.
+ * `events`, `uiRequests`, `hostToolCalls` and `hostUriRequests` streams never emit. A sink
+ * without `uiRequest` or `hostToolCall` drops those frames; one without `hostUriRequest` has
+ * every host URI request answered `unsupported`. A `hostUriRequest` owner must answer each one.
  */
 export interface NeoPiRpcFrameSink {
   readonly event: (frame: SessionEventFrame) => void;
-  readonly uiRequest: (frame: UiRequestFrame) => void;
-  readonly hostToolCall: (frame: HostToolCallFrame | HostToolCancelFrame) => void;
-  readonly hostUriRequest: (frame: HostUriRequestFrame) => void;
+  readonly uiRequest?: (frame: UiRequestFrame) => void;
+  readonly hostToolCall?: (frame: HostToolCallFrame | HostToolCancelFrame) => void;
+  readonly hostUriRequest?: (frame: HostUriRequestFrame) => void;
 }
 
 export interface NeoPiRpcClientOptions {
@@ -589,19 +590,19 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               yield* Queue.offer(startupUiChanges, undefined);
             }
           }
-          if (sink) return sink.uiRequest(ui);
+          if (sink) return sink.uiRequest?.(ui);
           return yield* Queue.offer(uiRequests, ui).pipe(Effect.ignore);
         }
         case "host_tool_call":
         case "host_tool_cancel": {
           const call = frame as HostToolCallFrame | HostToolCancelFrame;
-          if (sink) return sink.hostToolCall(call);
+          if (sink) return sink.hostToolCall?.(call);
           return yield* Queue.offer(hostToolCalls, call).pipe(Effect.ignore);
         }
         case "host_uri_request": {
           const uri = frame as HostUriRequestFrame;
-          if (sink) return sink.hostUriRequest(uri);
-          if (uriListeners === 0) {
+          if (sink?.hostUriRequest) return sink.hostUriRequest(uri);
+          if (sink || uriListeners === 0) {
             yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
             return;
           }

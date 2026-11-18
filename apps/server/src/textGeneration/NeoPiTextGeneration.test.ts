@@ -453,6 +453,46 @@ it.live("keeps only the successful retry after a partial JSON draft fails", () =
   ),
 );
 
+it.live("answers from the last attempt after a burst of deltas nobody could queue", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const reply = jsonText({ title: "After the burst", needsRefinement: false });
+        const burst = Array.from({ length: 5_000 }, () => ({
+          type: "message_update",
+          messageId: "m1",
+          assistantMessageEvent: { type: "text_delta", delta: "x" },
+        }));
+        const { textGeneration } = yield* makeHarness({
+          peerSource: streamingPeer([
+            { type: "message_start", message: { role: "assistant" }, messageId: "m1" },
+            ...burst,
+            { type: "auto_retry_start", attempt: 1 },
+            { type: "message_start", message: { role: "assistant" }, messageId: "m2" },
+            {
+              type: "message_update",
+              messageId: "m2",
+              assistantMessageEvent: { type: "text_delta", delta: reply },
+            },
+            { type: "extension_ui_request", id: "ui-1", method: "confirm", title: "t" },
+            {
+              type: "agent_end",
+              isTerminal: true,
+              messages: [{ role: "assistant", content: [{ type: "text", text: reply }] }],
+            },
+          ]),
+        });
+        const title = yield* textGeneration.generateThreadTitle({
+          cwd: process.cwd(),
+          message: "Generate a title",
+          modelSelection: TEST_MODEL,
+        });
+        expect(title.title).toBe("After the burst");
+      }),
+    ),
+  ),
+);
+
 it.live("rejects a failed final assistant attempt rather than publishing an earlier draft", () =>
   withNode(
     Effect.scoped(

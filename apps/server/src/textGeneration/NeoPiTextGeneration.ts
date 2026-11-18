@@ -6,11 +6,11 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 import * as Scope from "effect/Scope";
 import {
   type NeoPiRpcClient,
   type NeoPiRpcClientOptions,
+  type NeoPiRpcFrameSink,
   type PromptHandle,
   type SessionEventFrame,
   type SpawnFn,
@@ -100,6 +100,7 @@ export const makeNeoPiTextGeneration = (
         ),
       );
       const message = `${args.prompt}\n\nAnswer with a single JSON object matching this schema, and no other text:\n${schemaJson}`;
+      const settled = yield* Deferred.make<string, TextGenerationError>();
       const client = yield* input
         .makeClient({
           spawn: input.spawn,
@@ -108,6 +109,7 @@ export const makeNeoPiTextGeneration = (
           cwd: args.cwd,
           env: input.env,
           requestTimeoutMs: deadlineMs,
+          sink: assistantTextSink(settled, args.operation),
         })
         .pipe(
           Effect.mapError(
@@ -120,9 +122,11 @@ export const makeNeoPiTextGeneration = (
           ),
         );
       yield* Effect.addFinalizer(() => client.close(CLOSE_GRACE_MS));
-
-      const settled = yield* Deferred.make<string, TextGenerationError>();
-      yield* collectAssistantText(client, settled, args.operation);
+      yield* Deferred.await(client.exit).pipe(
+        Effect.flatMap((exit) => Deferred.fail(settled, exitError(args.operation, exit))),
+        Effect.ignore,
+        Effect.forkScoped,
+      );
 
       const handle = yield* client.prompt({ type: "prompt", message }).pipe(
         Effect.mapError(
@@ -365,69 +369,67 @@ interface AssistantAttempt {
 const messageIdOf = (frame: SessionEventFrame): string | undefined =>
   typeof frame.messageId === "string" && frame.messageId.length > 0 ? frame.messageId : undefined;
 
-const collectAssistantText = (
-  client: NeoPiRpcClient,
+/**
+ * Folds the event stream into the current attempt's text in the parser path. Only one
+ * attempt's text is held; UI and host-tool frames are dropped and host URI requests are
+ * answered `unsupported`, because this loadout runs no tools or extensions.
+ */
+const assistantTextSink = (
   settled: Deferred.Deferred<string, TextGenerationError>,
   operation: string,
-): Effect.Effect<void, never, Scope.Scope> =>
-  Effect.gen(function* () {
-    let current: AssistantAttempt = { deltas: "", snapshot: "", failed: false };
-    const beginAttempt = (messageId?: string): void => {
-      current = { deltas: "", snapshot: "", failed: false, ...(messageId ? { messageId } : {}) };
-    };
-    yield* Stream.runForEach(client.events, (frame) =>
-      Effect.gen(function* () {
+): NeoPiRpcFrameSink => {
+  let current: AssistantAttempt = { deltas: "", snapshot: "", failed: false };
+  const beginAttempt = (messageId?: string): void => {
+    current = { deltas: "", snapshot: "", failed: false, ...(messageId ? { messageId } : {}) };
+  };
+  return {
+    event: (frame) => {
+      if (
+        frame.type === "message_start" &&
+        isRecord(frame.message) &&
+        frame.message.role === "assistant"
+      ) {
+        beginAttempt(messageIdOf(frame));
+      }
+      if (frame.type === "auto_retry_start") {
+        current.failed = true;
+        beginAttempt();
+      }
+      const delta = textDelta(frame);
+      if (delta !== undefined) {
+        const messageId = messageIdOf(frame);
         if (
-          frame.type === "message_start" &&
-          isRecord(frame.message) &&
-          frame.message.role === "assistant"
+          current.failed ||
+          (messageId !== undefined &&
+            current.messageId !== undefined &&
+            messageId !== current.messageId)
         ) {
-          beginAttempt(messageIdOf(frame));
+          beginAttempt(messageId);
+        } else if (messageId !== undefined && current.messageId === undefined) {
+          current.messageId = messageId;
         }
-        if (frame.type === "auto_retry_start") {
-          current.failed = true;
-          beginAttempt();
+        current.deltas += delta;
+      }
+      if (frame.type === "message_end") {
+        const text = textFromMessage(frame.message);
+        if (text.length > 0) current.snapshot = text;
+        if (isFailedAssistant(frame.message)) current.failed = true;
+      }
+      if (isTerminalAgentEnd(frame)) {
+        const final = finalAssistantFromAgentEnd(frame);
+        if (final?.failure) {
+          Deferred.doneUnsafe(
+            settled,
+            Effect.fail(new TextGenerationError({ operation, detail: final.failure })),
+          );
+        } else {
+          const sameAttempt = !current.failed ? current.snapshot || current.deltas : "";
+          Deferred.doneUnsafe(settled, Effect.succeed(final ? final.text : sameAttempt));
         }
-        const delta = textDelta(frame);
-        if (delta !== undefined) {
-          const messageId = messageIdOf(frame);
-          if (
-            current.failed ||
-            (messageId !== undefined &&
-              current.messageId !== undefined &&
-              messageId !== current.messageId)
-          ) {
-            beginAttempt(messageId);
-          } else if (messageId !== undefined && current.messageId === undefined) {
-            current.messageId = messageId;
-          }
-          current.deltas += delta;
-        }
-        if (frame.type === "message_end") {
-          const text = textFromMessage(frame.message);
-          if (text.length > 0) current.snapshot = text;
-          if (isFailedAssistant(frame.message)) current.failed = true;
-        }
-        if (isTerminalAgentEnd(frame)) {
-          const final = finalAssistantFromAgentEnd(frame);
-          if (final?.failure) {
-            yield* Deferred.fail(
-              settled,
-              new TextGenerationError({ operation, detail: final.failure }),
-            ).pipe(Effect.ignore);
-          } else {
-            const sameAttempt = !current.failed ? current.snapshot || current.deltas : "";
-            yield* Deferred.succeed(settled, final ? final.text : sameAttempt).pipe(Effect.ignore);
-          }
-        }
-      }),
-    ).pipe(Effect.forkScoped);
-    yield* Deferred.await(client.exit).pipe(
-      Effect.flatMap((exit) => Deferred.fail(settled, exitError(operation, exit))),
-      Effect.ignore,
-      Effect.forkScoped,
-    );
-  });
+      }
+    },
+  };
+};
 
 const exitError = (
   operation: string,

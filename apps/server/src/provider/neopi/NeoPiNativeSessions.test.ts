@@ -3078,6 +3078,35 @@ describe("children after an unwatched interval (rc3-1a)", () => {
       }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "a child marked unobserved after a reopen loses the mark when its run is seen to finish live",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* watchThenClose(native, service);
+        const second = yield* follow(service, originalRef);
+        const view = yield* second.pass();
+        assert.isDefined(rowOf(view, "Load0")?.unobserved);
+        yield* service.setDemand(
+          { leaseId: second.leaseId, generation: 1, demand: [{ kind: "roster" }] },
+          testClient,
+        );
+        yield* TestClock.adjust("2 seconds");
+        const finished = spawned("Load0", "5f4a0d14-1cf6-4396-b217-ce24c2337edd");
+        yield* native.publish({
+          ...finished,
+          payload: { ...finished.payload, status: "completed" },
+        });
+        const after = yield* second.pass(view.cursor);
+        const row = rowOf(after, "Load0");
+        assert.isUndefined(row?.unobserved);
+        assert.equal(Reflect.get(Object(row?.lifecycle), "status"), "completed");
+        // The other child is still only known to have finished unseen.
+        const other = yield* second.pass();
+        assert.isDefined(rowOf(other, "Load1")?.unobserved);
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("a child the owner's history lists comes back finished, not unobserved", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();

@@ -392,12 +392,13 @@ export const setTerminalInputFocused = DesktopIpc.makeIpcMethod({
   handler: Effect.fn("desktop.ipc.window.setTerminalInputFocused")(function* (focused, event) {
     if (event === undefined) return;
     const window = yield* (yield* ElectronWindow.ElectronWindow).fromWebContentsId(event.sender.id);
-    // Only the window's own page owns its keys; a preview guest's report
-    // must not change how the shell treats them.
+    // Only the window's own page owns its keys; a preview guest's or an
+    // embedded frame's report must not change how the shell treats them.
     if (
       Option.isNone(window) ||
       window.value.isDestroyed() ||
-      window.value.webContents.id !== event.sender.id
+      window.value.webContents.id !== event.sender.id ||
+      event.senderFrame !== window.value.webContents.mainFrame
     ) {
       return;
     }

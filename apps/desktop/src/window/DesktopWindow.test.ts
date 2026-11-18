@@ -1008,8 +1008,8 @@ describe("DesktopWindow", () => {
       shift: false,
       isAutoRepeat: repeat,
     });
-    const shellKeeps = { quitShortcut: true, drop: false };
-    const terminalOwns = { quitShortcut: false, drop: false };
+    const shellKeeps = { quitShortcut: true, drop: false, ignoreMenuShortcuts: false };
+    const terminalOwns = { quitShortcut: false, drop: false, ignoreMenuShortcuts: true };
 
     for (const platform of ["linux", "win32"] as const) {
       const focused = { platform, terminalInputFocused: true };
@@ -1029,7 +1029,7 @@ describe("DesktopWindow", () => {
       );
       assert.deepStrictEqual(
         DesktopWindow.resolveShellKeyHandling(key("w", { control: true }, true), unfocused),
-        { quitShortcut: true, drop: true },
+        { quitShortcut: true, drop: true, ignoreMenuShortcuts: false },
       );
       assert.deepStrictEqual(
         DesktopWindow.resolveShellKeyHandling(key("w", { control: true }), unfocused),
@@ -1041,7 +1041,7 @@ describe("DesktopWindow", () => {
     const macFocused = { platform: "darwin" as const, terminalInputFocused: true };
     assert.deepStrictEqual(
       DesktopWindow.resolveShellKeyHandling(key("w", { meta: true }, true), macFocused),
-      { quitShortcut: true, drop: true },
+      { quitShortcut: true, drop: true, ignoreMenuShortcuts: false },
     );
     assert.deepStrictEqual(
       DesktopWindow.resolveShellKeyHandling(key("w", { control: true }, true), macFocused),
@@ -1102,6 +1102,64 @@ describe("DesktopWindow", () => {
         listener("render-process-gone")({}, { reason: "killed", exitCode: 0 });
         assert.isTrue(heldCloseIsPrevented());
         assert.isFalse(ignoresMenuShortcuts());
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("decides the quit guard and menu shortcuts together for each key", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+        platform: "linux",
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const beforeInput = fakeWindow.webContentsListeners.get("before-input-event");
+        if (!beforeInput)
+          return yield* Effect.die("before-input-event listener was not registered");
+        const quitKey = (type: "keyDown" | "keyUp") => {
+          let prevented = false;
+          beforeInput(
+            { preventDefault: () => (prevented = true) },
+            {
+              type,
+              key: "q",
+              control: true,
+              meta: false,
+              alt: false,
+              shift: false,
+              isAutoRepeat: false,
+            },
+          );
+          return prevented;
+        };
+        const flagWrites = () => fakeWindow.setIgnoreMenuShortcuts.mock.calls.map(([v]) => v);
+        const webContents = fakeWindow.window.webContents;
+
+        // Ctrl+Q typed into the terminal: the program gets it and, for this
+        // key, the menu's Quit accelerator is off.
+        DesktopWindow.setTerminalInputFocused(webContents, true);
+        assert.isFalse(quitKey("keyDown"));
+        assert.deepStrictEqual(flagWrites(), [true]);
+
+        // The user leaves the terminal; the report lands while that Ctrl+Q is
+        // still on its way back from the page. It must not re-arm the menu
+        // for it, and its keyup must not either.
+        DesktopWindow.setTerminalInputFocused(webContents, false);
+        assert.deepStrictEqual(flagWrites(), [true]);
+        assert.isFalse(quitKey("keyUp"));
+        assert.deepStrictEqual(flagWrites(), [true]);
+
+        // The next Ctrl+Q sees the terminal gone: the quit guard takes it.
+        assert.isTrue(quitKey("keyDown"));
+        assert.deepStrictEqual(flagWrites(), [true, false]);
       }).pipe(Effect.provide(layer));
     }),
   );

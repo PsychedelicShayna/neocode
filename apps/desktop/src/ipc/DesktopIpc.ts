@@ -6,6 +6,8 @@ import * as Scope from "effect/Scope";
 
 export interface DesktopIpcInvokeEvent {
   readonly sender: { readonly id: number };
+  /** The frame that sent the message; compare with `webContents.mainFrame`. */
+  readonly senderFrame?: object | null;
 }
 
 export interface DesktopIpcSyncEvent {

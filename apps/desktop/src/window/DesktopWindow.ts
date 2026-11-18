@@ -321,25 +321,27 @@ export function concealPendingQuitWindow(
 }
 
 /**
- * Whether a focused terminal input owns every key in this window. On Linux
- * and Windows the shell's Ctrl chords (Ctrl+Q quit, Ctrl+W close, the menu
- * accelerators) are also the program's own keys, so the shell steps aside.
- * macOS terminals never receive Cmd chords, so the shell keeps them there.
+ * What the shell does with a key in before-input-event, ahead of the page,
+ * given whether a terminal input had focus when that key arrived.
+ *
+ * On Linux and Windows the shell's Ctrl chords (Ctrl+Q quit, Ctrl+W close,
+ * the menu accelerators) are also the program's own keys, so with a terminal
+ * focused the shell steps aside entirely: no quit or close guard, and menu
+ * shortcuts are ignored for that key. Both come from the same focus reading,
+ * so a focus report landing mid-key can never leave the key with neither
+ * the guards nor the terminal. macOS terminals never receive Cmd chords, so
+ * the shell keeps them there.
  */
-export function terminalOwnsWindowKeys(
-  platform: NodeJS.Platform,
-  terminalInputFocused: boolean,
-): boolean {
-  return terminalInputFocused && platform !== "darwin";
-}
-
-/** What the shell does with a key in before-input-event, ahead of the page. */
 export function resolveShellKeyHandling(
   input: QuitHoldKeyInput,
   context: { readonly platform: NodeJS.Platform; readonly terminalInputFocused: boolean },
-): { readonly quitShortcut: boolean; readonly drop: boolean } {
-  if (terminalOwnsWindowKeys(context.platform, context.terminalInputFocused)) {
-    return { quitShortcut: false, drop: false };
+): {
+  readonly quitShortcut: boolean;
+  readonly drop: boolean;
+  readonly ignoreMenuShortcuts: boolean;
+} {
+  if (context.terminalInputFocused && context.platform !== "darwin") {
+    return { quitShortcut: false, drop: false, ignoreMenuShortcuts: true };
   }
   // Electron's windowMenu close role owns CmdOrCtrl+W. Holding the
   // close-terminal shortcut can outlive the terminal that handled its first
@@ -354,6 +356,7 @@ export function resolveShellKeyHandling(
       !input.alt &&
       !input.shift &&
       input.key.toLowerCase() === "w",
+    ignoreMenuShortcuts: false,
   };
 }
 
@@ -746,23 +749,6 @@ export const make = Effect.gen(function* () {
       }
     });
 
-    // The renderer reports when a terminal input gains or loses focus. Every
-    // way its page can go away (reload, navigation, crash) clears the report,
-    // so the shell never stays stepped aside for a terminal that is gone.
-    let terminalInputFocused = false;
-    const setWindowTerminalInputFocused = (focused: boolean) => {
-      if (terminalInputFocused === focused || window.isDestroyed()) return;
-      terminalInputFocused = focused;
-      // The terminal consumes every key it encodes, which already keeps those
-      // from the menu. Keys it leaves unconsumed (IME composition, AltGr text)
-      // must not fall through to a menu accelerator such as Quit either.
-      window.webContents.setIgnoreMenuShortcuts(
-        terminalOwnsWindowKeys(environment.platform, focused),
-      );
-    };
-    terminalInputFocusSetters.set(window.webContents, setWindowTerminalInputFocused);
-    window.webContents.on("did-navigate", () => setWindowTerminalInputFocused(false));
-
     // Intercept the quit accelerator before the native menu sees it and apply
     // the configured direct, hold, or double-press behavior.
     const quitShortcutHandler = makeQuitShortcutHandler({
@@ -789,11 +775,36 @@ export const make = Effect.gen(function* () {
         if (!window.isDestroyed()) void runPromise(electronApp.quit);
       },
     });
+
+    // The renderer reports when a terminal input gains or loses focus. Every
+    // way its page can go away (reload, navigation, crash) clears the report,
+    // so the shell never stays stepped aside for a terminal that is gone.
+    // Nothing here changes how keys are handled: each key decides that for
+    // itself in before-input-event from the state it sees.
+    let terminalInputFocused = false;
+    const setWindowTerminalInputFocused = (focused: boolean) => {
+      if (terminalInputFocused === focused) return;
+      terminalInputFocused = focused;
+      // A first quit tap made outside the terminal must not be completed by
+      // a second tap after the user has been typing in it.
+      if (focused) quitShortcutHandler.cancelPendingPress();
+    };
+    terminalInputFocusSetters.set(window.webContents, setWindowTerminalInputFocused);
+    window.webContents.on("did-navigate", () => setWindowTerminalInputFocused(false));
+
     window.webContents.on("before-input-event", (event, input) => {
       const handling = resolveShellKeyHandling(input, {
         platform: environment.platform,
         terminalInputFocused,
       });
+      // Set on every keydown from this key's own reading, never at report
+      // time: Electron consults the flag when the page hands this key back
+      // unhandled, and a report landing in between must not re-arm a Quit
+      // accelerator this key skipped the quit guard for. Keyups never fire
+      // accelerators and leave the flag to the keydown they belong to.
+      if (input.type === "keyDown") {
+        window.webContents.setIgnoreMenuShortcuts(handling.ignoreMenuShortcuts);
+      }
       if (handling.quitShortcut) quitShortcutHandler(event, input);
       if (handling.drop) event.preventDefault();
     });

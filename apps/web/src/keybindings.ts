@@ -254,60 +254,65 @@ export function isModifierKeyEvent(event: Pick<ShortcutEventLike, "key">): boole
 }
 
 interface PageFocus {
-  readonly activeElement: Element | null;
   readonly editableFocus: boolean;
   readonly terminalFocus: boolean;
 }
 
 function readPageFocus(): PageFocus {
-  if (typeof document === "undefined") {
-    return { activeElement: null, editableFocus: false, terminalFocus: false };
-  }
+  if (typeof document === "undefined") return { editableFocus: false, terminalFocus: false };
   return {
-    activeElement: document.activeElement,
     editableFocus: isEditableFocused(),
     terminalFocus: getTerminalFocusOwner() !== null,
   };
 }
 
+type SequenceRule = Extract<ResolvedKeybindingRule, { readonly sequence: unknown }>;
+
 /**
  * Sequence state shared by every caller. Several listeners resolve the same
  * keydown, each with its own context, so state advances once per keydown
- * (keyed by the browser event): every listener sees the same prefix and the
- * same page focus, read once from the page rather than from a caller's
+ * (keyed by the browser event): every listener sees the same held chord and
+ * the same page focus, read once from the page rather than from a caller's
  * context, which may omit it.
  */
 let sequenceKeydown: unknown = null;
-let sequenceKeydownEvent: ShortcutEventLike | null = null;
-let sequenceKeydownFocus: PageFocus = {
-  activeElement: null,
-  editableFocus: false,
-  terminalFocus: false,
-};
-let sequenceKeydownStarts = false;
-let sequencePrefix: ShortcutEventLike | null = null;
+let sequenceKeydownFocus: PageFocus = { editableFocus: false, terminalFocus: false };
+/** Rules the previous keydown armed: the only ones this keydown may complete. */
+let sequenceKeydownHeld: ReadonlyArray<SequenceRule> = [];
+/** Rules this keydown arms, in priority order, across all its listeners. */
+let sequenceKeydownArmed: SequenceRule[] = [];
 
 /**
- * Moves the state to this keydown. The previous keydown becomes the prefix
- * when it began a bound sequence and focus has not moved since.
+ * Any focus change cancels a first chord before its second: nothing armed so
+ * far carries over to the next keydown. A keydown already being resolved
+ * keeps what it holds, so its listeners still agree.
  */
-function advanceSequence(event: ShortcutEventLike): {
-  readonly prefix: ShortcutEventLike | null;
-  readonly focus: PageFocus;
-} {
+function dropArmedSequences(): void {
+  sequenceKeydownArmed = [];
+}
+
+let focusWatchedDocument: Document | null = null;
+
+function watchFocusChanges(): void {
+  if (typeof document === "undefined" || document === focusWatchedDocument) return;
+  if (typeof document.addEventListener !== "function") return;
+  focusWatchedDocument = document;
+  document.addEventListener("focusin", dropArmedSequences, true);
+  document.addEventListener("focusout", dropArmedSequences, true);
+  document.defaultView?.addEventListener("blur", dropArmedSequences);
+}
+
+/** Moves the state to this keydown: what the previous keydown armed is now held. */
+function advanceSequence(event: ShortcutEventLike): PageFocus {
+  watchFocusChanges();
   const identity = event.nativeEvent ?? event;
   if (identity !== sequenceKeydown) {
-    const focus = readPageFocus();
-    sequencePrefix =
-      sequenceKeydownStarts && focus.activeElement === sequenceKeydownFocus.activeElement
-        ? sequenceKeydownEvent
-        : null;
     sequenceKeydown = identity;
-    sequenceKeydownEvent = event;
-    sequenceKeydownFocus = focus;
-    sequenceKeydownStarts = false;
+    sequenceKeydownFocus = readPageFocus();
+    sequenceKeydownHeld = sequenceKeydownArmed;
+    sequenceKeydownArmed = [];
   }
-  return { prefix: sequencePrefix, focus: sequenceKeydownFocus };
+  return sequenceKeydownFocus;
 }
 
 /** A key that types a character into a focused field, which a sequence must never take. */
@@ -320,9 +325,10 @@ function typesText(event: ShortcutEventLike): boolean {
  * key for the program running in it, so nothing resolves while it has focus;
  * this is read from the page, whatever the caller's context claims.
  *
- * A keypress that begins a two-chord sequence resolves to null and is
- * prevented; the next keypress completes it if it matches the second chord.
- * Any other keypress, or a focus change in between, drops the pending first
+ * A keypress that begins a two-chord sequence resolves to null, is prevented
+ * and arms exactly the sequence rules eligible at that moment. The next
+ * keypress completes one of those if it still applies and matches the second
+ * chord. Any other keypress, or a focus change in between, drops the held
  * chord. There is no timeout. Sequence rules see `editableFocus` and
  * `terminalFocus` as the page reports them, so every listener agrees, and a
  * plain character typed into a field never begins a sequence.
@@ -334,7 +340,7 @@ export function resolveShortcutCommand(
 ): KeybindingCommand | null {
   if (event.type !== undefined && event.type !== "keydown") return null;
   if (isModifierKeyEvent(event)) return null;
-  const { prefix, focus } = advanceSequence(event);
+  const focus = advanceSequence(event);
   if (isTerminalInputFocused()) return null;
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
@@ -344,26 +350,27 @@ export function resolveShortcutCommand(
     terminalFocus: focus.terminalFocus,
   };
 
-  if (prefix) {
-    for (let index = keybindings.length - 1; index >= 0; index -= 1) {
-      const binding = keybindings[index];
-      if (!binding || !("sequence" in binding)) continue;
-      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
-      if (!matchesShortcut(prefix, binding.sequence[0], platform)) continue;
-      if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
-      return binding.command;
-    }
+  for (const binding of sequenceKeydownHeld) {
+    if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
+    if (!matchesShortcut(event, binding.sequence[1], platform)) continue;
+    return binding.command;
   }
 
+  const armable = (binding: ResolvedKeybindingRule | undefined): binding is SequenceRule =>
+    binding !== undefined &&
+    "sequence" in binding &&
+    matchesWhenClause(binding.whenAst, sequenceContext) &&
+    matchesShortcut(event, binding.sequence[0], platform);
   const mayBeginSequence = !(focus.editableFocus && typesText(event));
   for (let index = keybindings.length - 1; index >= 0; index -= 1) {
     const binding = keybindings[index];
     if (!binding) continue;
     if ("sequence" in binding) {
-      if (!mayBeginSequence) continue;
-      if (!matchesWhenClause(binding.whenAst, sequenceContext)) continue;
-      if (!matchesShortcut(event, binding.sequence[0], platform)) continue;
-      sequenceKeydownStarts = true;
+      if (!mayBeginSequence || !armable(binding)) continue;
+      for (let armed = index; armed >= 0; armed -= 1) {
+        const rule = keybindings[armed];
+        if (armable(rule) && !sequenceKeydownArmed.includes(rule)) sequenceKeydownArmed.push(rule);
+      }
       event.preventDefault?.();
       return null;
     }

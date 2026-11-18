@@ -1782,10 +1782,23 @@ describe("sequences read focus from the page", () => {
     globalThis.Element = originalElement;
     globalThis.HTMLElement = originalHTMLElement;
   });
+  // One page whose focus listeners the resolver installs; `focus` moves focus
+  // as the browser would, announcing it with focusout and focusin.
+  const focusListeners: Array<() => void> = [];
+  const page = {
+    activeElement: body as PageElement,
+    defaultView: null,
+    addEventListener: (type: string, listener: () => void) => {
+      if (type === "focusin" || type === "focusout") focusListeners.push(listener);
+    },
+  };
   function focus(element: PageElement) {
     globalThis.Element = PageElement as unknown as typeof Element;
     globalThis.HTMLElement = PageElement as unknown as typeof HTMLElement;
-    globalThis.document = { activeElement: element } as unknown as Document;
+    globalThis.document = page as unknown as Document;
+    if (page.activeElement === element) return;
+    page.activeElement = element;
+    for (const listener of focusListeners) listener();
   }
 
   // Each keydown is its own event object, as the browser delivers them.
@@ -1836,6 +1849,39 @@ describe("sequences read focus from the page", () => {
       resolveShortcutCommand(press({ key: "h" }).keydown, bindings, {
         platform: "Linux",
         context: { terminalFocus: false, editableFocus: true },
+      }),
+    );
+  });
+
+  it("drops a held chord when focus leaves and comes back before the second key", () => {
+    const bindings = bind([{ key: "ctrl+g ctrl+k", command: "sidebar.toggle" }]);
+    focus(body);
+    const first = press({ key: "g", ctrlKey: true });
+    assert.isNull(resolveShortcutCommand(first.keydown, bindings, options));
+    assert.isTrue(first.prevented());
+    focus(field);
+    focus(body);
+    // The second key is an ordinary keypress again.
+    assert.strictEqual(
+      resolveShortcutCommand(press({ key: "k", ctrlKey: true }).keydown, bindings, options),
+      "commandPalette.toggle",
+    );
+  });
+
+  it("completes only rules that were eligible when the first chord was pressed", () => {
+    const bindings = bind([
+      { key: "ctrl+g q", command: "sidebar.toggle" },
+      { key: "ctrl+g h", command: "navigation.back", when: "nativeSession" },
+    ]);
+    focus(body);
+    resolveShortcutCommand(press({ key: "g", ctrlKey: true }).keydown, bindings, {
+      platform: "Linux",
+      context: { terminalFocus: false, nativeSession: false },
+    });
+    assert.isNull(
+      resolveShortcutCommand(press({ key: "h" }).keydown, bindings, {
+        platform: "Linux",
+        context: { terminalFocus: false, nativeSession: true },
       }),
     );
   });

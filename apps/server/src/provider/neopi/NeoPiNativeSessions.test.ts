@@ -20,7 +20,6 @@ import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Queue from "effect/Queue";
 import * as TestClock from "effect/testing/TestClock";
-import { NEOPI_NATIVE_IDLE_DEBOUNCE_MS } from "./NeoPiNativeIdle.ts";
 import * as Scope from "effect/Scope";
 import {
   makeNeoPiNativeSessionsWith,
@@ -77,6 +76,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       startupDialog: false,
       jobs: [] as Record<string, unknown>[],
       agents: [] as Record<string, unknown>[],
+      /** Subagent subscription levels requested of the owner, in order. */
+      levels: [] as string[],
+      /** `snapshot_session_journal` requests the owner received. */
+      snapshots: 0,
       followUp: [] as string[],
       inventoryFailure: false,
       inventoryHook: Effect.void as Effect.Effect<void>,
@@ -183,6 +186,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                   case "get_subagents":
                     yield* native.inventoryHook;
                     return { subagents: native.agents };
+                  case "set_subagent_subscription":
+                    native.levels.push(String(Reflect.get(command, "level")));
+                    return { level: native.levels.at(-1) };
                   case "get_status":
                     return {
                       session: state(),
@@ -190,6 +196,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                       revisions: { generation: native.generation },
                     };
                   case "snapshot_session_journal": {
+                    native.snapshots++;
                     yield* publish({ type: "journal_state", reason: "snapshot", ...identity() });
                     if (native.blockSnapshot) yield* Deferred.await(snapshotReleased);
                     yield* native.snapshotHook;
@@ -362,70 +369,33 @@ const snapshot = Effect.fnUntraced(function* (service: Service, ref: NeoPiNative
 });
 
 describe("canonical native session lifecycle", () => {
-  it.effect("releases only unobserved idle owned runtimes and reopens them normally", () =>
-    Effect.gen(function* () {
-      const { native, service, disconnected } = yield* fixture();
-      yield* service.open(originalRef);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS - 1);
-      assert.equal(native.connections, 1);
-      yield* TestClock.adjust(1);
-      yield* Deferred.await(disconnected);
-      assert.equal(native.connections, 0);
-      assert.equal(native.disposals, 1);
-      assert.equal(native.aborts, 0);
-      yield* service.open(originalRef);
-      yield* service.request({
-        ref: originalRef,
-        command: { type: "prompt", message: "saved draft" },
-      });
-      assert.equal(native.starts, 2);
-      assert.deepEqual(native.prompts, ["saved draft"]);
-    }).pipe(Effect.scoped),
+  it.effect(
+    "I4(4): an owned runtime is never retired for being unobserved, idle or released; explicit close still ends it",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        yield* TestClock.adjust("1 hour");
+        assert.equal(native.connections, 1);
+        yield* Fiber.interrupt(lease.fiber);
+        yield* TestClock.adjust("1 hour");
+        assert.equal(native.connections, 1);
+        assert.equal(native.disposals, 0);
+        assert.equal(native.aborts, 0);
+        // Reopening reuses the same owner rather than starting another.
+        yield* service.open(originalRef);
+        assert.equal(native.starts, 1);
+        assert.deepEqual(yield* service.close({ ref: originalRef }), { closed: true });
+        assert.equal(native.connections, 0);
+        assert.equal(native.disposals, 1);
+      }).pipe(Effect.scoped),
   );
 
-  it.effect("waits for the last client watch to leave, then debounces its idle exit", () =>
+  it.effect("keeps an owner while its Models consumers are attached and after they leave", () =>
     Effect.gen(function* () {
-      const { native, service, disconnected } = yield* fixture();
-      yield* service.open(originalRef);
-      const first = (yield* follow(service, originalRef)).fiber;
-      const second = (yield* follow(service, originalRef)).fiber;
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 2);
-      assert.equal(native.connections, 1);
-      yield* Fiber.interrupt(first);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 2);
-      assert.equal(native.connections, 1);
-      yield* Fiber.interrupt(second);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS - 1);
-      assert.equal(native.connections, 1);
-      yield* TestClock.adjust(1);
-      yield* Deferred.await(disconnected);
-      assert.equal(native.disposals, 1);
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("retains owners with native work, unanswered dialogs or unverified inventories", () =>
-    Effect.gen(function* () {
-      for (const activity of ["streaming", "dialog", "job", "agent", "queue", "unknown"] as const)
-        yield* Effect.gen(function* () {
-          const { native, service } = yield* fixture();
-          yield* service.open(originalRef);
-          if (activity === "streaming") native.streaming = true;
-          else if (activity === "dialog")
-            yield* native.publish({ type: "extension_ui_request", id: "ask", method: "ask" });
-          else if (activity === "job") native.jobs.push({ id: "job", status: "running" });
-          else if (activity === "agent") native.agents.push({ id: "agent", status: "waiting" });
-          else if (activity === "queue") native.followUp.push("next turn");
-          else native.inventoryFailure = true;
-          yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 2);
-          assert.equal(native.connections, 1, activity);
-          assert.equal(native.aborts, 0, activity);
-        }).pipe(Effect.scoped);
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("protects an idle owner's Models subscription without a conversation watcher", () =>
-    Effect.gen(function* () {
-      const { native, service, disconnected } = yield* fixture();
+      const { native, service } = yield* fixture();
       yield* service.open(originalRef);
       const models = yield* service.modelsConnection(originalRef);
       const ready = yield* Deferred.make<void>();
@@ -439,35 +409,13 @@ describe("canonical native session lifecycle", () => {
       yield* Effect.yieldNow;
       yield* native.publish({ type: "extension_ui_request", id: "notice", method: "notify" });
       yield* Deferred.await(ready);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 2);
+      yield* TestClock.adjust("1 hour");
       assert.equal(native.connections, 1);
       yield* Fiber.interrupt(observer);
       yield* Fiber.interrupt(ui);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS);
-      yield* Deferred.await(disconnected);
-      assert.equal(native.disposals, 1);
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("invalidates an idle inventory when the session is reopened during the read", () =>
-    Effect.gen(function* () {
-      const { native, service, disconnected } = yield* fixture();
-      yield* service.open(originalRef);
-      const reading = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      native.inventoryHook = Deferred.succeed(reading, undefined).pipe(
-        Effect.andThen(Deferred.await(release)),
-      );
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS);
-      yield* Deferred.await(reading);
-      yield* service.open(originalRef);
-      yield* Deferred.succeed(release, undefined);
-      yield* TestClock.adjust(0);
+      yield* TestClock.adjust("1 hour");
+      assert.equal(native.connections, 1);
       assert.equal(native.disposals, 0);
-      native.inventoryHook = Effect.void;
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS);
-      yield* Deferred.await(disconnected);
-      assert.equal(native.disposals, 1);
     }).pipe(Effect.scoped),
   );
 
@@ -478,7 +426,7 @@ describe("canonical native session lifecycle", () => {
         const native = yield* Effect.gen(function* () {
           const { native, service } = yield* fixture("terminal");
           yield* service.open(originalRef);
-          yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 3);
+          yield* TestClock.adjust("1 hour");
           assert.equal(native.connections, 1);
           return native;
         }).pipe(Effect.scoped);
@@ -489,31 +437,6 @@ describe("canonical native session lifecycle", () => {
       }),
   );
 
-  it.effect("waits for an in-flight operation before starting the idle debounce", () =>
-    Effect.gen(function* () {
-      const { native, service, disconnected } = yield* fixture();
-      yield* service.open(originalRef);
-      const reading = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      native.pageHook = Deferred.succeed(reading, undefined).pipe(
-        Effect.andThen(Deferred.await(release)),
-      );
-      const operation = yield* service
-        .request({
-          ref: originalRef,
-          command: { type: "get_entries_page" },
-        })
-        .pipe(Effect.forkScoped);
-      yield* Deferred.await(reading);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 3);
-      assert.equal(native.connections, 1);
-      yield* Deferred.succeed(release, undefined);
-      yield* Fiber.join(operation);
-      yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS);
-      yield* Deferred.await(disconnected);
-      assert.equal(native.disposals, 1);
-    }).pipe(Effect.scoped),
-  );
   it.effect(
     "keeps native invalid-pattern diagnostics through the canonical connected Models path",
     () =>
@@ -1754,6 +1677,245 @@ describe("native observation (r12 §3.1)", () => {
         });
         assert.equal(foreign.type === "pass" && foreign.kind, "full");
       }).pipe(Effect.scoped),
+  );
+});
+
+const child = (id: string, status: string) => ({
+  type: "subagent_lifecycle",
+  payload: { id, runToken: `run-${id}`, status, agent: "task", agentSource: "bundled", index: 0 },
+});
+
+describe("native observation leases and demand (r12 C4)", () => {
+  it.effect(
+    "S7: two windows interleaving roster and child demand get the union; stale, repeated and conflicting generations never change it",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const a = yield* follow(service, originalRef);
+        const b = yield* follow(service, originalRef);
+        yield* a.pass();
+        yield* b.pass();
+        const demand = (lease: typeof a, generation: number, kinds: ReadonlyArray<string>) =>
+          service.setDemand({
+            leaseId: lease.leaseId,
+            generation,
+            demand: kinds.map((kind) =>
+              kind === "child"
+                ? { kind: "child" as const, childId: "c1", runToken: "run-c1" }
+                : { kind: kind as "roster" },
+            ),
+          });
+        const settle = () => TestClock.adjust("2 seconds");
+        assert.deepEqual(yield* demand(a, 2, ["roster"]), { outcome: "applied" });
+        yield* settle();
+        assert.deepEqual(native.levels, ["progress"]);
+        // A reordered older generation and a repeat change nothing.
+        assert.deepEqual(yield* demand(a, 1, []), { outcome: "stale" });
+        assert.deepEqual(yield* demand(a, 2, ["roster"]), { outcome: "unchanged" });
+        const conflict = yield* demand(a, 2, ["roster", "child"]).pipe(Effect.flip);
+        assert.equal(conflict.code, "demand_conflict");
+        // The second window's child view raises the aggregate to every child step.
+        yield* demand(b, 1, ["child"]);
+        yield* settle();
+        assert.deepEqual(native.levels, ["progress", "events"]);
+        // The first window dropping its roster leaves the union at the second's level.
+        yield* demand(a, 3, []);
+        yield* settle();
+        assert.deepEqual(native.levels, ["progress", "events"]);
+        // The last demand going away lowers the level; nothing asks for children any more.
+        yield* demand(b, 2, ["summary"]);
+        yield* settle();
+        assert.deepEqual(native.levels, ["progress", "events", "off"]);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "with roster demand, a child that spawns, ticks and finishes after the first build reaches a reader with no client read",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        assert.isFalse([...built.entities.keys()].some((key) => key.startsWith("roster:")));
+        yield* service.setDemand({
+          leaseId: lease.leaseId,
+          generation: 1,
+          demand: [{ kind: "roster" }],
+        });
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual(native.levels, ["progress"]);
+        yield* native.publish(child("c1", "started"));
+        const spawned = yield* lease.pass(built.cursor);
+        const key = [...spawned.entities.keys()].find((name) => name.startsWith("roster:"));
+        assert.isDefined(key);
+        yield* native.publish(child("c1", "completed"));
+        const finished = yield* lease.pass(spawned.cursor);
+        const value = finished.entities.get(key!);
+        const lifecycle = value?.class === "roster" ? Reflect.get(value.value, "lifecycle") : null;
+        assert.equal(Reflect.get(Object(lifecycle), "status"), "completed");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S9: releasing a lease by cancel or loss returns the level, ends its reads and credit, and the inbox stops retaining",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const lease = yield* follow(service, originalRef);
+        yield* lease.pass();
+        yield* service.setDemand({
+          leaseId: lease.leaseId,
+          generation: 1,
+          demand: [{ kind: "roster" }],
+        });
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual(native.levels, ["progress"]);
+        yield* Fiber.interrupt(lease.fiber);
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual(native.levels, ["progress", "off"]);
+        const gone = yield* service
+          .read({ leaseId: lease.leaseId, readId: 99, cursor: null })
+          .pipe(Effect.flip);
+        assert.equal(gone.code, "lease_unknown");
+        // While no lease is held, live-only records are not kept: a returning viewer is
+        // told they were not observed, never given silence (decision 8 amendment).
+        yield* native.publish({
+          type: "tool_stream_update",
+          toolCallId: "t1",
+          toolName: "bash",
+          update: { chunk: 1 },
+        });
+        yield* native.publish({ type: "notice", level: "info", message: "unseen" });
+        const returning = yield* follow(service, originalRef);
+        const { inbox } = yield* returning.pass();
+        assert.deepEqual(
+          inbox.map((record) => record.type === "gap" && record.reason),
+          ["not-observed"],
+        );
+        // A record every live lease has passed is not served to a later reader (8 (b)).
+        const inboxCursor = (yield* returning.pass()).cursor;
+        yield* native.publish({ type: "notice", level: "info", message: "seen by the first" });
+        const first = yield* returning.pass(inboxCursor);
+        const noticeOf = (records: ReadonlyArray<NeoPiNativeInboxRecord>) =>
+          records.filter((record) => record.type === "notice").map((record) => record.message);
+        assert.deepEqual(noticeOf(first.inbox), ["seen by the first"]);
+        // Its next read acknowledges that; the only live lease has now passed the record.
+        const acknowledging = yield* returning.pass(first.cursor).pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(acknowledging);
+        const later = yield* follow(service, originalRef);
+        assert.deepEqual(noticeOf((yield* later.pass()).inbox), []);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S9/S16: a successor adoption keeps the lease and applies the aggregate demand to the new connection",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        yield* service.setDemand({
+          leaseId: lease.leaseId,
+          generation: 1,
+          demand: [{ kind: "roster" }],
+        });
+        yield* TestClock.adjust("2 seconds");
+        assert.deepEqual(native.levels, ["progress"]);
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        native.ownerAlive = true;
+        yield* TestClock.adjust("1 second");
+        yield* lease.next("lifecycle", observing);
+        yield* TestClock.adjust("2 seconds");
+        // The new connection starts at `off`; the same lease's demand reaches it.
+        assert.deepEqual(native.levels, ["progress", "progress"]);
+        const same = yield* service.setDemand({
+          leaseId: lease.leaseId,
+          generation: 1,
+          demand: [{ kind: "roster" }],
+        });
+        assert.deepEqual(same, { outcome: "unchanged" });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a client's snapshot_session_journal never races a build: the build is the only sender",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        native.snapshotHook = Deferred.succeed(reached, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        const lease = yield* follow(service, originalRef);
+        yield* Deferred.await(reached);
+        const refused = yield* service
+          .request({ ref: originalRef, command: { type: "snapshot_session_journal" } })
+          .pipe(Effect.flip);
+        assert.equal(refused.code, "observation_server_owned");
+        const level = yield* service
+          .request({
+            ref: originalRef,
+            command: { type: "set_subagent_subscription", level: "events" },
+          })
+          .pipe(Effect.flip);
+        assert.equal(level.code, "observation_server_owned");
+        native.snapshotHook = Effect.void;
+        yield* Deferred.succeed(release, undefined);
+        yield* lease.pass();
+        assert.equal(native.snapshots, 1);
+        assert.deepEqual(native.levels, []);
+      }).pipe(Effect.scoped),
+  );
+});
+
+describe("attach-only discovery (r12 C5)", () => {
+  it.effect(
+    "with no session installed, a lease discovers a live terminal owner and attaches without starting one",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        const lease = yield* follow(service, originalRef);
+        const { session } = yield* lease.next("session");
+        assert.equal(session.attachment, "terminal");
+        yield* lease.next("lifecycle", observing);
+        assert.equal(native.starts, 1);
+        assert.equal(native.connections, 1);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "with no owner anywhere, discovery reports owner-stopped, ends the stream and starts nothing",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "owner-stopped");
+        yield* Fiber.join(lease.fiber);
+        assert.equal(native.starts, 0);
+        assert.equal(native.connections, 0);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("concurrent leases share one discovery and one attached session", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      const [a, b] = yield* Effect.all([
+        follow(service, originalRef),
+        follow(service, originalRef),
+      ]);
+      yield* a.next("lifecycle", observing);
+      yield* b.next("lifecycle", observing);
+      assert.equal(native.starts, 1);
+    }).pipe(Effect.scoped),
   );
 });
 

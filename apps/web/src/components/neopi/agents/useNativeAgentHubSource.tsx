@@ -118,13 +118,15 @@ export function useNativeAgentHubSource({
     ? feed.observation.entities.get(`roster:${openChild}`)?.value
     : undefined;
   const childRunToken = rosterEntry?.class === "roster" ? rosterEntry.value.runToken : undefined;
+  const { environmentId } = target;
+  const { providerInstanceId } = target.ref;
   useEffect(() => {
     if (openChild === null || typeof childRunToken !== "string") return;
-    return nativeSessionAtoms.holdDemand(target, [
-      { kind: "child", childId: openChild, runToken: childRunToken },
-    ]);
-    // `target` is read for the key it is part of.
-  }, [key, openChild, childRunToken]);
+    return nativeSessionAtoms.holdDemand(
+      { environmentId, ref: { providerInstanceId, sessionFile } },
+      [{ kind: "child", childId: openChild, runToken: childRunToken }],
+    );
+  }, [environmentId, providerInstanceId, sessionFile, openChild, childRunToken]);
 
   return useMemo(
     () => ({

@@ -325,6 +325,19 @@ export function NativeSessionView({
     unavailableReason: availability.kind === "disabled" ? availability.reason : null,
   });
   const dictationShown = availability.kind !== "hidden";
+  // Turning stt.enabled on happens in NeoPi's own settings, which announce nothing:
+  // coming back to this window re-reads it, so the button does not stay disabled.
+  const sttOff = state.dictationEnabled === false;
+  useEffect(() => {
+    if (!sttOff) return;
+    const refresh = () => {
+      void request({ type: "get_state" })
+        .then((observed) => setState(nativeRecord(observed)))
+        .catch(() => undefined);
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [sttOff, request]);
   // NeoPi moved this session to another file (`/wt`, fork): the selection and
   // its tab follow in place, never a second tab for the same session.
   const movedRef = feed.movedTo ?? session?.ref ?? null;
@@ -489,9 +502,9 @@ export function NativeSessionView({
       commandOutputs,
     ],
   );
-  // Missing live output of a call on screen is marked at that call; the rest of
-  // each gap is a warning beside the composer. Keyed by the gapped calls on
-  // screen, so streaming does not rebuild the markers.
+  // Missing live output of a call on screen is marked at that call; every gap is
+  // also listed above the panels, outside the conversation. Keyed by the gapped
+  // calls on screen, so streaming does not rebuild the markers.
   const inbox = feed.observation.inbox;
   const shownLossCalls = useMemo(() => {
     const gapped = new Set(

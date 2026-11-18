@@ -10,11 +10,7 @@ import {
   type ProviderSession,
   type ThreadId,
 } from "@t3tools/contracts";
-import {
-  make as makeModelsClient,
-  type SpawnFn,
-  type UiRequestFrame,
-} from "effect-neopi-rpc/client";
+import { type SpawnFn, type UiRequestFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import type {
   NeoPiChatMode,
@@ -168,7 +164,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
     lookup: (cwd: string) =>
       Effect.gen(function* () {
         const extra = yield* parseNeoPiLaunchArguments(options.settings.launchArgs);
-        const client = yield* makeModelsClient({
+        return yield* makeNeoPiModelsConnection({
           spawn: options.spawn,
           command: options.binary,
           cwd,
@@ -189,7 +185,6 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             ...extra,
           ],
         });
-        return yield* makeNeoPiModelsConnection(client);
       }).pipe(Effect.mapError((cause) => new NeoPiModelsError({ message: cause.message }))),
     idleTimeToLive: "30 seconds",
     capacity: 4,

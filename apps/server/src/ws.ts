@@ -3141,24 +3141,28 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "workspace",
             },
           ),
-        [WS_METHODS.neopiNativeSessionsWatch]: (input) =>
-          observeRpcStream(WS_METHODS.neopiNativeSessionsWatch, neopiNativeSessions.watch(input), {
-            "rpc.aggregate": "workspace",
-          }),
-        [WS_METHODS.neopiNativeSessionsRead]: (input) =>
-          observeRpcEffect(WS_METHODS.neopiNativeSessionsRead, neopiNativeSessions.read(input), {
-            "rpc.aggregate": "workspace",
-          }),
-        [WS_METHODS.neopiNativeSessionsSetDemand]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.neopiNativeSessionsSetDemand,
-            neopiNativeSessions.setDemand(input),
+        [WS_METHODS.neopiNativeSessionsWatch]: (input, metadata) =>
+          observeRpcStream(
+            WS_METHODS.neopiNativeSessionsWatch,
+            neopiNativeSessions.watch(input, String(metadata.client.id)),
             { "rpc.aggregate": "workspace" },
           ),
-        [WS_METHODS.neopiNativeSessionsCredit]: (input) =>
+        [WS_METHODS.neopiNativeSessionsRead]: (input, metadata) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsRead,
+            neopiNativeSessions.read(input, String(metadata.client.id)),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsSetDemand]: (input, metadata) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsSetDemand,
+            neopiNativeSessions.setDemand(input, String(metadata.client.id)),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsCredit]: (input, metadata) =>
           observeRpcEffect(
             WS_METHODS.neopiNativeSessionsCredit,
-            neopiNativeSessions.credit(input),
+            neopiNativeSessions.credit(input, String(metadata.client.id)),
             {
               "rpc.aggregate": "workspace",
             },

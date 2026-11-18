@@ -472,9 +472,8 @@ export const NeoPiNativeObservationLifecycle = Schema.Literals([
 export type NeoPiNativeObservationLifecycle = typeof NeoPiNativeObservationLifecycle.Type;
 
 /**
- * Essential `watch` envelopes. Each one consumes one unit of credit. Becomes
- * the `watch` success schema when the server and client cut over, replacing
- * `NeoPiNativeSessionsStreamEvent`.
+ * Essential `watch` envelopes, the `watch` success schema. Each one consumes
+ * one unit of credit.
  */
 export const NeoPiNativeEssentialEnvelope = Schema.Union([
   /** Always first. The lease lives exactly as long as this stream. */
@@ -531,27 +530,6 @@ export const NeoPiNativeEssentialEnvelope = Schema.Union([
 ]);
 export type NeoPiNativeEssentialEnvelope = typeof NeoPiNativeEssentialEnvelope.Type;
 
-export const NeoPiNativeSessionsStreamEvent = Schema.Union([
-  Schema.Struct({
-    type: Schema.Literal("snapshot"),
-    session: NeoPiNativeSessionsOpenResult,
-    journal: Schema.Unknown,
-  }),
-  Schema.Struct({ type: Schema.Literal("event"), frame: NeoPiNativeSessionCommand }),
-  Schema.Struct({ type: Schema.Literal("answered"), id: Schema.String }),
-  /**
-   * `code` names why the owner went away: `detached` after an explicit disconnect,
-   * `owner_exited` when the terminal that owned the session quit and nothing replaced it.
-   */
-  Schema.Struct({
-    type: Schema.Literal("closed"),
-    reason: Schema.String,
-    code: Schema.optional(Schema.String),
-  }),
-  /** The terminal owner exited. The server is waiting for a replacement; a fresh `snapshot` follows. */
-  Schema.Struct({ type: Schema.Literal("reconnecting"), reason: Schema.String }),
-]);
-export type NeoPiNativeSessionsStreamEvent = typeof NeoPiNativeSessionsStreamEvent.Type;
 export const NeoPiNativeSessionsCloseInput = NeoPiNativeSessionsWatchInput;
 export type NeoPiNativeSessionsCloseInput = typeof NeoPiNativeSessionsCloseInput.Type;
 export const NeoPiNativeSessionsCloseResult = Schema.Struct({ closed: Schema.Boolean });

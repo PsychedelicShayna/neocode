@@ -90,6 +90,11 @@ export type NativeConversationAction =
    * row is a continuity loss.
    */
   | { type: "owner_changed" }
+  /**
+   * These rows' durable entries are in history older than what is loaded: they
+   * leave the live tail and keep their association, so paging joins them there.
+   */
+  | { type: "in_older_history"; messageIds: ReadonlySet<string> }
   | { type: "turn_started" };
 
 /**
@@ -374,6 +379,10 @@ export function reduceNativeConversation(
         return { ...row, messageId };
       });
       return state.persisted.size === 0 && lost === state ? state : { ...lost, pending, persisted };
+    }
+    case "in_older_history": {
+      const pending = state.pending.filter((row) => !action.messageIds.has(row.messageId));
+      return pending.length === state.pending.length ? state : { ...state, pending };
     }
   }
 }

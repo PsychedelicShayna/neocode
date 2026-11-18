@@ -2077,8 +2077,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   /**
    * Joins a lease to a live session under the per-file gate (C4): the session is
    * re-read and must still be the file's live authority; the lease is counted before
-   * the gate opens. Then it receives what `open` would describe, identity, lifecycle,
-   * status and every open obligation.
+   * the gate opens. Then it receives what `open` would describe: session, identity,
+   * status, every open obligation, and only then its lifecycle. The client relies on
+   * that order: the lease's first building, observing or reconnecting lifecycle
+   * means the replay of open obligations is complete (an authority-unresolved one
+   * from discovery comes before any join and carries no such meaning).
    */
   const join = (observation: Observation, session: NativeSession, file: string) =>
     Effect.gen(function* () {
@@ -2104,6 +2107,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                   : identity.sessionFile,
               leafId: identity.leafId,
             });
+          const live = liveState(session, undefined);
+          if (live)
+            enqueue(observation, { type: "status", revision: projection.store.bump(), live });
+          for (const [id, { revision, request }] of projection.obligations)
+            enqueue(observation, { type: "obligation-opened", revision, id, request });
           enqueue(
             observation,
             lifecycle(
@@ -2111,11 +2119,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
               session.recovery ? "reconnecting" : projection.published ? "observing" : "building",
             ),
           );
-          const live = liveState(session, undefined);
-          if (live)
-            enqueue(observation, { type: "status", revision: projection.store.bump(), live });
-          for (const [id, { revision, request }] of projection.obligations)
-            enqueue(observation, { type: "obligation-opened", revision, id, request });
           observation.outboxLimit = observation.outbox.length + ESSENTIAL_OUTBOX_LIMIT;
           observation.session = session;
           session.observations.add(observation);

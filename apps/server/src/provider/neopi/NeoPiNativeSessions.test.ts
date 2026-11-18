@@ -2188,6 +2188,27 @@ describe("server wiring review round", () => {
   );
 
   it.effect(
+    "a new lease receives every open obligation before its first lifecycle, across several credit grants",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        // Built and observed already, so the joining lease's own lifecycle is its only one.
+        const built = yield* follow(service, originalRef);
+        yield* built.next("lifecycle", observing);
+        yield* openObligations(native, 20);
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
+        const first = lease.seen.findIndex((envelope) => envelope.type === "lifecycle");
+        const replayed = lease.seen.flatMap((envelope, index) =>
+          envelope.type === "obligation-opened" ? [index] : [],
+        );
+        assert.equal(replayed.length, 20);
+        assert.isTrue(replayed.every((index) => index < first));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
     "a lease whose stream is stuck does not hold a closed session beyond the grace period",
     () =>
       Effect.gen(function* () {

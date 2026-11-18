@@ -262,6 +262,38 @@ export interface NativeInboxLedgerItem {
 }
 /** Applied inbox items remembered for gap arithmetic; a gap reaching further back is counted as given. */
 const INBOX_LEDGER_LIMIT = 4096;
+/** A raw inbox record as this view received it: the projection it belongs to and when it was applied. */
+export type NativeInboxRawRecord = Exclude<NeoPiNativeInboxRecord, { type: "gap" }> & {
+  readonly projection: string;
+  readonly receivedAt: number;
+};
+/** Raw records this client cut to stay within `NATIVE_INBOX_LIMIT`; a client-only cause. */
+export interface NativeInboxTrimmedGap {
+  readonly type: "trimmed";
+  readonly projection: string;
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  /** When this client applied the first and last record it cut. */
+  readonly firstReceivedAt: number;
+  readonly lastReceivedAt: number;
+  readonly notices: number;
+  readonly toolStreams: ReadonlyArray<{
+    readonly toolCallId: string;
+    readonly toolName: string;
+    readonly updates: number;
+  }>;
+  readonly toolStreamsTruncated: boolean;
+}
+/**
+ * In arrival order: raw records, server gaps exactly as received, client
+ * `trimmed` gaps, and at most one leading `older-details-trimmed` entry, which
+ * replaces gap entries past `NATIVE_INBOX_GAP_LIMIT` and claims no cause or count.
+ */
+export type NativeInboxItem =
+  | NativeInboxRawRecord
+  | Extract<NeoPiNativeInboxRecord, { type: "gap" }>
+  | NativeInboxTrimmedGap
+  | { readonly type: "older-details-trimmed" };
 export interface NativeObservation {
   readonly domain: NeoPiNativeObservationDomain | null;
   /** Send with the next read; null before the first. A `full` pass in it means catching up. */
@@ -304,7 +336,7 @@ export interface NativeObservation {
    * this view missed: a gap never repeats records already applied here, and
    * nothing is invented for it. A consumer may remove what it has mapped.
    */
-  readonly inbox: readonly NeoPiNativeInboxRecord[];
+  readonly inbox: readonly NativeInboxItem[];
   /** The projection the inbox sequence numbers belong to, and the last one applied. */
   readonly inboxKey: string | null;
   readonly inboxSeq: number;
@@ -711,11 +743,12 @@ export function applyNativeRead(
   let inboxSeq = sameInbox ? held.inboxSeq : -1;
   const kept = sameInbox ? held.inboxLedger : [];
   const ledger = result.inbox.length === 0 ? [] : [...kept];
-  const arrived: NeoPiNativeInboxRecord[] = [];
+  const arrived: NativeInboxItem[] = [];
   for (const record of result.inbox) {
     if (record.seq <= inboxSeq) continue;
     if (record.type !== "gap") {
-      arrived.push(record);
+      // Stamped on application: a client `trimmed` gap's time span is then real.
+      arrived.push({ ...record, projection: inboxKey, receivedAt: nowMs() });
       ledger.push({
         fromSeq: record.seq,
         notices: record.type === "notice" ? 1 : 0,
@@ -789,75 +822,83 @@ export function applyNativeRead(
   };
 }
 
-/**
- * Inbox records a feed keeps (gaps included). Older ones fold into one leading
- * `evicted` gap per projection, so a tool that streams forever cannot grow the
- * cache. Nothing in the client reads inbox records beyond this window.
- */
+/** Raw inbox records (tool stream updates, notices) a feed keeps. */
 export const NATIVE_INBOX_LIMIT = 512;
+/** Gap entries (server gaps, client `trimmed` gaps, one `older-details-trimmed`) a feed keeps. */
+export const NATIVE_INBOX_GAP_LIMIT = 64;
 /** Command output rows a feed keeps: the projection retains the newest 256 receipts. */
 export const NATIVE_COMMAND_OUTPUT_LIMIT = 256;
-/** Per-call detail one folded gap lists before it reports `toolStreamsTruncated`. */
+/** Per-call detail one `trimmed` gap lists before it reports `toolStreamsTruncated`. */
 const NATIVE_GAP_TOOL_STREAMS = 64;
-type NativeInboxGap = Extract<NeoPiNativeInboxRecord, { type: "gap" }>;
 
-/** Folds a run of inbox records of one projection into the gap the server would have sent. */
-function foldNativeInbox(records: readonly NeoPiNativeInboxRecord[], at: number): NativeInboxGap {
-  const streams = new Map<string, NativeInboxGap["toolStreams"][number]>();
-  let truncated = false;
-  let notices = 0;
-  let notObserved = false;
-  // Records carry no server receive time, so a client fold ends at the time it
-  // happened; a folded gap keeps its own earlier start.
-  let firstReceivedAt = at;
-  const count = (stream: NativeInboxGap["toolStreams"][number]) => {
-    const prior = streams.get(stream.toolCallId);
-    if (prior)
-      streams.set(stream.toolCallId, { ...prior, updates: prior.updates + stream.updates });
-    else if (streams.size < NATIVE_GAP_TOOL_STREAMS) streams.set(stream.toolCallId, stream);
-    else truncated = true;
-  };
-  for (const record of records) {
-    if (record.type === "notice") notices++;
-    else if (record.type === "tool_stream_update")
-      count({ toolCallId: record.toolCallId, toolName: record.toolName, updates: 1 });
-    else {
-      notices += record.notices;
-      for (const stream of record.toolStreams) count(stream);
-      truncated ||= record.toolStreamsTruncated;
-      notObserved ||= record.reason === "not-observed";
-      firstReceivedAt = Math.min(firstReceivedAt, record.firstReceivedAt);
-    }
-  }
-  const first = records[0]!;
-  const last = records.at(-1)!;
-  return {
-    type: "gap",
-    seq: last.seq,
-    reason: notObserved ? "not-observed" : "evicted",
-    fromSeq: first.type === "gap" ? first.fromSeq : first.seq,
-    toSeq: last.seq,
-    firstReceivedAt,
-    lastReceivedAt: at,
-    notices,
-    toolStreams: [...streams.values()],
-    toolStreamsTruncated: truncated,
-  };
-}
+const isRawInboxRecord = (item: NativeInboxItem): item is NativeInboxRawRecord =>
+  item.type === "notice" || item.type === "tool_stream_update";
 
 /**
- * Keeps the inbox within `NATIVE_INBOX_LIMIT` by cutting from the front; the
- * cut records become one leading `evicted` gap, so nothing is dropped silently.
- * Dedupe and gap arithmetic live in `inboxSeq`/`inboxLedger`, which this never touches.
+ * Bounds the client inbox (decision of the stage orchestrator). Server gaps are
+ * kept exactly as received, never folded. Only raw records this view received
+ * are cut, oldest first, and each cut run of one projection becomes a client
+ * `trimmed` gap for exactly those records, merging only with a `trimmed` gap of
+ * the same projection directly before it. Gap entries are bounded separately;
+ * past that bound the oldest become one `older-details-trimmed` entry, which
+ * claims no cause and no count.
  */
-export function boundNativeInbox(observation: NativeObservation, at: number): NativeObservation {
-  const { inbox } = observation;
-  if (inbox.length <= NATIVE_INBOX_LIMIT) return observation;
-  const cut = inbox.length - NATIVE_INBOX_LIMIT + 1;
-  return {
-    ...observation,
-    inbox: [foldNativeInbox(inbox.slice(0, cut), at), ...inbox.slice(cut)],
-  };
+export function boundNativeInbox(observation: NativeObservation): NativeObservation {
+  let raw = 0;
+  let gaps = 0;
+  for (const item of observation.inbox) {
+    if (isRawInboxRecord(item)) raw++;
+    else gaps++;
+  }
+  if (raw <= NATIVE_INBOX_LIMIT && gaps <= NATIVE_INBOX_GAP_LIMIT) return observation;
+  let cut = Math.max(0, raw - NATIVE_INBOX_LIMIT);
+  const kept: NativeInboxItem[] = [];
+  for (const item of observation.inbox) {
+    if (cut === 0 || !isRawInboxRecord(item)) {
+      kept.push(item);
+      continue;
+    }
+    cut--;
+    const last = kept.at(-1);
+    const prior = last?.type === "trimmed" && last.projection === item.projection ? last : null;
+    const streams = new Map(prior?.toolStreams.map((stream) => [stream.toolCallId, stream]));
+    let truncated = prior?.toolStreamsTruncated ?? false;
+    if (item.type === "tool_stream_update") {
+      const held = streams.get(item.toolCallId);
+      if (held) streams.set(item.toolCallId, { ...held, updates: held.updates + 1 });
+      else if (streams.size < NATIVE_GAP_TOOL_STREAMS)
+        streams.set(item.toolCallId, {
+          toolCallId: item.toolCallId,
+          toolName: item.toolName,
+          updates: 1,
+        });
+      else truncated = true;
+    }
+    const trimmed: NativeInboxTrimmedGap = {
+      type: "trimmed",
+      projection: item.projection,
+      fromSeq: prior?.fromSeq ?? item.seq,
+      toSeq: item.seq,
+      firstReceivedAt: prior?.firstReceivedAt ?? item.receivedAt,
+      lastReceivedAt: item.receivedAt,
+      notices: (prior?.notices ?? 0) + (item.type === "notice" ? 1 : 0),
+      toolStreams: [...streams.values()],
+      toolStreamsTruncated: truncated,
+    };
+    if (prior) kept[kept.length - 1] = trimmed;
+    else {
+      kept.push(trimmed);
+      gaps++;
+    }
+  }
+  if (gaps <= NATIVE_INBOX_GAP_LIMIT) return { ...observation, inbox: kept };
+  // The marker takes one slot; the oldest gap entries (any marker included) give way to it.
+  let drop = gaps - NATIVE_INBOX_GAP_LIMIT + 1;
+  const inbox: NativeInboxItem[] = [{ type: "older-details-trimmed" }];
+  for (const item of kept)
+    if (drop > 0 && !isRawInboxRecord(item)) drop--;
+    else inbox.push(item);
+  return { ...observation, inbox };
 }
 
 /**
@@ -1313,7 +1354,7 @@ export function reduceNativeSessionFeed(
       ...(observer ? { observer } : {}),
     };
     const projected = projectNativeEntities(feed, staged);
-    const observation = boundNativeInbox(projected.observation, nowMs());
+    const observation = boundNativeInbox(projected.observation);
     return observation === projected.observation ? projected : { ...projected, observation };
   }
   if (event.type === "observer")

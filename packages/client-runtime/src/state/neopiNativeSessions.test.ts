@@ -27,6 +27,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
+  NATIVE_INBOX_GAP_LIMIT,
   NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
   nativeObservationStatus,
@@ -498,44 +499,77 @@ describe("native observation controller", () => {
 });
 
 describe("native inbox bound", () => {
-  it("keeps a tool that streams forever within the inbox bound and marks what it cut", () => {
-    const epoch = domain();
+  it("keeps a tool that streams forever within bounds, server gaps exact, cuts as trimmed", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
       revision: 1,
       session,
     });
-    const total = NATIVE_INBOX_LIMIT * 4;
-    for (let seq = 1; seq <= total; seq++)
-      feed = applyRead(
-        feed,
-        pass({
-          epoch,
-          watermark: seq,
-          kind: seq === 1 ? "full" : "incremental",
-          inbox: [
-            {
-              type: "tool_stream_update",
-              seq,
-              toolCallId: "bash-1",
-              toolName: "bash",
-              update: { chunk: seq },
-            },
-          ],
-        }),
-      );
+    const serverGaps: NeoPiNativeInboxRecord[] = [];
+    const perProjection = NATIVE_INBOX_LIMIT * 3;
+    // Two projections: sequence numbers restart with the second.
+    for (const incarnation of [1, 2]) {
+      const epoch = domain({ projectionIncarnation: incarnation });
+      for (let seq = 1; seq <= perProjection; seq++) {
+        const record: NeoPiNativeInboxRecord =
+          seq % 10 === 0
+            ? {
+                type: "gap",
+                seq,
+                reason: "evicted",
+                fromSeq: seq,
+                toSeq: seq,
+                firstReceivedAt: seq,
+                lastReceivedAt: seq,
+                notices: 1,
+                toolStreams: [],
+                toolStreamsTruncated: false,
+              }
+            : {
+                type: "tool_stream_update",
+                seq,
+                toolCallId: `bash-${incarnation}`,
+                toolName: "bash",
+                update: { chunk: seq },
+              };
+        if (record.type === "gap") serverGaps.push(record);
+        feed = applyRead(
+          feed,
+          pass({
+            epoch,
+            watermark: seq,
+            kind: seq === 1 ? "full" : "incremental",
+            inbox: [record],
+          }),
+        );
+      }
+    }
     const inbox = feed.observation.inbox;
-    expect(inbox.length).toBeLessThanOrEqual(NATIVE_INBOX_LIMIT);
-    const gap = inbox[0];
-    expect(gap?.type).toBe("gap");
-    if (gap?.type !== "gap") return;
-    const kept = inbox.slice(1);
-    expect(gap).toMatchObject({ reason: "evicted", fromSeq: 1, toSeq: kept[0]!.seq - 1 });
-    expect(gap.toolStreams).toEqual([
-      { toolCallId: "bash-1", toolName: "bash", updates: total - kept.length },
-    ]);
-    expect(kept.every((record, index) => record.seq === gap.toSeq + 1 + index)).toBe(true);
-    expect(kept.at(-1)?.seq).toBe(total);
+    const raw = inbox.filter((item) => item.type === "tool_stream_update");
+    const gaps = inbox.filter((item) => item.type !== "tool_stream_update");
+    expect(raw.length).toBe(NATIVE_INBOX_LIMIT);
+    expect(gaps.length).toBeLessThanOrEqual(NATIVE_INBOX_GAP_LIMIT);
+    // Past the gap bound the oldest entries become one marker that claims nothing.
+    expect(inbox[0]).toEqual({ type: "older-details-trimmed" });
+    // Server gaps are kept exactly as received.
+    const kept = gaps.filter((item) => item.type === "gap");
+    expect(kept.length).toBeGreaterThan(0);
+    for (const gap of kept) expect(serverGaps).toContainEqual(gap);
+    // Each trimmed gap covers exactly cut records of one projection, never across a server gap.
+    const trimmed = gaps.filter((item) => item.type === "trimmed");
+    expect(trimmed.length).toBeGreaterThan(0);
+    for (const gap of trimmed) {
+      expect(gap.toSeq - gap.fromSeq + 1).toBe(gap.toolStreams[0]!.updates);
+      expect(gap.lastReceivedAt).toBeGreaterThanOrEqual(gap.firstReceivedAt);
+      expect(gap.toolStreams.map((stream) => stream.toolCallId)).toEqual([
+        gap.projection === trimmed.at(-1)!.projection ? "bash-2" : "bash-1",
+      ]);
+    }
+    // The newest trimmed gap ends right before the oldest record still held, or
+    // before the server gap that separates them.
+    const edge = raw[0]!.seq - trimmed.at(-1)!.toSeq;
+    expect(edge === 1 || (edge === 2 && (raw[0]!.seq - 1) % 10 === 0)).toBe(true);
+    expect(trimmed.at(-1)!.projection).toBe(raw[0]!.projection);
   });
 });
 

@@ -1,5 +1,6 @@
 import {
   type KeybindingRule,
+  type KeybindingSequence,
   type KeybindingShortcut,
   type KeybindingWhenNode,
   MAX_KEYBINDINGS_COUNT,
@@ -26,10 +27,14 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
   { key: "ctrl+tab", command: "sessionTab.next", when: "!terminalFocus" },
   { key: "mod+j", command: "terminal.toggle" },
   { key: "mod+alt+b", command: "rightPanel.toggle" },
-  { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
-  { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
-  { key: "mod+n", command: "terminal.new", when: "terminalFocus" },
-  { key: "mod+w", command: "terminal.close", when: "terminalFocus" },
+  // A focused terminal acts only on these; every other key reaches the program.
+  { key: "ctrl+\\ ctrl+\\", command: "terminal.leaveFocus", when: "terminalFocus" },
+  { key: "mod+=", command: "terminal.fontSize.increase", when: "terminalFocus" },
+  { key: "mod++", command: "terminal.fontSize.increase", when: "terminalFocus" },
+  { key: "mod+shift+=", command: "terminal.fontSize.increase", when: "terminalFocus" },
+  { key: "mod+-", command: "terminal.fontSize.decrease", when: "terminalFocus" },
+  { key: "mod+0", command: "terminal.fontSize.reset", when: "terminalFocus" },
+  { key: "ctrl+;", command: "exLine.open", when: "!terminalFocus" },
   { key: "mod+w", command: "rightPanel.close", when: "!terminalFocus" },
   { key: "mod+d", command: "diff.toggle", when: "!terminalFocus" },
   { key: "mod+shift+j", command: "preview.toggle" },
@@ -113,6 +118,20 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
   },
 ];
 
+/**
+ * Former defaults that only applied while a terminal had focus. A focused
+ * terminal now sends these keys to its program, so they can no longer fire
+ * there. Startup removes exact copies of them from files written before
+ * `terminal.leaveFocus` existed; see the server's keybindings migration.
+ */
+export const RETIRED_TERMINAL_FOCUS_DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
+  { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
+  { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
+  { key: "mod+shift+d", command: "terminal.new", when: "terminalFocus" },
+  { key: "mod+n", command: "terminal.new", when: "terminalFocus" },
+  { key: "mod+w", command: "terminal.close", when: "terminalFocus" },
+];
+
 function normalizeKeyToken(token: string): string {
   if (token === "space") return " ";
   if (token === "esc") return "escape";
@@ -181,6 +200,42 @@ export function parseKeybindingShortcut(value: string): KeybindingShortcut | nul
     altKey,
     modKey,
   };
+}
+
+/**
+ * Splits a rule's `key` into its chords: one, or two separated by whitespace
+ * (`ctrl+w h`). Whitespace beside a joining `+` stays inside its chord, so
+ * `mod + k` is still one chord, while a `+` key keeps its own place:
+ * `ctrl++ h` and `ctrl+w +` are two chords each.
+ */
+function splitKeybindingSteps(value: string): string[] {
+  const steps: string[] = [];
+  for (const part of value.trim().split(/\s+/)) {
+    const previous = steps.at(-1);
+    const joins =
+      previous !== undefined &&
+      (parseKeybindingShortcut(previous) === null ||
+        (previous !== "+" && previous.endsWith("+") && !previous.endsWith("++")) ||
+        (part !== "+" && part.startsWith("+") && !part.startsWith("++")));
+    if (previous !== undefined && joins) {
+      steps[steps.length - 1] = `${previous}${part}`;
+    } else {
+      steps.push(part);
+    }
+  }
+  return steps;
+}
+
+/** Parses a rule's `key` as one chord or a two-chord sequence; null if it is neither. */
+export function parseKeybindingSteps(
+  value: string,
+): readonly [KeybindingShortcut] | KeybindingSequence | null {
+  const steps = splitKeybindingSteps(value);
+  const first = steps[0] === undefined ? null : parseKeybindingShortcut(steps[0]);
+  if (!first) return null;
+  if (steps.length === 1) return [first];
+  const second = steps.length === 2 ? parseKeybindingShortcut(steps[1]!) : null;
+  return second ? [first, second] : null;
 }
 
 function tokenizeWhenExpression(expression: string): WhenToken[] | null {
@@ -318,23 +373,20 @@ export function parseKeybindingWhenExpression(expression: string): KeybindingWhe
 }
 
 export function compileResolvedKeybindingRule(rule: KeybindingRule): ResolvedKeybindingRule | null {
-  const shortcut = parseKeybindingShortcut(rule.key);
-  if (!shortcut) return null;
+  const steps = parseKeybindingSteps(rule.key);
+  if (!steps) return null;
+  const binding =
+    steps.length === 1
+      ? { command: rule.command, shortcut: steps[0] }
+      : { command: rule.command, sequence: steps };
 
   if (rule.when !== undefined) {
     const whenAst = parseKeybindingWhenExpression(rule.when);
     if (!whenAst) return null;
-    return {
-      command: rule.command,
-      shortcut,
-      whenAst,
-    };
+    return { ...binding, whenAst };
   }
 
-  return {
-    command: rule.command,
-    shortcut,
-  };
+  return binding;
 }
 
 export function compileResolvedKeybindingsConfig(

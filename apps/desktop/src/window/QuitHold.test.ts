@@ -59,7 +59,15 @@ function makeHarness(options?: {
       await send(makeInput({ isAutoRepeat: true, ...repeatOverrides }));
     }
   };
-  return { notifications, concealWindow, quit, preventDefault, send, holdFor };
+  return {
+    notifications,
+    concealWindow,
+    quit,
+    preventDefault,
+    send,
+    holdFor,
+    cancelPendingPress: handler.cancelPendingPress,
+  };
 }
 
 describe("makeQuitShortcutHandler", () => {
@@ -458,6 +466,26 @@ describe("makeQuitShortcutHandler", () => {
     await harness.send(makeInput({}));
     expect(harness.quit).not.toHaveBeenCalled();
     expect(harness.notifications).toEqual([DOUBLE_CLICK_DOWN, UP, DOUBLE_CLICK_DOWN]);
+  });
+
+  it("does not let a cancelled first press count toward a double press", async () => {
+    // The shell cancels when a terminal takes focus, whose keys never reach
+    // this handler, so typing there cannot interrupt the press on its own.
+    const harness = makeHarness({ mode: "double-click" });
+    await harness.send(makeInput({}));
+    harness.cancelPendingPress();
+    await harness.send(makeInput({}));
+    expect(harness.quit).not.toHaveBeenCalled();
+    expect(harness.notifications).toEqual([DOUBLE_CLICK_DOWN, UP, DOUBLE_CLICK_DOWN]);
+  });
+
+  it("keeps a concealed hold committed through a cancel", async () => {
+    const harness = makeHarness();
+    await harness.send(makeInput({}));
+    await harness.holdFor(QUIT_HOLD_DURATION_MS);
+    harness.cancelPendingPress();
+    vi.advanceTimersByTime(QUIT_HOLD_RELEASE_GRACE_MS);
+    expect(harness.quit).toHaveBeenCalledTimes(1);
   });
 
   it("ignores other shortcuts", async () => {

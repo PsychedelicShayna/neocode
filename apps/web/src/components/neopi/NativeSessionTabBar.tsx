@@ -9,7 +9,7 @@ import { isElectron } from "../../env";
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { resolveShortcutCommand } from "../../keybindings";
 import { isEditableFocused } from "../../lib/editableFocus";
-import { isTerminalFocused } from "../../lib/terminalFocus";
+import { isTerminalFocused, isTerminalInputFocused } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { isModelPickerOpen } from "../../modelPickerVisibility";
 import {
@@ -114,7 +114,11 @@ function useNativeSessionTabShortcuts() {
     // The modifiers that were down when the switcher opened; letting go of any commits.
     let held = { ctrl: false, meta: false, alt: false };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (useNativeSessionSwitcher.getState().order && event.key === "Escape") {
+      if (
+        useNativeSessionSwitcher.getState().order &&
+        event.key === "Escape" &&
+        !isTerminalInputFocused()
+      ) {
         event.preventDefault();
         event.stopPropagation();
         cancelNativeSessionSwitcher();

@@ -133,7 +133,19 @@ describe("floating browser preview", () => {
     const panels = useRightPanelStore.getState();
     const revision = panels.getUserActionRevision(ref);
     usePreviewMiniPlayerStore.getState().open(ref, { kind: "browser", tabId: "agent-tab" });
-    panels.reconcileBrowserSurfaces(ref, ["agent-tab"]);
+    panels.reconcileBrowserSurfaces(ref, {
+      listed: true,
+      sessions: {
+        "agent-tab": {
+          threadId: "thread-1",
+          tabId: "agent-tab",
+          navStatus: { _tag: "Idle" },
+          canGoBack: false,
+          canGoForward: false,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    });
     const intent = selectThreadPreviewMiniPlayer(
       usePreviewMiniPlayerStore.getState().byThreadKey,
       ref,

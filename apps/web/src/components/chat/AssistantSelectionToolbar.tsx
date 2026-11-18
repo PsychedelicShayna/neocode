@@ -16,6 +16,7 @@ import {
   resolveSelectionActionPosition,
   type SelectionActionPoint,
 } from "~/lib/selectionActions";
+import { isTerminalInputFocused } from "~/lib/terminalFocus";
 import { Button } from "../ui/button";
 
 export function AssistantSelectionToolbar({
@@ -94,6 +95,7 @@ export function AssistantSelectionToolbar({
         event.metaKey ||
         event.isComposing ||
         event.defaultPrevented ||
+        isTerminalInputFocused() ||
         !toolbar ||
         toolbar.contains(event.target as Node)
       ) {

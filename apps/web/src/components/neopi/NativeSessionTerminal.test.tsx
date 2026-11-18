@@ -93,7 +93,6 @@ describe("native terminal close receipt", () => {
             target={target}
             cwd="/workspace"
             mode={mode}
-            keybindings={[]}
             {...(surface ? { surface } : {})}
           />,
         ),

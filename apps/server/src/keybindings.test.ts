@@ -283,6 +283,113 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
       }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
+  it.effect("keeps a two-chord sequence through decode and encode", () =>
+    Effect.gen(function* () {
+      const compiled = Keybindings.compileResolvedKeybindingRule({
+        key: "ctrl+w  h",
+        command: "sidebar.toggle",
+      });
+      assert.isNotNull(compiled);
+      const encoded = yield* encodeResolvedKeybindingFromConfig(compiled!);
+      assert.equal(encoded.key, "ctrl+w h");
+      // Whitespace beside a `+` stays inside one chord.
+      assert.deepEqual(
+        Keybindings.compileResolvedKeybindingRule({ key: "mod + k", command: "sidebar.toggle" }),
+        Keybindings.compileResolvedKeybindingRule({ key: "mod+k", command: "sidebar.toggle" }),
+      );
+      assert.isNull(
+        Keybindings.compileResolvedKeybindingRule({ key: "ctrl+w h j", command: "sidebar.toggle" }),
+      );
+      // A literal `+` key on either side of the chord boundary.
+      for (const [key, expected] of [
+        ["ctrl++ h", "ctrl++ h"],
+        ["ctrl+w +", "ctrl+w +"],
+        ["mod + k", "mod+k"],
+      ] as const) {
+        const rule = Keybindings.compileResolvedKeybindingRule({ key, command: "sidebar.toggle" });
+        assert.isNotNull(rule, key);
+        assert.equal((yield* encodeResolvedKeybindingFromConfig(rule!)).key, expected);
+      }
+    }),
+  );
+
+  it.effect("removes a sequence saved with other whitespace, as Settings shows it", () =>
+    Effect.gen(function* () {
+      const { keybindingsConfigPath } = yield* ServerConfig.ServerConfig;
+      yield* writeKeybindingsConfig(keybindingsConfigPath, [
+        { key: "ctrl+g  h", command: "sidebar.toggle" },
+        { key: "mod+shift+r", command: "script.run-tests.run" },
+      ]);
+      const keybindings = yield* Keybindings.Keybindings;
+      yield* keybindings.removeKeybindingRule({ key: "ctrl+g h", command: "sidebar.toggle" });
+      const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
+      assert.deepEqual(
+        persisted.map(({ key, command }) => ({ key, command })),
+        [{ key: "mod+shift+r", command: "script.run-tests.run" }],
+      );
+    }).pipe(Effect.provide(makeKeybindingsLayer())),
+  );
+
+  it.effect(
+    "removes saved copies of the retired terminal-focus defaults once and keeps user rules",
+    () =>
+      Effect.gen(function* () {
+        const { keybindingsConfigPath } = yield* ServerConfig.ServerConfig;
+        // A file the old backfill wrote: retired defaults alongside the
+        // user's own rules for the same commands and keys.
+        yield* writeKeybindingsConfig(keybindingsConfigPath, [
+          { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
+          { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
+          { key: "mod+n", command: "terminal.new", when: "terminalFocus" },
+          { key: "mod+w", command: "terminal.close", when: "terminalFocus" },
+          { key: "mod+shift+t", command: "terminal.new" },
+          { key: "mod+d", command: "terminal.split", when: "terminalOpen" },
+        ]);
+        const keybindings = yield* Keybindings.Keybindings;
+        yield* keybindings.syncDefaultKeybindingsOnStartup;
+
+        const migrated = yield* readKeybindingsConfig(keybindingsConfigPath);
+        const terminalRules = migrated.filter((entry) =>
+          ["terminal.split", "terminal.splitVertical", "terminal.new", "terminal.close"].includes(
+            entry.command,
+          ),
+        );
+        assert.deepEqual(terminalRules, [
+          { key: "mod+shift+t", command: "terminal.new" },
+          { key: "mod+d", command: "terminal.split", when: "terminalOpen" },
+        ]);
+        assert.isTrue(migrated.some((entry) => entry.command === "terminal.leaveFocus"));
+
+        // Later startups neither restore the retired rules nor remove the same
+        // rule once the user adds it back deliberately.
+        const readded = { key: "mod+w", command: "terminal.close", when: "terminalFocus" } as const;
+        yield* writeKeybindingsConfig(keybindingsConfigPath, [...migrated, readded]);
+        yield* keybindings.syncDefaultKeybindingsOnStartup;
+        assert.deepEqual(yield* readKeybindingsConfig(keybindingsConfigPath), [
+          ...migrated,
+          readded,
+        ]);
+
+        // Deleting the escape rule as well does not make the file look unmigrated:
+        // the user's re-added rule survives the next start.
+        const withoutEscape = [...migrated, readded].filter(
+          (entry) => entry.command !== "terminal.leaveFocus",
+        );
+        yield* writeKeybindingsConfig(keybindingsConfigPath, withoutEscape);
+        yield* keybindings.syncDefaultKeybindingsOnStartup;
+        const restarted = yield* readKeybindingsConfig(keybindingsConfigPath);
+        assert.isTrue(
+          restarted.some(
+            (entry) =>
+              entry.key === readded.key &&
+              entry.command === readded.command &&
+              entry.when === readded.when,
+          ),
+        );
+        assert.isTrue(restarted.some((entry) => entry.command === "terminal.leaveFocus"));
+      }).pipe(Effect.provide(makeKeybindingsLayer())),
+  );
+
   it.effect("skips conflicting default keybindings on startup and logs a detailed warning", () => {
     const messages: string[] = [];
     const logger = Logger.make(({ message }) => {

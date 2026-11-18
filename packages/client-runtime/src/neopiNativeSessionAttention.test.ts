@@ -73,18 +73,21 @@ describe("resolveNativeSessionStatus", () => {
 });
 
 describe("partitionNativeSessions", () => {
+  // Unopened sessions with activity after the baseline: each one resolves `done`.
   const sections = partitionNativeSessions(
     [
-      session("/done-newer.jsonl", "2026-11-04T10:00:00Z"),
-      session("/waiting-older.jsonl", "2026-11-04T08:00:00Z", { live: live("waiting") }),
-      session("/working.jsonl", "2026-11-04T09:00:00Z", { live: live("busy") }),
-      session("/recent-a.jsonl", "2026-10-31T00:00:00Z"),
-      session("/recent-b.jsonl", "2026-10-31T12:00:00Z"),
+      session("/done-a.jsonl", "2026-11-04T12:00:00Z"),
+      session("/done-b.jsonl", "2026-11-04T10:00:00Z"),
+      session("/done-c.jsonl", "2026-11-04T07:00:00Z"),
+      session("/waiting-a.jsonl", "2026-11-04T06:00:00Z", { live: live("waiting") }),
+      session("/waiting-b.jsonl", "2026-11-04T08:00:00Z", { live: live("waiting") }),
+      session("/working.jsonl", "2026-11-04T05:00:00Z", { live: live("busy") }),
+      session("/open.jsonl", "2026-11-04T09:00:00Z"),
+      session("/old.jsonl", "2026-10-31T00:00:00Z"),
       session("/settled-early.jsonl", "2026-10-01T00:00:00Z", {
         settledAt: "2026-10-05T00:00:00Z",
       }),
       session("/settled-late.jsonl", "2026-10-02T00:00:00Z", { settledAt: "2026-10-09T00:00:00Z" }),
-      session("/open.jsonl", "2026-11-04T11:00:00Z"),
     ],
     visits,
     "/open.jsonl",
@@ -92,13 +95,37 @@ describe("partitionNativeSessions", () => {
   const files = (entries: typeof sections.attention) =>
     entries.map((entry) => entry.session.ref.sessionFile);
 
-  it("puts blocked sessions before finished-unseen ones in the attention section", () => {
-    expect(files(sections.attention)).toEqual(["/waiting-older.jsonl", "/done-newer.jsonl"]);
+  it("needs attention holds only sessions waiting on the user, newest first", () => {
+    expect(files(sections.attention)).toEqual(["/waiting-b.jsonl", "/waiting-a.jsonl"]);
   });
 
-  it("keeps working, recent and settled sections newest first, settled by settle time", () => {
+  it("places a working session above every finished-unseen one", () => {
     expect(files(sections.working)).toEqual(["/working.jsonl"]);
-    expect(files(sections.recent)).toEqual(["/open.jsonl", "/recent-b.jsonl", "/recent-a.jsonl"]);
+    // Sections render attention, working, recent: done rows must all sit in recent.
+    expect([...sections.attention, ...sections.working].map((entry) => entry.status)).not.toContain(
+      "done",
+    );
+    expect(sections.recent.filter((entry) => entry.status === "done")).toHaveLength(3);
+  });
+
+  it("orders recent purely by activity, done or not, with the open session in place", () => {
+    expect(files(sections.recent)).toEqual([
+      "/done-a.jsonl",
+      "/done-b.jsonl",
+      "/open.jsonl",
+      "/done-c.jsonl",
+      "/old.jsonl",
+    ]);
+    expect(sections.recent.map((entry) => entry.status)).toEqual([
+      "done",
+      "done",
+      "idle",
+      "done",
+      "idle",
+    ]);
+  });
+
+  it("orders the settled shelf by settle time", () => {
     expect(files(sections.settled)).toEqual(["/settled-late.jsonl", "/settled-early.jsonl"]);
   });
 });

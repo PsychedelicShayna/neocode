@@ -1241,6 +1241,12 @@ export interface DesktopBridge {
   probeRemoteEditors?: () => Promise<readonly EditorId[]>;
   /** Present when the desktop shell can perform an ordered plain-text paste. */
   pasteAsText?: () => Promise<void>;
+  /**
+   * Reports that a terminal's keyboard input in this window gained or lost
+   * focus, so the desktop shell leaves its keys to the terminal program.
+   * Optional: older desktop builds lack it.
+   */
+  setTerminalInputFocused?: (focused: boolean) => Promise<void>;
   onMenuAction: (listener: (action: string) => void) => () => void;
   onSnapShotEvent?: (listener: (event: DesktopSnapShotEvent) => void) => () => void;
   /**

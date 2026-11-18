@@ -13,7 +13,11 @@ class EventBuffer<A> {
   private bytes = 0;
   private dropped = false;
 
-  constructor(private readonly retainedBytes: (event: A) => number) {}
+  private readonly retainedBytes: (event: A) => number;
+
+  constructor(retainedBytes: (event: A) => number) {
+    this.retainedBytes = retainedBytes;
+  }
 
   offer(event: A): void {
     const size = this.retainedBytes(event);

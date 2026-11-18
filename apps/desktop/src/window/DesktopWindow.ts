@@ -30,9 +30,50 @@ import * as PreviewManager from "../preview/Manager.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopClientSettings from "../settings/DesktopClientSettings.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
-import { makeQuitShortcutHandler } from "./QuitHold.ts";
+import { makeQuitShortcutHandler, type QuitHoldKeyInput } from "./QuitHold.ts";
 
 const TITLEBAR_HEIGHT = 40;
+// Windows draws its caption buttons 32 points tall at 100% scale; an overlay
+// shorter than that leaves them hit-testing below the strip at deep zoom-out.
+const TITLEBAR_MIN_OVERLAY_HEIGHT = 32;
+// Blink renders page zoom clamped to these factors (blink page_zoom.h), while
+// the browser keeps whatever level it was handed.
+const MIN_PAGE_ZOOM_FACTOR = 0.25;
+const MAX_PAGE_ZOOM_FACTOR = 5;
+// Electron's zoom factor is 1.2 to the power of the zoom level.
+const MIN_PAGE_ZOOM_LEVEL = Math.log(MIN_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+const MAX_PAGE_ZOOM_LEVEL = Math.log(MAX_PAGE_ZOOM_FACTOR) / Math.log(1.2);
+
+/**
+ * The View menu's next zoom level: the Electron menu roles' half-level step,
+ * held to the range Blink renders so steps past it are not silently swallowed.
+ */
+export function nextMainZoomLevel(level: number, direction: MainWindowZoomDirection): number {
+  if (direction === "reset") return 0;
+  return Math.min(
+    MAX_PAGE_ZOOM_LEVEL,
+    Math.max(MIN_PAGE_ZOOM_LEVEL, level + (direction === "in" ? 0.5 : -0.5)),
+  );
+}
+
+/**
+ * The overlay's height is in window points, which do not follow page zoom,
+ * while the renderer lays its title bar out in `env(titlebar-area-height)` CSS
+ * pixels. Scaling by the rendered zoom keeps that strip TITLEBAR_HEIGHT CSS
+ * pixels tall, so a zoomed-in UI does not crowd its two-line tabs into a
+ * shorter strip. Rounds up past float noise so the strip never ends up below
+ * its height, and never undercuts the native caption buttons.
+ */
+export function titleBarOverlayHeight(zoomFactor: number): number {
+  const rendered = Math.min(MAX_PAGE_ZOOM_FACTOR, Math.max(MIN_PAGE_ZOOM_FACTOR, zoomFactor));
+  return Math.max(TITLEBAR_MIN_OVERLAY_HEIGHT, Math.ceil(TITLEBAR_HEIGHT * rendered - 1e-9));
+}
+
+function syncTitleBarOverlayHeight(window: Electron.BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  window.setTitleBarOverlay({ height: titleBarOverlayHeight(window.webContents.getZoomFactor()) });
+}
+
 // Matches --workspace-topbar-height in apps/web/src/index.css. Native macOS
 // buttons are 14 points tall and do not scale with the renderer's zoom.
 const MACOS_WORKSPACE_TOPBAR_HEIGHT = 52;
@@ -279,9 +320,60 @@ export function concealPendingQuitWindow(
   window.setOpacity(0);
 }
 
+/**
+ * What the shell does with a key in before-input-event, ahead of the page,
+ * given whether a terminal input had focus when that key arrived.
+ *
+ * On Linux and Windows the shell's Ctrl chords (Ctrl+Q quit, Ctrl+W close,
+ * the menu accelerators) are also the program's own keys, so with a terminal
+ * focused the shell steps aside entirely: no quit or close guard, and menu
+ * shortcuts are ignored for that key. Both come from the same focus reading,
+ * so a focus report landing mid-key can never leave the key with neither
+ * the guards nor the terminal. macOS terminals never receive Cmd chords, so
+ * the shell keeps them there.
+ */
+export function resolveShellKeyHandling(
+  input: QuitHoldKeyInput,
+  context: { readonly platform: NodeJS.Platform; readonly terminalInputFocused: boolean },
+): {
+  readonly quitShortcut: boolean;
+  readonly drop: boolean;
+  readonly ignoreMenuShortcuts: boolean;
+} {
+  if (context.terminalInputFocused && context.platform !== "darwin") {
+    return { quitShortcut: false, drop: false, ignoreMenuShortcuts: true };
+  }
+  // Electron's windowMenu close role owns CmdOrCtrl+W. Holding the
+  // close-terminal shortcut can outlive the terminal that handled its first
+  // press, so repeats are dropped before they reach the native accelerator.
+  const modifier = context.platform === "darwin" ? input.meta : input.control;
+  return {
+    quitShortcut: true,
+    drop:
+      input.type === "keyDown" &&
+      input.isAutoRepeat &&
+      modifier &&
+      !input.alt &&
+      !input.shift &&
+      input.key.toLowerCase() === "w",
+    ignoreMenuShortcuts: false,
+  };
+}
+
+const terminalInputFocusSetters = new WeakMap<Electron.WebContents, (focused: boolean) => void>();
+
+/**
+ * Records the renderer's report that a terminal input in this window gained
+ * or lost focus. Contents that are not a main window's own page are ignored.
+ */
+export function setTerminalInputFocused(contents: Electron.WebContents, focused: boolean): void {
+  terminalInputFocusSetters.get(contents)?.(focused);
+}
+
 function getWindowTitleBarOptions(
   shouldUseDarkColors: boolean,
   platform: NodeJS.Platform,
+  zoomFactor: number,
 ): WindowTitleBarOptions {
   if (platform === "darwin") {
     return {
@@ -297,7 +389,7 @@ function getWindowTitleBarOptions(
     titleBarStyle: "hidden",
     titleBarOverlay: {
       color: TITLEBAR_COLOR,
-      height: TITLEBAR_HEIGHT,
+      height: titleBarOverlayHeight(zoomFactor),
       symbolColor: shouldUseDarkColors ? TITLEBAR_DARK_SYMBOL_COLOR : TITLEBAR_LIGHT_SYMBOL_COLOR,
     },
   };
@@ -314,7 +406,11 @@ function syncWindowAppearance(
     }
 
     window.setBackgroundColor(getInitialWindowBackgroundColor(shouldUseDarkColors));
-    const { titleBarOverlay } = getWindowTitleBarOptions(shouldUseDarkColors, platform);
+    const { titleBarOverlay } = getWindowTitleBarOptions(
+      shouldUseDarkColors,
+      platform,
+      window.webContents.getZoomFactor(),
+    );
     if (typeof titleBarOverlay === "object") {
       window.setTitleBarOverlay(titleBarOverlay);
     }
@@ -432,7 +528,8 @@ export const make = Effect.gen(function* () {
       backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors),
       ...iconOption,
       title: environment.displayName,
-      ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform),
+      // A fresh webContents is unzoomed; a restored zoom arrives with the load.
+      ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform, 1),
       webPreferences: {
         preload: environment.preloadPath,
         // The window boots hidden (show: false until ready-to-show), and
@@ -652,10 +749,6 @@ export const make = Effect.gen(function* () {
       }
     });
 
-    // Electron's windowMenu close role owns CmdOrCtrl+W. Holding the
-    // close-terminal shortcut can outlive the terminal that handled its first
-    // press, so reject repeats before they reach the native window accelerator.
-    // Deliberate presses still flow through the renderer or native menu.
     // Intercept the quit accelerator before the native menu sees it and apply
     // the configured direct, hold, or double-press behavior.
     const quitShortcutHandler = makeQuitShortcutHandler({
@@ -682,13 +775,38 @@ export const make = Effect.gen(function* () {
         if (!window.isDestroyed()) void runPromise(electronApp.quit);
       },
     });
+
+    // The renderer reports when a terminal input gains or loses focus. Every
+    // way its page can go away (reload, navigation, crash) clears the report,
+    // so the shell never stays stepped aside for a terminal that is gone.
+    // Nothing here changes how keys are handled: each key decides that for
+    // itself in before-input-event from the state it sees.
+    let terminalInputFocused = false;
+    const setWindowTerminalInputFocused = (focused: boolean) => {
+      if (terminalInputFocused === focused) return;
+      terminalInputFocused = focused;
+      // A first quit tap made outside the terminal must not be completed by
+      // a second tap after the user has been typing in it.
+      if (focused) quitShortcutHandler.cancelPendingPress();
+    };
+    terminalInputFocusSetters.set(window.webContents, setWindowTerminalInputFocused);
+    window.webContents.on("did-navigate", () => setWindowTerminalInputFocused(false));
+
     window.webContents.on("before-input-event", (event, input) => {
-      quitShortcutHandler(event, input);
-      if (input.type !== "keyDown" || !input.isAutoRepeat) return;
-      const modifier = environment.platform === "darwin" ? input.meta : input.control;
-      if (modifier && !input.alt && !input.shift && input.key.toLowerCase() === "w") {
-        event.preventDefault();
+      const handling = resolveShellKeyHandling(input, {
+        platform: environment.platform,
+        terminalInputFocused,
+      });
+      // Set on every keydown from this key's own reading, never at report
+      // time: Electron consults the flag when the page hands this key back
+      // unhandled, and a report landing in between must not re-arm a Quit
+      // accelerator this key skipped the quit guard for. Keyups never fire
+      // accelerators and leave the flag to the keydown they belong to.
+      if (input.type === "keyDown") {
+        window.webContents.setIgnoreMenuShortcuts(handling.ignoreMenuShortcuts);
       }
+      if (handling.quitShortcut) quitShortcutHandler(event, input);
+      if (handling.drop) event.preventDefault();
     });
     window.webContents.on("input-event", (_event, input) => {
       if (input.type === "gestureScrollEnd") window.webContents.send(TRACKPAD_SCROLL_END_CHANNEL);
@@ -773,7 +891,9 @@ export const make = Effect.gen(function* () {
       clearDevelopmentLoadRetry();
       developmentLoadRetryIndex = 0;
       window.setTitle(environment.displayName);
+      // Chromium restores the origin's zoom level on every load and reload.
       if (environment.platform === "darwin") syncMacosWindowButtons(window);
+      else syncTitleBarOverlayHeight(window);
     });
     window.webContents.on(
       "did-fail-load",
@@ -802,6 +922,7 @@ export const make = Effect.gen(function* () {
       },
     );
     window.webContents.on("render-process-gone", (_event, details) => {
+      setWindowTerminalInputFocused(false);
       const recoverable =
         details.reason === "crashed" ||
         details.reason === "oom" ||
@@ -1073,11 +1194,12 @@ export const make = Effect.gen(function* () {
         return;
       }
       const webContents = window.value.webContents;
-      // Same step size as the Electron zoomIn/zoomOut menu roles.
-      webContents.setZoomLevel(
-        direction === "reset" ? 0 : webContents.getZoomLevel() + (direction === "in" ? 0.5 : -0.5),
-      );
-      if (environment.platform === "darwin") syncMacosWindowButtons(window.value);
+      webContents.setZoomLevel(nextMainZoomLevel(webContents.getZoomLevel(), direction));
+      // Chromium zooms per origin, so every app window took the new level.
+      for (const appWindow of windowBoundsFlushes.keys()) {
+        if (environment.platform === "darwin") syncMacosWindowButtons(appWindow);
+        else syncTitleBarOverlayHeight(appWindow);
+      }
       // Chromium pushes the new level down to embedded guests, which would zoom
       // the previewed page along with the app UI. The preview browser keeps its
       // own zoom, so put each guest back where the preview left it.

@@ -17,6 +17,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import { resolveStorage } from "./lib/storage";
+import type { ThreadPreviewState } from "./previewStateStore";
 
 const RIGHT_PANEL_KINDS = [
   "diff",
@@ -166,7 +167,15 @@ interface RightPanelStoreState {
   closeOtherSurfaces: (ref: WorkspaceRef, surfaceId: string) => void;
   closeSurfacesToRight: (ref: WorkspaceRef, surfaceId: string) => void;
   closeAllSurfaces: (ref: WorkspaceRef) => void;
-  reconcileBrowserSurfaces: (ref: WorkspaceRef, tabIds: readonly string[]) => void;
+  /**
+   * Match browser surfaces to the workspace's preview sessions. Newly seen tabs
+   * are always added; tabs missing from the sessions are removed only once the
+   * session list is authoritative (`listed`), never against one still loading.
+   */
+  reconcileBrowserSurfaces: (
+    ref: WorkspaceRef,
+    preview: Pick<ThreadPreviewState, "listed" | "sessions">,
+  ) => void;
   reconcileFileSurfaces: (ref: WorkspaceRef, workspaceAvailable: boolean) => void;
   show: (ref: WorkspaceRef) => void;
   close: (ref: WorkspaceRef) => void;
@@ -779,22 +788,28 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               : { ...current, isOpen: false, surfaces: [], activeSurfaceId: null },
           ),
         ),
-      reconcileBrowserSurfaces: (ref, tabIds) =>
+      reconcileBrowserSurfaces: (ref, preview) =>
         set((state) =>
           automaticUpdate(state, workspaceKey(ref), (current) => {
+            const tabIds = Object.keys(preview.sessions);
+            // Keep every surviving tab where it is, so a dragged order outlives
+            // preview updates. Newly seen browser tabs take the blank tab's slot
+            // when it is being replaced (its first navigation), else join at the end.
             const validIds = new Set(tabIds.map((tabId) => `browser:${tabId}`));
-            const nonBrowser = current.surfaces.filter((surface) => surface.kind !== "preview");
-            const existingBrowser = current.surfaces.filter(
-              (surface): surface is Extract<RightPanelSurface, { kind: "preview" }> =>
-                surface.kind === "preview" &&
-                surface.id !== "browser:new" &&
-                validIds.has(surface.id),
-            );
-            const knownIds = new Set(existingBrowser.map((surface) => surface.id));
+            const knownIds = new Set(current.surfaces.map((surface) => surface.id));
             const added = tabIds
               .filter((tabId) => !knownIds.has(`browser:${tabId}`))
               .map((tabId) => browserSurface(tabId));
-            const surfaces = [...nonBrowser, ...existingBrowser, ...added];
+            if (!preview.listed && added.length === 0) return current;
+            const placeholderIndex = current.surfaces.findIndex(
+              (surface) => surface.id === "browser:new",
+            );
+            const surfaces = current.surfaces.flatMap((surface, index) => {
+              if (surface.kind !== "preview" || validIds.has(surface.id)) return [surface];
+              if (index === placeholderIndex && added.length > 0) return added;
+              return preview.listed ? [] : [surface];
+            });
+            if (placeholderIndex < 0) surfaces.push(...added);
             const activeStillExists = surfaces.some(
               (surface) => surface.id === current.activeSurfaceId,
             );

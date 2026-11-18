@@ -1,4 +1,5 @@
 import { isMacPlatform } from "../../lib/utils";
+import { TERMINAL_INPUT_CLASS_NAME } from "../../lib/terminalFocus";
 import { SELECTION_MULTI_CLICK_INTERVAL_MS } from "../../lib/selectionActions";
 import { collectWrappedTerminalLinkLine, extractTerminalLinks } from "../../terminal-links";
 import {
@@ -15,7 +16,7 @@ import {
   type GhosttyCellMetrics,
 } from "./renderer";
 import symbolsFontUrl from "./fonts/SymbolsNerdFontMono-Regular.woff2?url";
-import { isMonospaceFamily } from "../../appearanceFonts";
+import { isMonospaceFamily, resolveDefaultFamilyLabel } from "../../appearanceFonts";
 
 export const DEFAULT_TERMINAL_FONT_SIZE = 12;
 const MIN_TERMINAL_FONT_SIZE = 6;
@@ -28,11 +29,18 @@ const TERMINAL_GLYPH_FALLBACKS =
   '"Symbols Nerd Font Mono", "Symbols Nerd Font", "JetBrainsMono Nerd Font", ' +
   '"JetBrainsMono NF", "FiraCode Nerd Font", "Hack Nerd Font", "MesloLGS NF", ' +
   '"CaskaydiaCove Nerd Font", "PowerlineSymbols", monospace';
-// The platform's own monospace faces; concrete names only, because an
-// unknown keyword (like ui-monospace) makes canvas font shorthand parsing
-// reject the whole string.
-export const DEFAULT_TERMINAL_FONT_FAMILY =
-  '"SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", ' + TERMINAL_GLYPH_FALLBACKS;
+// Text faces for a terminal without an explicit font: installed Nerd Fonts in
+// preference order (Meslo, then JetBrains Mono, then other common ones), then
+// the platform's own monospace faces. The engine renders the first installed
+// face, so nothing enumerates fonts before the terminal paints, and a machine
+// without a Nerd Font (or an engine that hides local fonts) keeps the platform
+// faces. Concrete names only, because an unknown keyword (like ui-monospace)
+// makes canvas font shorthand parsing reject the whole string.
+const DEFAULT_TERMINAL_TEXT_FACES =
+  '"MesloLGS Nerd Font", "MesloLGS NF", "JetBrainsMono Nerd Font", "JetBrainsMono NF", ' +
+  '"FiraCode Nerd Font", "Hack Nerd Font", "CaskaydiaCove Nerd Font", ' +
+  '"SF Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono"';
+export const DEFAULT_TERMINAL_FONT_FAMILY = `${DEFAULT_TERMINAL_TEXT_FACES}, ${TERMINAL_GLYPH_FALLBACKS}`;
 const CONTENT_PADDING = 4;
 const MIN_SCROLLBAR_THUMB_HEIGHT = 18;
 /** Half a blink cycle: the visible and hidden phases are equally long. */
@@ -104,6 +112,11 @@ export function terminalFontFamily(family?: string): string {
   if (!isMonospaceFamily(custom)) return DEFAULT_TERMINAL_FONT_FAMILY;
   // A custom face keeps the glyph fallbacks so prompt symbols stay covered.
   return uncheckedTerminalFontFamily(custom);
+}
+
+/** The text face an unset terminal font renders as on this machine, or null when unnameable. */
+export function resolveDefaultTerminalFontLabel(): string | null {
+  return resolveDefaultFamilyLabel(`${DEFAULT_TERMINAL_TEXT_FACES}, monospace`);
 }
 
 /** Load every style the renderer can request, then validate the actual face. */
@@ -542,7 +555,14 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly font?: GhosttyTerminalFont;
   /** Read after font and WASM loading. Hosts can supply a getter for the latest value. */
   readonly visible?: boolean;
+  /** Input from the user: keys, IME commits, AltGr text, pastes, mouse and wheel. */
   readonly onData: (data: string) => void;
+  /**
+   * The terminal's own replies to the program's queries (cursor position,
+   * device attributes and the like). Defaults to `onData`; a host that treats
+   * user input specially passes this to keep replies out of that path.
+   */
+  readonly onReply?: (data: string) => void;
   readonly onResize: (cols: number, rows: number) => void;
   readonly onSelectionChange: () => void;
   readonly beforeKey: (event: KeyboardEvent) => boolean;
@@ -682,7 +702,7 @@ export class GhosttyTerminalSurface {
     canvas.setAttribute("aria-hidden", "true");
 
     const input = document.createElement("textarea");
-    input.className = "t3-ghostty-input";
+    input.className = TERMINAL_INPUT_CLASS_NAME;
     input.setAttribute("aria-label", "Terminal input");
     input.autocapitalize = "off";
     input.autocomplete = "off";
@@ -728,7 +748,7 @@ export class GhosttyTerminalSurface {
       metrics.width,
       metrics.height,
       options.theme,
-      options.onData,
+      options.onReply ?? options.onData,
     );
     const surface = new GhosttyTerminalSurface(
       mount,
@@ -770,6 +790,16 @@ export class GhosttyTerminalSurface {
     this.cursorOn = true;
     this.scrollbarDirty = true;
     this.requestRender();
+  }
+
+  /**
+   * The bytes this key's press and then its release send the program under
+   * the terminal's current modes; the release is empty unless the program
+   * asked for key releases (Kitty report-event-types).
+   */
+  encodeKeyPressAndRelease(event: KeyboardEvent): string {
+    if (this.disposed) return "";
+    return this.core.encodeKey(event) + this.core.encodeKey(event, "release");
   }
 
   resetAndWrite(data: string): void {

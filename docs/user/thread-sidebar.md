@@ -135,10 +135,11 @@ already settled threads.
 ## Find the sessions that need you
 
 The sidebar lists your NeoPi sessions by what they ask of you. **Needs attention** comes
-first: sessions waiting on a question or approval, then sessions that finished since you
-last opened them (marked **Done**). **Working** sessions follow, dimmed, and **Recent**
-holds everything else. Sessions idle for longer than the auto-settle window move to the
-collapsed **Settled** shelf, which shows the newest ten and offers **Show more**.
+first and holds sessions waiting on a question or approval. **Working** sessions follow,
+dimmed, and **Recent** holds everything else, newest activity first. A session that finished
+since you last opened it stays in its place in **Recent**, marked **Done**. Sessions idle for
+longer than the auto-settle window move to the collapsed **Settled** shelf, which shows the
+newest ten and offers **Show more**.
 
 Each row shows the project folder, title, branch and, when the branch has one, its pull
 request. Hover a row or right-click it to **Settle** or **Un-settle** it; sessions that are

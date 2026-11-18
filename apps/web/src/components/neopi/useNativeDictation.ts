@@ -5,6 +5,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
+import { isTerminalInputFocused } from "../../lib/terminalFocus";
 import type { ChatComposerHandle } from "../chat/ChatComposer";
 import type {
   ComposerDictationAnchor,
@@ -133,7 +134,7 @@ export function useNativeDictation(input: {
   useEffect(() => {
     if (!capture) return;
     const cancel = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || isTerminalInputFocused()) return;
       event.preventDefault();
       event.stopPropagation();
       stop(true);

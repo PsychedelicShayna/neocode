@@ -231,9 +231,10 @@ even when its shell is quiet. Reconnect the environment before trying again.
 
 ## Command line
 
-In a native session, `ctrl+;` (`exLine.open`) opens a one-line command line along
-the bottom edge of the workspace, like Vim's `:`. It works with the right panel
-maximized or the Agent Hub open. From a focused terminal, leave it first
+In a native session, `ctrl+;` (`exLine.open`) opens a one-line command line in
+place of the status bar, like Vim's `:`, in a narrow window too. With the right
+panel maximized or the Agent Hub open, it opens along the bottom edge of the
+workspace instead. From a focused terminal, leave it first
 with `ctrl+\ ctrl+\`, then press `ctrl+;`. Type a command and press Enter to run
 it; Escape closes the line and returns the keyboard to where it was. If a command
 is unknown or cannot run right now, the line says why and stays open. Up and Down

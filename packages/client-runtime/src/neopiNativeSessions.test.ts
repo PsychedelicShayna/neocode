@@ -1596,13 +1596,18 @@ describe("observation rebase", () => {
       journal: input.journal ?? null,
     };
   };
-  /** Applies a reply to the read that sent `sent`, by default the cursor the feed holds. */
-  const step = (
-    feed: NativeSessionFeed,
-    input: Reply,
-    sent = feed.observation.cursor,
-  ): NativeSessionFeed =>
-    reduceNativeSessionFeed(feed, { type: "read", sent, result: reply(input) });
+  /** Issues a read; returns the feed with it outstanding and its id. */
+  const issue = (feed: NativeSessionFeed) => {
+    const next = reduceNativeSessionFeed(feed, { type: "read-issued" });
+    return [next, next.observation.outstanding!.readId] as const;
+  };
+  const answer = (feed: NativeSessionFeed, readId: number, input: Reply) =>
+    reduceNativeSessionFeed(feed, { type: "read", readId, result: reply(input) });
+  /** Issues one read and applies its reply. */
+  const step = (feed: NativeSessionFeed, input: Reply): NativeSessionFeed => {
+    const [issued, readId] = issue(feed);
+    return answer(issued, readId, input);
+  };
   const journalEntry = (
     id: string,
     parentId: string | null,
@@ -1927,7 +1932,7 @@ describe("observation rebase", () => {
     expect(keys(feed)).toEqual(["message:m1", "roster:a", "roster:c"]);
   });
 
-  it("changes nothing for a duplicate, stale or interleaved reply", () => {
+  it("applies only the reply to the one outstanding read", () => {
     const epoch = domain();
     let feed = step(observing(), { epoch, passId: "p0", watermark: 2 });
     feed = step(feed, {
@@ -1937,22 +1942,27 @@ describe("observation rebase", () => {
       done: false,
       entities: [roster("a", 5)],
     });
-    const beforeFinal = feed.observation.cursor;
-    // Another pass's reply answers no read this feed has open.
-    const elsewhere = beforeFinal && { ...beforeFinal, base: 99 };
-    expect(step(feed, { epoch, passId: "G", watermark: 11 }, elsewhere)).toBe(feed);
-    feed = step(feed, { epoch, passId: "F", watermark: 10, entities: [roster("b", 6)] });
+    const [issued, readId] = issue(feed);
+    // A reply to no outstanding read, or to an older one, changes nothing.
+    expect(answer(issued, readId + 1, { epoch, passId: "G", watermark: 11 })).toBe(issued);
+    expect(answer(issued, readId - 1, { epoch, passId: "G", watermark: 11 })).toBe(issued);
+    feed = answer(issued, readId, {
+      epoch,
+      passId: "F",
+      watermark: 10,
+      entities: [roster("b", 6)],
+    });
     expect(keys(feed)).toEqual(["roster:a", "roster:b"]);
-    // The final reply delivered again must not count only `b` and delete `a`.
-    const duplicate = step(
-      feed,
-      { epoch, passId: "F", watermark: 10, entities: [roster("b", 6)] },
-      beforeFinal,
-    );
-    expect(duplicate).toBe(feed);
+    // A competing or repeated reply to that same read, after it applied, changes nothing.
+    expect(answer(feed, readId, { epoch, passId: "F", watermark: 10 })).toBe(feed);
+    expect(answer(feed, readId, { epoch, passId: "H", watermark: 12 })).toBe(feed);
   });
 
-  it("does not let a late reply from a retired domain undo a rebase", () => {
+  it.each([
+    { type: "reconnecting" as const, reason: "owner exited" },
+    { type: "closed" as const, reason: "gone", code: "owner_exited" },
+    { type: "disconnected" as const },
+  ])("drops the read outstanding when the owner or lease ends ($type)", (lifecycle) => {
     const retired = domain();
     let feed = step(observing(), {
       epoch: retired,
@@ -1960,17 +1970,43 @@ describe("observation rebase", () => {
       watermark: 4,
       entities: [roster("a", 4)],
     });
-    const retiredCursor = feed.observation.cursor;
-    feed = step(feed, {
+    const held = feed.observation.cursor;
+    const [issued, stale] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, lifecycle);
+    const ended = feed;
+    // The old owner's reply arrives late, sent with the cursor still held.
+    expect(answer(feed, stale, { epoch: retired, passId: "p2", watermark: 9 })).toBe(ended);
+    expect(feed.observation.cursor).toBe(held);
+    const [again, readId] = issue(feed);
+    feed = answer(again, readId, {
       epoch: domain({ ownerEpoch: 2 }),
       passId: "q",
       watermark: 3,
       entities: [roster("a", 2), message("n", 3, null, "successor")],
     });
-    const rebased = feed;
-    expect(step(feed, { epoch: retired, passId: "p2", watermark: 9 }, retiredCursor)).toBe(rebased);
-    expect(rebased.observation.cursor?.epoch.ownerEpoch).toBe(2);
-    expect(contents(rebased)).toEqual(["successor"]);
+    expect(feed.observation.cursor?.epoch.ownerEpoch).toBe(2);
+    expect(contents(feed)).toEqual(["successor"]);
+  });
+
+  it("removes a key absent from a promoted full pass at exactly its watermark", () => {
+    const epoch = domain();
+    let feed = step(observing(), { epoch, passId: "p0", watermark: 10 });
+    feed = step(feed, {
+      epoch,
+      passId: "inc",
+      kind: "incremental",
+      watermark: 14,
+      done: false,
+      entities: [roster("a", 14)],
+    });
+    // Promoted at 14; `a` is deleted before the scan reaches it, so the pass omits it.
+    const [issued, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, {
+      type: "read",
+      readId,
+      result: { ...reply({ epoch, passId: "full", watermark: 14 }), promoted: true },
+    });
+    expect(keys(feed)).toEqual([]);
   });
 
   it("never resurrects a removed key from an older revision", () => {
@@ -1982,7 +2018,8 @@ describe("observation rebase", () => {
       watermark: 4,
       entities: [roster("a", 4)],
     });
-    const first = feed.observation.cursor;
+    const [replayed, firstRead] = issue(feed);
+    feed = answer(replayed, firstRead, { ...incremental, passId: "p0", watermark: 4 });
     feed = step(feed, {
       ...incremental,
       passId: "p2",
@@ -1992,7 +2029,7 @@ describe("observation rebase", () => {
     });
     expect(keys(feed)).toEqual([]);
     const replay = { ...incremental, passId: "p1", watermark: 4, entities: [roster("a", 4)] };
-    expect(step(feed, replay, first)).toBe(feed);
+    expect(answer(feed, firstRead, replay)).toBe(feed);
     // An older value later in the same pass stays behind its tombstone.
     feed = step(feed, { ...incremental, passId: "p2", watermark: 8, entities: [roster("a", 4)] });
     expect(keys(feed)).toEqual([]);
@@ -2055,44 +2092,52 @@ describe("observation rebase", () => {
     expect(feed.conversation.persisted.size).toBe(0);
   });
 
-  it("loses a known row only when a navigation dropped the branch its entry was on", () => {
-    let feed = step(observing(), {
-      epoch: domain(),
-      passId: "p1",
-      watermark: 3,
-      journal: horizon(chain(["u", "x"], null)),
-      entities: [message("m", 3, "y", "abandoned reply")],
-    });
-    const navigated = domain({ branchGeneration: 2 });
-    feed = step(feed, {
-      epoch: navigated,
-      passId: "q",
-      watermark: 6,
-      done: false,
-      journal: horizon(chain(["u", "z"], null)),
-    });
-    // Absence from a partial reply deletes nothing.
-    expect(contents(feed)).toEqual(["abandoned reply"]);
-    feed = step(feed, { epoch: navigated, passId: "q", watermark: 6 });
-    expect(feed.conversation.pending).toEqual([]);
-    expect(feed.conversation.losses).toEqual([{ messageId: "m", afterEntryId: "z" }]);
-  });
+  it.each([
+    { dropped: true, loaded: ["u", "x"] },
+    { dropped: false, loaded: ["u"] },
+  ])(
+    "loses a row waiting for an unloaded entry when a navigation's full pass ends (dropped history: $dropped)",
+    ({ loaded }) => {
+      let feed = step(observing(), {
+        epoch: domain(),
+        passId: "p1",
+        watermark: 3,
+        journal: horizon(chain(loaded, null)),
+        entities: [message("m", 3, "y", "abandoned reply")],
+      });
+      // Waiting on the same branch is indefinite: `y` may be in a range not loaded.
+      feed = step(feed, { epoch: domain(), passId: "p2", watermark: 4 });
+      expect(contents(feed)).toEqual(["abandoned reply"]);
+      const navigated = domain({ branchGeneration: 2 });
+      feed = step(feed, {
+        epoch: navigated,
+        passId: "q",
+        watermark: 6,
+        done: false,
+        journal: horizon(chain(["u", "z"], null)),
+      });
+      // Absence from a partial reply deletes nothing.
+      expect(contents(feed)).toEqual(["abandoned reply"]);
+      feed = step(feed, { epoch: navigated, passId: "q", watermark: 6 });
+      expect(feed.conversation.pending).toEqual([]);
+      expect(feed.conversation.losses).toEqual([{ messageId: "m", afterEntryId: "z" }]);
+    },
+  );
 
   it("keeps a body whose durable entry is known but not loaded across an owner change", () => {
-    let feed = step(observing(), {
-      epoch: domain(),
-      passId: "p1",
-      watermark: 3,
-      journal: horizon([journalEntry("u", null)]),
-      entities: [message("m", 3, "E", "saved body")],
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "command_output", text: "after the saved body" },
-    });
+    const start = reduceNativeSessionFeed(
+      step(observing(), {
+        epoch: domain(),
+        passId: "p1",
+        watermark: 3,
+        journal: horizon([journalEntry("u", null)]),
+        entities: [message("m", 3, "E", "saved body")],
+      }),
+      { type: "event", frame: { type: "command_output", text: "after the saved body" } },
+    );
     const successor = domain({ ownerEpoch: 2, projectionIncarnation: 2 });
     // The successor's own `m` is a different message.
-    feed = step(feed, {
+    let feed = step(start, {
       epoch: successor,
       passId: "q",
       watermark: 2,
@@ -2102,18 +2147,22 @@ describe("observation rebase", () => {
     });
     expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
     expect(feed.conversation.losses).toEqual([]);
-    // The pass completes without the old row: it is identified, so it waits for `E`.
-    feed = step(feed, { epoch: successor, passId: "q", watermark: 2 });
-    expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
-    feed = step(feed, {
+    const partial = feed;
+    // `E` joins before the pass ends: the row retires onto it with its output.
+    feed = step(partial, {
       epoch: successor,
-      passId: "r",
-      kind: "incremental",
-      watermark: 5,
+      passId: "q",
+      watermark: 2,
       journal: horizon([journalEntry("u", null), journalEntry("E", "u", "saved body")]),
     });
     expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
     expect(ids(feed)).toEqual(["u", "E"]);
+    expect(feed.conversation.losses).toEqual([]);
+    // The successor's full pass ends without `E`: continuity across owners is not
+    // established, so the row is a continuity loss at the nearest durable entry.
+    feed = step(partial, { epoch: successor, passId: "q", watermark: 2 });
+    expect(transcript(feed)).toEqual(["u", "command", "successor body"]);
+    expect(feed.conversation.losses).toEqual([{ messageId: "durable:E", afterEntryId: "u" }]);
   });
 
   it("keeps a row retired by its durable entry until that entry is held", () => {

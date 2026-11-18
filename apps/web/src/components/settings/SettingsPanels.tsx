@@ -1466,14 +1466,12 @@ function useFontDefaultFamilies() {
     () => ({
       sans: resolveDefaultFamilyLabel(DEFAULT_SANS_FONT_STACK) ?? "System default",
       code: resolveDefaultFamilyLabel(DEFAULT_CODE_FONT_STACK) ?? "System monospace",
-      terminal: resolveDefaultTerminalFontLabel() ?? "System monospace",
     }),
     [],
   );
   return {
     sans: defaults.sans,
     code: defaults.code,
-    terminal: defaults.terminal,
     // The composer inherits whatever the interface preference resolves to.
     interfaceFamily: settings.fontFamilySans.trim() || defaults.sans,
   };
@@ -1585,12 +1583,13 @@ function CodeFontRow({
 function TerminalFontRow() {
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
-  const defaults = useFontDefaultFamilies();
+  // Probed here, not in useFontDefaultFamilies: no other row shows it.
+  const defaultFamily = useMemo(() => resolveDefaultTerminalFontLabel() ?? "System monospace", []);
   return (
     <FontFamilySettingsRow
       {...searchableSetting("terminal-font")}
       description="Terminal output, independent from code blocks and diffs."
-      defaultFamily={defaults.terminal}
+      defaultFamily={defaultFamily}
       defaultValue={DEFAULT_UNIFIED_SETTINGS.fontFamilyTerminal}
       value={settings.fontFamilyTerminal}
       onValueChange={(fontFamilyTerminal) => updateSettings({ fontFamilyTerminal })}

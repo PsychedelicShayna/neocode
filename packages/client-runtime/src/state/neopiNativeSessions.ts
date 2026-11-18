@@ -438,7 +438,7 @@ export function createNativeSessionAtoms<R, E>(
         : concealed(nativeSessionKey(target)),
     /**
      * Adds `items` to what the session's views need (C4 demand) until the
-     * returned release runs: a child view holds `child(id, runToken)` while open.
+     * returned release runs: a child view holds `child(id, runToken?)` while open.
      * Holds compose; a live lease sends the union at once under a new generation.
      */
     holdDemand: (target: NativeSessionTarget, items: readonly NeoPiNativeDemandItem[]) => {

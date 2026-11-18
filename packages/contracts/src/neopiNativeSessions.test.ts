@@ -111,7 +111,7 @@ describe("native observation wire", () => {
     );
   });
 
-  it("requires a run token on child demand", () => {
+  it("takes child demand with or without the child's run token, never without its id", () => {
     const decode = Schema.decodeUnknownOption(NeoPiNativeSessionsSetDemandInput);
     const base = { leaseId: "lease-1", generation: 1 };
     assert.equal(
@@ -121,7 +121,9 @@ describe("native observation wire", () => {
       })._tag,
       "Some",
     );
-    assert.equal(decode({ ...base, demand: [{ kind: "child", childId: "c" }] })._tag, "None");
+    // A child known only from the live inventory has no run token yet.
+    assert.equal(decode({ ...base, demand: [{ kind: "child", childId: "c" }] })._tag, "Some");
+    assert.equal(decode({ ...base, demand: [{ kind: "child", runToken: "r" }] })._tag, "None");
   });
 
   it("decodes essential envelopes and refuses raw native frames", () => {

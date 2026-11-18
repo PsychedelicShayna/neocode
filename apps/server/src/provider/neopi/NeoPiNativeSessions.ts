@@ -2454,7 +2454,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       // Demand is a set: order does not make it different.
       const payload = input.demand
         .map((item) =>
-          item.kind === "child" ? `child\0${item.childId}\0${item.runToken}` : item.kind,
+          item.kind === "child" ? `child\0${item.childId}\0${item.runToken ?? ""}` : item.kind,
         )
         .toSorted()
         .join("\n");

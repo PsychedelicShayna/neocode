@@ -35,6 +35,7 @@ import {
   type ThemeDefinition,
 } from "../../themePalette";
 import { cn } from "../../lib/utils";
+import { isTerminalInputFocused } from "../../lib/terminalFocus";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Switch } from "../ui/switch";
@@ -694,7 +695,7 @@ export function ThemeEditorPanel({
       shouldDisarmAfterClick = false;
     };
     const cancelInspection = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || isTerminalInputFocused()) return;
       event.preventDefault();
       clearHover();
       clearInspectorSelection();

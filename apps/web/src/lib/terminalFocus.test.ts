@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { getTerminalFocusOwner, isTerminalFocused } from "./terminalFocus";
+import {
+  getTerminalFocusOwner,
+  isTerminalFocused,
+  isTerminalInputFocused,
+  TERMINAL_INPUT_CLASS_NAME,
+} from "./terminalFocus";
 
 class MockHTMLElement {
   isConnected = false;
@@ -77,5 +82,40 @@ describe("isTerminalFocused", () => {
 
     expect(getTerminalFocusOwner()).toBe("right-panel");
     expect(isTerminalFocused()).toBe(true);
+  });
+});
+
+describe("isTerminalInputFocused", () => {
+  function focus(options: { className: string; connected: boolean; owner: string | null }) {
+    const element = new MockHTMLElement();
+    element.className = options.className;
+    element.isConnected = options.connected;
+    element.terminalOwner = options.owner;
+    if (options.owner !== null) element.dataset.terminalOwner = options.owner;
+    globalThis.HTMLElement = MockHTMLElement as unknown as typeof HTMLElement;
+    globalThis.document = { activeElement: element } as unknown as Document;
+  }
+
+  it("is true only for a connected terminal input inside a terminal owner", () => {
+    focus({ className: TERMINAL_INPUT_CLASS_NAME, connected: true, owner: "drawer" });
+    expect(isTerminalInputFocused()).toBe(true);
+  });
+
+  it("is false for a terminal's toolbar, which keeps GUI keys", () => {
+    focus({ className: "terminal-sidebar-button", connected: true, owner: "right-panel" });
+    expect(isTerminalFocused()).toBe(true);
+    expect(isTerminalInputFocused()).toBe(false);
+  });
+
+  it("is false for a detached or ownerless terminal input", () => {
+    focus({ className: TERMINAL_INPUT_CLASS_NAME, connected: false, owner: "drawer" });
+    expect(isTerminalInputFocused()).toBe(false);
+    focus({ className: TERMINAL_INPUT_CLASS_NAME, connected: true, owner: null });
+    expect(isTerminalInputFocused()).toBe(false);
+  });
+
+  it("is false without a document", () => {
+    delete (globalThis as { document?: Document }).document;
+    expect(isTerminalInputFocused()).toBe(false);
   });
 });

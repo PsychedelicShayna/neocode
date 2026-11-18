@@ -4,6 +4,7 @@ import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitation
 
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { cn } from "~/lib/utils";
+import { isTerminalInputFocused } from "~/lib/terminalFocus";
 import { type PromptStashEntry } from "../../promptStashStore";
 import { ComposerBanner } from "./ComposerBanner";
 
@@ -66,6 +67,7 @@ export const ComposerStashMenu = memo(function ComposerStashMenu(props: {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (isTerminalInputFocused()) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();

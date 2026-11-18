@@ -1,8 +1,13 @@
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { CheckIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { queryInstalledFontFamilies } from "../../appearanceFonts";
-import { filterInstalledMonospaceFonts } from "../../installedMonospaceFonts";
+import {
+  hasUnclassifiedFonts,
+  knownMonospaceFonts,
+  scanInstalledMonospaceFonts,
+} from "../../installedMonospaceFonts";
+import { cn } from "../../lib/utils";
 import {
   Combobox,
   ComboboxEmpty,
@@ -124,51 +129,86 @@ export function FontFamilyPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [monospaceScan, setMonospaceScan] = useState<{
+    source: readonly string[];
+    families: readonly string[];
+    done: boolean;
+  } | null>(null);
+  // Decided once per open: whether this open starts with fonts left to
+  // measure. Such an open keeps the list at its full height and reserves the
+  // status line for its whole duration, so arriving rows and the end of the
+  // scan never resize the popup, flip it to the other side, or move rows.
+  const [scanningOpen, setScanningOpen] = useState(false);
+  const listRef = useRef<LegendListRef | null>(null);
+  const enumeration = useFontEnumeration();
+  // Opening sets the starting list in the same update as the popup, so its
+  // first frame already shows the sorted known families and the scan only
+  // appends below them.
+  const openPicker = () => {
+    setOpen(true);
+    if (requireMonospace && enumeration.status === "granted") {
+      const source = enumeration.families;
+      const scanning = hasUnclassifiedFonts(source);
+      setScanningOpen(scanning);
+      setMonospaceScan({
+        source,
+        families: knownMonospaceFonts(source, selectedFamily),
+        done: !scanning,
+      });
+    } else {
+      setScanningOpen(false);
+    }
+  };
   // Open after mount rather than mounting open: a popup that first renders in
   // its open state never receives Base UI's entrance style baseline, so the
   // exit transition on close has no style delta, never fires transitionend,
   // and the popup lingers on screen forever.
   useEffect(() => {
-    if (initialOpen) setOpen(true);
+    if (initialOpen) openPicker();
     // The prop is only meaningful at mount - the control just swapped in
     // under an active focus - so later changes are deliberately ignored.
   }, []);
-  const listRef = useRef<LegendListRef | null>(null);
-  const enumeration = useFontEnumeration();
 
   const handleOpenChange = (nextOpen: boolean) => {
-    setOpen(nextOpen);
-    if (nextOpen) setQuery("");
+    if (!nextOpen) {
+      setOpen(false);
+      return;
+    }
+    openPicker();
+    setQuery("");
   };
 
-  const [monospaceResult, setMonospaceResult] = useState<{
-    source: readonly string[];
-    families: readonly string[];
-  } | null>(null);
+  const readSavedFamily = useEffectEvent(() => selectedFamily);
   useEffect(() => {
     // A closed picker must not measure every installed face during the
     // Appearance mount. Stop scanning when it closes or the page unmounts.
+    // Every open rescans from the cache; the scan's first report repeats the
+    // seeded list, and later reports only append to it.
     if (!open || !requireMonospace || enumeration.status !== "granted") return;
     const source = enumeration.families;
-    if (monospaceResult?.source === source) return;
     const controller = new AbortController();
-    void filterInstalledMonospaceFonts(source, controller.signal).then((families) => {
-      if (!controller.signal.aborted) setMonospaceResult({ source, families });
+    void scanInstalledMonospaceFonts(source, controller.signal, {
+      saved: readSavedFamily(),
+      onProgress: (families) => {
+        if (!controller.signal.aborted) setMonospaceScan({ source, families, done: false });
+      },
+    }).then((families) => {
+      if (!controller.signal.aborted) setMonospaceScan({ source, families, done: true });
     });
     return () => controller.abort();
-  }, [open, requireMonospace, enumeration, monospaceResult]);
+  }, [open, requireMonospace, enumeration]);
 
+  const currentScan =
+    enumeration.status === "granted" && monospaceScan?.source === enumeration.families
+      ? monospaceScan
+      : null;
   const loadingMonospace =
-    requireMonospace &&
-    enumeration.status === "granted" &&
-    monospaceResult?.source !== enumeration.families;
+    requireMonospace && enumeration.status === "granted" && currentScan?.done !== true;
   const families =
     enumeration.status !== "granted"
       ? EMPTY_FONT_FAMILIES
       : requireMonospace
-        ? monospaceResult?.source === enumeration.families
-          ? monospaceResult.families
-          : EMPTY_FONT_FAMILIES
+        ? (currentScan?.families ?? EMPTY_FONT_FAMILIES)
         : enumeration.families;
 
   const items = useMemo(() => {
@@ -239,13 +279,18 @@ export function FontFamilyPicker({
           onChange={(event) => setQuery(event.target.value)}
         />
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {loadingMonospace ? (
-            <div role="status" className="px-3 py-2 text-sm text-muted-foreground">
+          {scanningOpen ? (
+            <div
+              role="status"
+              className={cn(
+                "px-3 py-2 text-sm text-muted-foreground",
+                !loadingMonospace && "invisible",
+              )}
+            >
               Finding monospace fonts…
             </div>
-          ) : (
-            <ComboboxEmpty>No fonts found.</ComboboxEmpty>
-          )}
+          ) : null}
+          <ComboboxEmpty>No fonts found.</ComboboxEmpty>
           <div className="relative min-h-0 max-h-72 w-full flex-1 overflow-hidden">
             <ComboboxListVirtualized>
               <LegendList<string>
@@ -255,7 +300,7 @@ export function FontFamilyPicker({
                 renderItem={({ item, index }) => renderItem(item, index)}
                 estimatedItemSize={30}
                 drawDistance={360}
-                style={{ height: Math.min(items.length * 30, 288) }}
+                style={{ height: scanningOpen ? 288 : Math.min(items.length * 30, 288) }}
               />
             </ComboboxListVirtualized>
           </div>

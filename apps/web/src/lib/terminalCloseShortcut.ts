@@ -1,6 +1,6 @@
 import type { ResolvedKeybindingsConfig } from "@t3tools/contracts";
 
-import { isTerminalCloseShortcut, type ShortcutEventLike } from "../keybindings";
+import { resolveShortcutCommand, type ShortcutEventLike } from "../keybindings";
 
 export interface TerminalCloseShortcutEvent extends ShortcutEventLike {
   readonly repeat?: boolean;
@@ -19,7 +19,12 @@ export function preventTerminalCloseShortcut(
   keybindings: ResolvedKeybindingsConfig,
   platform?: string,
 ): boolean {
-  if (!isTerminalCloseShortcut(event, keybindings, terminalCloseShortcutOptions(platform))) {
+  const command = resolveShortcutCommand(
+    event,
+    keybindings,
+    terminalCloseShortcutOptions(platform),
+  );
+  if (command !== "terminal.close") {
     return false;
   }
   event.preventDefault();

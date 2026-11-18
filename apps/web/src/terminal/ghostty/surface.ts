@@ -1,4 +1,5 @@
 import { isMacPlatform } from "../../lib/utils";
+import { TERMINAL_INPUT_CLASS_NAME } from "../../lib/terminalFocus";
 import { SELECTION_MULTI_CLICK_INTERVAL_MS } from "../../lib/selectionActions";
 import { collectWrappedTerminalLinkLine, extractTerminalLinks } from "../../terminal-links";
 import {
@@ -682,7 +683,7 @@ export class GhosttyTerminalSurface {
     canvas.setAttribute("aria-hidden", "true");
 
     const input = document.createElement("textarea");
-    input.className = "t3-ghostty-input";
+    input.className = TERMINAL_INPUT_CLASS_NAME;
     input.setAttribute("aria-label", "Terminal input");
     input.autocapitalize = "off";
     input.autocomplete = "off";

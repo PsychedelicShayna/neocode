@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
+import { isTerminalInputFocused } from "./lib/terminalFocus";
 
 export interface ShortcutEventLike {
   getModifierState?: (key: "AltGraph") => boolean;
@@ -224,20 +225,17 @@ function findEffectiveShortcutForCommand(
   return null;
 }
 
-function matchesCommandShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  command: KeybindingCommand,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return resolveShortcutCommand(event, keybindings, options) === command;
-}
-
+/**
+ * The command bound to this keypress, or null. A focused terminal takes every
+ * key for the program running in it, so nothing resolves while it has focus;
+ * this is read from the page, whatever the caller's context claims.
+ */
 export function resolveShortcutCommand(
   event: ShortcutEventLike,
   keybindings: ResolvedKeybindingsConfig,
   options?: ShortcutMatchOptions,
 ): KeybindingCommand | null {
+  if (isTerminalInputFocused()) return null;
   const platform = resolvePlatform(options);
   const context = resolveContext(options);
 
@@ -357,54 +355,6 @@ export function modelPickerJumpIndexFromCommand(command: string): number | null 
     command as ModelPickerJumpKeybindingCommand,
   );
   return index === -1 ? null : index;
-}
-
-export function isTerminalToggleShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.toggle", options);
-}
-
-export function isTerminalSplitShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.split", options);
-}
-
-export function isTerminalSplitVerticalShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.splitVertical", options);
-}
-
-export function isTerminalNewShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.new", options);
-}
-
-export function isTerminalCloseShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.close", options);
-}
-
-export function isDiffToggleShortcut(
-  event: ShortcutEventLike,
-  keybindings: ResolvedKeybindingsConfig,
-  options?: ShortcutMatchOptions,
-): boolean {
-  return matchesCommandShortcut(event, keybindings, "diff.toggle", options);
 }
 
 /**

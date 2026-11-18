@@ -1076,6 +1076,49 @@ describe("observation rebase", () => {
     expect(transcript(feed)).toEqual(["u", "reply"]);
   });
 
+  // Shaped on acc primary-stall-detailed-wire.json (reads 3, 5..58, 59, 60): long
+  // assistant messages streamed live, then a rebuilt full pass whose journal
+  // slice, capped by the reply budget, holds only the newest entries.
+  it("retires rows joined to entries older than the loaded history instead of leaving them live", () => {
+    const streaming = domain({ buildAttempt: 2, branchGeneration: 1 });
+    let feed = step(observing(), {
+      epoch: streaming,
+      passId: "full:42:11",
+      watermark: 42,
+      journal: horizon(chain(["u"], null)),
+      entities: [message("m0", 42, null, "loop 0 block 799")],
+    });
+    feed = step(feed, {
+      epoch: streaming,
+      passId: "incremental:44:12",
+      kind: "incremental",
+      watermark: 44,
+      entities: [message("m1", 44, null, "loop 1 block 10")],
+    });
+    // Read 59: parked, then `building`.
+    const [waiting, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(waiting, { type: "read", readId, result: { type: "building" } });
+    // Read 60: the loop's entries are durable; both rows are joined to entries
+    // older than the slice, which ends at the leaf.
+    feed = step(feed, {
+      epoch: domain({ buildAttempt: 3, branchGeneration: 10 }),
+      passId: "full:9720:22",
+      watermark: 9720,
+      journal: horizon(chain(["tr1", "a2", "tr2", "a3"], "a1"), "before-tr1"),
+      tombstones: [
+        { key: "message:m0", ordinal: 1, revision: 9700, joinEntryId: "a0" },
+        { key: "message:m1", ordinal: 2, revision: 9701, joinEntryId: "a1" },
+      ],
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toEqual([]);
+    expect(transcript(feed)).toEqual(["tr1", "a2", "tr2", "a3"]);
+    expect(feed.conversation.cursor).toBe("before-tr1");
+    // Their content is in the older range, loaded on demand.
+    feed = older(feed, chain(["u2", "a0", "tr0", "a1"], "u"));
+    expect(transcript(feed)).toEqual(["u2", "a0", "tr0", "a1", "tr1", "a2", "tr2", "a3"]);
+  });
+
   it("keeps inbox gaps exact: what this view missed, once, in order", () => {
     const epoch = domain();
     const notice = (seq: number): NeoPiNativeInboxRecord => ({

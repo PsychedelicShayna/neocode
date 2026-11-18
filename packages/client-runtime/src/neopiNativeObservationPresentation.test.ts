@@ -2,13 +2,21 @@ import type { NeoPiJournalEntry } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  emptyNativeConversation,
+  reduceNativeConversation,
+  type NativeConversation,
+} from "./neopiConversation.ts";
+import {
   emptyNativeSessionFeed,
   nativeInboxLossWarnings,
   nativeObservationNotice,
+  nativeRowKeys,
   nativeTranscriptRows,
   type NativeObserverPhase,
   type NativeInboxItem,
+  type NativeTranscriptRow,
 } from "./neopiNativeSessions.ts";
+import { createTranscriptProjector } from "./neopiTranscript.ts";
 
 const message = {
   role: "assistant",
@@ -124,6 +132,138 @@ describe("mobile tool disclosure identity", () => {
     );
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map((row) => row.id)).size).toBe(2);
+  });
+});
+
+describe("a message keeps its row key when it persists", () => {
+  const identity = { sessionId: "s1", sessionFile: "/s1.jsonl", leafId: null };
+  const at = "2026-11-18T00:00:00Z";
+  const durable = (id: string, parentId: string | null, message: unknown): NeoPiJournalEntry => ({
+    id,
+    parentId,
+    type: "message",
+    timestamp: at,
+    message,
+  });
+  const reply = (n: number, withCall: boolean) => ({
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: `planning ${n}` },
+      { type: "text", text: `reply ${n}` },
+      ...(withCall ? [{ type: "toolCall", id: `call-${n}`, name: "read", arguments: {} }] : []),
+    ],
+    stopReason: withCall ? "toolUse" : "stop",
+  });
+  const result = (n: number) => ({
+    role: "toolResult",
+    toolCallId: `call-${n}`,
+    toolName: "read",
+    content: [{ type: "text", text: "ok" }],
+  });
+
+  /** Drives a turn through the reducer; `views` sees every state a view renders. */
+  function turn(withCall: boolean, view: (conversation: NativeConversation) => void) {
+    let c = reduceNativeConversation(emptyNativeConversation(), { type: "identity", identity });
+    const append = (entry: NeoPiJournalEntry) => {
+      c = reduceNativeConversation(c, {
+        type: "entry",
+        identity: { ...identity, leafId: entry.id },
+        entry,
+      });
+    };
+    append(durable("u1", null, { role: "user", content: "go" }));
+    let parent = "u1";
+    for (const n of [1, 2]) {
+      c = reduceNativeConversation(c, {
+        type: "message",
+        messageId: `m${n}`,
+        message: reply(n, withCall),
+      });
+      view(c);
+      // Native announces the persistence id with or after the entry; both orders occur.
+      if (n === 1) {
+        c = reduceNativeConversation(c, {
+          type: "persisted",
+          identity: c.identity!,
+          messageId: "m1",
+          entryId: "a1",
+        });
+        append(durable("a1", parent, reply(1, withCall)));
+      } else {
+        // One observation read applies both before the view renders.
+        append(durable("a2", parent, reply(2, withCall)));
+        c = reduceNativeConversation(c, {
+          type: "persisted",
+          identity: c.identity!,
+          messageId: "m2",
+          entryId: "a2",
+        });
+      }
+      parent = `a${n}`;
+      view(c);
+      if (withCall) {
+        append(durable(`r${n}`, parent, result(n)));
+        parent = `r${n}`;
+        view(c);
+      }
+    }
+    // A rebase: the same branch read again as fresh objects.
+    c = reduceNativeConversation(c, {
+      type: "horizon",
+      identity: c.identity!,
+      entries: c.entries.map((entry) => ({ ...entry })),
+      nextCursor: undefined,
+      continuous: true,
+    });
+    view(c);
+  }
+
+  it.each([false, true])("web rows (tool calls: %s)", (withCall) => {
+    const project = createTranscriptProjector();
+    let rowKeys: ReadonlyMap<string, string> = new Map();
+    const seen: string[][] = [];
+    turn(withCall, (c) => {
+      rowKeys = nativeRowKeys(c, rowKeys);
+      seen.push(
+        project(
+          { entries: c.entries, pending: c.pending, leafId: c.identity?.leafId ?? null },
+          {
+            debug: false,
+            rowKeys,
+          },
+        ).map((row) => row.id),
+      );
+    });
+    // Each key, once shown, stays in every later list, in the same order and once.
+    for (const [index, ids] of seen.entries()) {
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const later of seen.slice(index + 1)) {
+        const kept = later.filter((id) => ids.includes(id));
+        expect(kept).toEqual(ids);
+      }
+    }
+    expect(seen.at(-1)).toEqual(seen.at(-2));
+  });
+
+  it.each([false, true])("mobile rows (tool calls: %s)", (withCall) => {
+    let previous: readonly NativeTranscriptRow[] = [];
+    const seen: string[][] = [];
+    turn(withCall, (conversation) => {
+      previous = nativeTranscriptRows(
+        { ...emptyNativeSessionFeed(), conversation },
+        false,
+        previous,
+      );
+      seen.push(previous.map((row) => row.id));
+    });
+    for (const [index, ids] of seen.entries()) {
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const later of seen.slice(index + 1)) {
+        const kept = later.filter((id) => ids.includes(id));
+        expect(kept).toEqual(ids);
+      }
+    }
+    expect(seen.at(-1)).toEqual(seen.at(-2));
   });
 });
 

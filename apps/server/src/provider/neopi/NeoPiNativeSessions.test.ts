@@ -5,7 +5,11 @@ import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
   type NeoPiNativeSessionRef,
-  type NeoPiNativeSessionsStreamEvent,
+  type NeoPiNativeCursor,
+  type NeoPiNativeEntity,
+  type NeoPiNativeEssentialEnvelope,
+  type NeoPiNativeInboxRecord,
+  type NeoPiNativeObservedJournalEntry,
 } from "@t3tools/contracts";
 import type { ProcessExit, SessionEventFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
@@ -79,6 +83,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       pageHook: Effect.void as Effect.Effect<void>,
       disposeHook: Effect.void as Effect.Effect<void>,
       afterPageHook: Effect.void as Effect.Effect<void>,
+      /** Runs before a `get_state` reply is returned. */
+      stateHook: Effect.void as Effect.Effect<void>,
+      /** Runs after the snapshot marker is written and before the snapshot reply returns. */
+      snapshotHook: Effect.void as Effect.Effect<void>,
       publish: (_frame: SessionEventFrame): Effect.Effect<void> => Effect.void,
     };
     const state = () => ({
@@ -121,7 +129,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       preparePrompt: (input) =>
         prepareNeoPiNativePrompt(input, "/unused").pipe(Effect.provide(NodeFileSystem.layer)),
       catalog: () => Effect.succeed([]),
-      connect: (_profile, input, publish, mode) =>
+      connect: (_profile, input, observer, mode) =>
         Effect.gen(function* () {
           if (native.connections !== 0)
             return yield* new NeoPiNativeSessionsError({
@@ -138,6 +146,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
           native.connections++;
           native.running = true;
           native.sessionFile = input.sessionFile ?? "/native/lazy-created.jsonl";
+          // The real transport calls the observer synchronously from its parser.
+          const publish = (frame: SessionEventFrame) => Effect.sync(() => observer.frame(frame));
           native.publish = publish;
           const exit = yield* Deferred.make<ProcessExit>();
           native.exit = exit;
@@ -182,6 +192,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                   case "snapshot_session_journal": {
                     yield* publish({ type: "journal_state", reason: "snapshot", ...identity() });
                     if (native.blockSnapshot) yield* Deferred.await(snapshotReleased);
+                    yield* native.snapshotHook;
                     return identity();
                   }
                   case "get_entries_page": {
@@ -259,7 +270,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
             client,
             attachment: connectionAttachment,
             cwd: "/workspace-free",
-            readState: Effect.sync(state),
+            readState: Effect.suspend(() => native.stateHook).pipe(
+              Effect.andThen(Effect.sync(state)),
+            ),
           };
         }),
     };
@@ -267,16 +280,86 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
     return { native, service, dependencies, profileChanges, disconnected };
   });
 
-const snapshot = (
-  service: Effect.Success<ReturnType<typeof makeNeoPiNativeSessionsWith>>,
-  ref: NeoPiNativeSessionRef,
-) =>
-  Stream.runCollect(
-    service.watch({ ref }).pipe(
-      Stream.filter((event) => event.type === "snapshot"),
-      Stream.take(1),
+type Service = Effect.Success<ReturnType<typeof makeNeoPiNativeSessionsWith>>;
+type Envelope = NeoPiNativeEssentialEnvelope;
+
+/**
+ * Follows one lease the way the client does: each envelope is applied and its
+ * credit returned at once, and bulk state is read by cursor. Tests wait on
+ * envelopes in order, never on time.
+ */
+const follow = Effect.fnUntraced(function* (service: Service, ref: NeoPiNativeSessionRef) {
+  // `ended` marks the watch stream finishing, so a test waiting on an envelope fails instead of hanging.
+  const envelopes = yield* Queue.unbounded<Envelope | { readonly type: "ended" }>();
+  const leased = yield* Deferred.make<string>();
+  let applied = 0;
+  /** Every envelope delivered so far, in order. */
+  const seen: Envelope[] = [];
+  const fiber = yield* service.watch({ ref }).pipe(
+    Stream.runForEach((envelope) =>
+      Effect.gen(function* () {
+        if (envelope.type === "leased") yield* Deferred.succeed(leased, envelope.leaseId);
+        applied++;
+        seen.push(envelope);
+        yield* Queue.offer(envelopes, envelope);
+        yield* service.credit({ leaseId: yield* Deferred.await(leased), applied });
+      }),
     ),
+    Effect.ensuring(Queue.offer(envelopes, { type: "ended" })),
+    Effect.forkScoped,
   );
+  const leaseId = yield* Deferred.await(leased);
+  let readId = 0;
+  const next = Effect.fnUntraced(function* <Type extends Envelope["type"]>(
+    type: Type,
+    accept: (envelope: Extract<Envelope, { type: Type }>) => boolean = () => true,
+  ) {
+    while (true) {
+      const envelope = yield* Queue.take(envelopes);
+      if (envelope.type === "ended")
+        return yield* Effect.die(new Error(`The watch ended before a ${type} envelope.`));
+      if (envelope.type === type && accept(envelope as Extract<Envelope, { type: Type }>))
+        return envelope as Extract<Envelope, { type: Type }>;
+    }
+  });
+  const read = (cursor: NeoPiNativeCursor | null) =>
+    service.read({ leaseId, readId: readId++, cursor });
+  /** Reads until one pass completes; returns what it delivered and the cursor after it. */
+  const pass = Effect.fnUntraced(function* (from: NeoPiNativeCursor | null = null) {
+    const entities = new Map<string, NeoPiNativeEntity["value"]>();
+    const removed = new Set<string>();
+    const entries: NeoPiNativeObservedJournalEntry[] = [];
+    const inbox: NeoPiNativeInboxRecord[] = [];
+    let cursor = from;
+    while (true) {
+      const reply = yield* read(cursor);
+      if (reply.type === "unchanged")
+        return { entities, removed, entries, inbox, cursor, unchanged: true };
+      if (reply.type === "building") continue;
+      for (const entity of reply.entities) {
+        entities.set(entity.key, entity.value);
+        removed.delete(entity.key);
+      }
+      for (const tombstone of reply.tombstones) {
+        entities.delete(tombstone.key);
+        removed.add(tombstone.key);
+      }
+      entries.push(...(reply.journal?.entries ?? []));
+      inbox.push(...reply.inbox);
+      cursor = reply.continuation;
+      if (cursor.pass === null)
+        return { entities, removed, entries, inbox, cursor, unchanged: false };
+    }
+  });
+  return { fiber, leaseId, next, read, pass, seen };
+});
+
+/** A new lease's description and first complete pass, as a freshly mounted view sees them. */
+const snapshot = Effect.fnUntraced(function* (service: Service, ref: NeoPiNativeSessionRef) {
+  const lease = yield* follow(service, ref);
+  const { session } = yield* lease.next("session");
+  return { ...(yield* lease.pass()), session, lease };
+});
 
 describe("canonical native session lifecycle", () => {
   it.effect("releases only unobserved idle owned runtimes and reopens them normally", () =>
@@ -304,20 +387,8 @@ describe("canonical native session lifecycle", () => {
     Effect.gen(function* () {
       const { native, service, disconnected } = yield* fixture();
       yield* service.open(originalRef);
-      const observe = Effect.fnUntraced(function* () {
-        const ready = yield* Deferred.make<void>();
-        const fiber = yield* service.watch({ ref: originalRef }).pipe(
-          Stream.tap((event) =>
-            event.type === "snapshot" ? Deferred.succeed(ready, undefined) : Effect.void,
-          ),
-          Stream.runDrain,
-          Effect.forkScoped,
-        );
-        yield* Deferred.await(ready);
-        return fiber;
-      });
-      const first = yield* observe();
-      const second = yield* observe();
+      const first = (yield* follow(service, originalRef)).fiber;
+      const second = (yield* follow(service, originalRef)).fiber;
       yield* TestClock.adjust(NEOPI_NATIVE_IDLE_DEBOUNCE_MS * 2);
       assert.equal(native.connections, 1);
       yield* Fiber.interrupt(first);
@@ -584,17 +655,10 @@ describe("canonical native session lifecycle", () => {
         const { native, service } = yield* fixture();
         yield* service.open({ ...originalRef });
         native.sessionFile = "/alias/session.jsonl";
-        const first = (yield* snapshot(service, originalRef))[0];
-        if (first?.type !== "snapshot") return assert.fail("Expected native snapshot");
+        const first = yield* snapshot(service, originalRef);
         assert.deepEqual(first.session.ref, originalRef);
         assert.equal(first.session.state.sessionFile, originalRef.sessionFile);
-        assert.deepEqual(first.journal, {
-          sessionId: "native-id",
-          sessionFile: originalRef.sessionFile,
-          leafId: null,
-          entries: [],
-          totalEntries: 0,
-        });
+        assert.deepEqual(first.entries, []);
         native.sessionFile = originalRef.sessionFile;
         yield* native.publish({
           type: "journal_state",
@@ -629,29 +693,15 @@ describe("canonical native session lifecycle", () => {
           yield* native.publish({ type: "journal_entry", ...identity, entry: first });
           yield* native.publish({ type: "journal_entry", ...identity, entry: last });
         });
-        const result = yield* Stream.runCollect(
-          service.watch({ ref: originalRef }).pipe(Stream.take(5)),
-        );
+        const lease = yield* follow(service, originalRef);
+        // The two-entry batch under one leaf announcement costs a build retry today
+        // (reported to the projection's owner); the retry runs on the test clock.
+        const reading = yield* lease.pass().pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        const { entries } = yield* Fiber.join(reading);
         assert.deepEqual(
-          result
-            .filter((event) => event.type === "event" && event.frame.type === "journal_entry")
-            .map((event) => (event.type === "event" ? event.frame : null)),
-          [
-            {
-              type: "journal_entry",
-              sessionId: "native-id",
-              sessionFile: originalRef.sessionFile,
-              leafId: last.id,
-              entry: first,
-            },
-            {
-              type: "journal_entry",
-              sessionId: "native-id",
-              sessionFile: originalRef.sessionFile,
-              leafId: last.id,
-              entry: last,
-            },
-          ],
+          entries.map((entry) => entry.id),
+          [first.id, last.id],
         );
         assert.equal(native.acceptedPrompts, 0);
       }).pipe(Effect.scoped),
@@ -698,7 +748,8 @@ describe("canonical native session lifecycle", () => {
       Effect.gen(function* () {
         const { native, service } = yield* fixture();
         yield* service.open({ ...originalRef });
-        yield* snapshot(service, originalRef);
+        const first = yield* snapshot(service, originalRef);
+        yield* Fiber.interrupt(first.lease.fiber);
         assert.deepEqual(
           yield* service.request({
             ref: originalRef,
@@ -715,18 +766,20 @@ describe("canonical native session lifecycle", () => {
           entry: native.entries[0],
         });
         const second = yield* snapshot(service, originalRef);
-        const hydrated = second[0];
-        assert.equal(hydrated?.type, "snapshot");
-        if (hydrated?.type === "snapshot") {
-          assert.deepEqual(hydrated.journal, {
-            sessionId: "native-id",
-            sessionFile: originalRef.sessionFile,
-            leafId: "native-admission",
-            entries: [entry("native-admission")],
-            totalEntries: 1,
-          });
-          assert.equal(hydrated.session.state.isStreaming, true);
-        }
+        assert.deepEqual(second.entries, [entry("native-admission")]);
+        // A lease arriving after an unobserved stretch re-reads `get_state`; the change
+        // reaches it in its first pass or in the next read, whichever comes first.
+        const next = yield* second.lease.pass(second.cursor).pipe(Effect.forkChild);
+        yield* TestClock.adjust("20 seconds");
+        const latest = new Map([...second.entities, ...(yield* Fiber.join(next)).entities]);
+        const state = latest.get("setting:state");
+        const record = state?.class === "setting" ? state.value.value : undefined;
+        assert.isTrue(
+          typeof record === "object" &&
+            record !== null &&
+            "isStreaming" in record &&
+            record.isStreaming === true,
+        );
         assert.equal(native.acceptedPrompts, 1);
         assert.equal(native.aborts, 0);
         assert.equal(native.disposals, 0);
@@ -767,91 +820,46 @@ describe("canonical native session lifecycle", () => {
           yield* native.publish(persisted);
           yield* native.publish(update);
         });
-        const frames = yield* Stream.runCollect(
-          service.watch({ ref: originalRef }).pipe(Stream.take(4)),
-        );
-        assert.deepEqual(
-          frames
-            .filter((event) => event.type === "event")
-            .map((event) => (event.type === "event" ? event.frame : null)),
-          [
-            {
-              type: "journal_state",
-              reason: "snapshot",
-              sessionId: "native-id",
-              sessionFile: originalRef.sessionFile,
-              leafId: null,
-            },
-            persisted,
-            update,
-          ],
-        );
-        assert.equal(
-          frames.some((event) => event.type === "event" && event.frame.type === "journal_entry"),
-          false,
-        );
-        const first = frames[0];
-        if (first?.type === "snapshot")
-          assert.deepEqual(first.journal, {
-            sessionId: "native-id",
-            sessionFile: originalRef.sessionFile,
-            leafId: committed.id,
-            entries: [committed],
-            totalEntries: 1,
-          });
-        else assert.fail("Expected a native journal snapshot");
+        const { entities, entries } = yield* snapshot(service, originalRef);
+        // The commit arrived while the build's page was in flight: it is delivered once.
+        assert.deepEqual(entries, [committed]);
+        const live = entities.get("message:native-next");
+        assert.equal(live?.class === "message" && live.phase, "open");
       }).pipe(Effect.scoped),
   );
 
-  it.effect(
-    "delivers pending native UI before a blocked snapshot so answers can release native startup",
-    () =>
-      Effect.gen(function* () {
-        const { native, service } = yield* fixture();
-        native.startupDialog = true;
-        native.blockSnapshot = true;
-        yield* service.open({ ...originalRef });
-        const received = yield* Deferred.make<void>();
-        const observer = yield* service.watch({ ref: originalRef }).pipe(
-          Stream.tap((event) =>
-            event.type === "event" && event.frame.id === "native-dialog"
-              ? Deferred.succeed(received, undefined)
-              : Effect.void,
-          ),
-          Stream.filter((event) => event.type === "snapshot"),
-          Stream.take(1),
-          Stream.runCollect,
-          Effect.forkChild,
-        );
-        yield* Deferred.await(received);
-        yield* service.request({
-          ref: originalRef,
-          command: { type: "extension_ui_response", id: "native-dialog", confirmed: true },
-        });
-        const result = yield* Fiber.join(observer);
-        assert.equal(result[0]?.type, "snapshot");
-        assert.equal(native.running, true);
-        assert.equal(native.disposals, 0);
-      }).pipe(Effect.scoped),
+  it.effect("S2: a build gated on an interaction completes once the client answers it", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      native.startupDialog = true;
+      native.blockSnapshot = true;
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      // NeoPi withholds the snapshot reply until the dialog is answered; the request
+      // still reaches the client on the essential stream while the build waits.
+      const opened = yield* lease.next("obligation-opened", (env) => env.id === "native-dialog");
+      assert.equal(opened.request.type, "extension_ui_request");
+      const reading = yield* lease.pass().pipe(Effect.forkChild);
+      yield* service.request({
+        ref: originalRef,
+        command: { type: "extension_ui_response", id: opened.id, confirmed: true },
+      });
+      // The fixture's owner also cancels the answered dialog; either settle closes it.
+      yield* lease.next("obligation-settled", (env) => env.id === opened.id);
+      yield* lease.next("lifecycle", (env) => env.state === "observing");
+      const { entries } = yield* Fiber.join(reading);
+      assert.deepEqual(entries, []);
+      assert.equal(native.running, true);
+      assert.equal(native.disposals, 0);
+    }).pipe(Effect.scoped),
   );
 
-  it.effect("passes dictation commands to the native owner and forwards its frames", () =>
+  it.effect("passes dictation commands to the native owner and serves their outcome", () =>
     Effect.gen(function* () {
       const { service } = yield* fixture();
       yield* service.open({ ...originalRef });
-      const watching = yield* Deferred.make<void>();
-      const observer = yield* service.watch({ ref: originalRef }).pipe(
-        Stream.tap((event) =>
-          event.type === "snapshot" ? Deferred.succeed(watching, undefined) : Effect.void,
-        ),
-        Stream.filter(
-          (event) => event.type === "event" && event.frame.type.startsWith("dictation_"),
-        ),
-        Stream.take(2),
-        Stream.runCollect,
-        Effect.forkChild,
-      );
-      yield* Deferred.await(watching);
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
       yield* service.request({
         ref: originalRef,
         command: { type: "dictation_start", captureId: "capture-1" },
@@ -860,15 +868,11 @@ describe("canonical native session lifecycle", () => {
         yield* service.request({ ref: originalRef, command: { type: "dictation_stop" } }),
         { text: "hello" },
       );
-      assert.deepEqual(
-        Array.from(yield* Fiber.join(observer), (event) =>
-          event.type === "event" ? event.frame : null,
-        ),
-        [
-          { type: "dictation_state", captureId: "capture-1", state: "recording" },
-          { type: "dictation_end", captureId: "capture-1", text: "hello" },
-        ],
-      );
+      const { entities } = yield* lease.pass(built.cursor);
+      assert.deepEqual(entities.get("presentation:dictation"), {
+        class: "presentation",
+        value: { captureId: "capture-1", phase: "ended", text: "hello", error: null },
+      });
     }).pipe(Effect.scoped),
   );
 
@@ -1023,21 +1027,9 @@ describe("canonical native session lifecycle", () => {
           id: "plan",
           planMarkdown: "Native plan",
         });
-        const mounted = yield* Effect.all([Deferred.make<void>(), Deferred.make<void>()]);
-        const watchers = yield* Effect.all(
-          mounted.map((ready) =>
-            service.watch({ ref: originalRef }).pipe(
-              Stream.tap((event) =>
-                event.type === "event" && event.frame.id === "plan"
-                  ? Deferred.succeed(ready, undefined)
-                  : Effect.void,
-              ),
-              Stream.runCollect,
-              Effect.forkChild,
-            ),
-          ),
-        );
-        yield* Effect.all(mounted.map(Deferred.await));
+        const watchers = [yield* follow(service, originalRef), yield* follow(service, originalRef)];
+        for (const watcher of watchers)
+          yield* watcher.next("obligation-opened", (envelope) => envelope.id === "plan");
         yield* service.request({
           ref: originalRef,
           command: { type: "tool_approval_response", id: "approval", decision: "deny" },
@@ -1051,30 +1043,26 @@ describe("canonical native session lifecycle", () => {
             feedback: "Private review note",
           },
         });
-        const reconnect = yield* Stream.runCollect(
-          service.watch({ ref: originalRef }).pipe(Stream.take(2)),
-        );
-        assert.equal(
-          reconnect.some(
-            (event) =>
-              event.type === "event" &&
-              (event.frame.type === "tool_approval_request" ||
-                event.frame.type === "plan_proposal_request"),
-          ),
-          false,
-        );
-        yield* service.close({ ref: originalRef });
         for (const watcher of watchers) {
-          const events = yield* Fiber.join(watcher);
-          // Acknowledgements carry identity only, not private answer contents.
+          // Settles carry identity only, never private answer contents.
           assert.deepEqual(
-            events.filter((event) => event.type === "answered"),
             [
-              { type: "answered", id: "approval" },
-              { type: "answered", id: "plan" },
+              yield* watcher.next("obligation-settled"),
+              yield* watcher.next("obligation-settled"),
+            ].map(({ id, outcome }) => ({ id, outcome })),
+            [
+              { id: "approval", outcome: "answered" },
+              { id: "plan", outcome: "answered" },
             ],
           );
         }
+        const reconnect = yield* follow(service, originalRef);
+        yield* reconnect.pass();
+        assert.equal(
+          reconnect.seen.some((envelope) => envelope.type === "obligation-opened"),
+          false,
+        );
+        yield* service.close({ ref: originalRef });
       }).pipe(Effect.scoped),
   );
 
@@ -1090,15 +1078,12 @@ describe("canonical native session lifecycle", () => {
         targetId: "native-approval",
       });
       yield* native.publish({ type: "plan_proposal_cancel", id: "native-plan" });
-      const frames = yield* Stream.runCollect(
-        service.watch({ ref: originalRef }).pipe(Stream.take(2)),
+      const lease = yield* follow(service, originalRef);
+      yield* lease.pass();
+      assert.equal(
+        lease.seen.some((envelope) => envelope.type === "obligation-opened"),
+        false,
       );
-      assert.deepEqual(
-        frames.map((event) => event.type),
-        ["snapshot", "event"],
-      );
-      const event = frames[1];
-      assert.equal(event?.type === "event" && event.frame.type, "journal_state");
       assert.equal(native.connections, 1);
       assert.equal(native.disposals, 0);
     }).pipe(Effect.scoped),
@@ -1243,48 +1228,33 @@ describe("canonical native session lifecycle", () => {
   );
 });
 
-/** Collects a watch stream so a test can wait on its events in order, never on time. */
-const observe = Effect.fnUntraced(function* (
-  service: Effect.Success<ReturnType<typeof makeNeoPiNativeSessionsWith>>,
-  ref: NeoPiNativeSessionRef,
-) {
-  const events = yield* Queue.unbounded<NeoPiNativeSessionsStreamEvent>();
-  yield* Stream.runForEach(service.watch({ ref }), (event) => Queue.offer(events, event)).pipe(
-    Effect.forkScoped,
-  );
-  return {
-    next: Effect.fnUntraced(function* <Type extends NeoPiNativeSessionsStreamEvent["type"]>(
-      type: Type,
-    ) {
-      while (true) {
-        const event = yield* Queue.take(events);
-        if (event.type === type)
-          return event as Extract<NeoPiNativeSessionsStreamEvent, { type: Type }>;
-      }
-    }),
-  };
-});
 const ownerExited = { code: 0, signal: null, stderrTail: "" } as const;
+const observing = (envelope: Extract<Envelope, { type: "lifecycle" }>) =>
+  envelope.state === "observing";
 
 describe("terminal owner replacement", () => {
   it.effect(
-    "reattaches in place when a restarted terminal returns, then reads history afresh",
+    "reattaches in place when a restarted terminal returns, keeping the lease, then rebuilds",
     () =>
       Effect.gen(function* () {
         const { native, service } = yield* fixture("terminal");
         yield* service.open(originalRef);
-        const events = yield* observe(service, originalRef);
-        yield* events.next("snapshot");
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
 
         native.ownerAlive = false;
         yield* Deferred.succeed(native.exit!, ownerExited);
-        const reconnecting = yield* events.next("reconnecting");
-        assert.match(reconnecting.reason, /exited \(0\)/);
+        const reconnecting = yield* lease.next(
+          "lifecycle",
+          (envelope) => envelope.state === "reconnecting",
+        );
+        assert.match(reconnecting.reason ?? "", /exited \(0\)/);
 
         native.ownerAlive = true;
         yield* TestClock.adjust("1 second");
-        const snapshot = yield* events.next("snapshot");
-        assert.equal(snapshot.session.attachment, "terminal");
+        const { session } = yield* lease.next("session");
+        assert.equal(session.attachment, "terminal");
+        yield* lease.next("lifecycle", observing);
         assert.equal(native.starts, 2);
         assert.equal(native.connections, 1);
         assert.equal(native.disposals, 0);
@@ -1298,12 +1268,12 @@ describe("terminal owner replacement", () => {
     Effect.gen(function* () {
       const { native, service } = yield* fixture("terminal");
       yield* service.open(originalRef);
-      const events = yield* observe(service, originalRef);
-      yield* events.next("snapshot");
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
 
       native.ownerAlive = false;
       yield* Deferred.succeed(native.exit!, ownerExited);
-      yield* events.next("reconnecting");
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
       const sent = yield* service
         .request({ ref: originalRef, command: { type: "prompt", message: "queued" } })
         .pipe(Effect.forkScoped);
@@ -1319,29 +1289,29 @@ describe("terminal owner replacement", () => {
       assert.equal(native.starts, 2);
       assert.equal(native.acceptedPrompts, 1);
       assert.deepEqual(native.prompts, ["queued"]);
-      const snapshot = yield* events.next("snapshot");
-      assert.equal(snapshot.session.attachment, "owned");
+      const { session } = yield* lease.next("session");
+      assert.equal(session.attachment, "owned");
     }).pipe(Effect.scoped),
   );
 
   it.effect(
-    "closes as owner_exited when nothing replaces the terminal, and a revisit reopens",
+    "ends the lease as owner-stopped when nothing replaces the terminal, and a revisit reopens",
     () =>
       Effect.gen(function* () {
         const { native, service } = yield* fixture("terminal");
         yield* service.open(originalRef);
-        const events = yield* observe(service, originalRef);
-        yield* events.next("snapshot");
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
 
         native.ownerAlive = false;
         yield* Deferred.succeed(native.exit!, ownerExited);
-        yield* events.next("reconnecting");
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
         yield* TestClock.adjust("9 seconds");
         assert.equal(native.starts, 1);
 
         yield* TestClock.adjust("2 seconds");
-        const closed = yield* events.next("closed");
-        assert.equal(closed.code, "owner_exited");
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "owner-stopped");
+        yield* Fiber.join(lease.fiber);
         assert.equal(native.starts, 1);
 
         const reopened = yield* service.open(originalRef);
@@ -1354,12 +1324,12 @@ describe("terminal owner replacement", () => {
     Effect.gen(function* () {
       const { native, service } = yield* fixture("terminal");
       yield* service.open(originalRef);
-      const events = yield* observe(service, originalRef);
-      yield* events.next("snapshot");
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
 
       assert.deepEqual(yield* service.close({ ref: originalRef }), { closed: true });
-      const closed = yield* events.next("closed");
-      assert.equal(closed.code, "detached");
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "detached");
+      yield* Fiber.join(lease.fiber);
       assert.equal(native.running, true);
       assert.equal(native.aborts, 0);
       assert.equal(native.detaches, 1);
@@ -1372,12 +1342,12 @@ describe("terminal owner replacement", () => {
       Effect.gen(function* () {
         const { native, service } = yield* fixture("terminal");
         yield* service.open(originalRef);
-        const events = yield* observe(service, originalRef);
-        yield* events.next("snapshot");
+        const lease = yield* follow(service, originalRef);
+        yield* lease.next("lifecycle", observing);
 
         native.ownerAlive = false;
         yield* Deferred.succeed(native.exit!, ownerExited);
-        yield* events.next("reconnecting");
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
         const held = yield* service
           .request({ ref: originalRef, command: { type: "get_state" } })
           .pipe(Effect.forkScoped);
@@ -1388,6 +1358,398 @@ describe("terminal owner replacement", () => {
         assert.equal(result._tag, "Failure");
         if (result._tag === "Failure") assert.equal(result.failure.code, "detached");
         assert.equal(native.starts, 1);
+      }).pipe(Effect.scoped),
+  );
+});
+
+const assistant = (text: string) => ({ role: "assistant", content: [{ type: "text", text }] });
+const bodyOf = (value: NeoPiNativeEntity["value"] | undefined) =>
+  value?.class === "message" ? value.message.content : undefined;
+/** Appends `count` entries to the native branch, each announced as NeoPi does. */
+const appender = (native: Effect.Success<ReturnType<typeof fixture>>["native"]) => {
+  let made = 0;
+  return Effect.fnUntraced(function* (count: number) {
+    for (let index = 0; index < count; index++) {
+      const appended = entry(`append-${made++}`, native.entries.at(-1)?.id ?? null);
+      native.entries.push(appended);
+      yield* native.publish({
+        type: "journal_entry",
+        sessionId: native.sessionId,
+        sessionFile: native.sessionFile,
+        leafId: appended.id,
+        entry: appended,
+      });
+    }
+    return native.entries.at(-1)!;
+  });
+};
+
+describe("native observation (r12 §3.1)", () => {
+  it.effect(
+    "S1: a fast primary past every bound while state, snapshot and page are held ends no observation",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        yield* service.request({ ref: originalRef, command: { type: "prompt", message: "go" } });
+        let body = "";
+        // Each held reply waits behind 1,000 cumulative updates and 1,000 tool stream records:
+        // 3,000 frames and more than 8 MiB in all, beyond the old 256-item / 8 MiB budget and
+        // the inbox bound.
+        const burst = Effect.gen(function* () {
+          for (let index = 0; index < 1000; index++) {
+            body += "abc";
+            yield* native.publish({
+              type: "message_update",
+              messageId: "fast",
+              message: assistant(body),
+            });
+            yield* native.publish({
+              type: "tool_stream_update",
+              toolCallId: "bash-1",
+              toolName: "bash",
+              update: { chunk: index },
+            });
+          }
+        });
+        native.snapshotHook = burst;
+        native.stateHook = burst;
+        native.pageHook = burst;
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        native.snapshotHook = Effect.void;
+        native.stateHook = Effect.void;
+        native.pageHook = Effect.void;
+        const latestBody = assistant(body).content;
+        assert.deepEqual(bodyOf(built.entities.get("message:fast")), latestBody);
+        // The evicted inbox records are reported as such, never dropped silently.
+        assert.isTrue(
+          built.inbox.some((record) => record.type === "gap" && record.reason === "evicted"),
+        );
+        yield* native.publish({ type: "message_end", messageId: "fast", message: assistant(body) });
+        const ended = (yield* lease.pass(built.cursor)).entities.get("message:fast");
+        assert.equal(ended?.class === "message" && ended.phase, "ended");
+        assert.deepEqual(bodyOf(ended), latestBody);
+        // The stream carried only build and observing lifecycle: capacity ended nothing.
+        assert.isTrue(
+          lease.seen.every(
+            (envelope) =>
+              envelope.type !== "lifecycle" ||
+              envelope.state === "building" ||
+              envelope.state === "observing",
+          ),
+        );
+        assert.equal(native.starts, 1);
+        assert.equal(native.acceptedPrompts, 1);
+        assert.equal(native.aborts, 0);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S4: builds that span more than the ring still publish, and successive reads advance",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const append = appender(native);
+        // The producer never pauses: every build reply arrives behind more appends than
+        // the projection's recent-entry ring holds.
+        native.snapshotHook = append(600).pipe(Effect.asVoid);
+        native.stateHook = append(600).pipe(Effect.asVoid);
+        native.pageHook = append(600).pipe(Effect.asVoid);
+        const lease = yield* follow(service, originalRef);
+        let { cursor, entries } = yield* lease.pass();
+        native.snapshotHook = Effect.void;
+        native.stateHook = Effect.void;
+        native.pageHook = Effect.void;
+        assert.equal(entries.at(-1)?.id, native.entries.at(-1)?.id);
+        for (let round = 0; round < 3; round++) {
+          const head = yield* append(600);
+          const read = yield* lease.pass(cursor);
+          assert.equal(read.entries.at(-1)?.id, head.id);
+          assert.equal(new Set(read.entries.map((item) => item.id)).size, read.entries.length);
+          cursor = read.cursor;
+          entries = read.entries;
+        }
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S5: a stalled reader holds only its credit window while a second reader and every command proceed",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        // Lease A takes its envelopes but never reads and never returns credit.
+        const stalled = yield* Queue.unbounded<Envelope>();
+        yield* service.watch({ ref: originalRef }).pipe(
+          Stream.runForEach((envelope) => Queue.offer(stalled, envelope)),
+          Effect.forkScoped,
+        );
+        const current = yield* follow(service, originalRef);
+        const built = yield* current.pass();
+        let body = "";
+        for (let index = 0; index < 500; index++) {
+          body += "abc";
+          yield* native.publish({ type: "agent_start" });
+          yield* native.publish({
+            type: "message_update",
+            messageId: "live",
+            message: assistant(body),
+          });
+          yield* native.publish({ type: "agent_end" });
+        }
+        yield* native.publish({ type: "host_tool_call", id: "host-1", toolName: "preview" });
+        yield* current.next("obligation-opened", (envelope) => envelope.id === "host-1");
+        yield* native.publish({ type: "extension_ui_request", id: "ask-1", method: "confirm" });
+        yield* current.next("obligation-opened", (envelope) => envelope.id === "ask-1");
+        yield* service.request({
+          ref: originalRef,
+          command: { type: "extension_ui_response", id: "ask-1", confirmed: true },
+        });
+        yield* current.next("obligation-settled", (envelope) => envelope.id === "ask-1");
+        yield* service.request({ ref: originalRef, command: { type: "prompt", message: "next" } });
+        yield* service.request({ ref: originalRef, command: { type: "abort" } });
+        assert.equal(native.acceptedPrompts, 1);
+        assert.equal(native.aborts, 1);
+        const latest = yield* current.pass(built.cursor);
+        assert.deepEqual(bodyOf(latest.entities.get("message:live")), assistant(body).content);
+        // A never acknowledged more than one window, so it was sent exactly one window.
+        const held = yield* Queue.clear(stalled);
+        assert.equal(held.length, 8);
+        const leaseId = held[0]?.type === "leased" ? held[0].leaseId : "";
+        // What waited for A is current state, coalesced: 1,500 status-changing frames and
+        // two obligations leave less than another window behind.
+        let applied = held.length;
+        let more = 0;
+        for (let round = 0; round < 4; round++) {
+          yield* service.credit({ leaseId, applied });
+          for (let spin = 0; spin < 20; spin++) yield* Effect.yieldNow;
+          const sent = (yield* Queue.clear(stalled)).length;
+          applied += sent;
+          more += sent;
+        }
+        assert.isBelow(more, 8);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S13: appends never restart a build or a reader, navigation rebases, a reader behind the ring rejoins",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const append = appender(native);
+        yield* append(3);
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        const domain = built.cursor!.epoch;
+        yield* lease.next("lifecycle", observing);
+        const builds = () =>
+          lease.seen.filter(
+            (envelope) => envelope.type === "lifecycle" && envelope.state === "building",
+          ).length;
+        const buildsBefore = builds();
+        // 600 appends overrun the 512-entry ring while this reader waits.
+        const head = yield* append(600);
+        const behind = yield* lease.pass(built.cursor);
+        assert.deepEqual(behind.cursor!.epoch, domain);
+        assert.equal(behind.entries.at(-1)?.id, head.id);
+        assert.equal(new Set(behind.entries.map((item) => item.id)).size, behind.entries.length);
+        assert.equal(builds(), buildsBefore);
+        // A move back to an entry the branch already holds is navigation: the reader rebases.
+        const target = native.entries.at(-10)!;
+        yield* native.publish({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId: native.sessionId,
+          sessionFile: native.sessionFile,
+          leafId: target.id,
+        });
+        const rebased = yield* lease.pass(behind.cursor);
+        assert.equal(rebased.cursor!.epoch.branchGeneration, domain.branchGeneration + 1);
+        assert.equal(rebased.cursor!.epoch.buildAttempt, domain.buildAttempt);
+        assert.equal(rebased.entries.at(-1)?.id, target.id);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S14: one read per lease, stale reads refused, idle reads answer at their deadline, a cancelled lease cancels its read",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const lease = yield* follow(service, originalRef);
+        // Read until nothing more changes (the first lease's own re-reads settle first).
+        let cursor = (yield* lease.pass()).cursor;
+        while (true) {
+          const reading = yield* lease.pass(cursor).pipe(Effect.forkChild);
+          yield* TestClock.adjust("20 seconds");
+          const settled = yield* Fiber.join(reading);
+          if (settled.unchanged) break;
+          cursor = settled.cursor;
+        }
+        const { leaseId } = lease;
+        const waiting = yield* service
+          .read({ leaseId, readId: 100, cursor })
+          .pipe(Effect.forkChild);
+        for (let spin = 0; spin < 10; spin++) yield* Effect.yieldNow;
+        // The same or an older read id is a second read on this lease: refused.
+        const repeated = yield* service.read({ leaseId, readId: 100, cursor }).pipe(Effect.flip);
+        assert.equal(repeated.code, "stale_read");
+        // A newer read id is a retry: it replaces the one waiting, which ends as stale.
+        const retry = yield* service.read({ leaseId, readId: 101, cursor }).pipe(Effect.forkChild);
+        const replaced = yield* Fiber.join(waiting).pipe(Effect.flip);
+        assert.equal(replaced.code, "stale_read");
+        yield* TestClock.adjust("20 seconds");
+        assert.deepEqual(yield* Fiber.join(retry), { type: "unchanged" });
+        // Essential and bulk state share one revision space: an obligation opened after the
+        // read carries a revision the read could not have covered.
+        yield* native.publish({ type: "tool_approval_request", id: "approval", toolName: "bash" });
+        const opened = yield* lease.next(
+          "obligation-opened",
+          (envelope) => envelope.id === "approval",
+        );
+        assert.isAbove(opened.revision, cursor!.base);
+        // Catch up past the obligation's revision, then leave a read waiting.
+        const caughtUp = yield* service.read({ leaseId, readId: 102, cursor });
+        assert.equal(caughtUp.type, "pass");
+        const pending = yield* service
+          .read({
+            leaseId,
+            readId: 103,
+            cursor: caughtUp.type === "pass" ? caughtUp.continuation : cursor,
+          })
+          .pipe(Effect.forkChild);
+        for (let spin = 0; spin < 10; spin++) yield* Effect.yieldNow;
+        yield* Fiber.interrupt(lease.fiber);
+        const cancelled = yield* Fiber.join(pending).pipe(Effect.flip);
+        assert.equal(cancelled.code, "lease_unknown");
+        const late = yield* service.credit({ leaseId, applied: 1 }).pipe(Effect.flip);
+        assert.equal(late.code, "lease_unknown");
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S15: an ended body survives delayed durability, connection loss and rebuild, then joins once; a persistence failure is a visible fault",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        yield* native.publish({
+          type: "message_start",
+          messageId: "m1",
+          message: assistant("fin"),
+        });
+        yield* native.publish({
+          type: "message_update",
+          messageId: "m1",
+          message: assistant("final"),
+        });
+        yield* native.publish({
+          type: "message_end",
+          messageId: "m1",
+          message: assistant("final answer"),
+        });
+        const ended = yield* lease.pass(built.cursor);
+        const body = bodyOf(ended.entities.get("message:m1"));
+        assert.deepEqual(body, assistant("final answer").content);
+
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        native.ownerAlive = true;
+        yield* TestClock.adjust("1 second");
+        yield* lease.next("lifecycle", observing);
+        // The rebuild is a new domain: a full pass, which keeps the ended body as it was.
+        const rebuilt = yield* lease.pass(ended.cursor);
+        assert.notDeepEqual(rebuilt.cursor!.epoch, ended.cursor!.epoch);
+        const kept = rebuilt.entities.get("message:m1");
+        assert.equal(kept?.class === "message" && kept.phase, "ended");
+        assert.deepEqual(bodyOf(kept), body);
+
+        const committed = { ...entry("e1"), message: assistant("final answer") };
+        native.entries.push(committed);
+        yield* native.publish({
+          type: "journal_entry",
+          sessionId: native.sessionId,
+          sessionFile: native.sessionFile,
+          leafId: committed.id,
+          entry: committed,
+        });
+        yield* native.publish({
+          type: "message_persisted",
+          sessionId: native.sessionId,
+          sessionFile: native.sessionFile,
+          messageId: "m1",
+          entryId: committed.id,
+        });
+        const joined = yield* lease.pass(rebuilt.cursor);
+        assert.deepEqual(
+          joined.entries.map((item) => item.id),
+          [committed.id],
+        );
+        assert.isTrue(joined.removed.has("message:m1"));
+
+        yield* native.publish({ type: "message_end", messageId: "m2", message: assistant("kept") });
+        yield* native.publish({
+          type: "notice",
+          level: "error",
+          source: "session-persistence",
+          message: "The session file could not be written.",
+        });
+        const failed = yield* lease.pass(joined.cursor);
+        assert.equal(failed.entities.get("fault:session-persistence")?.class, "fault");
+        assert.deepEqual(bodyOf(failed.entities.get("message:m2")), assistant("kept").content);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "S16: replies, leases and cursors from an earlier incarnation change nothing but their own",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture("terminal");
+        yield* service.open(originalRef);
+        const released = yield* Deferred.make<void>();
+        let pages = 0;
+        native.pageHook = Effect.suspend(() =>
+          pages++ === 0 ? Deferred.await(released) : Effect.void,
+        );
+        const first = yield* follow(service, originalRef);
+        const second = yield* follow(service, originalRef);
+        // The first build's page is held across an owner succession.
+        native.ownerAlive = false;
+        yield* Deferred.succeed(native.exit!, ownerExited);
+        yield* second.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+        native.ownerAlive = true;
+        yield* TestClock.adjust("1 second");
+        yield* second.next("lifecycle", observing);
+        const current = yield* second.pass();
+        // The earlier attempt's reply now arrives carrying an entry the new owner never had.
+        native.entries = [entry("stale")];
+        yield* Deferred.succeed(released, undefined);
+        for (let spin = 0; spin < 20; spin++) yield* Effect.yieldNow;
+        native.entries = [];
+        const after = second.pass(current.cursor).pipe(Effect.forkChild);
+        const reading = yield* after;
+        yield* TestClock.adjust("20 seconds");
+        assert.isFalse((yield* Fiber.join(reading)).entries.some((item) => item.id === "stale"));
+        // Releasing the first lease after the succession leaves the second untouched.
+        yield* Fiber.interrupt(first.fiber);
+        const unknown = yield* service
+          .setDemand({ leaseId: first.leaseId, generation: 1, demand: [{ kind: "summary" }] })
+          .pipe(Effect.flip);
+        assert.equal(unknown.code, "lease_unknown");
+        yield* native.publish({ type: "tool_approval_request", id: "after", toolName: "bash" });
+        yield* second.next("obligation-opened", (envelope) => envelope.id === "after");
+        // A cursor from another server incarnation is judged by its domain alone: a full pass.
+        const foreign = yield* second.read({
+          ...current.cursor!,
+          epoch: { ...current.cursor!.epoch, serverIncarnation: "an-earlier-server" },
+        });
+        assert.equal(foreign.type === "pass" && foreign.kind, "full");
       }).pipe(Effect.scoped),
   );
 });

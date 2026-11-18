@@ -39,7 +39,7 @@ import {
   NeoPiNativeSessionsOpenResult,
   NeoPiNativeSessionsRequestInput,
   NeoPiNativeSessionsWatchInput,
-  NeoPiNativeSessionsStreamEvent,
+  NeoPiNativeEssentialEnvelope,
   NeoPiNativeSessionsCloseInput,
   NeoPiNativeSessionsCloseResult,
   NeoPiNativeSessionsSetSettledInput,
@@ -1003,7 +1003,7 @@ const WsNeoPiNativeSessionsRequestRpc = Rpc.make(WS_METHODS.neopiNativeSessionsR
 });
 const WsNeoPiNativeSessionsWatchRpc = Rpc.make(WS_METHODS.neopiNativeSessionsWatch, {
   payload: NeoPiNativeSessionsWatchInput,
-  success: NeoPiNativeSessionsStreamEvent,
+  success: NeoPiNativeEssentialEnvelope,
   error: NeoPiNativeSessionsRpcError,
   stream: true,
 });
@@ -1623,6 +1623,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiNativeSessionsOpenRpc,
   WsNeoPiNativeSessionsRequestRpc,
   WsNeoPiNativeSessionsWatchRpc,
+  WsNeoPiNativeSessionsReadRpc,
+  WsNeoPiNativeSessionsSetDemandRpc,
+  WsNeoPiNativeSessionsCreditRpc,
   WsNeoPiNativeSessionsCloseRpc,
   WsNeoPiNativeSessionsSetSettledRpc,
   WsNeoPiNativeSessionsGetDiffPreviewRpc,

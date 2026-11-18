@@ -987,6 +987,7 @@ export class NeoPiNativeProjection {
       listed.add(id);
       this.#rosterRow(id, mark, (entry) => {
         entry.inventory = row;
+        delete entry.unobserved;
       });
     }
     for (const record of this.store.values())
@@ -1022,6 +1023,7 @@ export class NeoPiNativeProjection {
         listed.add(id);
         this.#rosterRow(id, mark, (entry) => {
           entry.history = row;
+          delete entry.unobserved;
         });
       }
       const gone: string[] = [];
@@ -1032,6 +1034,8 @@ export class NeoPiNativeProjection {
             id !== undefined &&
             !listed.has(id) &&
             !record.value.value.inventory &&
+            // A child marked unobserved stays until a source lists it.
+            record.value.value.unobserved === undefined &&
             (this.#rosterLive.get(id) ?? 0) <= mark.revision
           )
             gone.push(id);
@@ -1814,7 +1818,15 @@ export class NeoPiNativeProjection {
     const sameRun = previous?.runToken === runToken;
     const entry: NativeRecord = sameRun
       ? { ...previous }
-      : { ...previous, id, runToken, lifecycle: undefined, progress: undefined, ticks: 0 };
+      : {
+          ...previous,
+          id,
+          runToken,
+          lifecycle: undefined,
+          progress: undefined,
+          unobserved: undefined,
+          ticks: 0,
+        };
     if (type === "subagent_lifecycle") {
       if (!sameRun && payload.status !== "started" && previous?.runToken !== undefined) return;
       entry.lifecycle = payload;
@@ -1824,7 +1836,7 @@ export class NeoPiNativeProjection {
       if (status !== undefined && TERMINAL_CHILD_STATUSES.has(status)) return;
       entry.progress = payload;
     }
-    for (const field of ["lifecycle", "progress"] as const)
+    for (const field of ["lifecycle", "progress", "unobserved"] as const)
       if (entry[field] === undefined) delete entry[field];
     this.#rosterLive.set(id, this.store.put(key, { class: "roster", value: entry }));
   }

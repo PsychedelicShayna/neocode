@@ -116,6 +116,7 @@ type Item =
   | { readonly type: "end" };
 interface FakeLease {
   readonly id: string;
+  readonly purpose: string | undefined;
   readonly items: Queue.Queue<Item>;
   readonly applied: SubscriptionRef.SubscriptionRef<number>;
   readonly released: Deferred.Deferred<void>;
@@ -156,7 +157,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
         if (input.command.type === "prompt") prompts++;
         return {};
       }),
-    [WS_METHODS.neopiNativeSessionsWatch]: () =>
+    [WS_METHODS.neopiNativeSessionsWatch]: (input: { readonly purpose?: string }) =>
       Stream.unwrap(
         Effect.gen(function* () {
           const id = `lease-${++leaseCount}`;
@@ -165,6 +166,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
           const released = yield* Deferred.make<void>();
           const lease: FakeLease = {
             id,
+            purpose: input.purpose,
             items,
             applied,
             released,
@@ -287,6 +289,50 @@ describe("native observation controller", () => {
         );
         expect(result._tag).toBe("Success");
         expect(h.atoms.cached(h.target)).toBeUndefined();
+      }),
+    ),
+  );
+
+  it.effect("a thread view leaves the owner's subagent level alone beside a session view", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const thread = h.atoms.watch({
+          environmentId: h.target.environmentId,
+          input: { ref, purpose: "thread" },
+        });
+        const unmountThread = h.registry.mount(thread);
+        const threadLease = yield* Queue.take(h.leases);
+        expect(threadLease.purpose).toBe("thread");
+        expect(yield* Queue.take(h.demands)).toEqual({
+          leaseId: threadLease.id,
+          generation: 1,
+          demand: [{ kind: "summary" }, { kind: "transcript" }],
+        });
+        // The session view of the same session is its own lease, with the roster.
+        const unmountSession = h.registry.mount(h.watch);
+        const sessionLease = yield* Queue.take(h.leases);
+        expect(sessionLease.purpose).toBeUndefined();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: DEFAULT_NATIVE_DEMAND,
+        });
+        // A child view's hold goes to session leases only.
+        const child = { kind: "child" as const, childId: "c", runToken: "r" };
+        const release = h.atoms.holdDemand(h.target, [child]);
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          leaseId: sessionLease.id,
+          demand: [...DEFAULT_NATIVE_DEMAND, child],
+        });
+        release();
+        yield* Queue.take(h.demands);
+        // Concealing the session view leaves the thread view's lease in place.
+        unmountSession();
+        yield* Deferred.await(sessionLease.released);
+        expect(h.counts().active).toBe(1);
+        expect(yield* Queue.size(h.demands)).toBe(0);
+        unmountThread();
+        yield* Deferred.await(threadLease.released);
       }),
     ),
   );

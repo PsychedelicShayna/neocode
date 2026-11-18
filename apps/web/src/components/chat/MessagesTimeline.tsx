@@ -244,7 +244,6 @@ import { createContextPresentationRegistry } from "../contextPresentationRegistr
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import { useClientSettings } from "~/hooks/useSettings";
 import type { ChatMarkdownContextReference } from "../ChatMarkdown";
-import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
@@ -402,13 +401,6 @@ const TIMELINE_MAINTAIN_SCROLL_AT_END = {
     itemLayout: true,
     layout: true,
   },
-} as const satisfies MaintainScrollAtEndOptions;
-// Streamed text lands a paragraph at a time. A smooth scroll to the end
-// turns each landing into a short glide instead of a jump. Thread switches
-// and layout settles keep the instant variant so nothing visibly travels.
-const TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH = {
-  ...TIMELINE_MAINTAIN_SCROLL_AT_END,
-  animated: true,
 } as const satisfies MaintainScrollAtEndOptions;
 
 // ---------------------------------------------------------------------------
@@ -572,12 +564,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     rememberedPosition?.atEnd === false ? null : listIdentityKey,
   );
   const restoringThreadPosition = positionedThreadKey !== listIdentityKey;
-  const prefersReducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const listIdentityRef = useRef(listIdentityKey);
   const previousLatestTurnRef = useRef(latestTurn);
-  // The list stays mounted across thread switches. Its first end pins on the
-  // new thread must snap, not glide, even if that thread is mid-turn.
-  const [settlingListIdentity, setSettlingListIdentity] = useState<string | null>(null);
   let paintedExpandedTurnIds = expandedTurnIds;
   let paintedExpandedWorkGroupIds = expandedWorkGroupIds;
   let paintedExpandedSpawnEntryIds = expandedSpawnEntryIds;
@@ -586,7 +574,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     listIdentityRef.current = listIdentityKey;
     setPositionedThreadKey(null);
     previousLatestTurnRef.current = latestTurn;
-    setSettlingListIdentity(listIdentityKey);
     paintedExpandedTurnIds = rememberedPosition?.disclosures?.turns ?? new Set();
     paintedExpandedWorkGroupIds = rememberedPosition?.disclosures?.workGroups ?? new Set();
     paintedExpandedSpawnEntryIds = rememberedPosition?.disclosures?.spawnEntries ?? new Set();
@@ -637,21 +624,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       }
     };
   }, []);
-
-  useEffect(() => {
-    if (settlingListIdentity === null) return;
-    // Two frames covers the fresh-data layout pass and the initial end pin.
-    let second: number | null = null;
-    const first = requestAnimationFrame(() => {
-      second = requestAnimationFrame(() => {
-        setSettlingListIdentity((current) => (current === settlingListIdentity ? null : current));
-      });
-    });
-    return () => {
-      cancelAnimationFrame(first);
-      if (second !== null) cancelAnimationFrame(second);
-    };
-  }, [settlingListIdentity]);
 
   const suspendEndScrollMaintenanceForDisclosure = useCallback((anchorKey: string) => {
     disclosureAnchorKeyRef.current = anchorKey;
@@ -1294,24 +1266,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     );
   }
 
-  const maintainScrollAtEnd =
-    citationPositioning ||
-    (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
-    anchoredEndSpace ||
-    !liveFollowEnabled ||
-    prependedAwayFromEnd ||
-    disclosureToggleSettling
-      ? false
-      : isWorking && !prefersReducedMotion && settlingListIdentity === null
-        ? TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH
-        : TIMELINE_MAINTAIN_SCROLL_AT_END;
-  // Legend re-pins only within this many viewports of the end. A fast model
-  // outgrows one viewport during a 500 ms smooth pin, and follow would then
-  // stop for good although the reader never left. Only a scroll up (which
-  // turns live-follow off) may end following while output streams.
-  const maintainScrollAtEndThreshold =
-    maintainScrollAtEnd !== false && isWorking ? Number.POSITIVE_INFINITY : 1;
-
   return (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
@@ -1342,14 +1296,27 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             onLoad={onCitationListLoad}
             {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
             contentInsetEndAdjustment={anchoredEndSpace ? contentInsetEndAdjustment : 0}
-            maintainScrollAtEnd={maintainScrollAtEnd}
+            // Always the instant pin. A smooth one locks out the next pin for
+            // 500 ms, so fast output outgrows the re-pin band and follow stops,
+            // and the browser folds a reader's wheel into its animation, so the
+            // list pulled the reader back.
+            maintainScrollAtEnd={
+              citationPositioning ||
+              (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
+              anchoredEndSpace ||
+              !liveFollowEnabled ||
+              prependedAwayFromEnd ||
+              disclosureToggleSettling
+                ? false
+                : TIMELINE_MAINTAIN_SCROLL_AT_END
+            }
             maintainVisibleContentPosition={
               citationPositioning ||
               (restoringThreadPosition && rememberedPosition?.atEnd === false)
                 ? false
                 : maintainVisibleContentPosition
             }
-            maintainScrollAtEndThreshold={maintainScrollAtEndThreshold}
+            maintainScrollAtEndThreshold={1}
             onScroll={handleScroll}
             className={cn(
               "scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5",

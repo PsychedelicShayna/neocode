@@ -4011,12 +4011,31 @@ describe("older history paging", () => {
   });
 
   it("treats only an upward scroll off the live edge as the reader leaving it", () => {
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: false })).toBe(true);
+    const byUser = true;
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: false, byUser })).toBe(
+      true,
+    );
     // Streaming growth under a pinned viewport raises scrollTop.
-    expect(scrollMovedAwayFromEnd({ previousTop: 700, top: 900, isAtEnd: false })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 700, top: 900, isAtEnd: false, byUser })).toBe(
+      false,
+    );
     // A small drop that stays inside the live-edge band keeps following.
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 880, isAtEnd: true })).toBe(false);
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 899.5, isAtEnd: false })).toBe(false);
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: undefined })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 880, isAtEnd: true, byUser })).toBe(
+      false,
+    );
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 899.5, isAtEnd: false, byUser })).toBe(
+      false,
+    );
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: undefined, byUser })).toBe(
+      false,
+    );
+  });
+
+  it("does not take the list's own scroll adjustment for the reader leaving", () => {
+    // Real trace: a row estimate briefly put the end 1.2 M px away, and the list
+    // nudged scrollTop up by 4 px. No gesture preceded it; follow must survive.
+    expect(
+      scrollMovedAwayFromEnd({ previousTop: 39965, top: 39961, isAtEnd: false, byUser: false }),
+    ).toBe(false);
   });
 });

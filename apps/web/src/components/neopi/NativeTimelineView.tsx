@@ -58,10 +58,21 @@ export function NativeTimelineView(props: {
     [visibleRows, props.busy, props.toolLosses, props.runPaused],
   );
   const [liveFollow, setLiveFollow] = useState(true);
+  // Follow re-arms only when the reader comes back: the view must have been seen
+  // away from the end since they left. A pin already in flight when they left
+  // (a new message starting) lands at the end and must not take them back.
+  const seenAway = useRef(false);
   const onIsAtEndChange = useCallback((atEnd: boolean) => {
-    if (atEnd) setLiveFollow(true);
+    if (!atEnd) seenAway.current = true;
+    else if (seenAway.current) {
+      seenAway.current = false;
+      setLiveFollow(true);
+    }
   }, []);
-  const onManualNavigation = useCallback(() => setLiveFollow(false), []);
+  const onManualNavigation = useCallback(() => {
+    seenAway.current = false;
+    setLiveFollow(false);
+  }, []);
   // Nothing else tells this view the reader scrolled up, and the list re-pins
   // to the end on every layout while follow is on.
   useLeaveLiveEdgeOnScroll(listRef, onManualNavigation);

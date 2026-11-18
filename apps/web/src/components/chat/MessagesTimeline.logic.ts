@@ -193,16 +193,18 @@ export function rowsWerePrepended(
 }
 
 /**
- * A scroll that moved the viewport up and off the live edge is the reader
- * leaving it. Growth under a pinned viewport only ever raises scrollTop, so a
- * drop is never the list following the stream.
+ * A scroll the reader made that moved the viewport up and off the live edge is
+ * the reader leaving it. Growth under a pinned viewport only ever raises
+ * scrollTop; the list itself also lowers it (a row estimate corrected, a size
+ * adjustment), so a drop counts only when a gesture of the reader caused it.
  */
 export function scrollMovedAwayFromEnd(input: {
   readonly previousTop: number;
   readonly top: number;
   readonly isAtEnd: boolean | undefined;
+  readonly byUser: boolean;
 }): boolean {
-  return input.isAtEnd === false && input.top < input.previousTop - 1;
+  return input.byUser && input.isAtEnd === false && input.top < input.previousTop - 1;
 }
 
 export function shouldPreserveAssistantLineBreaks(text: string): boolean {

@@ -1294,6 +1294,24 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     );
   }
 
+  const maintainScrollAtEnd =
+    citationPositioning ||
+    (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
+    anchoredEndSpace ||
+    !liveFollowEnabled ||
+    prependedAwayFromEnd ||
+    disclosureToggleSettling
+      ? false
+      : isWorking && !prefersReducedMotion && settlingListIdentity === null
+        ? TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH
+        : TIMELINE_MAINTAIN_SCROLL_AT_END;
+  // Legend re-pins only within this many viewports of the end. A fast model
+  // outgrows one viewport during a 500 ms smooth pin, and follow would then
+  // stop for good although the reader never left. Only a scroll up (which
+  // turns live-follow off) may end following while output streams.
+  const maintainScrollAtEndThreshold =
+    maintainScrollAtEnd !== false && isWorking ? Number.POSITIVE_INFINITY : 1;
+
   return (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
@@ -1324,25 +1342,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             onLoad={onCitationListLoad}
             {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
             contentInsetEndAdjustment={anchoredEndSpace ? contentInsetEndAdjustment : 0}
-            maintainScrollAtEnd={
-              citationPositioning ||
-              (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
-              anchoredEndSpace ||
-              !liveFollowEnabled ||
-              prependedAwayFromEnd ||
-              disclosureToggleSettling
-                ? false
-                : isWorking && !prefersReducedMotion && settlingListIdentity === null
-                  ? TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH
-                  : TIMELINE_MAINTAIN_SCROLL_AT_END
-            }
+            maintainScrollAtEnd={maintainScrollAtEnd}
             maintainVisibleContentPosition={
               citationPositioning ||
               (restoringThreadPosition && rememberedPosition?.atEnd === false)
                 ? false
                 : maintainVisibleContentPosition
             }
-            maintainScrollAtEndThreshold={1}
+            maintainScrollAtEndThreshold={maintainScrollAtEndThreshold}
             onScroll={handleScroll}
             className={cn(
               "scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5",
@@ -2481,10 +2488,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           {ctx.assistantName}
         </p>
       ) : null}
-      <div
-        data-bubble="assistant"
-        className="chat-bubble min-w-0 w-fit max-w-[85%] px-3.5 py-2.5"
-      >
+      <div data-bubble="assistant" className="chat-bubble min-w-0 w-fit max-w-[85%] px-3.5 py-2.5">
         <AssistantCitationSource
           messageId={row.message.id}
           {...(ctx.threadRef ? { threadRef: ctx.threadRef } : {})}

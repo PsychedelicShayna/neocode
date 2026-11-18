@@ -106,7 +106,14 @@ export const NeoPiNativeSessionsRequestInput = Schema.Struct({
   ),
 });
 export type NeoPiNativeSessionsRequestInput = typeof NeoPiNativeSessionsRequestInput.Type;
-export const NeoPiNativeSessionsWatchInput = Schema.Struct({ ref: NeoPiNativeSessionRef });
+export const NeoPiNativeSessionsWatchInput = Schema.Struct({
+  ref: NeoPiNativeSessionRef,
+  /**
+   * `thread`: a thread transcript observing the session. It changes nothing in the owner (no
+   * host tools are registered for it). Absent means a native session view.
+   */
+  purpose: Schema.optional(Schema.Literals(["session", "thread"])),
+});
 export type NeoPiNativeSessionsWatchInput = typeof NeoPiNativeSessionsWatchInput.Type;
 
 // ---------------------------------------------------------------------------

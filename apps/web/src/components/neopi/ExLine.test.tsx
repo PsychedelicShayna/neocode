@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
+import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import { act, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { registerCommand, type CommandInvocation } from "~/commandTable";
+import { closeNativeTerminal } from "./closeNativeTerminal";
 import { ExLine } from "./ExLine";
 
 vi.mock("../../state/neopiNativeSessions", () => ({
@@ -123,43 +125,61 @@ describe("ExLine", () => {
     key(composer, "keyup", "Enter");
   });
 
-  it("names the terminal focused last to :q, and stays open when none can close", () => {
+  function terminalViewport(terminalId: string) {
     const viewport = document.createElement("div");
-    viewport.dataset.terminalId = "terminal-2";
+    viewport.dataset.terminalId = terminalId;
     viewport.dataset.terminalThreadId = "thread-a";
     viewport.dataset.terminalEnvironmentId = "env-a";
     const terminalInput = document.createElement("textarea");
     viewport.append(terminalInput);
     document.body.append(viewport);
-    act(() => terminalInput.focus());
+    return { viewport, terminalInput };
+  }
 
-    let invoked: CommandInvocation | undefined;
+  function submit(text: string) {
+    const input = open();
+    type(input, text);
+    key(input, "keydown", "Enter");
+    key(document, "keyup", "Enter");
+    return input;
+  }
+
+  it("names the terminal focused last to :q, and never a later shell with its id", async () => {
+    const first = terminalViewport("terminal-2");
+    act(() => first.terminalInput.focus());
+
+    const invoked: Array<CommandInvocation | undefined> = [];
     cleanups.push(
       registerCommand("terminal.close", "workspace", {
         label: "Close terminal",
+        // The workspace still holds a terminal under this id.
         available: (invocation) => invocation?.terminal?.terminalId === "terminal-2",
         run: (invocation) => {
-          invoked = invocation;
+          invoked.push(invocation);
         },
       }),
     );
-    const input = open();
-    type(input, "q");
-    key(input, "keydown", "Enter");
-    key(document, "keyup", "Enter");
-    expect(invoked?.terminal).toEqual({
-      environmentId: "env-a",
+    submit("q");
+    expect(invoked.map((invocation) => invocation?.terminal)).toEqual([
+      { environmentId: "env-a", threadId: "thread-a", terminalId: "terminal-2" },
+    ]);
+
+    // The server closes that terminal; a new one is later created under the same id and never focused.
+    act(() => root.unmount());
+    await closeNativeTerminal({
+      close: async () => ({ _tag: "Success" }),
+      target: {
+        environmentId: EnvironmentId.make("env-a"),
+        ref: { providerInstanceId: ProviderInstanceId.make("neopi"), sessionFile: "/s.jsonl" },
+      },
       threadId: "thread-a",
       terminalId: "terminal-2",
+      surfaceId: null,
     });
-
-    viewport.remove();
-    act(() => root.unmount());
-    cleanups.splice(0).forEach((cleanup) => cleanup());
-    const again = open();
-    type(again, "q");
-    key(again, "keydown", "Enter");
-    key(document, "keyup", "Enter");
+    first.viewport.remove();
+    terminalViewport("terminal-2");
+    const again = submit("q");
+    expect(invoked).toHaveLength(1);
     expect(document.querySelector("[role='alert']")?.textContent).toBe("Nothing to close");
     expect(document.activeElement).toBe(again);
   });

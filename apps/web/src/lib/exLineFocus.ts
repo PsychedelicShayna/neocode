@@ -11,36 +11,47 @@ export function isExLineFocused(): boolean {
   );
 }
 
-let guardedKey: string | null = null;
+/** Keys that ran a command or closed the Ex line and are still held, each with its disarm. */
+const guards = new Map<string, () => void>();
 
-/** Whether this keydown is an auto-repeat of the key that just closed the Ex line. */
+/**
+ * Whether this keydown is an auto-repeat of a key that just closed the Ex
+ * line. Listeners on the window run before the document's guard, so any of
+ * them that acts on Enter or Escape checks this.
+ */
 export function isGuardedRepeat(event: { readonly key: string; readonly repeat?: boolean }) {
-  return event.repeat === true && event.key === guardedKey;
+  return event.repeat === true && guards.has(event.key);
 }
 
 /**
  * The key that ran a command or closed the Ex line is still held: until it is
- * released (or the window loses focus), its auto-repeat reaches nothing,
- * neither the field focus returns to nor a shortcut. A fresh press is not
- * affected.
+ * released, pressed afresh, or the window loses focus, its auto-repeat reaches
+ * nothing, neither the field focus returns to nor a shortcut. Each key has its
+ * own guard. A fresh press disarms the guard first, so a keyup lost inside an
+ * embedded page cannot keep it armed.
  */
 export function guardHeldKey(key: string): void {
-  guardedKey = key;
-  const swallow = (event: KeyboardEvent) => {
-    if (!isGuardedRepeat(event)) return;
+  guards.get(key)?.();
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== key) return;
+    if (!event.repeat) {
+      disarm();
+      return;
+    }
     event.preventDefault();
     event.stopImmediatePropagation();
   };
-  const release = (event: KeyboardEvent) => {
+  const onKeyUp = (event: KeyboardEvent) => {
     if (event.key === key) disarm();
   };
   const disarm = () => {
-    if (guardedKey === key) guardedKey = null;
-    document.removeEventListener("keydown", swallow, true);
-    document.removeEventListener("keyup", release, true);
+    if (guards.get(key) === disarm) guards.delete(key);
+    document.removeEventListener("keydown", onKeyDown, true);
+    document.removeEventListener("keyup", onKeyUp, true);
     window.removeEventListener("blur", disarm);
   };
-  document.addEventListener("keydown", swallow, true);
-  document.addEventListener("keyup", release, true);
+  guards.set(key, disarm);
+  document.addEventListener("keydown", onKeyDown, true);
+  document.addEventListener("keyup", onKeyUp, true);
   window.addEventListener("blur", disarm);
 }

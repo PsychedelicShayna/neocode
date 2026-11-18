@@ -53,6 +53,19 @@ export function getLastFocusedTerminal(): TerminalIdentity | null {
 }
 
 /**
+ * A terminal was closed: the record of it having had focus dies with it, so a
+ * terminal later created under the same id is never taken for it.
+ */
+export function forgetFocusedTerminal(terminal: TerminalIdentity): void {
+  if (
+    lastFocusedTerminal?.environmentId === terminal.environmentId &&
+    lastFocusedTerminal.threadId === terminal.threadId &&
+    lastFocusedTerminal.terminalId === terminal.terminalId
+  )
+    lastFocusedTerminal = null;
+}
+
+/**
  * Whether a terminal's own keyboard input has focus, so every key belongs to
  * the program running in it. Focus on a terminal's toolbar or tab list does
  * not count; those are GUI controls inside the terminal owner.

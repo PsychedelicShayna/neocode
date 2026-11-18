@@ -65,6 +65,7 @@ import { subscribePreviewAction } from "../preview/previewActionBus";
 import { ThreadPreviewMiniPlayer } from "../preview/ThreadPreviewMiniPlayer";
 import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
+import { closeNativeTerminal } from "./closeNativeTerminal";
 import { ExLine } from "./ExLine";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
 import { useNativePendingFiles } from "./useNativePendingFiles";
@@ -296,16 +297,16 @@ export function NativeSessionWorkspacePanels({
         if (surface.kind === "terminal") {
           let failed = false;
           for (const terminalId of surface.terminalIds) {
-            const result = await closeTerminal({
-              environmentId: target.environmentId,
-              input: { threadId: resourceId, terminalId, deleteHistory: true },
+            const result = await closeNativeTerminal({
+              close: closeTerminal,
+              target,
+              threadId: resourceId,
+              terminalId,
+              surfaceId: surface.id,
             });
             if (result._tag === "Failure") {
               report(squashAtomCommandFailure(result));
               failed = true;
-            } else {
-              useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
-              useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
             }
           }
           if (failed) continue;

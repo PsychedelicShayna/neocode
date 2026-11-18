@@ -80,6 +80,8 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       levels: [] as string[],
       /** `snapshot_session_journal` requests the owner received. */
       snapshots: 0,
+      /** The owner refuses to raise the subagent level. */
+      refuseLevels: false,
       followUp: [] as string[],
       inventoryFailure: false,
       inventoryHook: Effect.void as Effect.Effect<void>,
@@ -187,6 +189,10 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
                     yield* native.inventoryHook;
                     return { subagents: native.agents };
                   case "set_subagent_subscription":
+                    if (native.refuseLevels && Reflect.get(command, "level") !== "off")
+                      return yield* new NeoPiRpcError({
+                        message: "Subagent event bus is unavailable",
+                      });
                     native.levels.push(String(Reflect.get(command, "level")));
                     return { level: native.levels.at(-1) };
                   case "get_status":
@@ -1874,6 +1880,58 @@ describe("native observation leases and demand (r12 C4)", () => {
         assert.equal(native.snapshots, 1);
         assert.deepEqual(native.levels, []);
       }).pipe(Effect.scoped),
+  );
+});
+
+describe("a refused subagent level (decision 11 follow-up)", () => {
+  it.effect("is a fault a reader sees; a later success, or withdrawing the demand, clears it", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      native.refuseLevels = true;
+      const lease = yield* follow(service, originalRef);
+      let { cursor } = yield* lease.pass();
+      const ask = (generation: number, kinds: ReadonlyArray<"roster" | "summary">) =>
+        service.setDemand({
+          leaseId: lease.leaseId,
+          generation,
+          demand: kinds.map((kind) => ({ kind })),
+        });
+      const fault = () =>
+        Effect.gen(function* () {
+          // A read with nothing new waits for its deadline, which the test clock supplies.
+          const reading = yield* lease.pass(cursor).pipe(Effect.forkChild);
+          yield* TestClock.adjust("20 seconds");
+          const read = yield* Fiber.join(reading);
+          cursor = read.cursor;
+          return read;
+        });
+      yield* ask(1, ["roster"]);
+      yield* TestClock.adjust("2 seconds");
+      const refused = (yield* fault()).entities.get("fault:subagent-subscription");
+      assert.deepEqual(refused, {
+        class: "fault",
+        value: {
+          source: "subagent-subscription",
+          level: "error",
+          requestedLevel: "progress",
+          message: "Subagent event bus is unavailable",
+        },
+      });
+      // No retry loop: the owner was asked once.
+      yield* TestClock.adjust("1 minute");
+      assert.deepEqual(native.levels, []);
+      // The demand going away clears it.
+      yield* ask(2, ["summary"]);
+      yield* TestClock.adjust("2 seconds");
+      assert.isTrue((yield* fault()).removed.has("fault:subagent-subscription"));
+      // A later attempt that succeeds leaves no fault.
+      native.refuseLevels = false;
+      yield* ask(3, ["roster"]);
+      yield* TestClock.adjust("2 seconds");
+      assert.deepEqual(native.levels, ["off", "progress"]);
+      assert.isFalse((yield* fault()).entities.has("fault:subagent-subscription"));
+    }).pipe(Effect.scoped),
   );
 });
 

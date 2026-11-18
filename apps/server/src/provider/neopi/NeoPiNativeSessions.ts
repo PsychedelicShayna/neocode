@@ -150,6 +150,8 @@ const REFRESH_MIN_GAP = Duration.seconds(1);
  */
 const TERMINAL_POLL_INTERVAL = Duration.seconds(5);
 /** Build retries are bounded in rate and never terminal (C3.5). */
+/** Fault key for an owner that refused to raise its subagent subscription level (value: `{source, level: "error", requestedLevel, message}`). */
+const SUBAGENT_FAULT_KEY = "fault:subagent-subscription";
 const BUILD_RETRY_MIN_MS = 250;
 const BUILD_RETRY_MAX_MS = 5_000;
 /** One attach-only discovery attempt; past it the authority is unresolved and attach is retried. */
@@ -824,6 +826,28 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         // A reply from a replaced connection or an earlier epoch changes nothing.
         if (session.native !== native || session.projection.domain.ownerEpoch !== epoch) return;
         session.subagentLevel = { epoch, level };
+        // A refused raise is a visible fault, not silence: the Agents view would otherwise
+        // show a build-time roster. A success, a new owner or the demand going away clears it.
+        const { store } = session.projection;
+        if (applied._tag === "Failure" && level !== "off") {
+          const message = nativeError(applied.failure).message;
+          const held = store.get(SUBAGENT_FAULT_KEY)?.value;
+          const same =
+            held?.class === "fault" &&
+            held.value.requestedLevel === level &&
+            held.value.message === message;
+          if (!same)
+            store.put(SUBAGENT_FAULT_KEY, {
+              class: "fault",
+              value: {
+                source: "subagent-subscription",
+                level: "error",
+                requestedLevel: level,
+                message,
+              },
+            });
+        } else store.remove(SUBAGENT_FAULT_KEY);
+        notifyChanged(session);
         // A build in progress may have read the roster before the level rose: the re-read
         // is owed and runs once the projection publishes.
         if (
@@ -1115,6 +1139,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       current.attempt = null;
       if (abandoned) yield* Fiber.interrupt(abandoned);
       projection.rebuild(projection.domain.ownerEpoch + 1);
+      // A refusal belongs to the owner that gave it; the successor is asked afresh.
+      projection.store.remove(SUBAGENT_FAULT_KEY);
       current.recovery = null;
       yield* Deferred.succeed(recovery, undefined);
       yield* watchExit(current, successor);

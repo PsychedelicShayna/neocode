@@ -21,7 +21,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
-import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
+import { nativeSessionAtoms, usePageVisible } from "../../state/neopiNativeSessions";
 import { neopiSessionJournal } from "../../state/neopiSessions";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -31,9 +31,13 @@ export const threadObservationAtoms = createNeoPiThreadObservationAtoms(
   nativeSessionAtoms,
 );
 
-/** The thread's native observation and its thread status; mounting it holds the attach-only watch. */
+/**
+ * The thread's native observation and its thread status. A mounted thread view is the
+ * selected thread; it holds the attach-only lease while the document is visible (window
+ * focus plays no part) and only the cached feed while hidden.
+ */
 export function useThreadNativeObservation(threadRef: ScopedThreadRef) {
-  const observation = useAtomValue(threadObservationAtoms.observe(threadRef));
+  const observation = useAtomValue(threadObservationAtoms.observe(threadRef, usePageVisible()));
   return { observation, connection: threadObservationConnection(observation) };
 }
 

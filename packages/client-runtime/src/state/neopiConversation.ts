@@ -35,13 +35,14 @@ export function createNeoPiConversationAtoms<R, E>(
 
 /**
  * A thread's transcript observed through the native session controller: the thread's
- * native ref from its binding, then an attach-only watch of that ref (never Open, so a
- * thread view never starts an owner). Mounting the atom holds the watch, and with it the
- * lease; unmounting releases it.
+ * native ref from its binding, then an attach-only, thread-purpose watch of that ref (never
+ * Open, so a thread view never starts an owner, and it changes nothing in the owner). While
+ * the view is visible the atom holds the watch, and with it the lease; while it is concealed
+ * it holds only the cached feed (`view`); unmounting releases both.
  */
 export function createNeoPiThreadObservationAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
-  sessions: Pick<ReturnType<typeof createNativeSessionAtoms>, "watch" | "cached">,
+  sessions: Pick<ReturnType<typeof createNativeSessionAtoms>, "watch" | "view" | "cached">,
 ) {
   const nativeRef = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:neopi-sessions:native-ref",
@@ -49,7 +50,11 @@ export function createNeoPiThreadObservationAtoms<R, E>(
     staleTimeMs: 0,
   });
   const observation = Atom.family((key: string) => {
-    const [environmentId, threadId] = JSON.parse(key) as [EnvironmentId, ThreadId];
+    const [environmentId, threadId, visible] = JSON.parse(key) as [
+      EnvironmentId,
+      ThreadId,
+      boolean,
+    ];
     return Atom.make((get): ThreadNativeObservation => {
       const resolved = get(nativeRef({ environmentId, input: { threadId } }));
       const ref = Option.getOrNull(AsyncResult.value(resolved));
@@ -61,7 +66,7 @@ export function createNeoPiThreadObservationAtoms<R, E>(
         };
       if (ref.status !== "available") return { ref, feed: null, error: null };
       const target = { environmentId, ref: ref.ref };
-      const watched = get(sessions.watch({ environmentId, input: { ref: ref.ref } }));
+      const watched = get(sessions.view(target, visible, "thread"));
       return {
         ref,
         feed: Option.getOrNull(AsyncResult.value(watched)) ?? sessions.cached(target) ?? null,
@@ -69,10 +74,11 @@ export function createNeoPiThreadObservationAtoms<R, E>(
       };
     }).pipe(Atom.withLabel(`environment-data:neopi-sessions:thread:${key}`));
   });
-  const observe = (thread: {
-    readonly environmentId: EnvironmentId;
-    readonly threadId: ThreadId;
-  }) => observation(JSON.stringify([thread.environmentId, thread.threadId]));
+  /** `visible`: the document is visible and this thread's view is the selected one. */
+  const observe = (
+    thread: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId },
+    visible: boolean,
+  ) => observation(JSON.stringify([thread.environmentId, thread.threadId, visible]));
   return {
     observe,
     /**
@@ -83,13 +89,16 @@ export function createNeoPiThreadObservationAtoms<R, E>(
       registry: AtomRegistry.AtomRegistry,
       thread: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId },
     ) => {
-      const current = registry.get(observe(thread));
+      const current = registry.get(observe(thread, true));
       registry.refresh(
         nativeRef({ environmentId: thread.environmentId, input: { threadId: thread.threadId } }),
       );
       if (current.ref?.status === "available" && current.feed?.connected !== true)
         registry.refresh(
-          sessions.watch({ environmentId: thread.environmentId, input: { ref: current.ref.ref } }),
+          sessions.watch({
+            environmentId: thread.environmentId,
+            input: { ref: current.ref.ref, purpose: "thread" },
+          }),
         );
     },
     /** Re-reads only the binding, e.g. to learn whether NeoCode's own runtime still runs. */

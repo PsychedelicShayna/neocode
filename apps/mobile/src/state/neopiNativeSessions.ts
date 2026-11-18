@@ -30,14 +30,21 @@ const subscribeAppState = (changed: () => void) => {
   return () => subscription.remove();
 };
 
-export function useNativeSession(target: NativeSessionTarget) {
-  // A screen covered by another one, or the app in the background, holds no
-  // lease; it keeps the cached feed and resumes from it when shown again.
+/**
+ * Whether the current screen is shown: focused and the app in the foreground. A screen
+ * covered by another one, or the app in the background, holds no lease; it keeps the
+ * cached feed and resumes from it when shown again.
+ */
+export function useScreenVisible() {
   const foreground = useSyncExternalStore(
     subscribeAppState,
     () => AppState.currentState === "active",
   );
-  const visible = useIsFocused() && foreground;
+  return useIsFocused() && foreground;
+}
+
+export function useNativeSession(target: NativeSessionTarget) {
+  const visible = useScreenVisible();
   const result = useAtomValue(nativeSessionAtoms.view(target, visible));
   const send = useAtomCommand(nativeSessionAtoms.request, { reportFailure: false });
   const request = useCallback(

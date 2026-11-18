@@ -25,7 +25,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { scopedThreadKey } from "../lib/scopedEntities";
 import { appAtomRegistry } from "./atom-registry";
-import { nativeSessionAtoms } from "./neopiNativeSessions";
+import { nativeSessionAtoms, useScreenVisible } from "./neopiNativeSessions";
 import { bindComposerDraftToNativeSession } from "./use-composer-drafts";
 import { useAtomCommand } from "./use-atom-command";
 
@@ -46,7 +46,7 @@ export const nativeSessionDraftKey = (threadRef: ScopedThreadRef, identity: Nati
  * an owner); mobile only owns paging, read-only history for a stopped session and draft binding.
  */
 export function useNeoPiConversation(threadRef: ScopedThreadRef) {
-  const observation = useAtomValue(threadObservationAtoms.observe(threadRef));
+  const observation = useAtomValue(threadObservationAtoms.observe(threadRef, useScreenVisible()));
   const connection = threadObservationConnection(observation);
   const refresh = useCallback(
     () => threadObservationAtoms.refresh(appAtomRegistry, threadRef),

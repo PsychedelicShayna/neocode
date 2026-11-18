@@ -267,11 +267,13 @@ export const NeoPiNativeInboxRecord = Schema.Union([
 ]);
 export type NeoPiNativeInboxRecord = typeof NeoPiNativeInboxRecord.Type;
 
-/** A native journal entry after the stop-outcome filter. */
+/** A native journal entry after the stop-outcome filter; `NeoPiJournalEntry` plus the outcome. */
 export const NeoPiNativeObservedJournalEntry = Schema.StructWithRest(
   Schema.Struct({
     id: Schema.String,
     parentId: Schema.NullOr(Schema.String),
+    type: Schema.String,
+    timestamp: Schema.String,
     message: Schema.optionalKey(NeoPiNativeObservedMessage),
     stopOutcome: Schema.optionalKey(NeoPiStopOutcome),
   }),
@@ -288,6 +290,8 @@ export const NeoPiNativeJournalSlice = Schema.Struct({
   continuity: Schema.Literals(["append", "horizon"]),
   leafId: Schema.NullOr(Schema.String),
   entries: Schema.Array(NeoPiNativeObservedJournalEntry),
+  /** For `horizon`: the native page cursor for the entries before it, which fills a placeholder on demand. */
+  nextCursor: Schema.optionalKey(Schema.String),
 });
 export type NeoPiNativeJournalSlice = typeof NeoPiNativeJournalSlice.Type;
 
@@ -335,6 +339,11 @@ export const NeoPiNativeSessionsReadResult = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("pass"),
     passId: Schema.String,
+    /**
+     * The pass this reply belongs to. Only completing a `full` pass removes, by
+     * absence, held entities at or below the completed watermark.
+     */
+    kind: Schema.Literals(["incremental", "full"]),
     baseCursor: NeoPiNativeCursor,
     /** Revision through which the returned cohort is covered. */
     coveredThrough: NeoPiNativeRevision,

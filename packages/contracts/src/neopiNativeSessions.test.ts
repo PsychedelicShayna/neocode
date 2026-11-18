@@ -67,6 +67,7 @@ describe("native observation wire", () => {
     const pass = {
       type: "pass",
       passId: "pass-1",
+      kind: "incremental",
       baseCursor: cursor,
       coveredThrough: 14,
       continuation: { ...cursor, pass: null, base: 14 },
@@ -87,7 +88,13 @@ describe("native observation wire", () => {
     );
 
     const journal = Schema.decodeUnknownOption(NeoPiNativeObservedJournalEntry);
-    const entry = { id: "entry-1", parentId: null, type: "message", message: raw };
+    const entry = {
+      id: "entry-1",
+      parentId: null,
+      type: "message",
+      timestamp: "2026-11-18T00:00:00Z",
+      message: raw,
+    };
     assert.equal(journal(entry)._tag, "None");
     assert.equal(journal({ ...entry, message: filtered })._tag, "Some");
   });

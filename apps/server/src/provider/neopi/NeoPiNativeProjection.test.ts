@@ -32,6 +32,7 @@ const published = (capacity = { tombstones: 1000, journal: 512 }) => {
   });
   projection.applyStateReply({ sessionId }, projection.mark());
   projection.applySubagentsReply({ subagents: [] }, projection.mark());
+  projection.applySubagentHistoryReply(null, projection.mark());
   projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
   return projection;
 };
@@ -47,7 +48,7 @@ const entry = (id: string, parentId: string | null, message?: Record<string, unk
 
 /** The message value a full read serves for `messageId`, if any. */
 const servedMessage = (projection: NeoPiNativeProjection, messageId: string) => {
-  const reply = readNeoPiNativeObservation(projection, null, WIDE);
+  const reply = readNeoPiNativeObservation(projection, null, WIDE, "reader");
   assert.equal(reply.type, "pass");
   if (reply.type !== "pass") return undefined;
   const entity = reply.entities.find(
@@ -100,8 +101,9 @@ describe("NeoPiNativeProjection", () => {
     assert.isTrue(
       projection.applyStateReply({ sessionId, chatMode: "plan", thinkingLevel: "high" }, late),
     );
-    // The older reply arrives last: neither the event nor the newer reply regresses.
-    assert.isTrue(
+    // The older reply arrives last: it is refused, so neither the event nor
+    // the newer reply regresses.
+    assert.isFalse(
       projection.applyStateReply({ sessionId, chatMode: "code", thinkingLevel: "low" }, early),
     );
     const setting = (property: string) => {
@@ -217,6 +219,7 @@ describe("NeoPiNativeProjection", () => {
     });
     projection.applyStateReply({ sessionId }, mark);
     projection.applySubagentsReply({ subagents: [] }, mark);
+    projection.applySubagentHistoryReply(null, mark);
     projection.applyJournalPage({ sessionId, entries: [] }, mark);
     assert.isTrue(projection.published);
     let served = servedMessage(projection, messageId);
@@ -281,7 +284,7 @@ describe("NeoPiNativeProjection", () => {
       projection.fold(preview(500, false, { error: "anchor not found" }));
       projection.fold(preview(499, true));
       projection.fold(preview(501, true));
-      const reply = readNeoPiNativeObservation(projection, null, WIDE);
+      const reply = readNeoPiNativeObservation(projection, null, WIDE, "reader");
       assert.equal(reply.type, "pass");
       if (reply.type !== "pass") return;
       const previews = reply.entities.filter((entity) => entity.value.class === "editPreview");
@@ -328,7 +331,7 @@ describe("NeoPiNativeProjection", () => {
         projection.fold(update({ diagnostic: "schema drift in field x" }));
         projection.fold(update({ partial: 1 }));
         if (!interrupted) projection.fold(update({ final: "done" }));
-        const reply = readNeoPiNativeObservation(projection, null, WIDE);
+        const reply = readNeoPiNativeObservation(projection, null, WIDE, "reader");
         assert.equal(reply.type, "pass");
         if (reply.type !== "pass") return;
         assert.deepEqual(
@@ -529,6 +532,7 @@ describe("NeoPiNativeProjection", () => {
       const second = projection.mark();
       projection.applyStateReply({ sessionId }, second);
       projection.applySubagentsReply({ subagents: [] }, second);
+      projection.applySubagentHistoryReply(null, second);
       assert.isFalse(projection.published);
       projection.applyJournalPage({ sessionId, entries: [] }, second);
       assert.isTrue(projection.published);
@@ -554,6 +558,7 @@ describe("NeoPiNativeProjection", () => {
       });
       projection.applyStateReply({ sessionId }, projection.mark());
       projection.applySubagentsReply({ subagents: [] }, projection.mark());
+      projection.applySubagentHistoryReply(null, projection.mark());
       projection.applyJournalPage({ sessionId, entries: [] }, projection.mark());
       return projection;
     };
@@ -584,7 +589,7 @@ describe("NeoPiNativeProjection", () => {
 
     it("a reader behind the eviction receives one merged gap, once, with kinds, interval and time span", () => {
       const projection = bounded(4, 100_000);
-      const reader = readNeoPiNativeObservation(projection, null, WIDE);
+      const reader = readNeoPiNativeObservation(projection, null, WIDE, "reader");
       assert.equal(reader.type, "pass");
       if (reader.type !== "pass") return;
       const start = clock;
@@ -595,7 +600,7 @@ describe("NeoPiNativeProjection", () => {
       // Two evictions before the reader reads: adjacent, so one gap.
       projection.fold(stream("call-c", 1));
       projection.fold(stream("call-c", 2));
-      const behind = readNeoPiNativeObservation(projection, reader.continuation, WIDE);
+      const behind = readNeoPiNativeObservation(projection, reader.continuation, WIDE, "reader");
       assert.deepEqual(gaps(behind), [
         {
           type: "gap",
@@ -615,6 +620,7 @@ describe("NeoPiNativeProjection", () => {
         projection,
         behind.type === "pass" ? behind.continuation : null,
         WIDE,
+        "reader",
       );
       assert.deepEqual(gaps(again), [], "the gap is delivered once");
     });
@@ -622,7 +628,7 @@ describe("NeoPiNativeProjection", () => {
     it("records dropped while unobserved reach the next viewer as one not-observed gap covering exactly them", () => {
       const projection = bounded(64, 100_000);
       projection.fold(stream("seen", 1));
-      const first = readNeoPiNativeObservation(projection, null, WIDE);
+      const first = readNeoPiNativeObservation(projection, null, WIDE, "reader");
       assert.equal(first.type, "pass");
       if (first.type !== "pass") return;
       // The last watcher detaches; B5 drives this hook.
@@ -632,7 +638,7 @@ describe("NeoPiNativeProjection", () => {
       projection.fold({ type: "notice", level: "warning", message: "stopped auto-recovery" });
       projection.setInboxObserved(true);
       projection.fold(stream("after", 1));
-      const attached = readNeoPiNativeObservation(projection, null, WIDE);
+      const attached = readNeoPiNativeObservation(projection, null, WIDE, "reader");
       assert.equal(attached.type, "pass");
       if (attached.type !== "pass") return;
       assert.deepEqual(
@@ -774,7 +780,8 @@ describe("NeoPiNativeProjection", () => {
       );
       assert.deepEqual(value(projection, "job:j1"), { job: { id: "j1", status: "completed" } });
       assert.deepEqual(value(projection, "job:j2"), { job: { id: "j2", status: "running" } });
-      assert.deepEqual(value(projection, "presentation:jobs"), { runningCount: 1 });
+      // The stale running frame was refused, and so was its count.
+      assert.deepEqual(value(projection, "presentation:jobs"), { runningCount: 0 });
       projection.applyJobsReply({ running: [], recent: [], runningCount: 0 }, projection.mark());
       assert.isNull(projection.store.get("job:j2")?.value, "aged out of both lists");
     });
@@ -870,6 +877,450 @@ describe("NeoPiNativeProjection", () => {
         status: "ok",
         error: null,
       });
+    });
+  });
+
+  describe("final review", () => {
+    const tail = (projection: NeoPiNativeProjection) => {
+      const ids: string[] = [];
+      for (let position = projection.journal.start; position < projection.journal.end; position++)
+        ids.push(projection.journal.at(position)!.id);
+      return ids;
+    };
+    const rebuildWith = (
+      projection: NeoPiNativeProjection,
+      leafId: string | null,
+      entries: unknown[],
+    ) => {
+      projection.rebuild();
+      projection.beginBuildAttempt();
+      const mark = projection.mark();
+      projection.fold({
+        type: "journal_state",
+        reason: "snapshot",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId,
+        messageEntryIds: [],
+      });
+      projection.applyStateReply({ sessionId }, mark);
+      projection.applySubagentsReply({ subagents: [] }, mark);
+      projection.applySubagentHistoryReply(null, mark);
+      projection.applyJournalPage({ sessionId, entries }, mark);
+    };
+
+    it("2 tool joins never expire a message's retained join", () => {
+      const projection = published();
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("answer") });
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m", entryId: "e-m" });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: entry("e-m", null, assistant("answer")),
+      });
+      let parent = "e-m";
+      for (let n = 0; n < 300; n++) {
+        const toolCallId = `edit-${n}`;
+        projection.fold({ type: "tool_execution_start", toolCallId, toolName: "edit", args: {} });
+        projection.fold({
+          type: "tool_stream_update",
+          toolCallId,
+          toolName: "edit",
+          update: { generation: 0, streaming: false, files: [{ path: "a.ts" }] },
+        });
+        const id = `r-${n}`;
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: entry(id, parent, { role: "toolResult", toolCallId, content: [] }),
+        });
+        parent = id;
+      }
+      const record = projection.store.get("message:m");
+      assert.deepEqual([record?.value, record?.removed, record?.joinEntryId], [null, false, "e-m"]);
+    });
+
+    it("3 after an observation gap a build page never shows a live row beside its entry", () => {
+      const projection = published();
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("answer") });
+      // Observation lost; m was persisted meanwhile and its association is no
+      // longer among the snapshot's 256.
+      rebuildWith(projection, "e-m", [entry("e-m", null, assistant("answer"))]);
+      assert.isTrue(projection.published);
+      const reply = readNeoPiNativeObservation(projection, null, WIDE, "reader");
+      assert.equal(reply.type, "pass");
+      if (reply.type !== "pass") return;
+      const entries = (reply.journal?.entries ?? []).map((item) => item.id);
+      const live = reply.entities.filter((entity) => entity.value.class === "message");
+      assert.isFalse(entries.includes("e-m") && live.length > 0, "both copies");
+      assert.include(
+        entries,
+        "e-m",
+        "history is not held back for an association that cannot come",
+      );
+      assert.deepEqual(live, []);
+    });
+
+    it("4 a rebuild after a move to a sibling follows parent identity", () => {
+      const projection = published();
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("A", null) });
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("B", "A") });
+      rebuildWith(projection, "C", [entry("A", null), entry("C", "A")]);
+      assert.deepEqual(tail(projection), ["A", "C"]);
+      assert.equal(projection.journal.head?.id, "C");
+    });
+
+    it("an append batch announced by one leaf is not a navigation", () => {
+      const projection = published();
+      projection.fold({ type: "journal_entry", sessionId, entry: entry("h", null) });
+      const generation = projection.domain.branchGeneration;
+      const fences = [
+        projection.fold({
+          type: "journal_state",
+          reason: "leaf",
+          sessionId,
+          sessionFile: "/s.jsonl",
+          leafId: "b2",
+        }),
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("b1", "h") }),
+        projection.fold({ type: "journal_entry", sessionId, entry: entry("b2", "b1") }),
+        projection.fold({ type: "agent_end" }),
+      ];
+      assert.deepEqual(fences, ["none", "none", "none", "none"]);
+      assert.equal(projection.domain.branchGeneration, generation);
+      assert.deepEqual(tail(projection), ["h", "b1", "b2"]);
+    });
+
+    it("every entry hold ends: an alias for an unheld message, the run's end, eviction from the ring", () => {
+      const projection = published({ tombstones: 100, journal: 4 });
+      projection.fold({ type: "message_end", messageId: "m1", message: assistant("refused") });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: entry("E2", null, assistant("other")),
+      });
+      assert.equal(projection.deliverableJournalEnd, projection.journal.positionOf("E2"), "held");
+      // Its alias names a message whose live frames were missed.
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m2", entryId: "E2" });
+      assert.equal(projection.deliverableJournalEnd, projection.journal.end, "released");
+      let parent = "E2";
+      for (let n = 0; n < 50; n++) {
+        const id = `x${n}`;
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: entry(id, parent, assistant(id)),
+        });
+        parent = id;
+      }
+      assert.isAtMost(
+        projection.journal.end - projection.deliverableJournalEnd,
+        4,
+        "holds never outlive the ring",
+      );
+      projection.fold({ type: "agent_end" });
+      assert.equal(
+        projection.deliverableJournalEnd,
+        projection.journal.end,
+        "nothing waits past the run",
+      );
+    });
+
+    it("a stale whole get_state reply never publishes a field older than a live frame", () => {
+      const projection = published();
+      const mark = projection.mark();
+      projection.fold({ type: "thinking_level_changed", thinkingLevel: "high" });
+      projection.applyStateReply({ sessionId, thinkingLevel: "low", sessionName: "n" }, mark);
+      const state = projection.store.get("setting:state")?.value;
+      assert.deepEqual(state?.class === "setting" ? state.value.value : undefined, {
+        sessionId,
+        thinkingLevel: "high",
+        sessionName: "n",
+      });
+    });
+
+    it("the roster publishes with both sources, ticks do not block replies, older replies never win", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 100,
+        journalCapacity: 100,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      const older = projection.mark();
+      projection.fold({
+        type: "subagent_event",
+        payload: { id: "c", event: { type: "message_end" } },
+      });
+      const newer = projection.mark();
+      projection.applyStateReply({ sessionId }, older);
+      projection.applyJournalPage({ sessionId, entries: [] }, older);
+      projection.applySubagentsReply({ subagents: [{ id: "c", status: "running", n: 2 }] }, newer);
+      assert.isFalse(projection.published, "the history is part of the roster");
+      projection.applySubagentHistoryReply({ subagents: [{ id: "c", status: "running" }] }, older);
+      assert.isTrue(projection.published);
+      assert.isFalse(
+        projection.applySubagentsReply(
+          { subagents: [{ id: "c", status: "running", n: 1 }] },
+          older,
+        ),
+      );
+      const value = projection.store.get("roster:c")?.value;
+      assert.deepEqual(
+        value?.class === "roster"
+          ? [value.value.inventory, value.value.history, value.value.ticks]
+          : [],
+        [{ id: "c", status: "running", n: 2 }, { id: "c", status: "running" }, 1],
+      );
+    });
+
+    it("finished children, settled jobs and command outputs leave the store by tombstone", () => {
+      const projection = published();
+      for (let n = 0; n < 400; n++) {
+        projection.fold({
+          type: "job_lifecycle",
+          event: "registered",
+          job: { id: `j${n}`, status: "running" },
+        });
+        projection.fold({
+          type: "job_lifecycle",
+          event: "updated",
+          job: { id: `j${n}`, status: "completed" },
+        });
+        projection.fold({ type: "command_output", text: `out ${n}` });
+        projection.applySubagentsReply(
+          { subagents: [{ id: `c${n}`, status: "running" }] },
+          projection.mark(),
+        );
+      }
+      const live = (prefix: string) =>
+        [...projection.store.values()].filter(
+          (record) => record.value !== null && record.key.startsWith(prefix),
+        ).length;
+      assert.equal(live("job:"), 64);
+      assert.equal(live("receipt:"), 256);
+      assert.isAtMost(live("roster:"), 257);
+      projection.applySubagentHistoryReply(
+        { subagents: [{ id: "c399", status: "running" }] },
+        projection.mark(),
+      );
+      assert.equal(live("roster:"), 1, "children absent from the whole roster are gone");
+    });
+
+    it("detach drops every payload, and later eviction stays confirmed eviction", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+        inboxLimits: { records: 4, bytes: 100_000 },
+        now: () => 1,
+      });
+      for (const n of [1, 2, 3])
+        projection.fold({ type: "notice", level: "info", message: `n${n}` });
+      projection.setInboxObserved(false);
+      assert.deepEqual(
+        projection.inbox.map((record) =>
+          record.type === "gap" ? [record.reason, record.fromSeq, record.toSeq] : record.type,
+        ),
+        [["not-observed", 1, 3]],
+      );
+      projection.setInboxObserved(true);
+      for (let n = 4; n < 20; n++)
+        projection.fold({ type: "notice", level: "info", message: `n${n}` });
+      const reasons = projection.inbox.flatMap((record) =>
+        record.type === "gap" ? [[record.reason, record.fromSeq, record.toSeq]] : [],
+      );
+      // Four items: the two gaps and the two newest notices.
+      assert.deepEqual(reasons, [
+        ["not-observed", 1, 3],
+        ["evicted", 4, 17],
+      ]);
+      assert.equal(projection.inbox.length, 4);
+    });
+
+    it("record only: a gap can exceed the byte bound when one tool name alone does", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+        inboxLimits: { records: 8, bytes: 1_000 },
+      });
+      projection.fold({
+        type: "tool_stream_update",
+        toolCallId: "t",
+        toolName: "n".repeat(5_000),
+        update: 1,
+      });
+      assert.equal(projection.inbox.length, 1);
+      assert.equal(projection.inbox[0]?.type, "gap");
+      assert.isAbove(projection.inboxBytes, 1_000);
+    });
+  });
+
+  describe("first review 7–12", () => {
+    it("7 late frames never resurrect a retired message, tool or edit preview after its tombstone expires", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 1,
+        journalCapacity: 1000,
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId,
+        sessionFile: "/s.jsonl",
+        leafId: null,
+      });
+      projection.fold({ type: "message_end", messageId: "m", message: assistant("x") });
+      projection.fold({ type: "message_persisted", sessionId, messageId: "m", entryId: "e" });
+      projection.fold({ type: "tool_execution_start", toolCallId: "t", toolName: "edit" });
+      projection.fold({
+        type: "tool_stream_update",
+        toolCallId: "t",
+        toolName: "edit",
+        update: { generation: 0, streaming: false, files: [] },
+      });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: entry("e", null, assistant("x")),
+      });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: entry("r", "e", { role: "toolResult", toolCallId: "t" }),
+      });
+      // Expire every join tombstone through other retirements.
+      let parent = "r";
+      for (let n = 0; n < 600; n++) {
+        projection.fold({ type: "tool_execution_start", toolCallId: `o${n}`, toolName: "bash" });
+        projection.fold({ type: "message_end", messageId: `p${n}`, message: assistant("y") });
+        projection.fold({
+          type: "message_persisted",
+          sessionId,
+          messageId: `p${n}`,
+          entryId: `pe${n}`,
+        });
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: entry(`pe${n}`, parent, assistant("y")),
+        });
+        projection.fold({
+          type: "journal_entry",
+          sessionId,
+          entry: entry(`or${n}`, `pe${n}`, { role: "toolResult", toolCallId: `o${n}` }),
+        });
+        parent = `or${n}`;
+      }
+      assert.isUndefined(projection.store.get("message:m"), "its tombstone expired");
+      projection.fold({ type: "message_update", messageId: "m", message: assistant("x") });
+      projection.fold({
+        type: "tool_execution_update",
+        toolCallId: "t",
+        toolName: "edit",
+        partialResult: 1,
+      });
+      projection.fold({
+        type: "tool_stream_update",
+        toolCallId: "t",
+        toolName: "edit",
+        update: { generation: 1, streaming: true, files: [] },
+      });
+      for (const key of ["message:m", "tool:t", "editPreview:t"])
+        assert.isUndefined(projection.store.get(key), key);
+    });
+
+    it("9 the holding area is bounded (decision 8): see 'holds under a tool that streams forever'", () => {
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+        inboxLimits: { records: 16, bytes: 4_000 },
+      });
+      for (let n = 0; n < 5_000; n++)
+        projection.fold({ type: "notice", level: "info", message: `turn ${n}` });
+      assert.isAtMost(projection.inbox.length, 16);
+    });
+
+    it("10 one key put and removed forever keeps the tombstone queue bounded", () => {
+      const projection = published({ tombstones: 1, journal: 10 });
+      for (let n = 0; n < 10_000; n++) {
+        projection.store.put("k", { class: "presentation", value: { n } });
+        projection.store.remove("k");
+      }
+      assert.isAtMost(projection.store.tombstoneEntries, 200);
+    });
+
+    it("11 completed activations replace each other and aborted edit previews leave at the run's end", () => {
+      const projection = published();
+      for (let n = 0; n < 50; n++) {
+        const payload = {
+          id: "child",
+          runToken: `r${n}`,
+          agent: "task",
+          agentSource: "bundled",
+          index: 0,
+        };
+        projection.fold({ type: "subagent_lifecycle", payload: { ...payload, status: "started" } });
+        projection.fold({
+          type: "subagent_lifecycle",
+          payload: { ...payload, status: "completed" },
+        });
+        projection.fold({
+          type: "tool_stream_update",
+          toolCallId: `aborted-${n}`,
+          toolName: "edit",
+          update: { generation: 0, streaming: false, files: [{ path: "a" }] },
+        });
+      }
+      projection.fold({ type: "agent_end" });
+      const keys = [...projection.store.values()]
+        .filter((record) => record.value !== null)
+        .map((record) => record.key);
+      assert.deepEqual(
+        keys.filter((key) => key.startsWith("roster:")),
+        ["roster:child"],
+      );
+      assert.deepEqual(
+        keys.filter((key) => key.startsWith("editPreview:")),
+        [],
+      );
+    });
+
+    it("12 an identity change settles the previous session's pending interactions", () => {
+      const settled: string[] = [];
+      const projection = new NeoPiNativeProjection({
+        domain,
+        tombstoneCapacity: 10,
+        journalCapacity: 10,
+        onEssential: (envelope) => {
+          if (envelope.type === "obligation-settled")
+            settled.push(`${envelope.id}:${envelope.outcome}`);
+        },
+      });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId: "A",
+        sessionFile: "/a.jsonl",
+        leafId: null,
+      });
+      projection.fold({ type: "extension_ui_request", id: "d", method: "confirm", title: "?" });
+      projection.fold({
+        type: "journal_state",
+        reason: "identity",
+        sessionId: "B",
+        sessionFile: "/b.jsonl",
+        leafId: null,
+      });
+      assert.equal(projection.obligations.size, 0);
+      assert.deepEqual(settled, ["d:cancelled"]);
     });
   });
 });

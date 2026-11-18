@@ -6,6 +6,7 @@ import {
   type NeoPiNativeEntity,
   type NeoPiNativeJournalSlice,
   type NeoPiNativeObservationDomain,
+  type NeoPiNativeInboxRecord,
   type NeoPiNativeTombstone,
 } from "@t3tools/contracts";
 import { nativeConversationGaps } from "./neopiConversation.ts";
@@ -1558,10 +1559,11 @@ describe("observation rebase", () => {
     watermark: number;
     /** Completes the pass at `watermark`; otherwise `cut` names where it continues. */
     done?: boolean;
-    cut?: string;
+    cut?: number;
     entities?: readonly NeoPiNativeEntity[];
     tombstones?: readonly NeoPiNativeTombstone[];
     journal?: NeoPiNativeJournalSlice;
+    inbox?: readonly NeoPiNativeInboxRecord[];
   }
   const reply = (input: Reply) => {
     const kind = input.kind ?? "full";
@@ -1581,7 +1583,7 @@ describe("observation rebase", () => {
               passId: input.passId,
               watermark: input.watermark,
               lastOrdinal: 1000,
-              afterKey: input.cut ?? "cut",
+              afterOrdinal: input.cut ?? 0,
               segment: null,
             },
       },
@@ -1590,7 +1592,7 @@ describe("observation rebase", () => {
       entities: input.entities ?? [],
       tombstones: input.tombstones ?? [],
       segments: [],
-      inbox: [],
+      inbox: input.inbox ?? [],
       journal: input.journal ?? null,
     };
   };
@@ -1902,7 +1904,7 @@ describe("observation rebase", () => {
       passId: "p2",
       watermark: 30,
       done: false,
-      cut: "part-1",
+      cut: 1,
       entities: [roster("a", 25), message("m1", 26, "r", "body")],
     });
     expect(keys(feed)).toEqual(["message:m1", "roster:a", "roster:b"]);
@@ -1913,7 +1915,7 @@ describe("observation rebase", () => {
       passId: "p2",
       watermark: 30,
       done: false,
-      cut: "part-2",
+      cut: 2,
       entities: [roster("a", 20, "stale")],
       journal: horizon([journalEntry("u", null), journalEntry("r", "u", "body")]),
     });
@@ -2112,5 +2114,93 @@ describe("observation rebase", () => {
     });
     expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
     expect(ids(feed)).toEqual(["u", "E"]);
+  });
+
+  it("keeps a row retired by its durable entry until that entry is held", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "reply")],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 5,
+      tombstones: [{ key: "message:m", ordinal: 1, revision: 5, joinEntryId: "r" }],
+    });
+    expect(contents(feed)).toEqual(["reply"]);
+    expect(feed.conversation.losses).toEqual([]);
+    feed = step(feed, {
+      epoch,
+      passId: "p3",
+      kind: "incremental",
+      watermark: 6,
+      journal: { continuity: "append", leafId: "r", entries: [journalEntry("r", "u", "reply")] },
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(transcript(feed)).toEqual(["u", "reply"]);
+  });
+
+  it("keeps inbox gaps in order, replacing a grown gap and merging adjacent ones", () => {
+    const epoch = domain();
+    const notice = (seq: number): NeoPiNativeInboxRecord => ({
+      type: "notice",
+      seq,
+      level: "info",
+      message: `notice ${seq}`,
+    });
+    const gap = (
+      fromSeq: number,
+      toSeq: number,
+      reason: "evicted" | "not-observed",
+      notices: number,
+    ): NeoPiNativeInboxRecord => ({
+      type: "gap",
+      seq: toSeq,
+      reason,
+      fromSeq,
+      toSeq,
+      firstReceivedAt: fromSeq * 1000,
+      lastReceivedAt: toSeq * 1000,
+      notices,
+      toolStreams: [{ toolCallId: "t", toolName: "bash", updates: 1 }],
+      toolStreamsTruncated: false,
+    });
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 1,
+      inbox: [notice(1), gap(2, 4, "evicted", 2)],
+    });
+    // The server grew its gap; the shorter one is replaced, not repeated.
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 2,
+      inbox: [gap(2, 6, "evicted", 4), notice(7)],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p3",
+      watermark: 3,
+      inbox: [gap(8, 9, "not-observed", 1), gap(10, 11, "evicted", 1), notice(5)],
+    });
+    expect(
+      feed.observation.inbox.map((record) =>
+        record.type === "gap"
+          ? [record.fromSeq, record.toSeq, record.reason, record.notices, record.toolStreams]
+          : record.seq,
+      ),
+    ).toEqual([
+      1,
+      [2, 6, "evicted", 4, [{ toolCallId: "t", toolName: "bash", updates: 1 }]],
+      7,
+      [8, 11, "not-observed", 2, [{ toolCallId: "t", toolName: "bash", updates: 2 }]],
+    ]);
+    const held = feed.observation.inbox;
+    expect(step(feed, { epoch, passId: "p4", watermark: 4 }).observation.inbox).toBe(held);
   });
 });

@@ -266,8 +266,13 @@ export interface NativeObservation {
     string,
     { readonly revision: number; readonly parts: ReadonlyArray<string | undefined> }
   >;
-  /** Live-only records without a reducer, in order. */
+  /**
+   * Live-only records without a reducer, in order, and `gap` records where the
+   * server evicted records this view never received. Nothing is invented for a gap.
+   */
   readonly inbox: readonly NeoPiNativeInboxRecord[];
+  /** Index of the first inbox record of the current projection; sequence numbers restart per projection. */
+  readonly inboxStart: number;
 }
 export const emptyNativeObservation = (): NativeObservation => ({
   domain: null,
@@ -279,6 +284,7 @@ export const emptyNativeObservation = (): NativeObservation => ({
   historyReplaced: false,
   segments: new Map(),
   inbox: [],
+  inboxStart: 0,
 });
 export type NativeOwnerLoss = "reconnecting" | "orphaned" | "detached";
 export interface NativeSessionFeed {
@@ -494,13 +500,23 @@ export function applyNativeRead(
         entryId: value.entryId,
       });
   };
-  const remove = (key: string, revision: number) => {
+  const remove = (key: string, revision: number, joinEntryId?: string) => {
     const previous = entities.get(key);
     if (previous && previous.revision >= revision) return;
     removed.set(key, Math.max(revision, removed.get(key) ?? -1));
     if (!previous) return;
     entities.delete(key);
-    if (previous.value.class === "message") unresolved.add(previous.value.messageId);
+    const value = previous.value;
+    if (value.class !== "message") return;
+    // Retired by its durable entry: the row stays until that entry is held.
+    if (joinEntryId !== undefined && conversation.identity)
+      conversation = reduceNativeConversation(conversation, {
+        type: "persisted",
+        identity: conversation.identity,
+        messageId: value.messageId,
+        entryId: joinEntryId,
+      });
+    else unresolved.add(value.messageId);
   };
   for (const entity of result.entities) accept(entity);
   for (const segment of result.segments) {
@@ -518,7 +534,11 @@ export function applyNativeRead(
     segments.delete(segment.key);
     Option.map(decodeSegmentedEntity(parts.join("")), accept);
   }
-  for (const tombstone of result.tombstones) remove(tombstone.key, tombstone.revision);
+  for (const tombstone of result.tombstones) {
+    // A tombstone is the pass's answer for its key, never absence.
+    returned.add(tombstone.key);
+    remove(tombstone.key, tombstone.revision, tombstone.joinEntryId);
+  }
   const completed = result.continuation.pass === null;
   const fullCompleted = completed && result.kind === "full";
   if (fullCompleted) {
@@ -564,8 +584,46 @@ export function applyNativeRead(
     for (const [key, revision] of removed)
       if (revision <= result.continuation.base) removed.delete(key);
   // Inbox sequence numbers belong to one projection.
-  const lastSeq = sameProjection ? (held.inbox.at(-1)?.seq ?? -1) : -1;
-  const inbox = result.inbox.filter((record) => record.seq > lastSeq);
+  const inboxStart = sameProjection ? held.inboxStart : held.inbox.length;
+  const inbox: NeoPiNativeInboxRecord[] = result.inbox.length === 0 ? [] : [...held.inbox];
+  for (const record of result.inbox) {
+    const last = inbox.length > inboxStart ? inbox.at(-1) : undefined;
+    if (last && record.seq <= last.seq) continue;
+    if (record.type !== "gap") {
+      inbox.push(record);
+      continue;
+    }
+    // The server extends its one gap in place, keeping `fromSeq`: that replaces
+    // the shorter gap. A gap straight after another gap merges with it; mixing
+    // reasons leaves coverage unknown, so the merge is `not-observed`.
+    const at = inbox.findLastIndex(
+      (prior, index) =>
+        index >= inboxStart && prior.type === "gap" && prior.fromSeq === record.fromSeq,
+    );
+    if (at >= 0) {
+      inbox.splice(at, 1);
+      inbox.push(record);
+    } else if (last?.type === "gap") {
+      const streams = new Map(last.toolStreams.map((stream) => [stream.toolCallId, stream]));
+      for (const stream of record.toolStreams) {
+        const prior = streams.get(stream.toolCallId);
+        streams.set(
+          stream.toolCallId,
+          prior ? { ...stream, updates: prior.updates + stream.updates } : stream,
+        );
+      }
+      inbox[inbox.length - 1] = {
+        ...record,
+        fromSeq: last.fromSeq,
+        reason: last.reason === record.reason ? record.reason : "not-observed",
+        firstReceivedAt: Math.min(last.firstReceivedAt, record.firstReceivedAt),
+        lastReceivedAt: Math.max(last.lastReceivedAt, record.lastReceivedAt),
+        notices: last.notices + record.notices,
+        toolStreams: [...streams.values()],
+        toolStreamsTruncated: last.toolStreamsTruncated || record.toolStreamsTruncated,
+      };
+    } else inbox.push(record);
+  }
   return {
     ...feed,
     conversation,
@@ -579,7 +637,8 @@ export function applyNativeRead(
       removed,
       historyReplaced: historyReplaced && !fullCompleted,
       segments,
-      inbox: inbox.length > 0 ? [...held.inbox, ...inbox] : held.inbox,
+      inbox: result.inbox.length === 0 ? held.inbox : inbox,
+      inboxStart,
     },
   };
 }

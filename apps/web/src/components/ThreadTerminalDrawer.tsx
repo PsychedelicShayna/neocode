@@ -62,10 +62,7 @@ import {
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
 } from "../keybindings";
-import {
-  createTerminalFocusEscape,
-  TERMINAL_FOCUS_ESCAPE_BYTE,
-} from "~/terminal/terminalFocusEscape";
+import { createTerminalFocusEscape } from "~/terminal/terminalFocusEscape";
 import {
   DEFAULT_THREAD_TERMINAL_HEIGHT,
   MAX_TERMINALS_PER_GROUP,
@@ -504,7 +501,19 @@ export function TerminalViewport({
     let selectionActions: ReturnType<typeof observeSelectionActions> | null = null;
 
     const setup = async (): Promise<(() => void) | null> => {
-      const focusEscape = createTerminalFocusEscape();
+      // Every byte for the program leaves through focusEscape.send.
+      const focusEscape = createTerminalFocusEscape({
+        write: (data) => handleData(data),
+        // Blur rather than focus the terminal's owner: focus anywhere inside
+        // the owner still counts as terminal focus for keybinding `when`
+        // clauses, which would keep GUI shortcuts from resolving.
+        leave: () => {
+          const activeElement = document.activeElement;
+          if (activeElement instanceof HTMLElement && mount.contains(activeElement)) {
+            activeElement.blur();
+          }
+        },
+      });
       const setupFont = terminalFontRef.current;
       const terminalOptions: GhosttyTerminalSurfaceOptions = {
         theme: terminalThemeFromApp(mount),
@@ -512,10 +521,10 @@ export function TerminalViewport({
         get visible() {
           return visibleRef.current;
         },
-        onData: (data) => handleData(data),
+        onData: (data) => focusEscape.send(data),
         onResize: (cols, rows) => void resizeTerminal(cols, rows),
         onSelectionChange: () => handleSelectionChange(),
-        beforeKey: (event) => handleBeforeKey(event),
+        beforeKey: (event) => focusEscape.beforeKey(event) && handleBeforeKey(event),
         onLinkActivate: (text, event) => handleLinkActivate(text, event),
         // The surface listens from construction, so a right-click can land
         // while `create` is still awaiting WASM — before the handler below it
@@ -763,30 +772,6 @@ export function TerminalViewport({
       };
 
       function handleBeforeKey(event: KeyboardEvent): boolean {
-        switch (focusEscape.handleKey(event)) {
-          case "hold":
-            event.preventDefault();
-            event.stopPropagation();
-            return false;
-          case "escape": {
-            event.preventDefault();
-            event.stopPropagation();
-            // Blur rather than focus the terminal's owner: focus anywhere inside
-            // the owner still counts as terminal focus for keybinding `when`
-            // clauses, which would keep GUI shortcuts from resolving.
-            const activeElement = document.activeElement;
-            if (activeElement instanceof HTMLElement && mount.contains(activeElement)) {
-              activeElement.blur();
-            }
-            return false;
-          }
-          case "flush":
-            void sendTerminalInput(TERMINAL_FOCUS_ESCAPE_BYTE, "Terminal write failed");
-            break;
-          case "pass":
-            break;
-        }
-
         const navigationData = terminalNavigationShortcutData(event);
         if (navigationData !== null) {
           event.preventDefault();

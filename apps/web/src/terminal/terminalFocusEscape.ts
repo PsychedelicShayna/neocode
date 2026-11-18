@@ -15,16 +15,9 @@ export type TerminalFocusEscapeKey = Pick<
   | "repeat"
   | "isComposing"
   | "keyCode"
+  | "preventDefault"
+  | "stopPropagation"
 >;
-
-/**
- * What the terminal does with one keydown:
- * - `pass`: encode it for the program as usual.
- * - `hold`: swallow it; the first Ctrl+Backslash waits for the next key.
- * - `escape`: swallow it and move focus out of the terminal.
- * - `flush`: send the held Ctrl+Backslash first, then encode this key as usual.
- */
-export type TerminalFocusEscapeAction = "pass" | "hold" | "escape" | "flush";
 
 const MODIFIER_KEYS: Readonly<Record<string, true>> = {
   Control: true,
@@ -47,27 +40,53 @@ function isEscapeChord(event: TerminalFocusEscapeKey): boolean {
 /**
  * Ctrl+Backslash pressed twice leaves a focused terminal, as Neovim's terminal
  * mode leaves on Ctrl+Backslash followed by a second key. There is no timeout:
- * the held press waits for the next key, and any other key sends it to the
- * program ahead of that key. Call `reset` when the terminal loses focus.
+ * the first press is held until the next key.
+ *
+ * Every byte bound for the program must go through `send`, so a held press
+ * goes out ahead of anything else the terminal writes (keys, IME commits,
+ * AltGr text, pastes) and the next Ctrl+Backslash starts over. `beforeKey`
+ * runs first on each keydown and returns false for a key it consumed. Call
+ * `reset` when the terminal loses focus: a held press is then dropped unsent.
  */
-export function createTerminalFocusEscape() {
+export function createTerminalFocusEscape({
+  write,
+  leave,
+}: {
+  readonly write: (data: string) => void;
+  readonly leave: () => void;
+}) {
   let holding = false;
+  const send = (data: string) => {
+    const output = holding ? TERMINAL_FOCUS_ESCAPE_BYTE + data : data;
+    holding = false;
+    if (output.length > 0) write(output);
+  };
+  const consume = (event: TerminalFocusEscapeKey) => {
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  };
   return {
-    handleKey(event: TerminalFocusEscapeKey): TerminalFocusEscapeAction {
+    send,
+    beforeKey(event: TerminalFocusEscapeKey): boolean {
       if (!holding) {
-        if (!isEscapeChord(event)) return "pass";
+        // A repeat is an ordinary key: only a fresh press can start the escape.
+        if (event.repeat || !isEscapeChord(event)) return true;
         holding = true;
-        return "hold";
+        return consume(event);
       }
-      if (MODIFIER_KEYS[event.key] || isTerminalCompositionKey(event, false)) return "pass";
+      if (MODIFIER_KEYS[event.key] || isTerminalCompositionKey(event, false)) return true;
       if (isEscapeChord(event)) {
         // Holding the chord down must not leave the terminal by auto-repeat.
-        if (event.repeat) return "hold";
+        if (event.repeat) return consume(event);
         holding = false;
-        return "escape";
+        leave();
+        return consume(event);
       }
-      holding = false;
-      return "flush";
+      // Any other key releases the held press ahead of itself, even a key the
+      // terminal then encodes as nothing.
+      send("");
+      return true;
     },
     reset(): void {
       holding = false;

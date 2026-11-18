@@ -550,11 +550,12 @@ export function NativeSessionWorkspacePanels({
         ) : null}
         {activeSurface?.kind === "agents" ? <NativeAgentsPanel viewKey={key} /> : null}
         {activeSurface?.kind === "background-tasks" ? (
-          <NativeBackgroundTasksPanel target={target} />
+          <NativeBackgroundTasksPanel target={target} visible={panel.isOpen} />
         ) : null}
         {activeSurface?.kind === "native-history" ? (
           <NativeSessionTreePanel
             target={target}
+            visible={panel.isOpen}
             request={request}
             execute={execute}
             onNavigated={onTreeNavigated}

@@ -50,6 +50,8 @@ export interface AgentHubSource {
   /** Identifies this source, and so its transcripts, among every source the hub can show. */
   readonly key: string;
   readonly agents: readonly AgentHubAgent[];
+  /** Present only when NeoPi refused the requested live roster subscription. */
+  readonly rosterWarning?: string | null;
   /** Why the model control is unavailable; `null` when NeoPi can change a child's model. */
   readonly modelControlUnavailable: string | null;
   /** Rejects with the harness message. `fromByte` is the previous result's `nextByte`. */
@@ -60,6 +62,9 @@ export interface AgentHubSource {
   setModel(agentId: string, selector: AgentHubModelSelector): Promise<void>;
   cancel(agentId: string): Promise<void>;
 }
+
+export const NATIVE_ROSTER_UNAVAILABLE_NOTE =
+  "Live agent updates are unavailable from this session's NeoPi. The list is as of the last refresh.";
 
 export type AgentHubModelSelector =
   | { readonly kind: "role"; readonly role: string }

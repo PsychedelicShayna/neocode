@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { useIsFocused } from "@react-navigation/native";
 import type { NeoPiNativeSessionsRequestInput } from "@t3tools/contracts";
 import { createNativeSessionAtoms } from "@t3tools/client-runtime/state/neopi-native-sessions";
 import {
@@ -8,7 +9,8 @@ import {
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { useCallback } from "react";
+import { useCallback, useSyncExternalStore } from "react";
+import { AppState } from "react-native";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useAtomCommand } from "./use-atom-command";
 import { appAtomRegistry } from "./atom-registry";
@@ -22,10 +24,21 @@ export function useNativeSessionReconnect(target: NativeSessionTarget) {
     [target.environmentId, target.ref.providerInstanceId, target.ref.sessionFile],
   );
 }
+
+const subscribeAppState = (changed: () => void) => {
+  const subscription = AppState.addEventListener("change", changed);
+  return () => subscription.remove();
+};
+
 export function useNativeSession(target: NativeSessionTarget) {
-  const result = useAtomValue(
-    nativeSessionAtoms.watch({ environmentId: target.environmentId, input: { ref: target.ref } }),
+  // A screen covered by another one, or the app in the background, holds no
+  // lease; it keeps the cached feed and resumes from it when shown again.
+  const foreground = useSyncExternalStore(
+    subscribeAppState,
+    () => AppState.currentState === "active",
   );
+  const visible = useIsFocused() && foreground;
+  const result = useAtomValue(nativeSessionAtoms.view(target, visible));
   const send = useAtomCommand(nativeSessionAtoms.request, { reportFailure: false });
   const request = useCallback(
     async (

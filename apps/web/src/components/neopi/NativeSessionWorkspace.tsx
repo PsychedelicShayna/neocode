@@ -8,6 +8,8 @@ import {
   nativeRecord,
   nativeSessionKey,
   nativeDisconnectLabel,
+  nativeInboxLossWarnings,
+  nativeObservationNotice,
   nativeOwnerNotice,
   nativeSlashCommands,
   type NativeSessionTarget,
@@ -206,7 +208,7 @@ export function NativeSessionView({
   /** The tab bar's trailing slot, where this session's header actions render. */
   actionsSlot?: HTMLElement | null;
 }) {
-  const { feed, session, conversation, request, loading, error } = useNativeSession(target);
+  const { feed, session, conversation, request, error } = useNativeSession(target);
   // Dismissing hides that one message; a different failure shows again.
   const [dismissedError, setDismissedError] = useState<string | null>(null);
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
@@ -301,6 +303,7 @@ export function NativeSessionView({
   // takes them by starting an owner first.
   const canSend = feed.connected || feed.ownerLoss === "orphaned";
   const ownerNotice = nativeOwnerNotice(feed.ownerLoss, session?.attachment);
+  const observationNotice = nativeObservationNotice(feed);
   useEffect(() => {
     if (session) setState(session.state);
   }, [session]);
@@ -498,6 +501,27 @@ export function NativeSessionView({
       debug,
       commandOutputs,
     ],
+  );
+  // Missing live output of a call on screen is marked at that call; every gap is
+  // also listed above the panels, outside the conversation. Keyed by the gapped
+  // calls on screen, so streaming does not rebuild the markers.
+  const inbox = feed.observation.inbox;
+  const shownLossCalls = useMemo(() => {
+    const gapped = new Set(
+      inbox.flatMap((record) =>
+        record.type === "gap" || record.type === "trimmed"
+          ? record.toolStreams.map((stream) => stream.toolCallId)
+          : [],
+      ),
+    );
+    if (gapped.size === 0) return "";
+    return rows
+      .flatMap((row) => (row.kind === "tool" && gapped.has(row.call.id) ? [row.call.id] : []))
+      .join("\n");
+  }, [inbox, rows]);
+  const losses = useMemo(
+    () => nativeInboxLossWarnings(inbox, new Set(shownLossCalls.split("\n").filter(Boolean))),
+    [inbox, shownLossCalls],
   );
   const queueStamp = conversation.entries.at(-1)?.timestamp ?? "";
   const queuedMessages = useMemo(
@@ -846,6 +870,27 @@ export function NativeSessionView({
             actionsSlot,
           )
         : null}
+      {/* Outside the panels as well as the conversation: it stays visible in the Agent Hub. */}
+      {observationNotice ? (
+        <p
+          role="status"
+          aria-live="polite"
+          className="shrink-0 px-5 py-1 text-xs text-muted-foreground"
+        >
+          {observationNotice.text}
+        </p>
+      ) : null}
+      {losses.general.length > 0 ? (
+        <div
+          role="status"
+          aria-label="Live records not kept"
+          className="flex max-h-24 shrink-0 flex-col gap-0.5 overflow-y-auto px-5 py-1 text-xs text-warning-foreground"
+        >
+          {losses.general.map((warning) => (
+            <p key={warning.key}>{warning.text}</p>
+          ))}
+        </div>
+      ) : null}
       <NativeSessionWorkspacePanels
         target={target}
         cwd={session?.cwd ?? null}
@@ -898,6 +943,7 @@ export function NativeSessionView({
             queuedMessages={queuedMessages}
             hideThinking={hideThinking}
             toggleToolOutputSerial={toolOutputSerial}
+            toolLosses={losses.byToolCall}
             onSteerQueuedMessage={steerQueued}
             onRemoveQueuedMessage={removeQueued}
           />
@@ -956,9 +1002,15 @@ export function NativeSessionView({
                     ? "ready"
                     : "disconnected"
               }
-              isConnecting={loading}
+              isConnecting={false}
               isSendBusy={sending}
-              sendDisabledReason={canSend ? null : "Reconnect NeoPi before sending."}
+              sendDisabledReason={
+                canSend
+                  ? null
+                  : observationNotice
+                    ? "Reconnecting to the session; send once it is back."
+                    : "Reconnect NeoPi before sending."
+              }
               settings={settings}
               resolvedTheme={resolvedTheme}
               keybindings={keybindings}

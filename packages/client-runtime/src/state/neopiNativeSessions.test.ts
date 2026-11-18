@@ -423,6 +423,55 @@ describe("native observation controller", () => {
   );
 
   it.effect(
+    "a concealed view releases its lease and read, then resumes without losing its place",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness();
+          const visible = Atom.make(true);
+          // The atom used by both clients: a hidden page, background app or a
+          // covered screen holds the cache instead of keeping an observation.
+          const view = Atom.make((get) => get(h.atoms.view(h.target, get(visible))));
+          // What a client view shows: the observation's feed, else the cache.
+          const shownFeed = () => {
+            const result = h.registry.get(view);
+            return AsyncResult.isSuccess(result) ? result.value : h.atoms.cached(h.target);
+          };
+          // A collapsed panel of the same session, concealed before anything arrived.
+          const unmountPanel = h.registry.mount(h.atoms.view(h.target, false));
+          const unmount = h.registry.mount(view);
+          const first = yield* Queue.take(h.leases);
+          const read = yield* Queue.take(h.reads);
+          const epoch = domain();
+          yield* Deferred.succeed(
+            read.reply,
+            pass({ epoch, watermark: 5, entities: [live("m1", "At my place", 5)] }),
+          );
+          yield* h.observe(
+            (feed) => feed.conversation.pending[0]?.message.content === "At my place",
+          );
+          const waiting = yield* Queue.take(h.reads);
+
+          h.registry.set(visible, false);
+          yield* Deferred.await(first.released);
+          yield* Deferred.await(waiting.interrupted);
+          expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 0 });
+          const concealed = shownFeed();
+          expect(concealed?.conversation.pending[0]?.message.content).toBe("At my place");
+
+          h.registry.set(visible, true);
+          const next = yield* Queue.take(h.leases);
+          const resumed = yield* h.readOf(next.id);
+          expect(resumed.input.cursor).toEqual(cursorAt(epoch, 5));
+          expect(shownFeed()?.conversation).toBe(concealed?.conversation);
+          expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 1 });
+          unmount();
+          unmountPanel();
+        }),
+      ),
+  );
+
+  it.effect(
     "socket stays responsive (Pong, unrelated requests) while bulk application is held",
     () =>
       Effect.scoped(

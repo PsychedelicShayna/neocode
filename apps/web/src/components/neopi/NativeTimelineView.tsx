@@ -41,6 +41,8 @@ export function NativeTimelineView(props: {
   readonly hideThinking?: boolean;
   /** Each new value toggles every tool call of the latest turn open or closed. */
   readonly toggleToolOutputSerial?: number;
+  /** Live output missing from shown tool calls, by call id, marked at each call. */
+  readonly toolLosses?: ReadonlyMap<string, readonly { readonly text: string }[]>;
 }) {
   const settings = useEnvironmentSettings(props.environmentId);
   const { resolvedTheme } = useTheme();
@@ -51,8 +53,8 @@ export function NativeTimelineView(props: {
     [props.rows, props.hideThinking],
   );
   const timeline = useMemo(
-    () => projectNativeTimeline(visibleRows, props.busy),
-    [visibleRows, props.busy],
+    () => projectNativeTimeline(visibleRows, props.busy, props.toolLosses),
+    [visibleRows, props.busy, props.toolLosses],
   );
   const [liveFollow, setLiveFollow] = useState(true);
   const onIsAtEndChange = useCallback((atEnd: boolean) => {

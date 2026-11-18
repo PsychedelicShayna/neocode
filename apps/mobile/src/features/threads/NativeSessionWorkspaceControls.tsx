@@ -1,11 +1,13 @@
 import { useIsFocused, useNavigation } from "@react-navigation/native";
 import { workspaceResourceId } from "@t3tools/client-runtime/environment";
-import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
+import type {
+  NativeSessionFeed,
+  NativeSessionTarget,
+} from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   deriveAgentPanelModel,
   formatSubagentModelLabel,
   formatSubagentTokenCount,
-  type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ScrollView, View } from "react-native";
@@ -144,12 +146,22 @@ export function NativeSessionWorkspaceControls({
 /** Consumes the real native roster directly, never SQL activities or inferred execution settings. */
 export function NativeSessionAgents({
   agents,
+  rosterWarning,
+  observationNotice,
   onClose,
 }: {
-  agents: readonly RuntimeSubagent[];
+  agents: NativeSessionFeed["agents"];
+  rosterWarning?: string | null;
+  observationNotice?: string | null;
   onClose: () => void;
 }) {
   const model = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
+  // Finished while no view watched: its outcome is unknown, so it never reads as interrupted.
+  const unseen = useMemo(
+    () =>
+      new Set(agents.flatMap((agent) => (agent.native.unobservedSince !== null ? [agent.id] : []))),
+    [agents],
+  );
   const rows = useMemo(
     () => [
       ...model.workflows.flatMap((group) => [
@@ -163,11 +175,21 @@ export function NativeSessionAgents({
   );
   return (
     <NativeModal title="Agents" onClose={onClose}>
+      {observationNotice ? (
+        <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
+          {observationNotice}
+        </Text>
+      ) : null}
       <ScrollView className="flex-1" contentContainerClassName="px-4 pb-4">
         <Text className="text-sm text-foreground-muted">
           {model.liveCount} active · {model.settledCount} settled ·{" "}
           {formatSubagentTokenCount(model.totalTokens)} tokens
         </Text>
+        {rosterWarning ? (
+          <Text accessibilityLiveRegion="polite" className="py-2 text-xs text-foreground-muted">
+            {rosterWarning}
+          </Text>
+        ) : null}
         {!model.hasAgents ? (
           <Text className="text-foreground-muted">No agents observed in this session.</Text>
         ) : null}
@@ -175,7 +197,13 @@ export function NativeSessionAgents({
           <View key={agent.id} className="gap-1 border-b border-border py-3">
             <Text className="font-t3-medium text-foreground">{agent.title}</Text>
             <Text className="text-xs text-foreground-muted">
-              {[agent.status, agent.role, formatSubagentModelLabel(agent.model, agent.effort)]
+              {[
+                unseen.has(agent.id)
+                  ? "finished while this session was not being watched"
+                  : agent.status,
+                agent.role,
+                formatSubagentModelLabel(agent.model, agent.effort),
+              ]
                 .filter(Boolean)
                 .join(" · ")}
             </Text>

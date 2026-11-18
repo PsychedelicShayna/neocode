@@ -6,7 +6,7 @@ import {
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
+import { nativeSessionAtoms, usePageVisible } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
 
 export const TAB_STATUS = {
@@ -47,14 +47,17 @@ const selectSessionId = (result: FeedResult): string =>
 
 /**
  * What a session tab, and the Ctrl+Tab switcher, show for one session. Only a
- * `watched` tab holds the session open; the rest read the session inventory, so
- * NeoCode can release idle sessions that are merely open in the background.
+ * `watched` tab holds the session open, and only while the page is visible; the
+ * rest read the session inventory, so NeoCode can release idle sessions that are
+ * merely open in the background.
  */
 export function useNativeSessionTabPresentation(tab: NativeSessionTarget, watched: boolean) {
   const listedSessions = useEnvironmentQuery(
     nativeSessionAtoms.list({ environmentId: tab.environmentId, input: {} }),
   ).data?.sessions;
-  const feed: Atom.Atom<FeedResult> = watched
+  const visible = usePageVisible();
+  const observed = watched && visible;
+  const feed: Atom.Atom<FeedResult> = observed
     ? nativeSessionAtoms.watch({ environmentId: tab.environmentId, input: { ref: tab.ref } })
     : UNWATCHED;
   const watchedStatus = useAtomValue(feed, selectStatus);
@@ -77,7 +80,7 @@ export function useNativeSessionTabPresentation(tab: NativeSessionTarget, watche
       : undefined);
   const status =
     TAB_STATUS[
-      watched ? watchedStatus : listed?.live ? LISTED_TAB_STATUS[listed.live.state] : "idle"
+      observed ? watchedStatus : listed?.live ? LISTED_TAB_STATUS[listed.live.state] : "idle"
     ];
   const title =
     listed?.title || sessionName || listed?.firstMessage.split("\n")[0]?.trim() || "New session";

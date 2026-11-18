@@ -21,13 +21,18 @@ export function NativeAgentsPanel({ viewKey }: { viewKey: string }) {
         <Bot aria-hidden className="size-6 text-muted-foreground/60" />
         <p className="text-sm font-medium">No agents yet</p>
         <p className="max-w-56 text-xs text-muted-foreground">
-          When this session spawns subagents, they show up here with live status, activity and token
-          usage.
+          {source.rosterWarning ??
+            "When this session spawns subagents, they show up here with live status, activity and token usage."}
         </p>
       </div>
     );
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {source.rosterWarning ? (
+        <p role="status" className="shrink-0 px-3 py-2 text-xs text-muted-foreground">
+          {source.rosterWarning}
+        </p>
+      ) : null}
       <AgentSummary
         agents={source.agents}
         className="shrink-0 border-b border-border/60 px-3 py-1.5"

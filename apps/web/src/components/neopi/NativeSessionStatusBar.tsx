@@ -1,8 +1,9 @@
 import { BotIcon, ListChecksIcon } from "lucide-react";
 import { NATIVE_JOBS_CAPABILITY } from "@t3tools/client-runtime/neopi-native-jobs";
-import type {
-  NativeSessionFeed,
-  NativeSessionTarget,
+import {
+  nativeObservationNotice,
+  type NativeSessionFeed,
+  type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   IDLE_SUBAGENT_FLASH,
@@ -17,7 +18,7 @@ import {
 import { useEffect, useMemo, useReducer, useRef, type ReactNode } from "react";
 import { APP_BASE_NAME } from "../../branding";
 import { cn } from "../../lib/utils";
-import { useNativeSessionRequest, useNativeSessionSlice } from "../../state/neopiNativeSessions";
+import { useNativeSessionSlice } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
 import { vcsEnvironment } from "../../state/vcs";
 import { useRightPanelStore } from "../../rightPanelStore";
@@ -27,7 +28,9 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 // never on the streamed tokens that change the rest of the feed.
 const selectState = (feed: NativeSessionFeed) => feed.session?.state;
 const selectCwd = (feed: NativeSessionFeed) => feed.session?.cwd;
-const selectConnected = (feed: NativeSessionFeed) => feed.connected;
+/** Disconnected for good: a view that is reconnecting or catching up says so beside the composer instead. */
+const selectDisconnected = (feed: NativeSessionFeed) =>
+  !feed.connected && nativeObservationNotice(feed) === null;
 const selectAgents = (feed: NativeSessionFeed) => feed.agents;
 /** Whether the running-subagent count is real: read, failed to read, or not read yet. */
 const selectAgentCountState = (feed: NativeSessionFeed) =>
@@ -239,24 +242,14 @@ function ContextMeter({
 }
 
 /**
- * Compact session status under the composer, spanning the main column. Facts come
- * from NeoPi's `get_state`, re-read by the feed after turns, compaction, journal
- * commits, model changes and (for a terminal-owned session) on a slow timer while
- * the tab is visible, plus the feed's lifecycle frames; a value NeoPi did not
- * report is left out rather than guessed.
+ * Compact session status under the composer, spanning the main column. Facts
+ * come from the shared projection's state key; a value NeoPi did not report is
+ * left out rather than guessed.
  */
 export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget }) {
   const state = useNativeSessionSlice(target, selectState);
   const cwd = useNativeSessionSlice(target, selectCwd);
-  const connected = useNativeSessionSlice(target, selectConnected);
-  const request = useNativeSessionRequest(target);
-  // Selecting a session (or its connection coming back) reads NeoPi's current
-  // telemetry; the reconciler's own reads cover everything after that. The
-  // result lands in the feed through the request atom.
-  useEffect(() => {
-    if (!connected) return;
-    void request({ type: "get_state", includeDump: false }).catch(() => undefined);
-  }, [connected, request]);
+  const disconnected = useNativeSessionSlice(target, selectDisconnected);
   const facts = useMemo(() => (state ? nativeStatusFacts(state) : null), [state]);
   const gitStatus = useEnvironmentQuery(
     cwd ? vcsEnvironment.status({ environmentId: target.environmentId, input: { cwd } }) : null,
@@ -279,7 +272,7 @@ export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget
       >
         {project}
         {branch ? <span className="text-muted-foreground/70"> · {branch}</span> : null}
-        {connected ? null : <span className="text-warning-foreground"> · disconnected</span>}
+        {disconnected ? <span className="text-warning-foreground"> · disconnected</span> : null}
       </span>
       {facts?.hostname ? (
         <StatusItem

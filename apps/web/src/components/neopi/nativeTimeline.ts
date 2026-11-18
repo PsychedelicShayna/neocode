@@ -96,7 +96,7 @@ function noticeText(text: string): string {
  * plus the output. Without an intent, T3's own labelling applies: a shell row
  * shows its first command line, other tools their path or pattern.
  */
-function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogEntry {
+function toolWorkEntry(row: ToolRow, id: string, turnId: TurnId, running: boolean): WorkLogEntry {
   const intent = row.call.intent ?? undefined;
   const fullCommand = toolCommand(row)?.trim();
   const command = fullCommand ? (intent ? fullCommand : firstLine(fullCommand)) : undefined;
@@ -115,7 +115,7 @@ function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogE
             ? firstLine(row.result.text)
             : ""));
   return {
-    id: row.id,
+    id,
     // A finished call is dated by its result, so turn durations cover the work.
     createdAt: row.result?.entry.timestamp ?? row.timestamp,
     turnId,
@@ -241,17 +241,30 @@ function memoized(
   return entry;
 }
 
+/** A tool row's loss marker, kept while the row and the warning text hold. */
+const lossMemo = new WeakMap<
+  TranscriptRow,
+  { readonly text: string; readonly turnId: TurnId; readonly entry: TimelineEntry }
+>();
 /** The merged entry for a settings change, kept while the previous entry and label hold. */
 const mergedSettingMemo = new WeakMap<
   TimelineEntry,
   { readonly label: string; readonly entry: TimelineEntry }
 >();
 
+/**
+ * `lossByToolCall` holds live output missing from a call's inbox stream
+ * (`nativeInboxLossWarnings`); each such call gets a warning row right after it.
+ */
 export function projectNativeTimeline(
   rows: readonly TranscriptRow[],
   busy: boolean,
+  lossByToolCall?: ReadonlyMap<string, readonly { readonly text: string }[]>,
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
+  // A call keeps one entry id from its live row through its durable one and any
+  // rebase, so an expanded call stays expanded; a repeated call id falls back to its row.
+  const toolIds = new Set<string>();
   let turnId = TurnId.make("native:origin");
   let turnStartedAt: string | null = null;
   let lastAt: string | null = null;
@@ -323,16 +336,39 @@ export function projectNativeTimeline(
           ),
         );
         break;
-      case "tool":
+      case "tool": {
+        const callId = row.call.id;
+        const id = callId && !toolIds.has(callId) ? `tool:${callId}` : row.id;
+        if (callId) toolIds.add(callId);
         // Only a call still waiting for its result shows whether the run is live.
         entries.push(
-          memoized(row, turnId, row.result ? null : busy, () =>
-            work(toolWorkEntry(row, turnId, busy)),
+          memoized(row, `${turnId}\n${id}`, row.result ? null : busy, () =>
+            work(toolWorkEntry(row, id, turnId, busy)),
           ),
         );
+        const losses = callId ? lossByToolCall?.get(callId) : undefined;
+        if (losses?.length) {
+          const text = losses.map((loss) => loss.text).join("\n\n");
+          const hit = lossMemo.get(row);
+          if (hit && hit.text === text && hit.turnId === turnId) entries.push(hit.entry);
+          else {
+            const entry = work({
+              id: `${id}:loss`,
+              createdAt: row.result?.entry.timestamp ?? row.timestamp,
+              turnId,
+              label: "Some live output of this call was not kept",
+              detail: text,
+              tone: "info",
+              sourceActivityKind: "runtime.warning",
+            });
+            lossMemo.set(row, { text, turnId, entry });
+            entries.push(entry);
+          }
+        }
         lastAt = row.result?.entry.timestamp ?? lastAt;
         workEndedAt = lastAt;
         break;
+      }
       case "divider": {
         const setting = settingChange(row);
         const previous = entries.at(-1);

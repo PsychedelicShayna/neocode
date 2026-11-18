@@ -278,7 +278,7 @@ export function NativeAgentView({
           <>
             <div className="flex min-w-0 flex-1 basis-48 flex-col">
               <span className="flex min-w-0 items-center gap-2">
-                <AgentStatusDot status={agent.status} />
+                <AgentStatusDot agent={agent} />
                 <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
                 <span className="shrink-0 text-2xs text-muted-foreground/70">
                   {agent.identity.label} · {agent.identity.pronouns}
@@ -290,7 +290,7 @@ export function NativeAgentView({
                 ) : null}
               </span>
               <span className="flex items-center gap-2 text-2xs text-muted-foreground">
-                <span>{agentStatusLabel(agent.status)}</span>
+                <span>{agentStatusLabel(agent)}</span>
                 <AgentElapsed agent={agent} />
               </span>
             </div>

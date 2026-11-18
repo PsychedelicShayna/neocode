@@ -43,7 +43,11 @@ const TERMINAL_LIFECYCLES: ReadonlySet<NeoPiNativeObservationLifecycle> = new Se
   "detached",
   "identity-changed",
 ]);
-/** What a visible view of a session needs until a consumer narrows or widens it. */
+/**
+ * What every visible view of a session needs. The roster is part of it because
+ * the workspace status bar shows the session's agents whenever the session is
+ * visible; a child view adds `child` through `holdDemand`.
+ */
 export const DEFAULT_NATIVE_DEMAND: readonly NeoPiNativeDemandItem[] = [
   { kind: "summary" },
   { kind: "transcript" },
@@ -70,8 +74,14 @@ export function createNativeSessionAtoms<R, E>(
   const cache = new Map<string, NativeSessionFeed>();
   /** Live observations: updates published from outside the controller (commands). */
   const updates = new Map<string, Queue.Queue<NativeSessionUpdate>>();
-  /** Requested demand per session; absent means `DEFAULT_NATIVE_DEMAND`. */
-  const demands = new Map<string, readonly NeoPiNativeDemandItem[]>();
+  /** Demand held by views beyond `DEFAULT_NATIVE_DEMAND`, per session, one entry per hold. */
+  const demandHolds = new Map<string, Set<readonly NeoPiNativeDemandItem[]>>();
+  const demandOf = (key: string) => {
+    const items = new Map(DEFAULT_NATIVE_DEMAND.map((item) => [JSON.stringify(item), item]));
+    for (const held of demandHolds.get(key) ?? [])
+      for (const item of held) items.set(JSON.stringify(item), item);
+    return [...items.values()];
+  };
   const demandSignals = new Map<string, Queue.Queue<void>>();
   /** Wakes an observation that stopped on a terminal lifecycle, after an explicit open. */
   const restarts = new Map<string, Queue.Queue<void>>();
@@ -193,7 +203,7 @@ export function createNativeSessionAtoms<R, E>(
                 rpcRequest(WS_METHODS.neopiNativeSessionsSetDemand, {
                   leaseId,
                   generation: ++generation,
-                  demand: demands.get(key) ?? DEFAULT_NATIVE_DEMAND,
+                  demand: demandOf(key),
                 }).pipe(Effect.ignore),
               );
               yield* send;
@@ -391,14 +401,30 @@ export function createNativeSessionAtoms<R, E>(
     watch: observation,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
     /**
-     * Sets what the session's views need (C4 demand). A live lease sends it at
-     * once under a new generation; a later lease starts from it.
+     * Adds `items` to what the session's views need (C4 demand) until the
+     * returned release runs: a child view holds `child(id, runToken)` while open.
+     * Holds compose; a live lease sends the union at once under a new generation.
      */
-    setDemand: (target: NativeSessionTarget, demand: readonly NeoPiNativeDemandItem[]) => {
+    holdDemand: (target: NativeSessionTarget, items: readonly NeoPiNativeDemandItem[]) => {
       const key = nativeSessionKey(target);
-      demands.set(key, demand);
-      const signal = demandSignals.get(key);
-      if (signal) Queue.offerUnsafe(signal, undefined);
+      const holds = demandHolds.get(key) ?? new Set();
+      demandHolds.set(key, holds);
+      // A fresh array per hold, so two holds of equal items release separately.
+      const hold = [...items];
+      holds.add(hold);
+      const signal = () => {
+        const queue = demandSignals.get(key);
+        if (queue) Queue.offerUnsafe(queue, undefined);
+      };
+      signal();
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        holds.delete(hold);
+        if (holds.size === 0 && demandHolds.get(key) === holds) demandHolds.delete(key);
+        signal();
+      };
     },
     /**
      * The explicit route back for an owner-stopped or detached session: opens it

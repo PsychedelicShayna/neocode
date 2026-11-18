@@ -332,12 +332,31 @@ describe("native observation controller", () => {
         const fourth = yield* Queue.take(h.reads);
         expect(fourth.input).toMatchObject({ readId: 4, cursor: cursorAt(epochB, 2) });
 
-        const child = [{ kind: "child" as const, childId: "child", runToken: "run" }];
-        h.atoms.setDemand(h.target, child);
+        // Two child views hold demand; each release withdraws only its own.
+        const childA = { kind: "child" as const, childId: "a", runToken: "run-a" };
+        const childB = { kind: "child" as const, childId: "b", runToken: "run-b" };
+        const releaseA = h.atoms.holdDemand(h.target, [childA]);
         expect(yield* Queue.take(h.demands)).toEqual({
           leaseId: lease.id,
           generation: 2,
-          demand: child,
+          demand: [...DEFAULT_NATIVE_DEMAND, childA],
+        });
+        const releaseB = h.atoms.holdDemand(h.target, [childB]);
+        expect((yield* Queue.take(h.demands)).demand).toEqual([
+          ...DEFAULT_NATIVE_DEMAND,
+          childA,
+          childB,
+        ]);
+        releaseA();
+        releaseA();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          generation: 4,
+          demand: [...DEFAULT_NATIVE_DEMAND, childB],
+        });
+        releaseB();
+        expect(yield* Queue.take(h.demands)).toMatchObject({
+          generation: 5,
+          demand: DEFAULT_NATIVE_DEMAND,
         });
 
         // Concealing the last view releases the lease at once and cancels its read.

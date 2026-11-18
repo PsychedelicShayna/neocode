@@ -1830,6 +1830,9 @@ export class NeoPiNativeProjection {
     if (type === "subagent_lifecycle") {
       if (!sameRun && payload.status !== "started" && previous?.runToken !== undefined) return;
       entry.lifecycle = payload;
+      // A live outcome replaces "finished, outcome unknown".
+      const status = text(payload.status);
+      if (status !== undefined && TERMINAL_CHILD_STATUSES.has(status)) delete entry.unobserved;
     } else {
       if (!sameRun && previous?.runToken !== undefined) return;
       const status = text(asRecord(entry.lifecycle)?.status);

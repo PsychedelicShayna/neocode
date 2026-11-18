@@ -754,27 +754,33 @@ export class NeoPiNativeProjection {
   }
 
   fold(frame: NativeRecord): NeoPiNativeFence {
-    let fence: NeoPiNativeFence = "none";
     const pending = this.#pendingLeaf;
-    if (pending) {
-      const entry = frame.type === "journal_entry" ? asRecord(frame.entry) : undefined;
-      if (entry?.id === pending.leafId) this.#pendingLeaf = null;
-      // An append batch shares one leaf announcement: entries that extend the
-      // head keep it pending until the announced entry arrives.
-      else if (!(entry && entry.parentId === (this.journal.head?.id ?? null)))
-        fence = this.#settle();
+    if (pending && frame.type === "journal_entry") {
+      const entry = asRecord(frame.entry);
+      // NeoPi flushes pending entries as: leaf = the LAST entry, then each
+      // entry in order, each followed by its `message_persisted`
+      // (`session-journal-events.ts` `committed`; `rpc-session-events.ts`
+      // `#journalEvent`). Entries that extend the head keep the leaf pending;
+      // its own entry resolves it; any other entry is a navigation that
+      // `#journalEntry` decides by its parent. No other frame resolves it.
+      if (entry?.id === pending.leafId || entry?.parentId !== (this.journal.head?.id ?? null))
+        this.#pendingLeaf = null;
     }
-    const next = this.#fold(frame);
-    if (next !== "none") fence = next === "identity-changed" || fence === "none" ? next : fence;
+    const fence = this.#fold(frame);
     if (fence !== "none") this.#onFence?.(fence);
     return fence;
   }
 
+  /** A leaf was announced and neither its entry nor a navigation has arrived yet. */
+  get pendingLeaf(): boolean {
+    return this.#pendingLeaf !== null;
+  }
+
   /**
    * A leaf announced with no entry after it is a move to an entry the tail no
-   * longer holds: history is replaced (C3.4 navigation). `fold` settles it on
-   * the next frame that is not an append, and every read settles it first, so
-   * a quiet move is visible to the next read with no further frame.
+   * longer holds: history is replaced (C3.4 navigation). Neither frames nor
+   * reads can tell that from a flush still in flight, so the owner side calls
+   * this once a leaf has stayed pending past its own timeout.
    */
   settlePendingLeaf(): NeoPiNativeFence {
     const fence = this.#settle();
@@ -1130,10 +1136,12 @@ export class NeoPiNativeProjection {
     // continue it only if they descend from its last entry.
     const continues = later.length > 0 && later[0]!.parentId === pageLast?.id;
     const heldIsCurrent = oldHead === this.#identity?.leafId;
-    if (!joined && later.length > 0 && !continues && heldIsCurrent) {
+    // An empty page was read before the held entries existed: it joins them.
+    if (later.length > 0 && !continues && heldIsCurrent && (!joined || entries.length === 0)) {
       // The page ends before the held, current tail and does not reach it (the
-      // ring turned over while the page was in flight). Newer state is kept;
-      // the range between stays a placeholder (C3.3, C3.4).
+      // ring turned over while the page was in flight, or the page was read
+      // before these entries were committed). Newer state is kept; the range
+      // between stays a placeholder (C3.3, C3.4).
       this.#horizonCursor = null;
       for (const entry of entries) this.#joinEntry(entry);
       this.#pageApplied = true;
@@ -1157,6 +1165,65 @@ export class NeoPiNativeProjection {
       );
     this.#pageApplied = true;
     return true;
+  }
+
+  /** The leaf a pending announcement named, while it waits for its entry. */
+  get pendingLeafId(): string | null {
+    return this.#pendingLeaf?.leafId ?? null;
+  }
+
+  /**
+   * Decides a leaf that stayed pending by parent identity, from the owner's
+   * leaf and a backward page fetched after the owner side's timeout (C3.4).
+   * `append`: the page's entries extend the held head; they are appended
+   * (entries already held are joined by id) and the leaf is resolved with no
+   * fence. `navigated`: they do not; history is rebased on the page and one
+   * fence is raised. `stale`: the mark is no longer current, or the pending
+   * leaf is no longer `leafId`.
+   */
+  reconcilePendingLeaf(
+    leafId: string,
+    page: {
+      readonly sessionId: string;
+      readonly entries: readonly unknown[];
+      readonly nextCursor?: string;
+    },
+    mark: NeoPiNativeRequestMark,
+  ): "append" | "navigated" | "stale" {
+    const pending = this.#pendingLeaf;
+    if (
+      !this.#acceptsReply(mark) ||
+      pending?.leafId !== leafId ||
+      page.sessionId !== this.#identity?.sessionId
+    )
+      return "stale";
+    const entries = page.entries.flatMap((raw) => {
+      const entry = observeNeoPiJournalEntry(raw);
+      return entry ? [entry] : [];
+    });
+    const head = this.journal.head?.id;
+    const at = head === undefined ? -1 : entries.findIndex((entry) => entry.id === head);
+    if (head === undefined || at >= 0) {
+      // The held head is on the owner's branch: everything after it appends.
+      this.#pendingLeaf = null;
+      for (const entry of entries.slice(at + 1))
+        this.#fold({ type: "journal_entry", sessionId: page.sessionId, entry });
+      return "append";
+    }
+    this.#pendingLeaf = null;
+    this.journal.reset();
+    this.#heldEntries.clear();
+    for (const entry of entries) this.journal.append(entry);
+    this.#horizonCursor =
+      page.nextCursor !== undefined && entries[0]
+        ? { firstEntryId: entries[0].id, cursor: page.nextCursor }
+        : null;
+    this.#navigate(pending);
+    for (const entry of entries) this.#joinEntry(entry);
+    // The fetched page is the new branch's horizon page.
+    this.#pageApplied = true;
+    this.#onFence?.("navigated");
+    return "navigated";
   }
 
   /**

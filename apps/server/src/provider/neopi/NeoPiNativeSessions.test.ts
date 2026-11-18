@@ -2487,6 +2487,179 @@ describe("server wiring review round", () => {
   );
 });
 
+describe("leaf announcements (the live stall)", () => {
+  const frames = (native: { sessionId: string; sessionFile: string }, leafId: string) => ({
+    leaf: {
+      type: "journal_state",
+      reason: "leaf",
+      sessionId: native.sessionId,
+      sessionFile: native.sessionFile,
+      leafId,
+    },
+    entry: (item: NeoPiJournalEntry) => ({
+      type: "journal_entry",
+      sessionId: native.sessionId,
+      sessionFile: native.sessionFile,
+      leafId,
+      entry: item,
+    }),
+    persisted: (messageId: string, entryId: string) => ({
+      type: "message_persisted",
+      sessionId: native.sessionId,
+      sessionFile: native.sessionFile,
+      messageId,
+      entryId,
+    }),
+  });
+
+  it.effect(
+    "a flush of several entries under one leaf announcement is not a navigation, even with a read in the middle",
+    () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture();
+        yield* service.open({ ...originalRef });
+        const lease = yield* follow(service, originalRef);
+        const built = yield* lease.pass();
+        const domain = built.cursor!.epoch;
+        const snapshots = native.snapshots;
+        const e1 = entry("flush-1");
+        const e2 = entry("flush-2", e1.id);
+        const last = entry("flush-3", e2.id);
+        const f = frames(native, last.id);
+        // NeoPi's order: the leaf is the LAST entry, then each entry and its persisted event.
+        yield* native.publish(f.leaf);
+        yield* native.publish(f.entry(e1));
+        yield* native.publish(f.persisted("m1", e1.id));
+        const middle = yield* lease.pass(built.cursor).pipe(Effect.forkChild);
+        yield* Effect.forEach(Array.from({ length: 20 }), () => Effect.yieldNow, { discard: true });
+        yield* native.publish(f.entry(e2));
+        yield* native.publish(f.persisted("m2", e2.id));
+        yield* native.publish(f.entry(last));
+        const read = yield* Fiber.join(middle);
+        assert.deepEqual(read.cursor!.epoch.branchGeneration, domain.branchGeneration);
+        assert.equal(native.snapshots, snapshots);
+        const after = yield* lease.pass(read.cursor);
+        assert.equal(after.cursor!.epoch.branchGeneration, domain.branchGeneration);
+        assert.deepEqual(
+          [...read.entries, ...after.entries].map((item) => item.id),
+          [e1.id, e2.id, last.id],
+        );
+      }).pipe(Effect.scoped),
+  );
+
+  const settle = Effect.forEach(Array.from({ length: 30 }), () => Effect.yieldNow, {
+    discard: true,
+  });
+  const idsOf = (entries: ReadonlyArray<{ readonly id: string }>) => entries.map((item) => item.id);
+
+  it.effect("a leaf resolved in time leaves no timer behind to settle the next one", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      const pages = native.pages;
+      const a1 = entry("a1");
+      const a2 = entry("a2", a1.id);
+      const fa = frames(native, a2.id);
+      yield* native.publish(fa.leaf);
+      yield* native.publish(fa.entry(a1));
+      yield* native.publish(fa.entry(a2));
+      // Leaf B is announced just before leaf A's deadline would have fired.
+      yield* TestClock.adjust("1900 millis");
+      const b1 = entry("b1", a2.id);
+      const b2 = entry("b2", b1.id);
+      const fb = frames(native, b2.id);
+      yield* native.publish(fb.leaf);
+      yield* TestClock.adjust("300 millis");
+      yield* native.publish(fb.entry(b1));
+      yield* native.publish(fb.entry(b2));
+      yield* settle;
+      const read = yield* lease.pass(built.cursor);
+      assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+      assert.deepEqual(idsOf(read.entries), ["a1", "a2", "b1", "b2"]);
+      assert.equal(native.pages, pages);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("entries that are only late are appended, not a navigation, and never twice", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      const e1 = entry("late-1");
+      const e2 = entry("late-2", e1.id);
+      const f = frames(native, e2.id);
+      // The owner has committed both; its frames are slow.
+      native.entries.push(e1, e2);
+      yield* native.publish(f.leaf);
+      yield* TestClock.adjust("3 seconds");
+      yield* settle;
+      // The answer fetched from the owner extended the held head: appended, no fence.
+      const read = yield* lease.pass(built.cursor);
+      assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+      assert.deepEqual(idsOf(read.entries), ["late-1", "late-2"]);
+      // The late frames now arrive live: nothing is applied twice.
+      yield* native.publish(f.entry(e1));
+      yield* native.publish(f.entry(e2));
+      const after = yield* lease.pass(read.cursor).pipe(Effect.forkChild);
+      yield* TestClock.adjust("20 seconds");
+      const rest = yield* Fiber.join(after);
+      assert.deepEqual(idsOf(rest.entries), []);
+      assert.equal(rest.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a quiet move to a leaf outside the held tail is detected and history rebased", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const append = appender(native);
+      yield* append(3);
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      // The owner moves to another branch whose entries the tail never held.
+      const other = entry("other-root");
+      const leaf = entry("other-leaf", other.id);
+      native.entries = [other, leaf];
+      yield* native.publish(frames(native, leaf.id).leaf);
+      yield* TestClock.adjust("3 seconds");
+      yield* settle;
+      const read = yield* lease.pass(built.cursor);
+      assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration + 1);
+      assert.equal(read.entries.at(-1)?.id, "other-leaf");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("a failed fetch is retried with backoff and the view keeps its branch meanwhile", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open({ ...originalRef });
+      const lease = yield* follow(service, originalRef);
+      const built = yield* lease.pass();
+      const e1 = entry("slow-1");
+      native.entries.push(e1);
+      native.pageHook = Effect.fail(new NeoPiRpcError({ message: "page unavailable" }));
+      yield* native.publish(frames(native, e1.id).leaf);
+      yield* TestClock.adjust("8 seconds");
+      yield* settle;
+      assert.isAbove(native.pages, 2);
+      // Nothing false was said: still the same branch, nothing rebased.
+      const quiet = yield* lease.pass(built.cursor).pipe(Effect.forkChild);
+      yield* TestClock.adjust("20 seconds");
+      const unchanged = yield* Fiber.join(quiet);
+      assert.equal(unchanged.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+      native.pageHook = Effect.void;
+      yield* TestClock.adjust("6 seconds");
+      yield* settle;
+      const read = yield* lease.pass(unchanged.cursor);
+      assert.deepEqual(idsOf(read.entries), ["slow-1"]);
+      assert.equal(read.cursor!.epoch.branchGeneration, built.cursor!.epoch.branchGeneration);
+    }).pipe(Effect.scoped),
+  );
+});
+
 describe("attach-only discovery (r12 C5)", () => {
   it.effect(
     "with no session installed, a lease discovers a live terminal owner and attaches without starting one",

@@ -10,12 +10,16 @@ import {
   ProviderInstanceId,
   WS_METHODS,
   type NeoPiJournalEntry,
+  type NeoPiNativeEntity,
+  type NeoPiNativeEntityValue,
+  type NeoPiNativeEssentialEnvelope,
+  type NeoPiNativeSessionsReadInput,
+  type NeoPiNativeSessionsReadResult,
 } from "@t3tools/contracts";
 import {
   emptyNativeSessionFeed,
   type NativeSession,
   type NativeSessionTarget,
-  type NativeSessionUpdate,
   type NativeTranscriptRow,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { createNativeSessionAtoms } from "@t3tools/client-runtime/state/neopi-native-sessions";
@@ -224,6 +228,19 @@ const user: NeoPiJournalEntry = {
 };
 const closedReason = "The native connection was explicitly closed.";
 
+const domain = {
+  serverIncarnation: "mobile-test",
+  ownerEpoch: 1,
+  projectionIncarnation: 1,
+  buildAttempt: 1,
+  branchGeneration: 0,
+};
+
+/**
+ * A server per the observation contract: each watch is a lease that sends
+ * `leased`, `session` and `observing`, then whatever `publishEnvelope` sends;
+ * reads answer from one projection and long-poll until it changes.
+ */
 const makeHarness = Effect.fnUntraced(function* (
   options: {
     readonly session?: NativeSession;
@@ -233,14 +250,63 @@ const makeHarness = Effect.fnUntraced(function* (
   } = {},
 ) {
   const currentSession = options.session ?? session;
-  const active = new Set<Queue.Queue<NativeSessionUpdate>>();
+  const active = new Set<Queue.Queue<NeoPiNativeEssentialEnvelope>>();
   let watches = 0;
   let closes = 0;
-  const publish = (update: NativeSessionUpdate) => {
-    for (const events of active) Queue.offerUnsafe(events, update);
+  let revision = 0;
+  let leases = 0;
+  const entities: NeoPiNativeEntity[] = [];
+  let waiting: Array<() => void> = [];
+  const publishEnvelope = (envelope: NeoPiNativeEssentialEnvelope) => {
+    for (const events of active) Queue.offerUnsafe(events, envelope);
+  };
+  /** One projection change: every read waiting on it answers. */
+  const publishEntity = (key: string, value: NeoPiNativeEntityValue) => {
+    revision += 1;
+    const existing = entities.findIndex((entity) => entity.key === key);
+    const entity = {
+      key,
+      ordinal: existing >= 0 ? entities[existing]!.ordinal : revision,
+      revision,
+      value,
+    };
+    if (existing >= 0) entities[existing] = entity;
+    else entities.push(entity);
+    const wake = waiting;
+    waiting = [];
+    for (const resume of wake) resume();
   };
   const closeOwner = (code?: string) =>
-    publish({ type: "closed", reason: closedReason, ...(code ? { code } : {}) });
+    publishEnvelope({
+      type: "lifecycle",
+      revision: ++revision,
+      state: code === "detached" ? "detached" : "owner-stopped",
+      reason: closedReason,
+    });
+  const pass = (base: number, kind: "full" | "incremental"): NeoPiNativeSessionsReadResult => {
+    const cursor = (at: number) => ({
+      epoch: domain,
+      base: at,
+      pass: null,
+      inboxSeq: 0,
+      journalAt: null,
+    });
+    return {
+      type: "pass",
+      passId: `${kind}-${revision}`,
+      kind,
+      baseCursor: cursor(base),
+      coveredThrough: revision,
+      continuation: cursor(revision),
+      complete: true,
+      promoted: false,
+      entities: entities.filter((entity) => entity.revision > base),
+      tombstones: [],
+      segments: [],
+      inbox: [],
+      journal: kind === "full" ? { continuity: "horizon", leafId: user.id, entries: [user] } : null,
+    };
+  };
   const client = {
     [WS_METHODS.neopiNativeSessionsOpen]: () => Effect.succeed(currentSession),
     [WS_METHODS.neopiNativeSessionsClose]: () =>
@@ -263,7 +329,7 @@ const makeHarness = Effect.fnUntraced(function* (
     [WS_METHODS.neopiNativeSessionsWatch]: () =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const events = yield* Queue.unbounded<NativeSessionUpdate>();
+          const events = yield* Queue.unbounded<NeoPiNativeEssentialEnvelope>();
           yield* Effect.acquireRelease(
             Effect.sync(() => {
               watches++;
@@ -274,22 +340,45 @@ const makeHarness = Effect.fnUntraced(function* (
                 active.delete(events);
               }),
           );
+          const opening: NeoPiNativeEssentialEnvelope[] = [
+            {
+              type: "leased",
+              leaseId: `lease-${++leases}`,
+              domain,
+              creditWindow: 16,
+              readDeadlineMs: 20_000,
+            },
+            { type: "session", revision: ++revision, session: currentSession },
+            { type: "lifecycle", revision: ++revision, state: "observing" },
+          ];
           return Stream.concat(
-            Stream.succeed<NativeSessionUpdate>({
-              type: "snapshot",
-              session: currentSession,
-              journal: {
-                sessionId: session.sessionId,
-                sessionFile: ref.sessionFile,
-                leafId: user.id,
-                entries: [user],
-                totalEntries: 1,
-              },
-            }),
-            Stream.fromQueue(events).pipe(Stream.takeUntil((update) => update.type === "closed")),
+            Stream.fromIterable(opening),
+            Stream.fromQueue(events).pipe(
+              Stream.takeUntil(
+                (envelope) =>
+                  envelope.type === "lifecycle" &&
+                  (envelope.state === "detached" || envelope.state === "owner-stopped"),
+              ),
+            ),
           );
         }),
       ),
+    [WS_METHODS.neopiNativeSessionsRead]: (input: NeoPiNativeSessionsReadInput) =>
+      Effect.suspend(() => {
+        if (input.cursor === null) return Effect.succeed(pass(0, "full"));
+        const base = input.cursor.base;
+        if (entities.some((entity) => entity.revision > base))
+          return Effect.succeed(pass(base, "incremental"));
+        return Effect.callback<void>((resume) => {
+          const wake = () => resume(Effect.void);
+          waiting.push(wake);
+          return Effect.sync(() => {
+            waiting = waiting.filter((other) => other !== wake);
+          });
+        }).pipe(Effect.as(pass(base, "incremental")));
+      }),
+    [WS_METHODS.neopiNativeSessionsCredit]: () => Effect.void,
+    [WS_METHODS.neopiNativeSessionsSetDemand]: () => Effect.succeed({ outcome: "applied" }),
   } as unknown as WsRpcProtocolClient;
   const environmentId = EnvironmentId.make("mobile-retained-listener");
   const connection = { client } as RpcSession;
@@ -326,7 +415,7 @@ const makeHarness = Effect.fnUntraced(function* (
     atoms,
     registry,
     flush,
-    publish,
+    publishEntity,
     closeOwner,
     target: { environmentId, ref },
     counts: () => ({ watches, closes, active: active.size }),
@@ -434,9 +523,14 @@ describe("NativeSessionScreen exit and canonical reselection", () => {
           expect(focused().textContent).toContain("Keep this question after reopening");
           expect(focused().textContent).not.toContain("Reconnecting");
           await act(async () => {
-            h.publish({
-              type: "event",
-              frame: { type: "command_output", text: "Retained native output" },
+            h.publishEntity("receipt:command:1", {
+              class: "receipt",
+              value: {
+                kind: "command_output",
+                text: "Retained native output",
+                afterEntryId: user.id,
+                afterMessageId: null,
+              },
             });
             h.flush();
           });
@@ -451,13 +545,12 @@ describe("NativeSessionScreen exit and canonical reselection", () => {
           });
           expect(focused().textContent).toBe("Sessions");
           expect(h.counts().closes).toBe(0);
-          // Back itself must leave the owner running. Its terminal can close
-          // while we're away; a warm observation still records that closure.
+          // Back itself must leave the owner running, and a concealed screen
+          // holds no lease: an owner stop meanwhile reaches no watch.
           await act(async () => {
             h.closeOwner();
             h.flush();
           });
-          expect(h.atoms.cached(h.target)?.error).toBe(closedReason);
           expect(h.counts().active).toBe(0);
 
           // This drain is essential: idleTTL=0 removes the mount boundary only
@@ -479,13 +572,12 @@ describe("NativeSessionScreen exit and canonical reselection", () => {
           expect(focused().textContent).toContain("Retained native output");
           expect(h.counts()).toEqual({ watches: 2, closes: 0, active: 1 });
           await act(async () => {
-            h.publish({
-              type: "event",
-              frame: {
-                type: "message_update",
-                messageId: "new-live",
-                message: { role: "assistant", content: "Live after reopening" },
-              },
+            h.publishEntity("message:new-live", {
+              class: "message",
+              messageId: "new-live",
+              phase: "open",
+              entryId: null,
+              message: { role: "assistant", content: "Live after reopening" },
             });
             h.flush();
           });

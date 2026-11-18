@@ -55,3 +55,19 @@ export function guardHeldKey(key: string): void {
   document.addEventListener("keyup", onKeyUp, true);
   window.addEventListener("blur", disarm);
 }
+
+/**
+ * Modal surfaces that hold the keyboard until they close, the narrow window's
+ * panel sheet among them. The sheet stays mounted while closed, so only a
+ * popup Base UI marks open counts.
+ */
+const OPEN_MODAL_POPUPS = [
+  '[data-slot="dialog-popup"][data-open]',
+  '[data-slot="alert-dialog-popup"][data-open]',
+  '[data-slot="sheet-popup"][data-open]',
+].join(",");
+
+/** Whether an open modal holds the keyboard, so the Ex line could not take it. */
+export function isModalSurfaceOpen(): boolean {
+  return typeof document !== "undefined" && document.querySelector(OPEN_MODAL_POPUPS) !== null;
+}

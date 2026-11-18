@@ -27,6 +27,7 @@ import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { useCommandHandlers, type CommandInvocation } from "~/commandTable";
 import { shortcutLabelForCommand } from "~/keybindings";
+import { isModalSurfaceOpen } from "~/lib/exLineFocus";
 import { getTerminalFocusOwner } from "~/lib/terminalFocus";
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import type { TerminalContextSelection } from "~/lib/terminalContext";
@@ -82,12 +83,6 @@ const ESCAPE_OWNING_OVERLAYS = [
   '[data-slot="combobox-popup"]',
   '[data-slot="autocomplete-popup"]',
   "[data-composer-stash-drawer]",
-].join(",");
-/** Modal surfaces that hold the keyboard until they close, the narrow window's panel sheet among them. */
-const MODAL_POPUPS = [
-  '[data-slot="dialog-popup"]',
-  '[data-slot="alert-dialog-popup"]',
-  '[data-slot="sheet-popup"]',
 ].join(",");
 import { NativeSessionTreePanel } from "./NativeSessionTreePanel";
 
@@ -501,7 +496,7 @@ export function NativeSessionWorkspacePanels({
     "exLine.open": {
       label: "Open command line",
       // A modal keeps the keyboard, so the line could not take it.
-      available: () => !document.querySelector(MODAL_POPUPS),
+      available: () => !isModalSurfaceOpen(),
       // Asked for again while open, it takes the keyboard back.
       run: () => (exLineInputRef.current ? exLineInputRef.current.focus() : setExLineOpen(true)),
     },

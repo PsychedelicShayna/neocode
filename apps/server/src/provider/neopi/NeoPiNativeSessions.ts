@@ -1002,6 +1002,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             .pipe(Effect.flatMap(decodeJournalPage), Effect.result);
           if (page._tag === "Success") {
             projection.reconcilePendingLeaf(
+              pending,
               {
                 sessionId: page.success.sessionId,
                 entries: page.success.entries,
@@ -1010,7 +1011,6 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
                   : { nextCursor: page.success.nextCursor }),
               },
               mark,
-              pending,
             );
             notifyChanged(session);
             if (projection.pendingLeafId !== pending) break;

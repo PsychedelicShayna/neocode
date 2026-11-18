@@ -1,4 +1,4 @@
-import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import {
   emptyNativeConversation,
   nativeIdentityKey,
@@ -6,22 +6,30 @@ import {
   sameNativeSession,
   type NativeIdentity,
 } from "@t3tools/client-runtime/neopi-conversation";
-import { createNeoPiConversationAtoms } from "@t3tools/client-runtime/state/neopi-conversation";
+import {
+  createNeoPiConversationAtoms,
+  createNeoPiThreadObservationAtoms,
+  threadObservationConnection,
+} from "@t3tools/client-runtime/state/neopi-conversation";
 import {
   createEnvironmentRpcCommand,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { WS_METHODS, type NeoPiJournalPage, type ScopedThreadRef } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { connectionAtomRuntime } from "../connection/runtime";
 import { scopedThreadKey } from "../lib/scopedEntities";
+import { appAtomRegistry } from "./atom-registry";
+import { nativeSessionAtoms } from "./neopiNativeSessions";
 import { bindComposerDraftToNativeSession } from "./use-composer-drafts";
 import { useAtomCommand } from "./use-atom-command";
 
 export const nativeConversationAtoms = createNeoPiConversationAtoms(connectionAtomRuntime);
+export const threadObservationAtoms = createNeoPiThreadObservationAtoms(
+  connectionAtomRuntime,
+  nativeSessionAtoms,
+);
 export const nativeJournalRead = createEnvironmentRpcCommand(connectionAtomRuntime, {
   label: "mobile:neopi-journal:read",
   tag: WS_METHODS.neopiSessionsJournal,
@@ -29,14 +37,17 @@ export const nativeJournalRead = createEnvironmentRpcCommand(connectionAtomRunti
 export const nativeSessionDraftKey = (threadRef: ScopedThreadRef, identity: NativeIdentity) =>
   `${threadRef.environmentId}:native-${encodeURIComponent(nativeIdentityKey(identity))}`;
 
-/** The shared reducer folds every native frame before React; mobile only owns paging and draft binding. */
+/**
+ * The thread's transcript from the native session controller (attach only, never starting
+ * an owner); mobile only owns paging, read-only history for a stopped session and draft binding.
+ */
 export function useNeoPiConversation(threadRef: ScopedThreadRef) {
-  const atom = nativeConversationAtoms.watch({
-    environmentId: threadRef.environmentId,
-    input: { threadId: threadRef.threadId },
-  });
-  const result = useAtomValue(atom);
-  const refresh = useAtomRefresh(atom);
+  const observation = useAtomValue(threadObservationAtoms.observe(threadRef));
+  const connection = threadObservationConnection(observation);
+  const refresh = useCallback(
+    () => threadObservationAtoms.refresh(appAtomRegistry, threadRef),
+    [threadRef.environmentId, threadRef.threadId],
+  );
   const read = useAtomCommand(nativeJournalRead, { reportFailure: false });
   const [conversation, setConversation] = useState(emptyNativeConversation);
   const [paging, setPaging] = useState(false);
@@ -46,7 +57,9 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   current.current = conversation;
   const pagingRef = useRef(false);
   const active = useRef(true);
-  const feed = AsyncResult.isSuccess(result) ? result.value : null;
+  const feed = observation.feed;
+  const stopped = connection?.ownership === "stopped";
+  const live = stopped ? null : (feed?.conversation ?? null);
   useEffect(() => {
     active.current = true;
     return () => {
@@ -54,11 +67,11 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     };
   }, []);
   useEffect(() => {
-    if (!feed) return;
-    const unchanged = sourceEntries.current === feed.conversation.entries;
-    sourceEntries.current = feed.conversation.entries;
+    if (!live) return;
+    const unchanged = sourceEntries.current === live.entries;
+    sourceEntries.current = live.entries;
     setConversation((previous) => {
-      const next = feed.conversation;
+      const next = live;
       if (!next.identity || next.needsSnapshot) return next;
       if (
         unchanged &&
@@ -91,18 +104,33 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
         ...(keepCursor ? { cursor: previous.cursor, cursorLeaf: previous.cursorLeaf } : {}),
       };
     });
-  }, [feed]);
-  const refreshRevision = useRef(-1);
+  }, [live]);
+  // No owner runs the session: show its history read-only. The journal read never starts one.
   useEffect(() => {
-    if (
-      !feed?.conversation.needsSnapshot ||
-      feed.connection?.status !== "connected" ||
-      refreshRevision.current === feed.conversation.revision
-    )
-      return;
-    refreshRevision.current = feed.conversation.revision;
-    refresh();
-  }, [feed, refresh]);
+    if (!stopped) return;
+    let cancelled = false;
+    void read({
+      environmentId: threadRef.environmentId,
+      input: { threadId: threadRef.threadId, scope: "branch", direction: "backward", limit: 128 },
+    }).then((response) => {
+      if (cancelled || !active.current) return;
+      if (response._tag === "Failure") {
+        const failure = squashAtomCommandFailure(response);
+        return setError(
+          failure instanceof Error ? failure.message : "Could not read native history.",
+        );
+      }
+      if (response.value.status !== "available")
+        return setError(
+          response.value.status === "error" ? response.value.message : response.value.reason,
+        );
+      const page = response.value.page;
+      setConversation((state) => reduceNativeConversation(state, { type: "snapshot", page }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [stopped, read, threadRef.environmentId, threadRef.threadId]);
   const identityKey = conversation.identity
     ? nativeSessionDraftKey(threadRef, conversation.identity)
     : null;
@@ -179,12 +207,12 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
   }, [read, threadRef.environmentId, threadRef.threadId]);
   return {
     conversation,
-    connection: feed?.connection ?? null,
-    busy: feed?.busy ?? null,
-    loading: !feed && !AsyncResult.isFailure(result),
+    connection,
+    busy: feed && !stopped ? feed.busy : null,
+    loading: connection === null && observation.error === null,
     refresh,
     loadOlder,
     paging,
-    error: AsyncResult.isFailure(result) ? String(Cause.squash(result.cause)) : error,
+    error: observation.error ?? error,
   };
 }

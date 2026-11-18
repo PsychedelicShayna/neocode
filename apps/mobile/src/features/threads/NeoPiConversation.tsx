@@ -50,13 +50,8 @@ export function NeoPiConversation({
   const currentConnected = useRef(false);
   currentConnected.current = connection?.status === "connected";
   useEffect(() => {
-    if (
-      ownerStatus &&
-      ownerStatus !== "starting" &&
-      ownerStatus !== "stopped" &&
-      !currentConnected.current
-    )
-      refresh();
+    // A stopped runtime is re-read too: the binding then says no NeoCode runtime runs it.
+    if (ownerStatus && ownerStatus !== "starting" && !currentConnected.current) refresh();
   }, [ownerStatus, refresh]);
   const nativeDraft = useComposerDraft(
     conversation.identity ? nativeSessionDraftKey(threadRef, conversation.identity) : null,
@@ -114,7 +109,7 @@ export function NeoPiConversation({
     : connection?.ownership === "stopped"
       ? "Stopped native session · read-only history"
       : !attached
-        ? connection?.status === "disconnected" || connection?.status === "gap"
+        ? connection?.status === "disconnected"
           ? "Reconnecting native conversation"
           : "Native conversation unavailable"
         : connection.ownership === "gui"

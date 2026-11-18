@@ -30,13 +30,8 @@ export function NeoPiConversation({
   useEffect(() => {
     // The provider's running native session is the only source of its live
     // messages. A new or replaced owner means the observer must reattach.
-    if (
-      ownerStatus &&
-      ownerStatus !== "starting" &&
-      ownerStatus !== "stopped" &&
-      !connected.current
-    )
-      refresh();
+    // A stopped runtime is re-read too: the binding then says no NeoCode runtime runs it.
+    if (ownerStatus && ownerStatus !== "starting" && !connected.current) refresh();
   }, [ownerStatus, refresh]);
   useNativeDraftIdentity(threadRef, conversation.identity);
   const [pendingResume] = useNativeTreeField(
@@ -84,7 +79,7 @@ export function NeoPiConversation({
     : connection?.ownership === "stopped"
       ? "Stopped session · read-only"
       : !attached
-        ? connection?.status === "disconnected" || connection?.status === "gap"
+        ? connection?.status === "disconnected"
           ? "Reconnecting to NeoPi"
           : "Native conversation unavailable"
         : connection?.ownership === "terminal"

@@ -62,14 +62,12 @@ export type NativeSessionUpdate =
   | { type: "observer"; phase: NativeObserverPhase; reason?: string }
   | { type: "disconnected" }
   /**
-   * One reply of the observation cursor read, applied by `applyNativeRead`.
-   * `sent` is the cursor this feed held (`observation.cursor`) when the read was sent.
+   * Starts the one read a feed may have outstanding: send
+   * `observation.outstanding` (`readId`, `cursor`) to `neopiNativeSessionsRead`.
    */
-  | {
-      type: "read";
-      sent: NeoPiNativeCursor | null;
-      result: NeoPiNativeSessionsReadResult;
-    }
+  | { type: "read-issued" }
+  /** The reply to read `readId`, applied by `applyNativeRead`. */
+  | { type: "read"; readId: number; result: NeoPiNativeSessionsReadResult }
   | { type: "state"; state: Record<string, unknown> }
   | {
       type: "page";
@@ -263,10 +261,12 @@ export interface NativeObservation {
   /** Revision at which each removed key was removed; an older value never brings it back. */
   readonly removed: ReadonlyMap<string, number>;
   /**
-   * Loaded history was dropped by a navigation since the last full pass, so a
-   * row's known durable entry may never be loaded again.
+   * Live rows whose durable entry was known but not loaded when branch
+   * continuity was lost (a navigation, a rebuild that cannot know, an owner
+   * change). The next completed full pass decides them: entry loaded, they
+   * retire; otherwise they are continuity losses.
    */
-  readonly historyReplaced: boolean;
+  readonly unproven: ReadonlySet<string>;
   /** Oversized values in transit, by key, at one revision. */
   readonly segments: ReadonlyMap<
     string,
@@ -279,6 +279,13 @@ export interface NativeObservation {
   readonly inbox: readonly NeoPiNativeInboxRecord[];
   /** Index of the first inbox record of the current projection; sequence numbers restart per projection. */
   readonly inboxStart: number;
+  /** Last read id issued; only grows, so it rises on every lease. */
+  readonly readSeq: number;
+  /** The one read whose reply may apply; cleared by its reply or by `invalidateNativeReads`. */
+  readonly outstanding: {
+    readonly readId: number;
+    readonly cursor: NeoPiNativeCursor | null;
+  } | null;
 }
 export const emptyNativeObservation = (): NativeObservation => ({
   domain: null,
@@ -287,10 +294,12 @@ export const emptyNativeObservation = (): NativeObservation => ({
   passId: null,
   returned: new Set(),
   removed: new Map(),
-  historyReplaced: false,
+  unproven: new Set(),
   segments: new Map(),
   inbox: [],
   inboxStart: 0,
+  readSeq: 0,
+  outstanding: null,
 });
 export type NativeOwnerLoss = "reconnecting" | "orphaned" | "detached";
 /**
@@ -412,28 +421,35 @@ function retainNativePending(
   };
 }
 
+/**
+ * Ends the outstanding read, so its reply changes nothing. Called whenever the
+ * owner, the identity domain or the lease the read was sent under ends.
+ */
+export const invalidateNativeReads = (feed: NativeSessionFeed): NativeSessionFeed =>
+  feed.observation.outstanding === null
+    ? feed
+    : { ...feed, observation: { ...feed.observation, outstanding: null } };
+
 const decodeSegmentedEntity = Schema.decodeUnknownOption(Schema.fromJsonString(NeoPiNativeEntity));
 /**
  * Applies one cursor-read reply in place; a rebase is a full pass in a new
- * domain or after falling behind, never a reset. Only the reply to the read
- * sent with the cursor this feed holds is applied: a duplicate, stale or
- * interleaved reply changes nothing. Until a full pass completes, held
- * entities stay visible and absence means nothing; at completion, held keys it
- * did not return at or below its watermark are removed. Live rows retire only
- * once their identified durable entry is present; a row the authority no
- * longer holds and cannot identify becomes a continuity loss.
+ * domain or after falling behind, never a reset. Only the reply to the one
+ * outstanding read applies; any other reply changes nothing. Until a full pass
+ * completes, held entities stay visible and absence means nothing; at
+ * completion, held keys it did not return at or below its watermark are
+ * removed. Live rows retire only once their identified durable entry is
+ * present; a row the authority no longer holds and cannot identify becomes a
+ * continuity loss.
  */
 export function applyNativeRead(
   feed: NativeSessionFeed,
-  sent: NeoPiNativeCursor | null,
+  readId: number,
   result: NeoPiNativeSessionsReadResult,
 ): NativeSessionFeed {
-  const held = feed.observation;
-  if (
-    result.type !== "pass" ||
-    !(sent === held.cursor || JSON.stringify(sent) === JSON.stringify(held.cursor))
-  )
-    return feed;
+  const answered = feed.observation;
+  if (answered.outstanding?.readId !== readId) return feed;
+  const held = { ...answered, outstanding: null };
+  if (result.type !== "pass") return { ...feed, observation: held };
   const domain = result.continuation.epoch;
   const was = held.domain;
   const ownerChanged =
@@ -469,10 +485,8 @@ export function applyNativeRead(
   // History first, so the previous owner's identified rows retire on entries
   // this reply brings before their ids are retired.
   const journal = result.journal;
-  let historyReplaced = held.historyReplaced;
   if (journal && conversation.identity) {
     const identity = { ...conversation.identity, leafId: journal.leafId };
-    const before = conversation.entries;
     if (journal.continuity === "horizon")
       conversation = reduceNativeConversation(conversation, {
         type: "horizon",
@@ -484,8 +498,6 @@ export function applyNativeRead(
     else
       for (const entry of journal.entries)
         conversation = reduceNativeConversation(conversation, { type: "entry", identity, entry });
-    const after = new Set(conversation.entries.map((entry) => entry.id));
-    historyReplaced ||= before.some((entry) => !after.has(entry.id));
   }
   if (ownerChanged) {
     const persisted = conversation.persisted;
@@ -500,6 +512,20 @@ export function applyNativeRead(
         ? { ...output, afterMessageId: key }
         : { ...output, afterEntryId: entryId, afterMessageId: null };
     });
+  }
+  // Same branch: a known entry is on it and will be loaded, so its row waits.
+  // Otherwise nothing proves that entry is on the current branch.
+  let unproven = held.unproven;
+  if (was !== null && !continuous) {
+    const loadedNow = new Set(conversation.entries.map((entry) => entry.id));
+    const waiting = conversation.pending.filter((row) => {
+      const entryId = conversation.persisted.get(row.messageId);
+      return entryId !== undefined && !loadedNow.has(entryId);
+    });
+    unproven = new Set([
+      ...(ownerChanged ? [] : held.unproven),
+      ...waiting.map((row) => row.messageId),
+    ]);
   }
   const accept = (entity: NeoPiNativeEntity) => {
     returned.add(entity.key);
@@ -526,7 +552,8 @@ export function applyNativeRead(
   };
   const remove = (key: string, revision: number, joinEntryId?: string) => {
     const previous = entities.get(key);
-    if (previous && previous.revision >= revision) return;
+    // Equal revisions: completion removes a key held at exactly the watermark.
+    if (previous && previous.revision > revision) return;
     removed.set(key, Math.max(revision, removed.get(key) ?? -1));
     if (!previous) return;
     entities.delete(key);
@@ -576,12 +603,15 @@ export function applyNativeRead(
     for (const row of conversation.pending)
       if (!live.has(row.messageId)) unresolved.add(row.messageId);
   }
-  // An identified row waits for its entry, unless a navigation dropped the
-  // history that entry belongs to.
+  // An identified row waits for its entry, unless continuity with the branch
+  // that entry is on was lost and a completed full pass still has not loaded it.
   const loaded = new Set(conversation.entries.map((entry) => entry.id));
   for (const messageId of unresolved) {
     const entryId = conversation.persisted.get(messageId);
-    if (entryId !== undefined && !(fullCompleted && historyReplaced && !loaded.has(entryId)))
+    if (
+      entryId !== undefined &&
+      !(fullCompleted && unproven.has(messageId) && !loaded.has(entryId))
+    )
       unresolved.delete(messageId);
   }
   if (unresolved.size > 0) {
@@ -659,10 +689,12 @@ export function applyNativeRead(
       passId: completed ? null : result.passId,
       returned: completed ? new Set() : returned,
       removed,
-      historyReplaced: historyReplaced && !fullCompleted,
+      unproven: fullCompleted ? new Set() : unproven,
       segments,
       inbox: result.inbox.length === 0 ? held.inbox : inbox,
       inboxStart,
+      readSeq: held.readSeq,
+      outstanding: null,
     },
   };
 }
@@ -1133,8 +1165,20 @@ export function reduceNativeSessionFeed(
   feed: NativeSessionFeed,
   event: NativeSessionUpdate,
 ): NativeSessionFeed {
+  if (event.type === "read-issued") {
+    const { observation } = feed;
+    const readId = observation.readSeq + 1;
+    return {
+      ...feed,
+      observation: {
+        ...observation,
+        readSeq: readId,
+        outstanding: { readId, cursor: observation.cursor },
+      },
+    };
+  }
   if (event.type === "read") {
-    const next = applyNativeRead(feed, event.sent, event.result);
+    const next = applyNativeRead(feed, event.readId, event.result);
     if (next === feed) return feed;
     const projected = projectNativeEntities(feed, next);
     const observation = boundNativeInbox(projected.observation, nowMs());
@@ -1151,7 +1195,14 @@ export function reduceNativeSessionFeed(
     event.type === "obligation-opened" ||
     event.type === "obligation-settled"
   )
-    return reduceNativeEssential(feed, event);
+    return reduceNativeEssential(
+      // A new lease, or an owner, domain or lease ending, retires the outstanding read.
+      event.type === "leased" ||
+        (event.type === "lifecycle" && event.state !== "building" && event.state !== "observing")
+        ? invalidateNativeReads(feed)
+        : feed,
+      event,
+    );
   if (event.type === "reconciliation") {
     if (event.error !== null)
       return {
@@ -1256,7 +1307,8 @@ export function reduceNativeSessionFeed(
     // The session stays connected to the server, which is waiting for the owner's
     // successor: sends are held there. Nothing the old owner was doing continues.
     return {
-      ...feed,
+      // The old owner's outstanding read must not apply to its successor.
+      ...invalidateNativeReads(feed),
       ownerLoss: "reconnecting",
       busy: false,
       queue: EMPTY_NATIVE_QUEUE,
@@ -1289,7 +1341,7 @@ export function reduceNativeSessionFeed(
           ? null
           : feed.ownerLoss;
     return {
-      ...feed,
+      ...invalidateNativeReads(feed),
       connected: false,
       ownerLoss,
       // Pending UI replays independently and may precede the next snapshot.

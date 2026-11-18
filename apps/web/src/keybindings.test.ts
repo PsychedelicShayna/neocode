@@ -1161,15 +1161,13 @@ describe("terminalNavigationShortcutData", () => {
     );
   });
 
-  it("maps Ctrl+Arrow on non-macOS to word movement", () => {
-    assert.strictEqual(
-      terminalNavigationShortcutData(event({ key: "ArrowLeft", ctrlKey: true }), "Win32"),
-      "\u001bb",
-    );
-    assert.strictEqual(
-      terminalNavigationShortcutData(event({ key: "ArrowRight", ctrlKey: true }), "Linux"),
-      "\u001bf",
-    );
+  it("leaves Ctrl+Arrow and Alt+Arrow to the terminal off macOS", () => {
+    for (const platform of ["Win32", "Linux"]) {
+      for (const key of ["ArrowLeft", "ArrowRight"]) {
+        assert.isNull(terminalNavigationShortcutData(event({ key, ctrlKey: true }), platform));
+        assert.isNull(terminalNavigationShortcutData(event({ key, altKey: true }), platform));
+      }
+    }
   });
 
   it("rejects unsupported combinations", () => {

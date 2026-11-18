@@ -420,6 +420,10 @@ export function terminalDeleteShortcutData(
     : null;
 }
 
+/**
+ * The bytes to send for a macOS Cmd/Option+Arrow, which a terminal would not
+ * otherwise receive. Elsewhere the program gets the real Ctrl/Alt+Arrow.
+ */
 export function terminalNavigationShortcutData(
   event: ShortcutEventLike,
   platform = navigator.platform,
@@ -428,33 +432,18 @@ export function terminalNavigationShortcutData(
     return null;
   }
 
-  if (event.shiftKey) return null;
+  if (event.shiftKey || !isMacPlatform(platform)) return null;
 
   const key = normalizeEventKey(event.key);
   if (key !== "arrowleft" && key !== "arrowright") {
     return null;
   }
 
-  const moveWord = key === "arrowleft" ? TERMINAL_WORD_BACKWARD : TERMINAL_WORD_FORWARD;
-  const moveLine = key === "arrowleft" ? TERMINAL_LINE_START : TERMINAL_LINE_END;
-
-  if (isMacPlatform(platform)) {
-    if (event.altKey && !event.metaKey && !event.ctrlKey) {
-      return moveWord;
-    }
-    if (event.metaKey && !event.altKey && !event.ctrlKey) {
-      return moveLine;
-    }
-    return null;
-  }
-
-  if (event.ctrlKey && !event.metaKey && !event.altKey) {
-    return moveWord;
-  }
-
   if (event.altKey && !event.metaKey && !event.ctrlKey) {
-    return moveWord;
+    return key === "arrowleft" ? TERMINAL_WORD_BACKWARD : TERMINAL_WORD_FORWARD;
   }
-
+  if (event.metaKey && !event.altKey && !event.ctrlKey) {
+    return key === "arrowleft" ? TERMINAL_LINE_START : TERMINAL_LINE_END;
+  }
   return null;
 }

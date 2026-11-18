@@ -1166,29 +1166,10 @@ function reduceNativeEssential(
             ownerLoss: feed.ownerLoss === "reconnecting" ? null : feed.ownerLoss,
           };
         case "reconnecting":
-          // The server waits for the owner's successor and holds sends. Nothing
-          // the old owner was doing continues.
-          return {
-            ...feed,
-            observer,
-            ownerLoss: "reconnecting",
-            busy: false,
-            queue: EMPTY_NATIVE_QUEUE,
-            dialogs: [],
-            agents: disconnectNativeSubagents(
-              feed.agents,
-              feed.agentsRevision + 1,
-              DateTime.formatIso(DateTime.nowUnsafe()),
-            ),
-            agentsRevision: feed.agentsRevision + 1,
-            agentsEpoch: feed.agentsEpoch + 1,
-            activity: closeNativeActivity(feed.activity, nowMs()),
-            error: null,
-            dictation:
-              feed.dictation && feed.dictation.phase !== "ended"
-                ? { ...feed.dictation, phase: "ended" as const, error: reason }
-                : feed.dictation,
-          };
+          // The server waits for an owner on the same file and holds sends. Nothing
+          // is marked interrupted here: the successor's roster, status and
+          // obligation envelopes, or `owner-stopped`, say what still runs.
+          return { ...feed, observer, ownerLoss: "reconnecting", error: null };
         case "owner-stopped":
           return { ...endNativeOwner(feed, "orphaned", reason), observer };
         case "detached":

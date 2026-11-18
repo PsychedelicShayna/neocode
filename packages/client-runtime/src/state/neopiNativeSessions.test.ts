@@ -606,7 +606,7 @@ describe("native projection mapping", () => {
     expect(feed.agents).toEqual([]);
   });
 
-  it("stops children when the owner stops, not when the view loses its transport", () => {
+  it("stops children when the owner stops, not on transport loss or while a successor is awaited", () => {
     let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
       type: "session",
       revision: 1,
@@ -621,13 +621,119 @@ describe("native projection mapping", () => {
       phase: "transport-lost",
     });
     expect(lost.agents[0]?.native.disconnected).toBe(false);
-    const stopped = reduceNativeSessionFeed(feed, {
+    // The owner may still be live while the server re-attaches: no flash.
+    const awaiting = reduceNativeSessionFeed(feed, {
       type: "lifecycle",
       revision: 2,
+      state: "reconnecting",
+    });
+    expect(awaiting.ownerLoss).toBe("reconnecting");
+    expect(awaiting.agents[0]?.native.disconnected).toBe(false);
+    expect(awaiting.agents[0]?.status).toBe("running");
+    const stopped = reduceNativeSessionFeed(awaiting, {
+      type: "lifecycle",
+      revision: 3,
       state: "owner-stopped",
     });
     expect(stopped.agents[0]?.native.disconnected).toBe(true);
     expect(stopped.ownerLoss).toBe("orphaned");
+    expect(stopped.connected).toBe(false);
+  });
+
+  it("maps envelopes and presentation keys into the fields web and mobile read", () => {
+    const presentation = (key: string, revision: number, value: Record<string, unknown>) => ({
+      key,
+      ordinal: revision,
+      revision,
+      value: { class: "presentation" as const, value },
+    });
+    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
+      type: "session",
+      revision: 1,
+      session: { ...session, state: { queuedMessages: { steering: ["s"], followUp: [] } } },
+    });
+    expect(feed.connected).toBe(true);
+    expect(feed.queue.steering).toEqual(["s"]);
+    feed = reduceNativeSessionFeed(feed, {
+      type: "status",
+      revision: 2,
+      live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
+    });
+    expect(feed.busy).toBe(true);
+    feed = reduceNativeSessionFeed(feed, {
+      type: "obligation-opened",
+      revision: 3,
+      id: "approval",
+      request: { type: "tool_approval_request", id: "approval" },
+    });
+    expect(feed.dialogs.map((dialog) => dialog.id)).toEqual(["approval"]);
+    feed = applyRead(
+      feed,
+      pass({
+        epoch: domain(),
+        watermark: 20,
+        entities: [
+          {
+            key: "setting:state",
+            ordinal: 4,
+            revision: 4,
+            value: {
+              class: "setting",
+              value: { property: "state", value: { sessionName: "Named", model: { id: "m" } } },
+            },
+          },
+          presentation("job:j1", 5, {
+            job: { id: "j1", type: "bash", status: "running", label: "build", startedAt: 1 },
+          }),
+          presentation("presentation:jobs", 6, { runningCount: 1 }),
+          presentation("presentation:dictation", 7, {
+            captureId: "c",
+            phase: "recording",
+            text: "hello",
+            error: null,
+          }),
+          presentation("presentation:editorText", 8, { id: "e1", text: "draft" }),
+          presentation("presentation:notify", 9, { message: "Heads up" }),
+          presentation("presentation:setStatus:git", 10, {
+            method: "setStatus",
+            statusKey: "git",
+            statusText: "main",
+          }),
+          presentation("presentation:promptResult", 11, { status: "error", error: "Refused" }),
+          presentation("presentation:available_commands_update", 12, {}),
+        ],
+      }),
+    );
+    expect(feed.session?.state).toEqual({ sessionName: "Named", model: { id: "m" } });
+    expect(feed.jobs.runningCount).toBe(1);
+    expect(feed.jobs.entries.map((job) => job.id)).toEqual(["j1"]);
+    expect(feed.dictation).toEqual({
+      captureId: "c",
+      phase: "recording",
+      text: "hello",
+      error: null,
+    });
+    expect(feed.editor).toEqual({ id: "e1", text: "draft" });
+    expect(feed.notices).toMatchObject({ notification: "Heads up", git: "main" });
+    expect(feed.error).toBe("Refused");
+    expect(feed.commandsRevision).toBe(1);
+    feed = reduceNativeSessionFeed(feed, {
+      type: "obligation-settled",
+      revision: 21,
+      id: "approval",
+      outcome: "answered",
+    });
+    expect(feed.dialogs).toEqual([]);
+    // The same session moved to another file: the web layer repoints.
+    feed = reduceNativeSessionFeed(feed, {
+      type: "identity",
+      revision: 22,
+      domain: domain(),
+      sessionId: session.sessionId,
+      sessionFile: "/sessions/moved.jsonl",
+      leafId: null,
+    });
+    expect(feed.movedTo?.sessionFile).toBe("/sessions/moved.jsonl");
   });
 });
 

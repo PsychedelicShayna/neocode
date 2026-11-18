@@ -2,7 +2,7 @@ import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { CheckIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { queryInstalledFontFamilies } from "../../appearanceFonts";
-import { scanInstalledMonospaceFonts } from "../../installedMonospaceFonts";
+import { knownMonospaceFonts, scanInstalledMonospaceFonts } from "../../installedMonospaceFonts";
 import {
   Combobox,
   ComboboxEmpty,
@@ -124,34 +124,52 @@ export function FontFamilyPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  // Open after mount rather than mounting open: a popup that first renders in
-  // its open state never receives Base UI's entrance style baseline, so the
-  // exit transition on close has no style delta, never fires transitionend,
-  // and the popup lingers on screen forever.
-  useEffect(() => {
-    if (initialOpen) setOpen(true);
-    // The prop is only meaningful at mount - the control just swapped in
-    // under an active focus - so later changes are deliberately ignored.
-  }, []);
-  const listRef = useRef<LegendListRef | null>(null);
-  const enumeration = useFontEnumeration();
-
-  const handleOpenChange = (nextOpen: boolean) => {
-    setOpen(nextOpen);
-    if (nextOpen) setQuery("");
-  };
-
   const [monospaceScan, setMonospaceScan] = useState<{
     source: readonly string[];
     families: readonly string[];
     done: boolean;
   } | null>(null);
+  const listRef = useRef<LegendListRef | null>(null);
+  const enumeration = useFontEnumeration();
+  // Opening sets the starting list in the same update as the popup, so its
+  // first frame already shows the sorted known families and the scan only
+  // appends below them.
+  const openPicker = () => {
+    setOpen(true);
+    if (requireMonospace && enumeration.status === "granted") {
+      const source = enumeration.families;
+      setMonospaceScan({
+        source,
+        families: knownMonospaceFonts(source, selectedFamily),
+        done: false,
+      });
+    }
+  };
+  // Open after mount rather than mounting open: a popup that first renders in
+  // its open state never receives Base UI's entrance style baseline, so the
+  // exit transition on close has no style delta, never fires transitionend,
+  // and the popup lingers on screen forever.
+  useEffect(() => {
+    if (initialOpen) openPicker();
+    // The prop is only meaningful at mount - the control just swapped in
+    // under an active focus - so later changes are deliberately ignored.
+  }, []);
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      setOpen(false);
+      return;
+    }
+    openPicker();
+    setQuery("");
+  };
+
   const readSavedFamily = useEffectEvent(() => selectedFamily);
   useEffect(() => {
     // A closed picker must not measure every installed face during the
     // Appearance mount. Stop scanning when it closes or the page unmounts.
-    // Every open rescans: known families come back sorted from the cache, so
-    // only the first scan ever shows appended runs.
+    // Every open rescans from the cache; the scan's first report repeats the
+    // seeded list, and later reports only append to it.
     if (!open || !requireMonospace || enumeration.status !== "granted") return;
     const source = enumeration.families;
     const controller = new AbortController();

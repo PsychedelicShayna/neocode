@@ -10,40 +10,51 @@ const StoredClassifications = Schema.Record(Schema.String, Schema.Boolean);
 // of the list arrives in the first slices; the name never decides the answer.
 const LIKELY_MONOSPACE_NAME = /mono|nerd font|\bnf[mp]?\b|code|term|console|courier|fixed/i;
 
-// Classifications by family name, loaded once from client-local storage and
-// shared by the code and terminal pickers.
-let classifications: Map<string, boolean> | null = null;
+// Classifications by family name, shared by the code and terminal pickers and
+// by overlapping scans. Updated in place, never replaced, so a scan that
+// outlives another's cancellation still lands its results here.
+const classifications = new Map<string, boolean>();
+let storageLoaded = false;
 
 function knownClassifications(): Map<string, boolean> {
-  if (classifications !== null) return classifications;
-  let stored: { readonly [family: string]: boolean } | null = null;
+  if (storageLoaded) return classifications;
+  storageLoaded = true;
   try {
-    stored = getLocalStorageItem(STORAGE_KEY, StoredClassifications);
+    const stored = getLocalStorageItem(STORAGE_KEY, StoredClassifications);
+    for (const [family, monospace] of Object.entries(stored ?? {})) {
+      if (!classifications.has(family)) classifications.set(family, monospace);
+    }
   } catch {
     // Unreadable or corrupt storage only costs a fresh scan.
   }
-  classifications = new Map(Object.entries(stored ?? {}));
   return classifications;
 }
 
-/** Keep only installed families, in memory and in storage. */
+/** Forget families no longer installed, then store what is known. */
 function rememberInstalled(families: readonly string[], measured: boolean): void {
   const known = knownClassifications();
-  const installed: Record<string, boolean> = {};
-  let count = 0;
-  for (const family of families) {
-    const monospace = known.get(family);
-    if (monospace === undefined) continue;
-    installed[family] = monospace;
-    count++;
+  const installed = new Set(families);
+  let pruned = false;
+  for (const family of known.keys()) {
+    if (installed.has(family)) continue;
+    known.delete(family);
+    pruned = true;
   }
-  if (!measured && count === known.size) return;
-  classifications = new Map(Object.entries(installed));
+  if (!measured && !pruned) return;
   try {
-    setLocalStorageItem(STORAGE_KEY, installed, StoredClassifications);
+    setLocalStorageItem(STORAGE_KEY, Object.fromEntries(known), StoredClassifications);
   } catch {
     // The in-memory result still serves this launch.
   }
+}
+
+/**
+ * The list a picker starts from: every family already known to be monospace,
+ * plus the saved family so it stays selectable, in the input order.
+ */
+export function knownMonospaceFonts(families: readonly string[], saved: string): string[] {
+  const known = knownClassifications();
+  return families.filter((family) => family === saved || known.get(family) === true);
 }
 
 /**
@@ -66,9 +77,7 @@ export function scanInstalledMonospaceFonts(
 ): Promise<readonly string[]> {
   return new Promise((resolve) => {
     const known = knownClassifications();
-    const matches = families.filter(
-      (family) => family === options.saved || known.get(family) === true,
-    );
+    const matches = knownMonospaceFonts(families, options.saved);
     const listed = new Set(matches);
     const unmeasured = families.filter((family) => !known.has(family));
     const queue = [

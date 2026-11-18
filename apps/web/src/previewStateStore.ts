@@ -50,6 +50,12 @@ export interface ThreadPreviewState {
   serverEpoch: string | null;
   /** Latest ordered server revision applied from a list response or event. */
   serverRevision: number;
+  /**
+   * Whether an authoritative session list (preview.list or a resync) has been
+   * applied. Until then `sessions` may hold only tabs seen in stray events or
+   * local snapshots, so nothing may treat it as the complete set.
+   */
+  listed: boolean;
 }
 
 const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
@@ -62,6 +68,7 @@ const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
   recentlySeenUrls: [] as string[],
   serverEpoch: null,
   serverRevision: 0,
+  listed: false,
 });
 
 const emptyPreviewStateAtom = Atom.make<ThreadPreviewState>(EMPTY_THREAD_PREVIEW_STATE).pipe(
@@ -382,6 +389,7 @@ export function reconcilePreviewServerSessions(ref: WorkspaceRef, result: Previe
       recentlySeenUrls,
       serverEpoch: result.serverEpoch,
       serverRevision: result.revision,
+      listed: true,
     };
   });
 }

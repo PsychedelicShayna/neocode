@@ -858,14 +858,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [listRef, streamingRowId, timelineViewportElement],
   );
   const anchorVisibleContent = useSyncExternalStore(subscribeToScroll, readAnchoring, () => true);
-  const maintainVisibleContentPosition = useMemo(
-    () => ({
-      data: anchorVisibleContent,
-      size: anchorVisibleContent,
-      shouldRestorePosition: shouldRestoreVisibleContentPosition,
-    }),
-    [anchorVisibleContent, shouldRestoreVisibleContentPosition],
-  );
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
@@ -1042,6 +1034,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     !anchoredEndSpace &&
     !prependedAwayFromEnd &&
     !disclosureToggleSettling;
+  const maintainVisibleContentPosition = useMemo(
+    () => ({
+      data: anchorVisibleContent,
+      // The live pin owns size changes. A second adjustment for the same
+      // growth moves the viewport away from the text we just revealed.
+      size: anchorVisibleContent && !followContentGrowth,
+      shouldRestorePosition: shouldRestoreVisibleContentPosition,
+    }),
+    [anchorVisibleContent, followContentGrowth, shouldRestoreVisibleContentPosition],
+  );
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();

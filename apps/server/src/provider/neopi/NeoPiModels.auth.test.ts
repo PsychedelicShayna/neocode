@@ -40,7 +40,8 @@ const fixture = Effect.fnUntraced(function* (
     capabilities: new Set(["cancellable_login"]),
     validate,
     changes: Stream.empty,
-    ui: Stream.fromPubSub(ui),
+    loginUi: (id) =>
+      Effect.succeed(Stream.fromPubSub(ui).pipe(Stream.filter((frame) => frame.loginId === id))),
     respondUi: (response) =>
       Ref.update(responses, (current) => [...current, response]).pipe(
         Effect.andThen(Deferred.succeed(respondStarted, undefined)),

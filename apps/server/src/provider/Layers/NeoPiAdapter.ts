@@ -10,11 +10,7 @@ import {
   type ProviderSession,
   type ThreadId,
 } from "@t3tools/contracts";
-import {
-  make as makeModelsClient,
-  type SpawnFn,
-  type UiRequestFrame,
-} from "effect-neopi-rpc/client";
+import { type SpawnFn, type UiRequestFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import type {
   NeoPiChatMode,
@@ -73,9 +69,9 @@ import type {
   NeoPiSessionRuntimeShape,
 } from "../neopi/NeoPiRuntimeTypes.ts";
 import type { NeoPiAdapterShape } from "../Services/NeoPiAdapter.ts";
+import { makeNeoPiLoginUi } from "../neopi/NeoPiLoginUi.ts";
 import { makeNeoPiModelsConnection } from "../neopi/NeoPiModelsConnection.ts";
 import { parseNeoPiLaunchArguments } from "../neopi/NeoPiLaunchArgs.ts";
-import { NeoPiRuntimeError } from "../neopi/NeoPiRuntimeError.ts";
 
 const PROVIDER = ProviderDriverKind.make("neopi");
 const record = (value: unknown): Record<string, unknown> =>
@@ -160,15 +156,13 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
     PubSub.shutdown,
   );
   const sessions = new Map<ThreadId, Session>();
-  const modelsUi = yield* Effect.acquireRelease(
-    PubSub.unbounded<{ threadId: ThreadId; frame: UiRequestFrame }>(),
-    PubSub.shutdown,
-  );
+  // Login flow ids are unique, so one fan-out serves every thread.
+  const modelsUi = makeNeoPiLoginUi();
   const configurationClients = yield* RcMap.make({
     lookup: (cwd: string) =>
       Effect.gen(function* () {
         const extra = yield* parseNeoPiLaunchArguments(options.settings.launchArgs);
-        const client = yield* makeModelsClient({
+        return yield* makeNeoPiModelsConnection({
           spawn: options.spawn,
           command: options.binary,
           cwd,
@@ -189,7 +183,6 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             ...extra,
           ],
         });
-        return yield* makeNeoPiModelsConnection(client);
       }).pipe(Effect.mapError((cause) => new NeoPiModelsError({ message: cause.message }))),
     idleTimeToLive: "30 seconds",
     capacity: 4,
@@ -219,10 +212,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
   const processFrame = (session: Session, frame: NeoPiRuntimeFrame) =>
     Effect.gen(function* () {
       if (frame.type === "extension_ui_request" && typeof frame.loginId === "string") {
-        yield* PubSub.publish(modelsUi, {
-          threadId: session.session.threadId,
-          frame: frame as UiRequestFrame,
-        });
+        modelsUi.publish(frame as UiRequestFrame);
         return;
       }
       const data = record(frame);
@@ -868,31 +858,19 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         );
       }),
     readThread,
-    observeNative: (threadId) =>
+    nativeOwner: (threadId) =>
       Effect.gen(function* () {
         const session = sessions.get(threadId);
-        if (!session?.runtime.observeNative || !session.runtime.nativeRequest) return undefined;
+        if (!session?.runtime.nativeRequest) return undefined;
         const runtime = session.runtime;
         const status = yield* SubscriptionRef.get(runtime.state);
         if (status === "stopped" || status === "failed") return undefined;
         const generation = runtime.processGeneration;
-        const events = (yield* session.runtime.observeNative).pipe(
-          Stream.mapError((cause) =>
-            cause instanceof NeoPiRuntimeError
-              ? cause
-              : new NeoPiRuntimeError({
-                  code: "rpc",
-                  message: cause instanceof Error ? cause.message : String(cause),
-                  cause,
-                }),
-          ),
-        );
         return {
           ownership: runtime.capabilities.has(NEOPI_CAPABILITIES.controlAttached)
             ? ("terminal" as const)
             : ("gui" as const),
           capabilities: runtime.capabilities,
-          events,
           request: (command: { readonly type: string; readonly [key: string]: unknown }) =>
             Effect.gen(function* () {
               if (sessions.get(threadId) !== session || runtime.processGeneration !== generation)
@@ -987,10 +965,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
           capabilities: session.runtime.capabilities,
           request: session.runtime.request,
           respondUi: session.runtime.respondUi,
-          ui: Stream.fromPubSub(modelsUi).pipe(
-            Stream.filter((entry) => entry.threadId === threadId),
-            Stream.map((entry) => entry.frame),
-          ),
+          loginUi: modelsUi.subscribe,
           changes: Stream.fromEffectRepeat(PubSub.take(changes)),
           validate,
         };

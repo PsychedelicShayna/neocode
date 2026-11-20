@@ -3141,10 +3141,32 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "workspace",
             },
           ),
-        [WS_METHODS.neopiNativeSessionsWatch]: (input) =>
-          observeRpcStream(WS_METHODS.neopiNativeSessionsWatch, neopiNativeSessions.watch(input), {
-            "rpc.aggregate": "workspace",
-          }),
+        [WS_METHODS.neopiNativeSessionsWatch]: (input, metadata) =>
+          observeRpcStream(
+            WS_METHODS.neopiNativeSessionsWatch,
+            neopiNativeSessions.watch(input, String(metadata.client.id)),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsRead]: (input, metadata) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsRead,
+            neopiNativeSessions.read(input, String(metadata.client.id)),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsSetDemand]: (input, metadata) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsSetDemand,
+            neopiNativeSessions.setDemand(input, String(metadata.client.id)),
+            { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.neopiNativeSessionsCredit]: (input, metadata) =>
+          observeRpcEffect(
+            WS_METHODS.neopiNativeSessionsCredit,
+            neopiNativeSessions.credit(input, String(metadata.client.id)),
+            {
+              "rpc.aggregate": "workspace",
+            },
+          ),
         [WS_METHODS.neopiNativeSessionsClose]: (input) =>
           observeRpcEffect(WS_METHODS.neopiNativeSessionsClose, neopiNativeSessions.close(input), {
             "rpc.aggregate": "workspace",
@@ -3195,10 +3217,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.neopiSessionsJournal, neopiSessionJournal(input), {
             "rpc.aggregate": "workspace",
           }),
-        [WS_METHODS.neopiSessionsWatchJournal]: (input) =>
-          observeRpcStream(
-            WS_METHODS.neopiSessionsWatchJournal,
-            neopiNativeConversation.watch(input.threadId),
+        [WS_METHODS.neopiSessionsNativeRef]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.neopiSessionsNativeRef,
+            neopiNativeConversation.nativeRef(input.threadId),
             { "rpc.aggregate": "workspace" },
           ),
         [WS_METHODS.neopiSessionsNavigateTree]: (input) =>

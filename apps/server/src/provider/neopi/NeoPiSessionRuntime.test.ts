@@ -642,110 +642,88 @@ it.live("does not invoke session catalog commands unless the capability was adve
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live(
-  "publishes external native identities without SQL turns and relaunches after owner exit",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const fixture = yield* attachFixture();
-        const freePeer = yield* testPeer(
-          (cmd, emit) =>
-            cmd.type === "negotiate_protocol"
-              ? answer(cmd, emit, { protocolVersion: 2 })
-              : cmd.type === "get_state"
-                ? answer(cmd, emit, {
-                    sessionId: "s1",
-                    sessionFile: attachedCursor.sessionFile,
-                    messageCount: 3,
-                  })
-                : basicHandler(cmd, emit),
-          { ...defaultReady, capabilities: ["rpc-ui", "session_lease"] },
-        );
-        let normalLaunches = 0;
-        const runtime = yield* make(
-          (command) => {
-            if (ChildProcess.isStandardCommand(command) && command.args[0] === "--mode") {
-              normalLaunches++;
-              if (normalLaunches > 1) return Effect.succeed(freePeer.handle);
-            }
-            return fixture.spawn(command);
-          },
-          attachedCursor,
-          undefined,
-          attachCapabilities,
-        );
-        const exited = yield* Deferred.make<void>();
-        const frames: Array<Record<string, unknown>> = [];
-        yield* Stream.runForEach(runtime.frames, (frame) =>
-          Effect.gen(function* () {
-            frames.push(frame as Record<string, unknown>);
-            if (frame.type === "t3.session.exited") yield* Deferred.succeed(exited, undefined);
-          }),
-        ).pipe(Effect.forkScoped);
-        const native = yield* runtime.observeNative!;
-        const persisted = yield* Deferred.make<void>();
-        const nativeFrames: Array<Record<string, unknown>> = [];
-        yield* Stream.runForEach(native, (frame) =>
-          Effect.gen(function* () {
-            nativeFrames.push(frame);
-            if (frame.type === "message_persisted") yield* Deferred.succeed(persisted, undefined);
-          }),
-        ).pipe(Effect.forkScoped);
-        yield* runtime.start;
-        yield* fixture.pipe.emit({ type: "agent_start" });
-        yield* fixture.pipe.emit({
-          type: "message_start",
-          messageId: "msg-external",
-          message: { role: "assistant", content: [] },
-        });
-        yield* fixture.pipe.emit({
-          type: "message_update",
-          messageId: "msg-external",
-          assistantMessageEvent: { type: "text_delta", delta: "terminal" },
-        });
-        yield* fixture.pipe.emit({
-          type: "message_end",
-          messageId: "msg-external",
-          message: { role: "assistant", content: [{ type: "text", text: "terminal" }] },
-        });
-        yield* fixture.pipe.emit({
-          type: "message_persisted",
-          sessionId: "s1",
-          sessionFile: attachedCursor.sessionFile,
-          leafId: "entry-external",
-          messageId: "msg-external",
-          entryId: "entry-external",
-        });
-        yield* Deferred.await(persisted);
-        NodeAssert.deepEqual(
-          nativeFrames
-            .filter((frame) => typeof frame.messageId === "string")
-            .map((frame) => frame.messageId),
-          ["msg-external", "msg-external", "msg-external", "msg-external"],
-        );
-        NodeAssert.equal(
-          nativeFrames.some((frame) => "turnId" in frame),
-          false,
-        );
-        yield* fixture.pipe.emit({ type: "agent_end", messages: [] });
-        yield* fixture.pipe.finish(null);
-        yield* Deferred.await(exited);
-        NodeAssert.equal(
-          frames.some(
-            (frame) =>
-              frame.type === "agent_start" ||
-              frame.type === "agent_end" ||
-              frame.type === "t3.turn.outcome",
-          ),
-          false,
-        );
-        NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, []);
-        yield* runtime.start;
-        NodeAssert.equal(normalLaunches, 2);
-        NodeAssert.equal(runtime.capabilities.has("control_v1"), false);
-        yield* runtime.stop;
-      }),
-    ).pipe(Effect.provide(NodeServices.layer)),
+it.live("keeps external native work out of SQL turns and relaunches after owner exit", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fixture = yield* attachFixture();
+      const freePeer = yield* testPeer(
+        (cmd, emit) =>
+          cmd.type === "negotiate_protocol"
+            ? answer(cmd, emit, { protocolVersion: 2 })
+            : cmd.type === "get_state"
+              ? answer(cmd, emit, {
+                  sessionId: "s1",
+                  sessionFile: attachedCursor.sessionFile,
+                  messageCount: 3,
+                })
+              : basicHandler(cmd, emit),
+        { ...defaultReady, capabilities: ["rpc-ui", "session_lease"] },
+      );
+      let normalLaunches = 0;
+      const runtime = yield* make(
+        (command) => {
+          if (ChildProcess.isStandardCommand(command) && command.args[0] === "--mode") {
+            normalLaunches++;
+            if (normalLaunches > 1) return Effect.succeed(freePeer.handle);
+          }
+          return fixture.spawn(command);
+        },
+        attachedCursor,
+        undefined,
+        attachCapabilities,
+      );
+      const exited = yield* Deferred.make<void>();
+      const frames: Array<Record<string, unknown>> = [];
+      yield* Stream.runForEach(runtime.frames, (frame) =>
+        Effect.gen(function* () {
+          frames.push(frame as Record<string, unknown>);
+          if (frame.type === "t3.session.exited") yield* Deferred.succeed(exited, undefined);
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* runtime.start;
+      yield* fixture.pipe.emit({ type: "agent_start" });
+      yield* fixture.pipe.emit({
+        type: "message_start",
+        messageId: "msg-external",
+        message: { role: "assistant", content: [] },
+      });
+      yield* fixture.pipe.emit({
+        type: "message_update",
+        messageId: "msg-external",
+        assistantMessageEvent: { type: "text_delta", delta: "terminal" },
+      });
+      yield* fixture.pipe.emit({
+        type: "message_end",
+        messageId: "msg-external",
+        message: { role: "assistant", content: [{ type: "text", text: "terminal" }] },
+      });
+      yield* fixture.pipe.emit({
+        type: "message_persisted",
+        sessionId: "s1",
+        sessionFile: attachedCursor.sessionFile,
+        leafId: "entry-external",
+        messageId: "msg-external",
+        entryId: "entry-external",
+      });
+      yield* fixture.pipe.emit({ type: "agent_end", messages: [] });
+      yield* fixture.pipe.finish(null);
+      yield* Deferred.await(exited);
+      NodeAssert.equal(
+        frames.some(
+          (frame) =>
+            frame.type === "agent_start" ||
+            frame.type === "agent_end" ||
+            frame.type === "t3.turn.outcome",
+        ),
+        false,
+      );
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, []);
+      yield* runtime.start;
+      NodeAssert.equal(normalLaunches, 2);
+      NodeAssert.equal(runtime.capabilities.has("control_v1"), false);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live(
@@ -1558,13 +1536,6 @@ it.live("settles consecutive turns when native events precede the boundary reply
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle));
         yield* runtime.start;
-        const native = yield* runtime.observeNative;
-        const persisted = yield* Stream.runCollect(
-          native.pipe(
-            Stream.filter((frame) => frame.type === "message_persisted"),
-            Stream.take(2),
-          ),
-        ).pipe(Effect.forkScoped);
         for (let index = 1; index <= 2; index++) {
           const settled = yield* Stream.runCollect(
             runtime.frames.pipe(Stream.takeUntil((frame) => frame.type === "t3.turn.outcome")),
@@ -1589,10 +1560,6 @@ it.live("settles consecutive turns when native events precede the boundary reply
             })),
           );
         }
-        NodeAssert.deepEqual(
-          (yield* Fiber.join(persisted)).map((frame) => frame.entryId),
-          ["assistant-1", "assistant-2"],
-        );
         yield* runtime.stop;
       }
     }),

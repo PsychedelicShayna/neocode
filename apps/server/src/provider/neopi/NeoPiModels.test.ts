@@ -92,7 +92,7 @@ const connection = (input: Partial<NeoPiModelsConnection> = {}): NeoPiModelsConn
   request: () => Effect.succeed(configuration),
   respondUi: () => Effect.void,
   validate: Effect.void,
-  ui: Stream.empty,
+  loginUi: () => Effect.succeed(Stream.empty),
   changes: Stream.empty,
   ...input,
 });

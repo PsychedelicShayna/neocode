@@ -43,7 +43,6 @@ type RpcMethod<TTag extends EnvironmentRpcTag> = WsRpcProtocolClient[TTag];
 export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.neopiSessionsWatchConfiguration
   | typeof WS_METHODS.neopiNativeSessionsWatch
-  | typeof WS_METHODS.neopiSessionsWatchJournal
   | typeof WS_METHODS.neopiModelsWatch
   | typeof WS_METHODS.neopiModelsAuthWatch
   | typeof ORCHESTRATION_WS_METHODS.subscribeShell

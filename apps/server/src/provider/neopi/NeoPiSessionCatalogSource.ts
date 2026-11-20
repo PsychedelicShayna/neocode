@@ -19,7 +19,7 @@ export interface NeoPiSessionCatalogSource {
   readonly configuration?: NeoPiAdapterShape["getConfiguration"];
   readonly observeConfiguration?: NeoPiAdapterShape["observeConfiguration"];
   readonly journal?: NeoPiAdapterShape["readJournal"];
-  readonly observeNative?: NeoPiAdapterShape["observeNative"];
+  readonly nativeOwner?: NeoPiAdapterShape["nativeOwner"];
   readonly modelsConnection?: NeoPiAdapterShape["getModelsConnection"];
 }
 

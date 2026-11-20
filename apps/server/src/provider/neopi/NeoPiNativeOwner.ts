@@ -4,17 +4,16 @@ import {
   DEFAULT_RUNTIME_MODE,
   ProviderDriverKind,
   type NeoPiNavigateTreeInput,
+  type NeoPiThreadNativeRef,
   type ThreadId,
 } from "@t3tools/contracts";
-import { make as makeClient, type SessionEventFrame } from "effect-neopi-rpc/client";
+import { make as makeClient } from "effect-neopi-rpc/client";
 import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
 import type { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import type * as Stream from "effect/Stream";
-import * as Streams from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
@@ -25,19 +24,18 @@ import {
   neoPiSessionCatalogSource,
   type NeoPiSessionCatalogSource,
 } from "./NeoPiSessionCatalogSource.ts";
-import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 
 export interface NeoPiNativeOwner {
   readonly ownership: "gui" | "terminal";
   readonly capabilities: ReadonlySet<string>;
-  readonly events: Stream.Stream<SessionEventFrame, NeoPiRuntimeError>;
   readonly request: (command: {
     readonly type: string;
     readonly [key: string]: unknown;
   }) => Effect.Effect<unknown, NeoPiRpcError | NeoPiRuntimeError>;
 }
 const Cursor = Schema.Struct({ sessionId: Schema.String, sessionFile: Schema.String });
+const decodeCursor = Schema.decodeUnknownOption(Cursor);
 const Catalog = Schema.fromJsonString(
   Schema.Struct({
     version: Schema.Literal(1),
@@ -96,29 +94,38 @@ export const readNeoPiNativeOwnerCatalog = Effect.fn("NeoPiNativeOwner.readCatal
   Effect.mapError(nativeOwnerError),
 );
 
-/** Resolve the existing writer only. History observation never starts or resumes a session. */
-export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(function* () {
+/**
+ * A thread's saved native binding: its canonical session identity, the enabled NeoPi
+ * instance that owns it, and a check that the binding has not changed since it was read.
+ * Opens no connection.
+ */
+const makeNeoPiThreadBinding = Effect.fn("NeoPiNativeOwner.binding")(function* () {
   const directory = yield* ProviderSessionDirectory;
   const instances = yield* ProviderInstanceRegistry;
-  const snapshots = yield* ProjectionSnapshotQuery;
   const fs = yield* FileSystem.FileSystem;
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  return Effect.fn("NeoPiNativeOwner.resolve")(function* (threadId: ThreadId) {
-    const scope = yield* Effect.scope;
+  return Effect.fn("NeoPiNativeOwner.readBinding")(function* (threadId: ThreadId) {
     const binding = yield* directory.getBinding(threadId);
-    if (Option.isNone(binding) || binding.value.provider !== "neopi") return undefined;
-    const saved = yield* Schema.decodeUnknownEffect(Cursor)(binding.value.resumeCursor);
-    if (!NodePath.isAbsolute(saved.sessionFile)) return undefined;
+    if (Option.isNone(binding) || binding.value.provider !== "neopi")
+      return { status: "unavailable" as const, reason: "This thread has no native NeoPi session." };
+    const saved = decodeCursor(binding.value.resumeCursor);
+    if (Option.isNone(saved) || !NodePath.isAbsolute(saved.value.sessionFile))
+      return {
+        status: "unavailable" as const,
+        reason: "This thread has not recorded its native session file yet.",
+      };
     const expected = {
-      sessionId: saved.sessionId,
-      sessionFile: yield* fs.realPath(saved.sessionFile),
+      sessionId: saved.value.sessionId,
+      sessionFile: yield* fs.realPath(saved.value.sessionFile),
     };
     const instance = binding.value.providerInstanceId
       ? yield* instances.getInstance(binding.value.providerInstanceId)
       : undefined;
-    if (!instance?.enabled || instance.driverKind !== "neopi") return undefined;
-    const source = neoPiSessionCatalogSource(instance);
-    if (!source) return undefined;
+    const source = instance ? neoPiSessionCatalogSource(instance) : undefined;
+    if (!instance?.enabled || instance.driverKind !== "neopi" || !source)
+      return {
+        status: "unavailable" as const,
+        reason: "This thread's NeoPi provider instance is disabled or missing.",
+      };
     const unchanged = Effect.gen(function* () {
       const current = yield* directory.getBinding(threadId);
       if (
@@ -129,15 +136,61 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
         (yield* instances.getInstance(instance.instanceId)) !== instance
       )
         return false;
-      const cursor = Schema.decodeUnknownOption(Cursor)(current.value.resumeCursor);
+      const cursor = decodeCursor(current.value.resumeCursor);
       return (
         Option.isSome(cursor) &&
         cursor.value.sessionId === expected.sessionId &&
         (yield* fs.realPath(cursor.value.sessionFile)) === expected.sessionFile
       );
     });
-    let owner: NeoPiNativeOwner | undefined = source.observeNative
-      ? yield* source.observeNative(threadId)
+    return { status: "available" as const, expected, instance, source, unchanged };
+  });
+});
+
+/**
+ * The native session ref of an active thread, for attach-only observation. A deleted thread's
+ * retained binding is never disclosed. Never opens a connection.
+ */
+export const makeNeoPiThreadNativeRef = Effect.fn("NeoPiNativeOwner.nativeRef")(function* () {
+  const readBinding = yield* makeNeoPiThreadBinding();
+  const snapshots = yield* ProjectionSnapshotQuery;
+  return (threadId: ThreadId): Effect.Effect<NeoPiThreadNativeRef> =>
+    Effect.gen(function* () {
+      if (Option.isNone(yield* snapshots.getThreadShellById(threadId)))
+        return { status: "unavailable" as const, reason: "This thread does not exist." };
+      const binding = yield* readBinding(threadId);
+      if (binding.status !== "available") return binding;
+      return {
+        status: "available" as const,
+        ref: {
+          providerInstanceId: binding.instance.instanceId,
+          sessionFile: binding.expected.sessionFile,
+        },
+        sessionId: binding.expected.sessionId,
+        runtime: binding.source.nativeOwner
+          ? ((yield* Effect.scoped(binding.source.nativeOwner(threadId)))?.ownership ??
+            ("none" as const))
+          : ("none" as const),
+      };
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.succeed({ status: "unavailable" as const, reason: nativeOwnerError(cause).message }),
+      ),
+    );
+});
+
+/** Resolve the existing writer for tree operations only; it never starts or resumes a session. */
+export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(function* () {
+  const readBinding = yield* makeNeoPiThreadBinding();
+  const snapshots = yield* ProjectionSnapshotQuery;
+  const fs = yield* FileSystem.FileSystem;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  return Effect.fn("NeoPiNativeOwner.resolve")(function* (threadId: ThreadId) {
+    const binding = yield* readBinding(threadId);
+    if (binding.status !== "available") return undefined;
+    const { expected, source, unchanged } = binding;
+    let owner: NeoPiNativeOwner | undefined = source.nativeOwner
+      ? yield* source.nativeOwner(threadId)
       : undefined;
     if (!owner) {
       if (
@@ -151,7 +204,9 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
       const project = yield* snapshots.getProjectShellById(thread.value.projectId);
       if (Option.isNone(project)) return undefined;
       const cwd = thread.value.worktreePath ?? project.value.workspaceRoot;
-      const catalog = yield* readNeoPiNativeOwnerCatalog(source, cwd, expected.sessionFile);
+      const catalog = yield* readNeoPiNativeOwnerCatalog(source, cwd, expected.sessionFile).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      );
       let instanceId: string | undefined;
       for (const row of catalog.sessions) {
         if (
@@ -163,30 +218,19 @@ export const makeNeoPiNativeOwnerResolver = Effect.fn("NeoPiNativeOwner.make")(f
         }
       }
       if (!instanceId) return undefined;
-      const hub = makeNeoPiNativeEventHub();
-      const events = yield* hub.subscribe;
+      // Requests only: tree operations. Frames on this connection are dropped by the
+      // client; observation goes through NeoPiNativeSessions.
       const peer = yield* makeClient({
         spawn: spawner.spawn,
         command: source.binary,
         args: ["ctl", "pipe", instanceId, "--label", "neocode-conversation"],
         cwd,
         env: source.env,
-        eventQueueCapacity: 1,
-        onTransportReady: (transport) =>
-          Effect.gen(function* () {
-            yield* Streams.runDrain(transport.uiRequests).pipe(Effect.forkIn(scope));
-            yield* Streams.runDrain(transport.hostToolCalls).pipe(Effect.forkIn(scope));
-            yield* Streams.runForEach(transport.events, hub.publish).pipe(
-              Effect.ensuring(hub.publish({ type: "neocode_connection_closed" })),
-              Effect.forkIn(scope),
-            );
-          }),
       });
       if (!peer.capabilities.has("control_v1")) return undefined;
       owner = {
         ownership: "terminal",
         capabilities: peer.capabilities,
-        events,
         request: peer.request,
       };
     }

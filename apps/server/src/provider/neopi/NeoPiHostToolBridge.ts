@@ -3,6 +3,7 @@ import { nativeWorkspaceResourceId } from "@t3tools/shared/neopiWorkspace";
 import type {
   AgentToolResultWire,
   HostToolCallFrame,
+  HostToolCancelFrame,
   NeoPiRpcTransport,
 } from "effect-neopi-rpc/client";
 import * as Cause from "effect/Cause";
@@ -137,7 +138,9 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
 
 /** Each pump belongs to one transport; terminal registration requires connection_owned_host_tools. */
 export const makeNeoPiNativeHostToolPump = Effect.fn("NeoPiHostToolBridge.nativePump")(function* (
-  peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">,
+  peer: Pick<NeoPiRpcTransport, "hostToolResult"> & {
+    readonly hostToolCalls: Stream.Stream<HostToolCallFrame | HostToolCancelFrame>;
+  },
   validate: (ref: NeoPiNativeSessionRef) => Effect.Effect<void, NeoPiNativeSessionsError>,
 ) {
   const lifetime = yield* Effect.scope;

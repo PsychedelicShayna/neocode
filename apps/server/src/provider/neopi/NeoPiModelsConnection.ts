@@ -1,41 +1,53 @@
 import { NeoPiModelsError } from "@t3tools/contracts";
-import type { NeoPiRpcClient, UiRequestFrame } from "effect-neopi-rpc/client";
+import {
+  make as makeClient,
+  type NeoPiRpcClientOptions,
+  type NeoPiRpcClient,
+  type UiRequestFrame,
+} from "effect-neopi-rpc/client";
 import * as Effect from "effect/Effect";
 import * as PubSub from "effect/PubSub";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { makeNeoPiLoginUi } from "./NeoPiLoginUi.ts";
 
 export interface NeoPiModelsConnection {
   readonly capabilities: ReadonlySet<string>;
   readonly request: NeoPiRpcClient["request"];
   readonly respondUi: NeoPiRpcClient["respondUi"];
-  readonly ui: Stream.Stream<UiRequestFrame>;
+  /** One login flow's UI frames, from now until the scope closes; see `makeNeoPiLoginUi`. */
+  readonly loginUi: (
+    loginId: string,
+  ) => Effect.Effect<Stream.Stream<UiRequestFrame, NeoPiModelsError>, never, Scope.Scope>;
   readonly changes: Stream.Stream<void>;
   readonly validate: Effect.Effect<void, NeoPiModelsError>;
 }
 
-/** Drain the native queues once, then fan out to graphical observers without competing readers. */
+/**
+ * The native process feeds graphical observers through a synchronous sink. Each observer
+ * holds at most one pending change signal (the hub re-reads once per burst). Login UI goes
+ * only to the flow it belongs to; with no follower nothing is kept.
+ */
 export const makeNeoPiModelsConnection = Effect.fn("NeoPiModelsConnection.make")(function* (
-  client: NeoPiRpcClient,
+  options: Omit<NeoPiRpcClientOptions, "sink" | "onTransportReady">,
 ) {
-  const changes = yield* Effect.acquireRelease(PubSub.unbounded<void>(), PubSub.shutdown);
-  const ui = yield* Effect.acquireRelease(PubSub.unbounded<UiRequestFrame>(), PubSub.shutdown);
-  yield* client.events.pipe(
-    Stream.runForEach((event) =>
-      event.type === "models_configuration_changed" || event.type === "model_changed"
-        ? PubSub.publish(changes, undefined)
-        : Effect.void,
-    ),
-    Effect.forkScoped,
-  );
-  yield* client.uiRequests.pipe(
-    Stream.runForEach((frame) => PubSub.publish(ui, frame)),
-    Effect.forkScoped,
-  );
+  const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);
+  const loginUi = makeNeoPiLoginUi();
+  const client = yield* makeClient({
+    ...options,
+    sink: {
+      event: (event) => {
+        if (event.type === "models_configuration_changed" || event.type === "model_changed")
+          PubSub.publishUnsafe(changes, undefined);
+      },
+      uiRequest: loginUi.publish,
+    },
+  });
   return {
     capabilities: client.capabilities,
     request: client.request,
     respondUi: client.respondUi,
-    ui: Stream.fromPubSub(ui),
+    loginUi: loginUi.subscribe,
     changes: Stream.fromPubSub(changes),
     validate: Effect.void,
   } satisfies NeoPiModelsConnection;

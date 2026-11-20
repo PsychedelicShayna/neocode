@@ -21,6 +21,7 @@ import {
 import {
   closeNativeSession,
   moveNativeSession,
+  retryStoppedNativeSession,
   selectNativeSession,
   useNativeSessionSelection,
 } from "../../state/neopiNativeSessions";
@@ -74,7 +75,11 @@ function NativeSessionTab({
               type="button"
               aria-current={active ? "page" : undefined}
               className="flex min-w-0 cursor-pointer flex-col text-left"
-              onClick={() => selectNativeSession(tab)}
+              onClick={() => {
+                selectNativeSession(tab);
+                // The selected tab's view is already mounted; a click on it is the retry.
+                if (active) retryStoppedNativeSession(tab);
+              }}
             />
           }
         >

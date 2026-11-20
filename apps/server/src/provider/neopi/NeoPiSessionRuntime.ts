@@ -9,6 +9,9 @@ import {
   type PromptOutcome,
   type SpawnFn,
   type HostToolCallFrame,
+  type HostToolCancelFrame,
+  type SessionEventFrame,
+  type UiRequestFrame,
 } from "effect-neopi-rpc/client";
 import type { PlanProposalResponseFrame } from "effect-neopi-rpc/schema";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
@@ -37,7 +40,6 @@ import { NEOPI_CAPABILITIES, neopiCompatibility } from "./NeoPiCompatibility.ts"
 import { neoPiRoleFromModelSlug } from "./NeoPiModelCatalog.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
-import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
 import type {
   NeoPiResumeCursor,
   NeoPiRuntimeFrame,
@@ -149,7 +151,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     input.cursor ?? { v: 1, sessionFile: "", sessionId: "", sessionDir: "", turnBoundaries: [] },
   );
   const frames = yield* Queue.unbounded<NeoPiRuntimeFrame, Cause.Done<void>>();
-  const nativeEvents = makeNeoPiNativeEventHub();
   const configurationChanges = yield* PubSub.sliding<void>(1);
   const invalidateConfiguration = PubSub.publish(configurationChanges, undefined).pipe(
     Effect.asVoid,
@@ -192,14 +193,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const emit = (frame: NeoPiRuntimeFrame) =>
     Queue.offer(frames, frame).pipe(Effect.orDie, Effect.asVoid);
   const setState = (value: NeoPiRuntimeState) =>
-    SubscriptionRef.set(state, value).pipe(
-      Effect.andThen(invalidateConfiguration),
-      Effect.andThen(() =>
-        value === "stopped" || value === "failed" || value === "stopping"
-          ? nativeEvents.publish({ type: "neocode_connection_closed", state: value })
-          : Effect.void,
-      ),
-    );
+    SubscriptionRef.set(state, value).pipe(Effect.andThen(invalidateConfiguration));
   const current = () =>
     client
       ? Effect.succeed(client)
@@ -473,10 +467,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         frame.type === "journal_entry"
       )
         yield* invalidateConfiguration;
-      // Native observers retain process-local message IDs independently of SQL
-      // turns. Only message_persisted can associate one with a durable entry.
-      const nativeFrame: { readonly type: string } = frame;
-      yield* nativeEvents.publish(nativeFrame);
       if (
         frame.type === "journal_state" ||
         frame.type === "journal_entry" ||
@@ -611,7 +601,11 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         message,
       );
     });
-  const pumpHost = (peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">) =>
+  const pumpHost = (
+    peer: Pick<NeoPiRpcTransport, "hostToolResult"> & {
+      readonly hostToolCalls: Stream.Stream<HostToolCallFrame | HostToolCancelFrame>;
+    },
+  ) =>
     Stream.runForEach(peer.hostToolCalls, (call) =>
       Effect.gen(function* () {
         if (attached) return;
@@ -736,72 +730,107 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     const begin = Effect.gen(function* () {
       if (launch.sessionDir) yield* fs.makeDirectory(launch.sessionDir, { recursive: true });
       attached = false;
+      // The one remaining unbounded ingestion: the parser offers each frame, in wire order,
+      // to these runtime-local queues and the existing handlers drain them. Handlers await
+      // replies on this connection, so they cannot be made synchronous, and bounding the
+      // queues would need flow control NeoPi does not offer.
       const connect = (args: ReadonlyArray<string>) =>
-        makeClient({
-          spawn: input.spawn,
-          command: launch.command,
-          args,
-          cwd: launch.cwd,
-          env: launch.env,
-          // Event handlers await replies on this connection (turn boundaries,
-          // state refreshes). Backpressuring stdout here can strand those
-          // replies behind queued events. Window observers have their own budgets.
-          ...(input.requestTimeoutMs === undefined
-            ? {}
-            : { requestTimeoutMs: input.requestTimeoutMs }),
-          onTransportReady: (transport) =>
-            Effect.gen(function* () {
-              earlyUi = transport;
-              yield* transport.transportReady.pipe(
-                Effect.flatMap((ready) => {
-                  attached =
-                    ready.capabilities?.includes(NEOPI_CAPABILITIES.controlAttached) === true;
-                  return emit({ ...ready, type: "ready" });
-                }),
-                Effect.ignore,
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-              yield* Stream.runForEach(transport.events, handleEvent).pipe(
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-              yield* Stream.runForEach(transport.uiRequests, (frame) =>
-                Effect.gen(function* () {
-                  if (typeof frame.loginId === "string") {
-                    if (frame.method === "input" || frame.method === "confirm")
-                      modelsAuthUi.add(frame.id);
+        Effect.gen(function* () {
+          const inboundEvents = yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>();
+          const inboundUi = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
+          const inboundHost = yield* Queue.unbounded<
+            HostToolCallFrame | HostToolCancelFrame,
+            Cause.Done<void>
+          >();
+          return yield* makeClient({
+            sink: {
+              event: (frame) => {
+                Queue.offerUnsafe(inboundEvents, frame);
+              },
+              uiRequest: (frame) => {
+                Queue.offerUnsafe(inboundUi, frame);
+              },
+              hostToolCall: (call) => {
+                Queue.offerUnsafe(inboundHost, call);
+              },
+            },
+            spawn: input.spawn,
+            command: launch.command,
+            args,
+            cwd: launch.cwd,
+            env: launch.env,
+            // Event handlers await replies on this connection (turn boundaries,
+            // state refreshes); the sink never backpressures stdout.
+            ...(input.requestTimeoutMs === undefined
+              ? {}
+              : { requestTimeoutMs: input.requestTimeoutMs }),
+            onTransportReady: (transport) =>
+              Effect.gen(function* () {
+                earlyUi = transport;
+                // The queues belong to this peer: when it exits they end, and their readers
+                // finish after draining, even if a fallback peer replaces it in this scope.
+                yield* Deferred.await(transport.exit).pipe(
+                  Effect.andThen(
+                    Effect.all([
+                      Queue.end(inboundEvents),
+                      Queue.end(inboundUi),
+                      Queue.end(inboundHost),
+                    ]),
+                  ),
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
+                yield* transport.transportReady.pipe(
+                  Effect.flatMap((ready) => {
+                    attached =
+                      ready.capabilities?.includes(NEOPI_CAPABILITIES.controlAttached) === true;
+                    return emit({ ...ready, type: "ready" });
+                  }),
+                  Effect.ignore,
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
+                yield* Stream.runForEach(Stream.fromQueue(inboundEvents), handleEvent).pipe(
+                  Effect.forkScoped,
+                  Effect.provideService(Scope.Scope, scope),
+                );
+                yield* Stream.runForEach(Stream.fromQueue(inboundUi), (frame) =>
+                  Effect.gen(function* () {
+                    if (typeof frame.loginId === "string") {
+                      if (frame.method === "input" || frame.method === "confirm")
+                        modelsAuthUi.add(frame.id);
+                      if (frame.method === "cancel" && typeof frame.targetId === "string")
+                        modelsAuthUi.delete(frame.targetId);
+                      yield* emit(frame);
+                      return;
+                    }
+                    if (attached && !active) return;
+                    if (activeUiMethods.has(frame.method)) {
+                      if (
+                        (yield* SubscriptionRef.get(state)) === "failed" ||
+                        (yield* SubscriptionRef.get(state)) === "stopping"
+                      ) {
+                        yield* emit({
+                          type: "extension_ui_request",
+                          id: frame.id,
+                          method: "cancel",
+                          targetId: frame.id,
+                          ...(active ? { turnId: active.id } : {}),
+                        });
+                      } else uiPending.add(frame.id);
+                    }
                     if (frame.method === "cancel" && typeof frame.targetId === "string")
-                      modelsAuthUi.delete(frame.targetId);
-                    yield* emit(frame);
-                    return;
-                  }
-                  if (attached && !active) return;
-                  if (activeUiMethods.has(frame.method)) {
-                    if (
-                      (yield* SubscriptionRef.get(state)) === "failed" ||
-                      (yield* SubscriptionRef.get(state)) === "stopping"
-                    ) {
-                      yield* emit({
-                        type: "extension_ui_request",
-                        id: frame.id,
-                        method: "cancel",
-                        targetId: frame.id,
-                        ...(active ? { turnId: active.id } : {}),
-                      });
-                    } else uiPending.add(frame.id);
-                  }
-                  if (frame.method === "cancel" && typeof frame.targetId === "string")
-                    uiPending.delete(frame.targetId);
-                  yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
-                }),
-              ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
-              yield* pumpHost(transport).pipe(
-                Effect.forkScoped,
-                Effect.provideService(Scope.Scope, scope),
-              );
-            }),
-        }).pipe(Effect.provideService(Scope.Scope, scope));
+                      uiPending.delete(frame.targetId);
+                    yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
+                  }),
+                ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
+                yield* pumpHost({
+                  hostToolCalls: Stream.fromQueue(inboundHost),
+                  hostToolResult: transport.hostToolResult,
+                }).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
+              }),
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+        });
       const peer = yield* connect(launch.args).pipe(
         Effect.catchIf(
           (error) =>
@@ -1368,7 +1397,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       return generation;
     },
     subscribeConfigurationChanges: PubSub.subscribe(configurationChanges),
-    observeNative: nativeEvents.subscribe,
     nativeRequest: (command) =>
       Effect.gen(function* () {
         if (

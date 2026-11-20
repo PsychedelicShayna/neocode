@@ -79,6 +79,10 @@
       "types": "./src/neopiModels.ts",
       "default": "./src/neopiModels.ts"
     },
+    "./neopi-thread-observation": {
+      "types": "./src/neopiThreadObservation.ts",
+      "default": "./src/neopiThreadObservation.ts"
+    },
     "./neopi-conversation": {
       "types": "./src/neopiConversation.ts",
       "default": "./src/neopiConversation.ts"

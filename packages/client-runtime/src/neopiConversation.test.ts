@@ -5,10 +5,6 @@ import {
   nativeNavigationGuards,
   reduceNativeConversation,
 } from "./neopiConversation.ts";
-import {
-  applyNativeConversationEvent,
-  emptyNativeConversationFeed,
-} from "./state/neopiConversation.ts";
 
 const identity = {
   sessionId: "native-session",
@@ -30,39 +26,6 @@ const initial = () =>
   reduceNativeConversation(emptyNativeConversation(), { type: "snapshot", page: page() });
 
 describe("native main conversation", () => {
-  it("accepts the producer's unsaved snapshot and rejects another canonical file", () => {
-    let feed = applyNativeConversationEvent(emptyNativeConversationFeed(), {
-      type: "snapshot",
-      page: page(),
-    });
-    feed = applyNativeConversationEvent(feed, {
-      type: "native",
-      event: {
-        type: "message_start",
-        snapshot: true,
-        ...identity,
-        messageId: "msg-current",
-        message: { role: "assistant", content: [{ type: "text", text: "Already running" }] },
-      },
-    });
-    expect(feed.conversation.pending[0]?.messageId).toBe("msg-current");
-    expect(feed.busy).toBe(true);
-    const previous = feed;
-    feed = applyNativeConversationEvent(feed, {
-      type: "native",
-      event: {
-        type: "message_start",
-        snapshot: true,
-        ...identity,
-        sessionFile: "/other/session.jsonl",
-        messageId: "msg-old-binding",
-        message: { role: "assistant", content: "Wrong owner" },
-      },
-    });
-    expect(feed).toBe(previous);
-    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_end" } });
-    expect(feed.busy).toBe(false);
-  });
   it("keeps complete older pages beyond 2000 entries, native boundaries and unknown fields", () => {
     const all = Array.from({ length: 2307 }, (_, index) =>
       entry(
@@ -104,6 +67,30 @@ describe("native main conversation", () => {
     expect(
       state.entries.filter((value) => value.type !== "message").map((value) => value.type),
     ).toEqual(["future_extension", "compaction", "reset_boundary", "branch_summary"]);
+  });
+
+  it("changes nothing when an older page reply is replayed after later pages", () => {
+    const all = Array.from({ length: 5 }, (_, index) =>
+      entry(String(index), index ? String(index - 1) : null),
+    );
+    const current = { ...identity, leafId: "4" };
+    let state = reduceNativeConversation(emptyNativeConversation(), {
+      type: "snapshot",
+      page: { ...current, entries: all.slice(3), totalEntries: 5, nextCursor: "3" },
+    });
+    const first = {
+      type: "older" as const,
+      revision: state.revision,
+      page: { ...current, entries: all.slice(2, 3), totalEntries: 5, nextCursor: "2" },
+    };
+    state = reduceNativeConversation(state, first);
+    state = reduceNativeConversation(state, {
+      type: "older",
+      revision: state.revision,
+      page: { ...current, entries: all.slice(0, 2), totalEntries: 5 },
+    });
+    expect(state.cursor).toBeUndefined();
+    expect(reduceNativeConversation(state, first)).toBe(state);
   });
 
   it.each([true, false])(
@@ -271,54 +258,31 @@ describe("native main conversation", () => {
     expect(state.entries.map((value) => value.id)).toEqual(["a", "b", "c"]);
   });
 
-  it("clears process-local stream identities on reconnect without emitting a send", () => {
+  it("keeps a live row across a reconnect until its identified durable entry is present", () => {
     let state = reduceNativeConversation(initial(), {
       type: "message",
       messageId: "msg-1",
       message: { role: "assistant", content: "unsaved" },
     });
     state = reduceNativeConversation(state, { type: "disconnect" });
-    expect(state.pending).toEqual([]);
     expect(state.needsSnapshot).toBe(true);
     state = reduceNativeConversation(state, { type: "snapshot", page: page() });
+    expect(state.pending.map((row) => row.messageId)).toEqual(["msg-1"]);
+    const next = { ...identity, leafId: "c" };
     state = reduceNativeConversation(state, {
-      type: "message",
+      type: "persisted",
+      identity: next,
       messageId: "msg-1",
-      message: { role: "user", content: "new process" },
+      entryId: "c",
     });
-    expect(state.pending[0]?.message.content).toBe("new process");
-  });
-
-  it("reduces all frames before consumers observe the latest subscription value", () => {
-    let feed = applyNativeConversationEvent(emptyNativeConversationFeed(), {
-      type: "snapshot",
-      page: page(),
+    expect(state.pending.map((row) => row.messageId)).toEqual(["msg-1"]);
+    state = reduceNativeConversation(state, {
+      type: "entry",
+      identity: next,
+      entry: entry("c", "b"),
     });
-    for (const text of ["a", "ab", "abc"])
-      feed = applyNativeConversationEvent(feed, {
-        type: "native",
-        event: {
-          type: "message_update",
-          messageId: "msg-4",
-          message: { role: "assistant", content: text },
-        },
-      });
-    feed = applyNativeConversationEvent(feed, {
-      type: "native",
-      event: { type: "journal_entry", ...identity, leafId: "c", entry: entry("c", "b") },
-    });
-    feed = applyNativeConversationEvent(feed, {
-      type: "native",
-      event: {
-        type: "message_persisted",
-        ...identity,
-        leafId: "c",
-        messageId: "msg-4",
-        entryId: "c",
-      },
-    });
-    expect(feed.conversation.pending).toEqual([]);
-    expect(feed.conversation.entries.at(-1)?.id).toBe("c");
+    expect(state.pending).toEqual([]);
+    expect(state.entries.map((value) => value.id)).toEqual(["a", "b", "c"]);
   });
 
   it("keeps root-leaf and canonical-file preconditions exact", () => {
@@ -340,25 +304,21 @@ describe("native main conversation", () => {
       errorMessage: "404 0 endpoints out of 5 requested are available",
     };
     const reply = { role: "assistant", content: "Fine", stopReason: "stop" };
-    const stream = (type: string, messageId: string, message: Record<string, unknown>) =>
-      ({ type: "native", event: { type, ...identity, messageId, message } }) as const;
-    let feed = applyNativeConversationEvent(emptyNativeConversationFeed(), {
-      type: "snapshot",
-      page: page(),
-    });
+    const message = (messageId: string, body: Record<string, unknown>) =>
+      ({ type: "message", messageId, message: body }) as const;
+    let conversation = initial();
     // The failed turn: its live copy shows while the turn is the latest.
-    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_start" } });
-    feed = applyNativeConversationEvent(feed, stream("message_end", "failed", failure));
-    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_end" } });
-    expect(feed.conversation.pending.map((message) => message.messageId)).toEqual(["failed"]);
+    conversation = reduceNativeConversation(conversation, { type: "turn_started" });
+    conversation = reduceNativeConversation(conversation, message("failed", failure));
+    expect(conversation.pending.map((item) => item.messageId)).toEqual(["failed"]);
     // The next turn starts and succeeds: the failure is not carried into it.
-    feed = applyNativeConversationEvent(feed, { type: "native", event: { type: "agent_start" } });
-    expect(feed.conversation.pending).toEqual([]);
-    feed = applyNativeConversationEvent(feed, stream("message_end", "ok", reply));
-    expect(feed.conversation.pending.map((message) => message.messageId)).toEqual(["ok"]);
+    conversation = reduceNativeConversation(conversation, { type: "turn_started" });
+    expect(conversation.pending).toEqual([]);
+    conversation = reduceNativeConversation(conversation, message("ok", reply));
+    expect(conversation.pending.map((item) => item.messageId)).toEqual(["ok"]);
     // A durable failed entry stays where the journal put it.
     const failed = { ...entry("c", "b"), message: failure };
-    const settled = reduceNativeConversation(feed.conversation, {
+    const settled = reduceNativeConversation(conversation, {
       type: "entry",
       identity: { ...identity, leafId: "c" },
       entry: failed,

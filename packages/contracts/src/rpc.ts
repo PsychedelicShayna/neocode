@@ -39,18 +39,23 @@ import {
   NeoPiNativeSessionsOpenResult,
   NeoPiNativeSessionsRequestInput,
   NeoPiNativeSessionsWatchInput,
-  NeoPiNativeSessionsStreamEvent,
+  NeoPiNativeEssentialEnvelope,
   NeoPiNativeSessionsCloseInput,
   NeoPiNativeSessionsCloseResult,
   NeoPiNativeSessionsSetSettledInput,
   NeoPiNativeSessionsSetSettledResult,
   NeoPiNativeSessionsGetDiffPreviewInput,
   NeoPiNativeSessionsGetDiffFileContentsInput,
+  NeoPiNativeSessionsReadInput,
+  NeoPiNativeSessionsReadResult,
+  NeoPiNativeSessionsSetDemandInput,
+  NeoPiNativeSessionsSetDemandResult,
+  NeoPiNativeSessionsCreditInput,
 } from "./neopiNativeSessions.ts";
 import { NeoPiSessionJournalInput, NeoPiSessionJournalResult } from "./neopiJournal.ts";
 import {
-  NeoPiWatchJournalInput,
-  NeoPiJournalStreamEvent,
+  NeoPiNativeThreadInput,
+  NeoPiThreadNativeRef,
   NeoPiNavigateTreeInput,
   NeoPiResumeTreeInput,
   NeoPiTreeOperationResult,
@@ -327,6 +332,9 @@ export const WS_METHODS = {
   neopiNativeSessionsOpen: "neopiNativeSessions.open",
   neopiNativeSessionsRequest: "neopiNativeSessions.request",
   neopiNativeSessionsWatch: "neopiNativeSessions.watch",
+  neopiNativeSessionsRead: "neopiNativeSessions.read",
+  neopiNativeSessionsSetDemand: "neopiNativeSessions.setDemand",
+  neopiNativeSessionsCredit: "neopiNativeSessions.credit",
   neopiNativeSessionsClose: "neopiNativeSessions.close",
   neopiNativeSessionsSetSettled: "neopiNativeSessions.setSettled",
   neopiNativeSessionsGetDiffPreview: "neopiNativeSessions.getDiffPreview",
@@ -337,7 +345,7 @@ export const WS_METHODS = {
   neopiSessionsConfiguration: "neopiSessions.configuration",
   neopiSessionsWatchConfiguration: "neopiSessions.watchConfiguration",
   neopiSessionsJournal: "neopiSessions.journal",
-  neopiSessionsWatchJournal: "neopiSessions.watchJournal",
+  neopiSessionsNativeRef: "neopiSessions.nativeRef",
   neopiSessionsNavigateTree: "neopiSessions.navigateTree",
   neopiSessionsResumeTree: "neopiSessions.resumeTree",
   neopiSessionsCancelNavigation: "neopiSessions.cancelNavigation",
@@ -952,11 +960,10 @@ const WsFilesystemBrowseRpc = Rpc.make(WS_METHODS.filesystemBrowse, {
   error: Schema.Union([FilesystemBrowseError, EnvironmentAuthorizationError]),
 });
 
-const WsNeoPiWatchJournalRpc = Rpc.make(WS_METHODS.neopiSessionsWatchJournal, {
-  payload: NeoPiWatchJournalInput,
-  success: NeoPiJournalStreamEvent,
+const WsNeoPiNativeRefRpc = Rpc.make(WS_METHODS.neopiSessionsNativeRef, {
+  payload: NeoPiNativeThreadInput,
+  success: NeoPiThreadNativeRef,
   error: EnvironmentAuthorizationError,
-  stream: true,
 });
 const WsNeoPiNavigateTreeRpc = Rpc.make(WS_METHODS.neopiSessionsNavigateTree, {
   payload: NeoPiNavigateTreeInput,
@@ -969,7 +976,7 @@ const WsNeoPiResumeTreeRpc = Rpc.make(WS_METHODS.neopiSessionsResumeTree, {
   error: EnvironmentAuthorizationError,
 });
 const WsNeoPiCancelNavigationRpc = Rpc.make(WS_METHODS.neopiSessionsCancelNavigation, {
-  payload: NeoPiWatchJournalInput,
+  payload: NeoPiNativeThreadInput,
   success: NeoPiTreeCancelResult,
   error: EnvironmentAuthorizationError,
 });
@@ -995,9 +1002,25 @@ const WsNeoPiNativeSessionsRequestRpc = Rpc.make(WS_METHODS.neopiNativeSessionsR
 });
 const WsNeoPiNativeSessionsWatchRpc = Rpc.make(WS_METHODS.neopiNativeSessionsWatch, {
   payload: NeoPiNativeSessionsWatchInput,
-  success: NeoPiNativeSessionsStreamEvent,
+  success: NeoPiNativeEssentialEnvelope,
   error: NeoPiNativeSessionsRpcError,
   stream: true,
+});
+/** Bulk long-poll by cursor; one active read per lease. */
+const WsNeoPiNativeSessionsReadRpc = Rpc.make(WS_METHODS.neopiNativeSessionsRead, {
+  payload: NeoPiNativeSessionsReadInput,
+  success: NeoPiNativeSessionsReadResult,
+  error: NeoPiNativeSessionsRpcError,
+});
+const WsNeoPiNativeSessionsSetDemandRpc = Rpc.make(WS_METHODS.neopiNativeSessionsSetDemand, {
+  payload: NeoPiNativeSessionsSetDemandInput,
+  success: NeoPiNativeSessionsSetDemandResult,
+  error: NeoPiNativeSessionsRpcError,
+});
+/** Returns essential `watch` credit; see `NeoPiNativeSessionsCreditInput`. */
+const WsNeoPiNativeSessionsCreditRpc = Rpc.make(WS_METHODS.neopiNativeSessionsCredit, {
+  payload: NeoPiNativeSessionsCreditInput,
+  error: NeoPiNativeSessionsRpcError,
 });
 const WsNeoPiNativeSessionsCloseRpc = Rpc.make(WS_METHODS.neopiNativeSessionsClose, {
   payload: NeoPiNativeSessionsCloseInput,
@@ -1599,6 +1622,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiNativeSessionsOpenRpc,
   WsNeoPiNativeSessionsRequestRpc,
   WsNeoPiNativeSessionsWatchRpc,
+  WsNeoPiNativeSessionsReadRpc,
+  WsNeoPiNativeSessionsSetDemandRpc,
+  WsNeoPiNativeSessionsCreditRpc,
   WsNeoPiNativeSessionsCloseRpc,
   WsNeoPiNativeSessionsSetSettledRpc,
   WsNeoPiNativeSessionsGetDiffPreviewRpc,
@@ -1609,7 +1635,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsNeoPiSessionsConfigurationRpc,
   WsNeoPiSessionsWatchConfigurationRpc,
   WsNeoPiSessionsJournalRpc,
-  WsNeoPiWatchJournalRpc,
+  WsNeoPiNativeRefRpc,
   WsNeoPiNavigateTreeRpc,
   WsNeoPiResumeTreeRpc,
   WsNeoPiCancelNavigationRpc,

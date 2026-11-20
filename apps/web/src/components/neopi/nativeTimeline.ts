@@ -96,14 +96,20 @@ function noticeText(text: string): string {
  * plus the output. Without an intent, T3's own labelling applies: a shell row
  * shows its first command line, other tools their path or pattern.
  */
-function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogEntry {
+function toolWorkEntry(
+  row: ToolRow,
+  id: string,
+  turnId: TurnId,
+  running: boolean,
+  loss: string | null,
+): WorkLogEntry {
   const intent = row.call.intent ?? undefined;
   const fullCommand = toolCommand(row)?.trim();
   const command = fullCommand ? (intent ? fullCommand : firstLine(fullCommand)) : undefined;
   const changedFiles = toolChangedFiles(row);
   const itemType = ITEM_TYPE[row.call.name] ?? "dynamic_tool_call";
   const output = row.result ? boundedOutput(row.result.text) : "";
-  const detail = intent
+  const body = intent
     ? [fullCommand ? "" : (row.detail ?? ""), output].filter(Boolean).join("\n\n")
     : fullCommand
       ? [fullCommand !== command ? fullCommand : "", output].filter(Boolean).join("\n\n")
@@ -114,8 +120,11 @@ function toolWorkEntry(row: ToolRow, turnId: TurnId, running: boolean): WorkLogE
           : row.result?.isError
             ? firstLine(row.result.text)
             : ""));
+  // The marker lives in the call's own body: a separate entry would regroup
+  // the call and fold a row the user expanded.
+  const detail = [body, loss ? `${LOSS_MARKER_LABEL}\n${loss}` : ""].filter(Boolean).join("\n\n");
   return {
-    id: row.id,
+    id,
     // A finished call is dated by its result, so turn durations cover the work.
     createdAt: row.result?.entry.timestamp ?? row.timestamp,
     turnId,
@@ -241,17 +250,27 @@ function memoized(
   return entry;
 }
 
+const LOSS_MARKER_LABEL = "Some live output of this call was not kept.";
 /** The merged entry for a settings change, kept while the previous entry and label hold. */
 const mergedSettingMemo = new WeakMap<
   TimelineEntry,
   { readonly label: string; readonly entry: TimelineEntry }
 >();
 
+/**
+ * `lossByToolCall` holds live output missing from a call's inbox stream
+ * (`nativeInboxLossWarnings`); each such call shows it in its own body.
+ */
 export function projectNativeTimeline(
   rows: readonly TranscriptRow[],
   busy: boolean,
+  lossByToolCall?: ReadonlyMap<string, readonly { readonly text: string }[]>,
+  runPaused = false,
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
+  // A call keeps one entry id from its live row through its durable one and any
+  // rebase, so an expanded call stays expanded; a repeated call id falls back to its row.
+  const toolIds = new Set<string>();
   let turnId = TurnId.make("native:origin");
   let turnStartedAt: string | null = null;
   let lastAt: string | null = null;
@@ -303,14 +322,14 @@ export function projectNativeTimeline(
         break;
       case "assistant":
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, turnId, row.live ? runPaused : null, () =>
             message(
               row.id,
               "assistant",
               row.text,
               turnId,
               row.timestamp,
-              row.live,
+              row.live && !runPaused,
               imageAttachments(row.id, row.images),
             ),
           ),
@@ -318,21 +337,27 @@ export function projectNativeTimeline(
         break;
       case "thinking":
         entries.push(
-          memoized(row, turnId, null, () =>
-            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live),
+          memoized(row, turnId, row.live ? runPaused : null, () =>
+            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live && !runPaused),
           ),
         );
         break;
-      case "tool":
+      case "tool": {
+        const callId = row.call.id;
+        const id = callId && !toolIds.has(callId) ? `tool:${callId}` : row.id;
+        if (callId) toolIds.add(callId);
+        const losses = callId ? lossByToolCall?.get(callId) : undefined;
+        const loss = losses?.length ? losses.map((item) => item.text).join("\n\n") : null;
         // Only a call still waiting for its result shows whether the run is live.
         entries.push(
-          memoized(row, turnId, row.result ? null : busy, () =>
-            work(toolWorkEntry(row, turnId, busy)),
+          memoized(row, `${turnId}\n${id}\n${loss ?? ""}`, row.result ? null : busy, () =>
+            work(toolWorkEntry(row, id, turnId, busy, loss)),
           ),
         );
         lastAt = row.result?.entry.timestamp ?? lastAt;
         workEndedAt = lastAt;
         break;
+      }
       case "divider": {
         const setting = settingChange(row);
         const previous = entries.at(-1);
@@ -406,15 +431,16 @@ export function projectNativeTimeline(
         break;
     }
   }
+  const runOpen = busy || runPaused;
   const latestTurn: TimelineLatestTurn | null = sawTurn
     ? {
         turnId,
-        state: busy ? "running" : "completed",
+        state: runOpen ? "running" : "completed",
         startedAt: turnStartedAt,
-        completedAt: busy ? null : workEndedAt,
+        completedAt: runOpen ? null : workEndedAt,
       }
     : null;
-  return { entries, latestTurn, runningTurnId: busy && sawTurn ? turnId : null };
+  return { entries, latestTurn, runningTurnId: runOpen && sawTurn ? turnId : null };
 }
 
 const NATIVE_SEND_SETTINGS: QueuedComposerMessage["sendSettings"] = {

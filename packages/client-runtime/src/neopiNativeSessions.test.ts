@@ -2,20 +2,26 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   ProviderInstanceId,
   type NeoPiJournalEntry,
-  type NeoPiJournalPage,
+  type NeoPiNativeEntity,
+  type NeoPiNativeJournalSlice,
+  type NeoPiNativeObservationDomain,
+  type NeoPiNativeInboxRecord,
+  type NeoPiNativeSegment,
+  type NeoPiNativeTombstone,
 } from "@t3tools/contracts";
+import { nativeConversationGaps } from "./neopiConversation.ts";
 import {
   emptyNativeSessionFeed,
   deferNativeEditorText,
   executeNativeSessionCommand,
   nativeCommandCompletions,
   nativeCommandNeedsTerminal,
-  nativeSessionKey,
+  nativeRecord,
   nativeSlashArgument,
   nativeSlashCommands,
-  nativeTranscriptEntries,
   nativeTranscriptRows,
   reduceNativeSessionFeed,
+  type NativeSessionFeed,
   type NativeSession,
 } from "./neopiNativeSessions.ts";
 
@@ -192,1245 +198,35 @@ const session: NativeSession = {
   capabilities: [],
   state: { isStreaming: true },
 };
-const user: NeoPiJournalEntry = {
-  id: "user-a",
-  parentId: null,
-  timestamp: "2026-10-28T00:00:00Z",
-  type: "message",
-  message: { role: "user", content: "Question" },
-};
+/** A feed whose watch described the session. */
 const initial = () =>
-  reduceNativeSessionFeed(emptyNativeSessionFeed(), {
-    type: "snapshot",
-    session,
-    journal: {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: user.id,
-      entries: [user],
-      totalEntries: 1,
+  reduceNativeSessionFeed(emptyNativeSessionFeed(), { type: "session", revision: 1, session });
+
+it("stops streaming but keeps an async pause through a non-streaming watch snapshot", () => {
+  let feed = reduceNativeSessionFeed(initial(), {
+    type: "status",
+    revision: 2,
+    live: {
+      state: "busy",
+      isStreaming: false,
+      pendingDialogs: 0,
+      branch: null,
+      runPause: "async-work",
     },
   });
-
-describe("canonical native client projection", () => {
-  it.each(["message_start", "message_update", "tool_execution_update", "unknown"])(
-    "retains feed identity for ignored child %s frames",
-    (type) => {
-      const feed = initial();
-      const next = reduceNativeSessionFeed(feed, {
-        type: "event",
-        frame: { type: "subagent_event", payload: { id: "child", event: { type } } },
-      });
-      expect(next).toBe(feed);
-    },
-  );
-
-  it.each(["message_end", "tool_execution_end", "agent_end"])(
-    "publishes a child refresh tick for settled %s frames",
-    (type) => {
-      const feed = initial();
-      const update = {
-        type: "event" as const,
-        frame: { type: "subagent_event", payload: { id: "child", event: { type } } },
-      };
-      const next = reduceNativeSessionFeed(feed, update);
-      expect(next).not.toBe(feed);
-      expect(next.agentTicks.child).toBe(1);
-      expect(next.conversation).toBe(feed.conversation);
-      expect(next.busy).toBe(feed.busy);
-      expect(reduceNativeSessionFeed(next, update).agentTicks.child).toBe(2);
-    },
-  );
-
-  it("keeps command output between messages across hidden entries and reconnect", () => {
-    let feed = initial();
-    const bookkeeping = { ...user, id: "config", parentId: user.id, type: "model_change" };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: bookkeeping.id,
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_entry", ...identity, entry: bookkeeping },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "command_output", text: "Context\n42% used" },
-    });
-    const nextUser = { ...user, id: "user-b", parentId: bookkeeping.id };
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: {
-        ...identity,
-        leafId: nextUser.id,
-        entries: [user, bookkeeping, nextUser],
-        totalEntries: 3,
-      },
-    });
-    expect(
-      nativeTranscriptRows(feed, false).map((row) =>
-        row.kind === "command" ? row.text : row.entry.id,
-      ),
-    ).toEqual([user.id, "Context\n42% used", nextUser.id]);
-    expect(feed.conversation.entries).toEqual([user, bookkeeping, nextUser]);
-    expect(
-      nativeTranscriptRows(feed, true).map((row) =>
-        row.kind === "command" ? row.text : row.entry.id,
-      ),
-    ).toEqual([user.id, bookkeeping.id, "Context\n42% used", nextUser.id]);
+  expect(feed).toMatchObject({ busy: false, runPause: "async-work" });
+  feed = reduceNativeSessionFeed(feed, {
+    type: "session",
+    revision: 3,
+    session: { ...session, state: { isStreaming: false } },
   });
-
-  it("keeps command output visible when the announced journal leaf is not loaded", () => {
-    const bookkeeping = { ...user, id: "unloaded-config", parentId: user.id, type: "chat_mode" };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: bookkeeping.id,
-    };
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: { type: "journal_state", reason: "append", ...identity },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "command_output", text: "Chat mode: chat" },
-    });
-    expect(feed.commandOutputs.map((output) => output.text)).toEqual(["Chat mode: chat"]);
-    for (const debug of [false, true])
-      expect(
-        nativeTranscriptRows(feed, debug).map((row) =>
-          row.kind === "command" ? row.text : row.entry.id,
-        ),
-      ).toEqual([user.id, "Chat mode: chat"]);
-
-    const nextUser = { ...user, id: "user-b", parentId: bookkeeping.id };
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: {
-        ...identity,
-        leafId: nextUser.id,
-        entries: [user, bookkeeping, nextUser],
-        totalEntries: 3,
-      },
-    });
-    expect(
-      nativeTranscriptRows(feed, false).map((row) =>
-        row.kind === "command" ? row.text : row.entry.id,
-      ),
-    ).toEqual([user.id, "Chat mode: chat", nextUser.id]);
-    const otherBranch = { ...user, id: "other-branch" };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: { ...identity, leafId: otherBranch.id, entries: [otherBranch], totalEntries: 1 },
-    });
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual(["entry:other-branch"]);
+  expect(feed).toMatchObject({ busy: false, runPause: "async-work" });
+  feed = reduceNativeSessionFeed(feed, {
+    type: "status",
+    revision: 4,
+    live: { state: "idle", isStreaming: false, pendingDialogs: 0, branch: null },
   });
-
-  it("shows command output after a streamed turn is durable and idle", () => {
-    const message = { role: "assistant", content: "Finished reply" };
-    const reply = { ...user, id: "durable-reply", parentId: user.id, message };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: reply.id,
-    };
-    let feed = initial();
-    for (const frame of [
-      { type: "agent_start" },
-      { type: "message_start", messageId: "reply-live", message },
-      { type: "message_update", messageId: "reply-live", message },
-      { type: "message_end", messageId: "reply-live", message },
-      { type: "journal_entry", ...identity, entry: reply },
-      { type: "message_persisted", ...identity, messageId: "reply-live", entryId: reply.id },
-      { type: "agent_end" },
-    ])
-      feed = reduceNativeSessionFeed(feed, { type: "event", frame });
-    const snapshot = {
-      type: "snapshot" as const,
-      session: { ...session, state: { isStreaming: false } },
-      journal: { ...identity, entries: [user, reply], totalEntries: 2 },
-    };
-    feed = reduceNativeSessionFeed(feed, snapshot);
-    const results = ["Current model: provider/model", "Context\n42% used"];
-    for (const text of results)
-      feed = reduceNativeSessionFeed(feed, {
-        type: "event",
-        frame: { type: "command_output", text },
-      });
-    const visibleRows = () =>
-      nativeTranscriptRows(feed, false).map((row) =>
-        row.kind === "command" ? row.text : row.entry.id,
-      );
-    expect(feed.busy).toBe(false);
-    expect(feed.conversation.pending).toEqual([]);
-    expect(visibleRows()).toEqual([user.id, reply.id, ...results]);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_state", reason: "snapshot", ...identity },
-    });
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    feed = reduceNativeSessionFeed(feed, snapshot);
-    expect(visibleRows()).toEqual([user.id, reply.id, ...results]);
-  });
-
-  it("keeps repeated command results after their live message becomes durable", () => {
-    let feed = initial();
-    const message = { role: "assistant", content: "Answer" };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "message_update", messageId: "live-answer", message },
-    });
-    for (let i = 0; i < 2; i++)
-      feed = reduceNativeSessionFeed(feed, {
-        type: "event",
-        frame: { type: "command_output", text: "Current model: provider/model" },
-      });
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual([
-      "entry:user-a",
-      "entry:live:live-answer",
-      "command:0",
-      "command:1",
-    ]);
-    const reply = { ...user, id: "reply", parentId: user.id, message };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: reply.id,
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_persisted",
-        ...identity,
-        messageId: "live-answer",
-        entryId: reply.id,
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_entry", ...identity, entry: reply },
-    });
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual([
-      "entry:user-a",
-      "entry:reply",
-      "command:0",
-      "command:1",
-    ]);
-    expect(feed.conversation.entries).toEqual([user, reply]);
-    expect(feed.conversation.pending).toEqual([]);
-  });
-
-  it("hides output from another branch and clears it when the session changes", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: { type: "command_output", text: "Usage for the original branch" },
-    });
-    const branch = { ...user, id: "other-branch" };
-    const snapshot = {
-      type: "snapshot" as const,
-      session,
-      journal: {
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: branch.id,
-        entries: [branch],
-        totalEntries: 1,
-      },
-    };
-    feed = reduceNativeSessionFeed(feed, snapshot);
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual(["entry:other-branch"]);
-    feed = reduceNativeSessionFeed(feed, {
-      ...snapshot,
-      journal: { ...snapshot.journal, leafId: user.id, entries: [user] },
-    });
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual([
-      "entry:user-a",
-      "command:0",
-    ]);
-    feed = reduceNativeSessionFeed(feed, {
-      ...snapshot,
-      session: { ...session, sessionId: "replacement" },
-      journal: { ...snapshot.journal, sessionId: "replacement", leafId: user.id, entries: [user] },
-    });
-    expect(nativeTranscriptRows(feed, false).map((row) => row.id)).toEqual(["entry:user-a"]);
-  });
-
-  it("recovers missed persistence from an idle snapshot without matching message content", () => {
-    let feed = initial();
-    const message = { role: "assistant", content: "Identical text is not an identity" };
-    for (const messageId of ["finished-live", "unmatched-live"]) {
-      feed = reduceNativeSessionFeed(feed, {
-        type: "event",
-        frame: { type: "message_update", messageId, message },
-      });
-    }
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    const reply = { ...user, id: "finished-entry", parentId: user.id, message };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: reply.id,
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session: { ...session, state: { isStreaming: false } },
-      journal: { ...identity, entries: [user, reply], totalEntries: 2 },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "snapshot",
-        ...identity,
-        messageEntryIds: [{ messageId: "finished-live", entryId: reply.id }],
-      },
-    });
-    expect(feed.conversation.pending).toEqual([{ messageId: "unmatched-live", message }]);
-    expect(nativeTranscriptEntries(feed.conversation, false).map((entry) => entry.id)).toEqual([
-      user.id,
-      reply.id,
-      "live:unmatched-live",
-    ]);
-    expect(feed.busy).toBe(false);
-  });
-
-  it("retains recovery associations until their durable entries arrive on an older page", () => {
-    const message = { role: "assistant", content: "Finished before newer turns" };
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "missed-live",
-        message,
-      },
-    });
-    const reply = { ...user, id: "missed-entry", parentId: user.id, message };
-    const latest = { ...user, id: "latest-entry", parentId: reply.id };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: latest.id,
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "snapshot",
-        ...identity,
-        messageEntryIds: [{ messageId: "missed-live", entryId: reply.id }],
-      },
-    });
-    expect(feed.conversation.pending).toEqual([{ messageId: "missed-live", message }]);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: { ...identity, entries: [latest], totalEntries: 3, nextCursor: "older" },
-    });
-    expect(feed.conversation.pending).toEqual([{ messageId: "missed-live", message }]);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "page",
-      older: true,
-      revision: feed.conversation.revision,
-      page: { ...identity, entries: [user, reply], totalEntries: 3 },
-    });
-    expect(feed.conversation.pending).toEqual([]);
-    expect(feed.conversation.entries.map((entry) => entry.id)).toEqual([
-      user.id,
-      reply.id,
-      latest.id,
-    ]);
-  });
-
-  it("does not infer discarded output from an absent or empty recovery window", () => {
-    const message = { role: "assistant", content: "Retained output" };
-    const seeded = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "outside-window",
-        message,
-      },
-    });
-    for (const recovery of [{}, { messageEntryIds: [] }]) {
-      const feed = reduceNativeSessionFeed(seeded, {
-        type: "event",
-        frame: {
-          type: "journal_state",
-          reason: "snapshot",
-          sessionId: session.sessionId,
-          sessionFile: ref.sessionFile,
-          leafId: user.id,
-          ...recovery,
-        },
-      });
-      expect(feed.conversation.pending).toEqual([{ messageId: "outside-window", message }]);
-    }
-    const otherFile = reduceNativeSessionFeed(seeded, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "snapshot",
-        sessionId: session.sessionId,
-        sessionFile: "/sessions/another.jsonl",
-        leafId: user.id,
-        messageEntryIds: [{ messageId: "outside-window", entryId: user.id }],
-      },
-    });
-    expect(otherFile.conversation.pending).toEqual([{ messageId: "outside-window", message }]);
-    expect(otherFile.conversation.persisted.has("outside-window")).toBe(false);
-  });
-
-  it("uses snapshot recovery IDs without rewinding an already hydrated leaf", () => {
-    const message = { role: "assistant", content: "Finished" };
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "finished-live",
-        message,
-      },
-    });
-    const reply = { ...user, id: "finished-entry", parentId: user.id, message };
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: reply.id,
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: { ...identity, entries: [user, reply], totalEntries: 2 },
-    });
-    const entries = feed.conversation.entries;
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "snapshot",
-        ...identity,
-        leafId: user.id,
-        messageEntryIds: [{ messageId: "finished-live", entryId: reply.id }],
-      },
-    });
-    expect(feed.conversation.identity?.leafId).toBe(reply.id);
-    expect(feed.conversation.entries).toBe(entries);
-    expect(feed.conversation.pending).toEqual([]);
-  });
-
-  it("retains durable and live content across disconnect and unavailable hydration", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "live-a",
-        message: { role: "assistant", content: "Still working" },
-      },
-    });
-    const conversation = feed.conversation;
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    expect(feed.connected).toBe(false);
-    expect(feed.conversation).toBe(conversation);
-    feed = reduceNativeSessionFeed(feed, { type: "snapshot", session, journal: null });
-    expect(nativeTranscriptEntries(feed.conversation, false).map((entry) => entry.message)).toEqual(
-      [user.message, { role: "assistant", content: "Still working" }],
-    );
-  });
-
-  it("continues live updates between a native leaf notification and its durable entry", () => {
-    let feed = initial();
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: "assistant-b",
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_state", reason: "leaf", ...identity },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "live-b",
-        message: { role: "assistant", content: "Answer" },
-      },
-    });
-    expect(feed.conversation.pending[0]?.message.content).toBe("Answer");
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_persisted",
-        ...identity,
-        messageId: "live-b",
-        entryId: "assistant-b",
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_entry",
-        ...identity,
-        entry: {
-          ...user,
-          id: "assistant-b",
-          parentId: user.id,
-          message: { role: "assistant", content: "Answer" },
-        },
-      },
-    });
-    expect(feed.conversation.entries.map((entry) => entry.id)).toEqual(["user-a", "assistant-b"]);
-    expect(feed.conversation.pending).toEqual([]);
-  });
-
-  it("does not retire pending messages from a pre-turn idle state on reconnect", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "reply-live",
-        message: { role: "assistant", content: "Partial reply" },
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session: { ...session, state: { isStreaming: false } },
-      journal: {
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: user.id,
-        entries: [user],
-        totalEntries: 1,
-      },
-    });
-    expect(nativeTranscriptEntries(feed.conversation, false).map((entry) => entry.message)).toEqual(
-      [user.message, { role: "assistant", content: "Partial reply" }],
-    );
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_start",
-        snapshot: true,
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: user.id,
-        messageId: "reply-live",
-        message: { role: "assistant", content: "Reconnected reply" },
-      },
-    });
-    expect(feed.conversation.pending).toEqual([
-      { messageId: "reply-live", message: { role: "assistant", content: "Reconnected reply" } },
-    ]);
-    expect(feed.busy).toBe(true);
-  });
-
-  it("reconciles persisted IDs without dropping unrelated pending messages on a stream snapshot", () => {
-    let feed = initial();
-    for (const [messageId, content] of [
-      ["reply-done", "Finished"],
-      ["reply-next", "Working"],
-    ]) {
-      feed = reduceNativeSessionFeed(feed, {
-        type: "event",
-        frame: {
-          type: "message_update",
-          messageId,
-          message: { role: "assistant", content },
-        },
-      });
-    }
-    const reply = {
-      ...user,
-      id: "reply-entry",
-      parentId: user.id,
-      message: { role: "assistant", content: "Finished" },
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_persisted",
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: reply.id,
-        messageId: "reply-done",
-        entryId: reply.id,
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: {
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: reply.id,
-        entries: [user, reply],
-        totalEntries: 2,
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_start",
-        snapshot: true,
-        messageId: "reply-next",
-        message: { role: "assistant", content: "Still working" },
-      },
-    });
-    expect(nativeTranscriptEntries(feed.conversation, false).map((entry) => entry.message)).toEqual(
-      [user.message, reply.message, { role: "assistant", content: "Still working" }],
-    );
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_start",
-        snapshot: true,
-        messageId: "reply-done",
-        message: reply.message,
-      },
-    });
-    expect(feed.conversation.pending.map((message) => message.messageId)).toEqual(["reply-next"]);
-  });
-
-  it("rejects an older hydration response after a newer durable append", () => {
-    let feed = initial();
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: "reply-entry",
-    };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_state", reason: "leaf", ...identity },
-    });
-    const revision = feed.conversation.revision;
-    const reply = {
-      ...user,
-      id: identity.leafId,
-      parentId: user.id,
-      message: { role: "assistant", content: "Durable" },
-    };
-    const page: NeoPiJournalPage = { ...identity, entries: [user, reply], totalEntries: 2 };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_entry", ...identity, entry: reply },
-    });
-    const latest = { ...reply, id: "latest-entry", parentId: reply.id };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_entry", ...identity, leafId: latest.id, entry: latest },
-    });
-    const durable = feed.conversation;
-    feed = reduceNativeSessionFeed(feed, { type: "page", page, revision, identity, older: false });
-    expect(feed.conversation).toBe(durable);
-    expect(feed.conversation.entries.map((entry) => entry.id)).toEqual([
-      user.id,
-      reply.id,
-      latest.id,
-    ]);
-    expect(feed.conversation.needsSnapshot).toBe(false);
-  });
-
-  it("does not let an older reconnect boundary move a hydrated leaf backwards", () => {
-    let feed = initial();
-    const identity = {
-      sessionId: session.sessionId,
-      sessionFile: ref.sessionFile,
-      leafId: "reply-entry",
-    };
-    const reply = { ...user, id: identity.leafId, parentId: user.id };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_entry", ...identity, entry: reply },
-    });
-    const conversation = feed.conversation;
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "snapshot",
-        ...identity,
-        leafId: user.id,
-      },
-    });
-    expect(feed.conversation).toBe(conversation);
-    expect(feed.conversation.identity?.leafId).toBe(reply.id);
-  });
-
-  it("rejects branch pages from a different leaf and stale older-page cursors", () => {
-    let feed = initial();
-    const identity = feed.conversation.identity!;
-    const revision = feed.conversation.revision;
-    const page: NeoPiJournalPage = {
-      ...identity,
-      sessionFile: ref.sessionFile,
-      leafId: "other-leaf",
-      entries: [user],
-      totalEntries: 1,
-      nextCursor: "wrong-branch",
-    };
-    const conversation = feed.conversation;
-    feed = reduceNativeSessionFeed(feed, { type: "page", page, revision, identity, older: false });
-    expect(feed.conversation).toBe(conversation);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "page",
-      page: { ...page, leafId: identity.leafId },
-      revision: revision - 1,
-      older: true,
-    });
-    expect(feed.conversation).toBe(conversation);
-    feed = reduceNativeSessionFeed(feed, { type: "page", page, revision, older: true });
-    expect(feed.conversation).toBe(conversation);
-  });
-
-  it("does not relabel cached content or the command ref when a terminal changes files", () => {
-    let feed = initial();
-    const conversation = feed.conversation;
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "identity",
-        sessionId: "other-session",
-        sessionFile: "/sessions/other.jsonl",
-        leafId: "other-entry",
-      },
-    });
-    expect(feed.session?.ref).toEqual(ref);
-    expect(feed.conversation).toBe(conversation);
-    expect(feed.conversation.entries).toEqual([user]);
-    expect(feed.connected).toBe(false);
-    expect(feed.error).not.toBeNull();
-  });
-
-  it("follows a same-session move to a new file and keeps the transcript", () => {
-    const moved = "/sessions/worktree/moved.jsonl";
-    const feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "identity",
-        sessionId: session.sessionId,
-        sessionFile: moved,
-        leafId: user.id,
-      },
-    });
-    expect(feed.movedTo).toEqual({ ...ref, sessionFile: moved });
-    expect(feed.session?.ref).toEqual({ ...ref, sessionFile: moved });
-    expect(feed.conversation.identity?.sessionFile).toBe(moved);
-    expect(feed.conversation.entries).toEqual([user]);
-    expect(feed.connected).toBe(true);
-    expect(feed.error).toBeNull();
-  });
-
-  it("does not follow a move that carries a different session id", () => {
-    const feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        reason: "identity",
-        sessionId: "someone-else",
-        sessionFile: "/sessions/worktree/other.jsonl",
-        leafId: user.id,
-      },
-    });
-    expect(feed.movedTo).toBeNull();
-    expect(feed.session?.ref).toEqual(ref);
-    expect(feed.error).not.toBeNull();
-  });
-
-  it("resets the transcript and old dialogs when native replaces identity within the same file", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: {
-        type: "tool_approval_request",
-        id: "old-approval",
-        toolName: "bash",
-      },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "message_update",
-        messageId: "old-live",
-        message: { role: "assistant", content: "Old session" },
-      },
-    });
-    const identity = { sessionId: "replacement", sessionFile: ref.sessionFile, leafId: null };
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "journal_state", reason: "identity", ...identity },
-    });
-    expect(feed.session?.sessionId).toBe(identity.sessionId);
-    expect(feed.session?.ref).toEqual(ref);
-    expect(feed.conversation.entries).toEqual([]);
-    expect(feed.conversation.pending).toEqual([]);
-    expect(feed.dialogs).toEqual([]);
-    expect(feed.busy).toBe(false);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "page",
-      revision: feed.conversation.revision,
-      identity,
-      older: false,
-      page: { ...identity, entries: [], totalEntries: 0 },
-    });
-    expect(feed.conversation.identity).toMatchObject(identity);
-    expect(feed.conversation.needsSnapshot).toBe(false);
-  });
-
-  it("does not clear a newer command error when branch reconciliation recovers", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "reconciliation",
-      operation: "branch",
-      error: "Branch read failed",
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "prompt_result", status: "error", error: { message: "Prompt rejected" } },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "page",
-      revision: feed.conversation.revision,
-      older: false,
-      page: {
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: user.id,
-        entries: [user],
-        totalEntries: 1,
-      },
-    });
-    expect(feed.reconciliationError).toBeNull();
-    expect(feed.error).toBe("Prompt rejected");
-    expect(feed.conversation.entries).toEqual([user]);
-  });
-
-  it("preserves native approval payloads and removes only the native cancellation target", () => {
-    const approval = {
-      type: "tool_approval_request",
-      id: "approval",
-      toolCallId: "tool-1",
-      toolName: "computer",
-      args: { action: "publish" },
-      tier: "exec",
-      approvalMode: "ask",
-      details: ["Publish"],
-      safetyChecks: [{ id: "check-1", code: "confirmation", message: "Confirm publish" }],
-      timeout: 600_000,
-    };
-    const plan = {
-      type: "plan_proposal_request",
-      id: "plan",
-      title: "Proposal",
-      planFilePath: "/plans/proposal.md",
-      planMarkdown: "Plan",
-    };
-    let feed = reduceNativeSessionFeed(initial(), { type: "event", frame: approval });
-    feed = reduceNativeSessionFeed(feed, { type: "event", frame: plan });
-    feed = reduceNativeSessionFeed(feed, { type: "event", frame: approval });
-    expect(feed.dialogs).toEqual([plan, approval]);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "tool_approval_cancel", id: "new-cancel-id", targetId: approval.id },
-    });
-    expect(feed.dialogs).toEqual([plan]);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "plan_proposal_cancel", id: plan.id, reason: "mode_change" },
-    });
-    expect(feed.dialogs).toEqual([]);
-  });
-
-  it("clears answered approval IDs without answering another native dialog", () => {
-    const approval = { type: "tool_approval_request", id: "approval", toolName: "bash" };
-    const plan = { type: "plan_proposal_request", id: "plan", title: "Review" };
-    let feed = reduceNativeSessionFeed(initial(), { type: "event", frame: approval });
-    feed = reduceNativeSessionFeed(feed, { type: "event", frame: plan });
-    feed = reduceNativeSessionFeed(feed, { type: "answered", id: approval.id });
-    expect(feed.dialogs).toEqual([plan]);
-    feed = reduceNativeSessionFeed(feed, { type: "answered", id: plan.id });
-    expect(feed.dialogs).toEqual([]);
-  });
-
-  it.each([
-    ["disconnected", true],
-    ["disconnected", false],
-    ["closed", true],
-    ["closed", false],
-  ] as const)(
-    "%s drops obsolete dialogs while preserving pending replay (replay first: %s)",
-    (type, replayFirst) => {
-      const answered = {
-        type: "tool_approval_request",
-        id: "answered-elsewhere",
-        toolName: "bash",
-      };
-      const cancelled = { type: "plan_proposal_request", id: "cancelled-elsewhere", title: "Plan" };
-      const pending = {
-        type: "extension_ui_request",
-        id: "still-pending",
-        method: "input",
-        title: "Name",
-      };
-      let feed = initial();
-      for (const frame of [answered, cancelled, pending])
-        feed = reduceNativeSessionFeed(feed, { type: "event", frame });
-      expect(feed.dialogs).toEqual([answered, cancelled, pending]);
-
-      feed = reduceNativeSessionFeed(
-        feed,
-        type === "closed" ? { type, reason: "Connection closed." } : { type },
-      );
-      expect(feed.dialogs).toEqual([]);
-      const snapshot = { type: "snapshot", session, journal: null } as const;
-      const replay = { type: "event", frame: pending } as const;
-      for (const update of replayFirst ? [replay, snapshot] : [snapshot, replay])
-        feed = reduceNativeSessionFeed(feed, update);
-
-      expect(feed.connected).toBe(true);
-      expect(feed.dialogs).toEqual([pending]);
-      expect(feed.conversation.entries).toEqual([user]);
-    },
-  );
-
-  it("keeps bookkeeping inspectable without adding it to ordinary conversation", () => {
-    const feed = initial();
-    const entries = [
-      user,
-      { ...user, id: "model", type: "model_change" },
-      { ...user, id: "digest", type: "custom", customType: "system-prompt-digest" },
-      { ...user, id: "tool", message: { role: "toolResult", content: "Tool output" } },
-    ];
-    const conversation = { ...feed.conversation, entries };
-    expect(nativeTranscriptEntries(conversation, false).map((entry) => entry.id)).toEqual([
-      "user-a",
-      "tool",
-    ]);
-    expect(nativeTranscriptEntries(conversation, true)).toEqual(entries);
-  });
-
-  it("does not share cache identity across configured profiles or environments", () => {
-    const target = { environmentId: "host-a" as import("@t3tools/contracts").EnvironmentId, ref };
-    expect(nativeSessionKey(target)).not.toBe(
-      nativeSessionKey({
-        ...target,
-        ref: { ...ref, providerInstanceId: ProviderInstanceId.make("other-profile") },
-      }),
-    );
-    expect(nativeSessionKey(target)).not.toBe(
-      nativeSessionKey({
-        ...target,
-        environmentId: "host-b" as import("@t3tools/contracts").EnvironmentId,
-      }),
-    );
-  });
-
-  it("isolates agent inventory by profile, canonical file, identity and reconnect epoch", () => {
-    let feed = initial();
-    const inventory = {
-      type: "subagents" as const,
-      ref,
-      sessionId: session.sessionId,
-      epoch: feed.agentsEpoch,
-      revision: feed.agentsRevision,
-      agents: [{ id: "worker", status: "running", agent: "scout", index: 0 }],
-    };
-    feed = reduceNativeSessionFeed(feed, inventory);
-    expect(feed.agents[0]?.status).toBe("running");
-    const original = feed.agents;
-    for (const stale of [
-      { ...inventory, sessionId: "other-session" },
-      { ...inventory, ref: { ...ref, sessionFile: "/sessions/other.jsonl" } },
-      { ...inventory, ref: { ...ref, providerInstanceId: ProviderInstanceId.make("other") } },
-    ]) {
-      feed = reduceNativeSessionFeed(feed, stale);
-      expect(feed.agents).toBe(original);
-    }
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    expect(feed.agents[0]?.status).toBe("interrupted");
-    feed = reduceNativeSessionFeed(feed, {
-      type: "snapshot",
-      session,
-      journal: {
-        sessionId: session.sessionId,
-        sessionFile: ref.sessionFile,
-        leafId: user.id,
-        entries: [user],
-        totalEntries: 1,
-      },
-    });
-    // Even an id not previously observed cannot leak from an old connection.
-    feed = reduceNativeSessionFeed(feed, {
-      ...inventory,
-      agents: [{ id: "stale-worker", status: "running" }],
-    });
-    expect(feed.agents.map((agent) => agent.id)).toEqual(["worker"]);
-    expect(feed.agents[0]?.status).toBe("interrupted");
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        sessionId: "replacement",
-        sessionFile: ref.sessionFile,
-        leafId: null,
-      },
-    });
-    expect(feed.agents).toEqual([]);
-    expect(feed.conversation.entries).toEqual([]);
-  });
-
-  it("tracks NeoPi's prompt queue until the session closes", () => {
-    let feed = reduceNativeSessionFeed(emptyNativeSessionFeed(), {
-      type: "snapshot",
-      session: {
-        ...session,
-        state: {
-          isStreaming: true,
-          queuedMessages: { steering: ["steer now"], followUp: [], liveSteered: 1 },
-        },
-      },
-      journal: null,
-    });
-    expect(feed.queue).toEqual({ steering: ["steer now"], followUp: [], liveSteered: 1 });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: { type: "queue_update", steering: [], followUp: ["after the run"], liveSteered: 0 },
-    });
-    expect(feed.queue).toEqual({ steering: [], followUp: ["after the run"], liveSteered: 0 });
-    // A state read without a queue (older NeoPi) keeps the last known queue.
-    feed = reduceNativeSessionFeed(feed, { type: "state", state: { isStreaming: true } });
-    expect(feed.queue.followUp).toEqual(["after the run"]);
-    feed = reduceNativeSessionFeed(feed, { type: "closed", reason: "gone" });
-    expect(feed.queue).toEqual({ steering: [], followUp: [], liveSteered: 0 });
-  });
-
-  it("projects one native dictation capture and ignores stragglers", () => {
-    const frame = (value: { type: string } & Record<string, unknown>) => ({
-      type: "event" as const,
-      frame: value,
-    });
-    let feed = initial();
-    expect(feed.dictation).toBeNull();
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_state", captureId: "a", state: "starting" }),
-    );
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_state", captureId: "a", state: "recording" }),
-    );
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_transcript", captureId: "a", text: "hello wor" }),
-    );
-    expect(feed.dictation).toEqual({
-      captureId: "a",
-      phase: "recording",
-      text: "hello wor",
-      error: null,
-    });
-    // A preview replaces the previous one, and another capture's frames are not ours.
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_transcript", captureId: "b", text: "intruder" }),
-    );
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_state", captureId: "a", state: "transcribing" }),
-    );
-    expect(feed.dictation).toMatchObject({ phase: "transcribing", text: "hello wor" });
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_end", captureId: "a", text: "hello world" }),
-    );
-    expect(feed.dictation).toEqual({
-      captureId: "a",
-      phase: "ended",
-      text: "hello world",
-      error: null,
-    });
-    // Nothing revives a finished capture; the next capture starts with its state frame.
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_transcript", captureId: "a", text: "late" }),
-    );
-    expect(feed.dictation?.text).toBe("hello world");
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({ type: "dictation_state", captureId: "b", state: "starting" }),
-    );
-    expect(feed.dictation).toEqual({ captureId: "b", phase: "starting", text: "", error: null });
-    feed = reduceNativeSessionFeed(
-      feed,
-      frame({
-        type: "dictation_end",
-        captureId: "b",
-        text: "",
-        error: "Speech-to-text is disabled",
-      }),
-    );
-    expect(feed.dictation).toMatchObject({ phase: "ended", error: "Speech-to-text is disabled" });
-  });
-
-  it("ends a live dictation capture when the native connection closes", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: { type: "dictation_state", captureId: "a", state: "recording" },
-    });
-    feed = reduceNativeSessionFeed(feed, {
-      type: "closed",
-      reason: "The native connection closed.",
-    });
-    expect(feed.dictation).toMatchObject({
-      captureId: "a",
-      phase: "ended",
-      error: "The native connection closed.",
-    });
-  });
-
-  describe("owner loss", () => {
-    it("keeps a feed connected but idle while a terminal owner is replaced, then clears on its snapshot", () => {
-      const live = initial();
-      expect(live.busy).toBe(true);
-      let feed = reduceNativeSessionFeed(live, { type: "reconnecting", reason: "exited (0)" });
-      expect(feed).toMatchObject({
-        connected: true,
-        ownerLoss: "reconnecting",
-        busy: false,
-        dialogs: [],
-        error: null,
-      });
-      expect(feed.queue).toEqual({ steering: [], followUp: [], liveSteered: 0 });
-      expect(feed.activity.openedAt).toBeNull();
-
-      feed = reduceNativeSessionFeed(feed, {
-        type: "snapshot",
-        session: live.session!,
-        journal: null,
-      });
-      expect(feed).toMatchObject({ connected: true, ownerLoss: null, error: null });
-    });
-
-    it("reads a detach and an exited terminal as states, not errors", () => {
-      const detached = reduceNativeSessionFeed(initial(), {
-        type: "closed",
-        reason: "The native connection was explicitly closed.",
-        code: "detached",
-      });
-      expect(detached).toMatchObject({ connected: false, ownerLoss: "detached", error: null });
-      const orphaned = reduceNativeSessionFeed(
-        reduceNativeSessionFeed(initial(), { type: "reconnecting", reason: "x" }),
-        {
-          type: "closed",
-          reason: "No NeoPi is running this session now.",
-          code: "owner_exited",
-        },
-      );
-      expect(orphaned).toMatchObject({ connected: false, ownerLoss: "orphaned", error: null });
-      // A restarted observation begins with `disconnected`; the state stands until a snapshot.
-      expect(reduceNativeSessionFeed(orphaned, { type: "disconnected" }).ownerLoss).toBe(
-        "orphaned",
-      );
-    });
-
-    it("still reports an unexpected close as an error", () => {
-      const feed = reduceNativeSessionFeed(initial(), {
-        type: "closed",
-        reason: "Profile replaced",
-      });
-      expect(feed).toMatchObject({ connected: false, ownerLoss: null, error: "Profile replaced" });
-    });
-  });
-
-  it("accumulates working time across turns and closes the window with the connection", () => {
-    const frame = (type: string) => ({ type: "event" as const, frame: { type } });
-    // The snapshot's state is streaming, so the first window is already open.
-    let feed = initial();
-    expect(feed.activity.openedAt).not.toBeNull();
-    feed = reduceNativeSessionFeed(feed, frame("agent_end"));
-    expect(feed.activity.openedAt).toBeNull();
-    const idle = feed.activity.accumulatedMs;
-    feed = reduceNativeSessionFeed(feed, frame("agent_start"));
-    expect(feed.activity.openedAt).not.toBeNull();
-    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
-    expect(feed.activity.openedAt).toBeNull();
-    expect(feed.activity.accumulatedMs).toBeGreaterThanOrEqual(idle);
-  });
-
-  it("clears a failed prompt's banner when the next turn starts, but keeps a failed read", () => {
-    const failedPrompt = {
-      type: "event" as const,
-      frame: { type: "prompt_result", status: "error", error: { message: "404 no endpoints" } },
-    };
-    let feed = reduceNativeSessionFeed(initial(), failedPrompt);
-    expect(feed.error).toBe("404 no endpoints");
-    feed = reduceNativeSessionFeed(feed, { type: "event", frame: { type: "agent_start" } });
-    expect(feed.error).toBeNull();
-    feed = reduceNativeSessionFeed(feed, {
-      type: "reconciliation",
-      operation: "state",
-      error: "State read failed",
-    });
-    feed = reduceNativeSessionFeed(feed, { type: "event", frame: { type: "agent_start" } });
-    expect(feed.error).toBe("State read failed");
-  });
-
-  it("adopts NeoPi's reported active time and restarts it for another session", () => {
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "state",
-      state: { activeTimeMs: 90_000, isStreaming: false },
-    });
-    expect(feed.activity.accumulatedMs).toBe(90_000);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "event",
-      frame: {
-        type: "journal_state",
-        sessionFile: ref.sessionFile,
-        sessionId: "another-session",
-        leafId: null,
-      },
-    });
-    expect(feed.activity).toEqual({ accumulatedMs: 0, openedAt: null });
-    expect(feed.jobs.entries).toEqual([]);
-  });
-
-  it("tracks background job frames and reads an inventory for the same session only", () => {
-    const registered = {
-      id: "bg_1",
-      type: "bash",
-      label: "sleep 60",
-      status: "running",
-      startedAt: 1_000,
-      outputBytes: 0,
-    };
-    let feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: { type: "job_lifecycle", event: "registered", job: registered, runningCount: 1 },
-    });
-    expect(feed.jobs.entries.map((job) => job.id)).toEqual(["bg_1"]);
-    expect(feed.jobs.runningCount).toBe(1);
-    const stale = reduceNativeSessionFeed(feed, {
-      type: "jobs",
-      ref,
-      sessionId: "other-session",
-      revision: 0,
-      response: { running: [], recent: [], runningCount: 0 },
-    });
-    expect(stale).toBe(feed);
-    feed = reduceNativeSessionFeed(feed, {
-      type: "jobs",
-      ref,
-      sessionId: session.sessionId,
-      revision: feed.jobs.revision,
-      response: { running: [], recent: [], runningCount: 0 },
-    });
-    expect(feed.jobs.entries).toEqual([]);
-  });
+  expect(feed).toMatchObject({ busy: false, runPause: null });
 });
 
 describe("native slash commands", () => {
@@ -1492,18 +288,10 @@ describe("native slash commands", () => {
       ),
     ).toEqual([{ value: "Angela", label: "Angela", description: "Warm", submitsCommand: true }]);
   });
-
-  it("counts command list announcements so readers re-request the list", () => {
-    const feed = reduceNativeSessionFeed(initial(), {
-      type: "event",
-      frame: { type: "available_commands_update", commands: [] },
-    });
-    expect(feed.commandsRevision).toBe(initial().commandsRevision + 1);
-  });
 });
 
 describe("subagent roster knowledge", () => {
-  it("is unknown until the live inventory is read, and unknown again whenever the roster resets", () => {
+  it("is unknown until the live inventory is read, and unknown again when the owner closes", () => {
     let feed = initial();
     expect(feed.agentsKnown).toBe(false);
     feed = reduceNativeSessionFeed(feed, {
@@ -1516,6 +304,928 @@ describe("subagent roster knowledge", () => {
     });
     expect(feed.agentsKnown).toBe(true);
     expect(feed.agents).toEqual([]);
-    expect(reduceNativeSessionFeed(feed, { type: "disconnected" }).agentsKnown).toBe(false);
+    // A lost stream keeps the last roster; only a stopped owner resets it.
+    expect(reduceNativeSessionFeed(feed, { type: "disconnected" }).agentsKnown).toBe(true);
+    expect(
+      reduceNativeSessionFeed(feed, { type: "lifecycle", revision: 2, state: "owner-stopped" })
+        .agentsKnown,
+    ).toBe(false);
+  });
+});
+
+describe("observation rebase", () => {
+  const domain = (
+    overrides: Partial<NeoPiNativeObservationDomain> = {},
+  ): NeoPiNativeObservationDomain => ({
+    serverIncarnation: "server-1",
+    ownerEpoch: 1,
+    projectionIncarnation: 1,
+    buildAttempt: 1,
+    branchGeneration: 1,
+    ...overrides,
+  });
+  const cursorAt = (epoch: NeoPiNativeObservationDomain, base: number) => ({
+    epoch,
+    base,
+    pass: null,
+    inboxSeq: 0,
+    journalAt: null,
+  });
+  interface Reply {
+    epoch: NeoPiNativeObservationDomain;
+    passId: string;
+    kind?: "incremental" | "full";
+    watermark: number;
+    /** Completes the pass at `watermark`; otherwise `cut` names where it continues. */
+    done?: boolean;
+    cut?: number;
+    entities?: readonly NeoPiNativeEntity[];
+    tombstones?: readonly NeoPiNativeTombstone[];
+    journal?: NeoPiNativeJournalSlice;
+    inbox?: readonly NeoPiNativeInboxRecord[];
+    segments?: readonly NeoPiNativeSegment[];
+  }
+  const reply = (input: Reply) => {
+    const kind = input.kind ?? "full";
+    const done = input.done ?? true;
+    return {
+      type: "pass" as const,
+      passId: input.passId,
+      kind,
+      baseCursor: cursorAt(input.epoch, 0),
+      coveredThrough: input.watermark,
+      continuation: {
+        ...cursorAt(input.epoch, done ? input.watermark : 0),
+        pass: done
+          ? null
+          : {
+              kind,
+              passId: input.passId,
+              watermark: input.watermark,
+              lastOrdinal: 1000,
+              afterOrdinal: input.cut ?? 0,
+              segment: null,
+            },
+      },
+      complete: false,
+      promoted: false,
+      entities: input.entities ?? [],
+      tombstones: input.tombstones ?? [],
+      segments: input.segments ?? [],
+      inbox: input.inbox ?? [],
+      journal: input.journal ?? null,
+    };
+  };
+  /** Issues a read; returns the feed with it outstanding and its id. */
+  const issue = (feed: NativeSessionFeed) => {
+    const next = reduceNativeSessionFeed(feed, { type: "read-issued" });
+    return [next, next.observation.outstanding!.readId] as const;
+  };
+  const answer = (feed: NativeSessionFeed, readId: number, input: Reply) =>
+    reduceNativeSessionFeed(feed, { type: "read", readId, result: reply(input) });
+  /** Issues one read and applies its reply. */
+  const step = (feed: NativeSessionFeed, input: Reply): NativeSessionFeed => {
+    const [issued, readId] = issue(feed);
+    return answer(issued, readId, input);
+  };
+  let receipts = 0;
+  /** Command output as the projection records it: anchored after the last row held. */
+  const output = (feed: NativeSessionFeed, text: string): NativeSessionFeed => {
+    const cursor = feed.observation.cursor!;
+    receipts += 1;
+    const revision = cursor.base + 1;
+    return step(feed, {
+      epoch: cursor.epoch,
+      passId: `out-${receipts}`,
+      kind: "incremental",
+      watermark: revision,
+      entities: [
+        {
+          key: `receipt:command:${receipts}`,
+          ordinal: 5000 + receipts,
+          revision,
+          value: {
+            class: "receipt",
+            value: {
+              kind: "command_output",
+              text,
+              afterEntryId: feed.conversation.entries.at(-1)?.id ?? null,
+              afterMessageId: feed.conversation.pending.at(-1)?.messageId ?? null,
+            },
+          },
+        },
+      ],
+    });
+  };
+  const journalEntry = (
+    id: string,
+    parentId: string | null,
+    content: unknown = id,
+  ): NeoPiJournalEntry => ({
+    id,
+    parentId,
+    type: "message",
+    timestamp: "2026-11-18T00:00:00Z",
+    message: { role: "assistant", content },
+  });
+  const chain = (ids: readonly string[], parentId: string | null) =>
+    ids.map((id, index) => journalEntry(id, index ? ids[index - 1]! : parentId));
+  const horizon = (
+    entries: readonly NeoPiJournalEntry[],
+    nextCursor?: string,
+  ): NeoPiNativeJournalSlice => ({
+    continuity: "horizon",
+    leafId: entries.at(-1)?.id ?? null,
+    entries,
+    ...(nextCursor ? { nextCursor } : {}),
+  });
+  let ordinal = 0;
+  const message = (
+    messageId: string,
+    revision: number,
+    entryId: string | null,
+    content: unknown = "live text",
+  ): NeoPiNativeEntity => ({
+    key: `message:${messageId}`,
+    ordinal: (ordinal += 1),
+    revision,
+    value: {
+      class: "message",
+      messageId,
+      phase: entryId === null ? "open" : "durable",
+      entryId,
+      message: { role: "assistant", content },
+    },
+  });
+  const roster = (id: string, revision: number, status = "running"): NeoPiNativeEntity => ({
+    key: `roster:${id}`,
+    ordinal: id.charCodeAt(0),
+    revision,
+    value: { class: "roster", value: { id, status } },
+  });
+  const observing = (): NativeSessionFeed => ({
+    ...emptyNativeSessionFeed(),
+    session,
+    connected: true,
+  });
+  const ids = (feed: NativeSessionFeed) => feed.conversation.entries.map((entry) => entry.id);
+  const keys = (feed: NativeSessionFeed) => [...feed.observation.entities.keys()].sort();
+  const contents = (feed: NativeSessionFeed) =>
+    feed.conversation.pending.map((row) => row.message.content);
+  const transcript = (value: NativeSessionFeed) =>
+    nativeTranscriptRows(value, false).flatMap((row) =>
+      row.kind === "command"
+        ? ["command"]
+        : row.entry.message === undefined
+          ? []
+          : [String(nativeRecord(row.entry.message).content)],
+    );
+  const older = (feed: NativeSessionFeed, entries: readonly NeoPiJournalEntry[], next?: string) =>
+    reduceNativeSessionFeed(feed, {
+      type: "page",
+      older: true,
+      revision: feed.conversation.revision,
+      page: {
+        sessionId: session.sessionId,
+        sessionFile: ref.sessionFile,
+        leafId: feed.conversation.cursorLeaf,
+        entries,
+        totalEntries: 100,
+        ...(next ? { nextCursor: next } : {}),
+      },
+    });
+
+  it("keeps the history being read and leaves a placeholder for a gap larger than one page", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 5,
+      journal: horizon(chain(["e0", "e1", "e2"], null)),
+    });
+    // The viewport sits on e1 while the view falls behind by more than a page.
+    const viewport = feed.conversation.entries[1];
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 40,
+      journal: horizon(chain(["e9", "e10"], "e8"), "before-e9"),
+    });
+    expect(ids(feed)).toEqual(["e0", "e1", "e2", "e9", "e10"]);
+    expect(feed.conversation.entries[1]).toBe(viewport);
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["e9"]);
+    expect(feed.conversation.cursor).toBe("before-e9");
+
+    // On demand, page by page, the placeholder fills and closes where it joins.
+    feed = older(feed, chain(["e6", "e7", "e8"], "e5"), "before-e6");
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["e6"]);
+    feed = older(feed, chain(["e2", "e3", "e4", "e5"], "e1"));
+    expect(ids(feed)).toEqual(["e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"]);
+    expect(nativeConversationGaps(feed.conversation).size).toBe(0);
+    expect(feed.conversation.entries[1]).toBe(viewport);
+
+    // A navigation keeps only the shared ancestry; no placeholder joins branches.
+    feed = step(feed, {
+      epoch: domain({ branchGeneration: 2 }),
+      passId: "p3",
+      watermark: 50,
+      journal: horizon([journalEntry("e1", "e0"), journalEntry("x2", "e1")]),
+    });
+    expect(ids(feed)).toEqual(["e0", "e1", "x2"]);
+  });
+
+  it("keeps loaded history and a live row through a rebuild whose first page does not join", () => {
+    const start = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 5,
+      journal: horizon(chain(["e0", "e1", "e2"], null)),
+      entities: [message("m", 5, null, "streaming")],
+    });
+    const page = horizon(chain(["e9", "e10"], "e8"), "before-e9");
+    // Same owner and branch, replaced observation connection; the message key comes later.
+    let feed = step(start, {
+      epoch: domain({ projectionIncarnation: 2, buildAttempt: 0 }),
+      passId: "q",
+      watermark: 30,
+      done: false,
+      journal: page,
+    });
+    expect(ids(feed)).toEqual(["e0", "e1", "e2", "e9", "e10"]);
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["e9"]);
+    expect(contents(feed)).toEqual(["streaming"]);
+    expect(feed.conversation.losses).toEqual([]);
+
+    // A rebuild that cannot know the branch is continuous changes its generation:
+    // history is replaced as for a navigation, but the live row waits for the pass.
+    const unknown = domain({ projectionIncarnation: 2, buildAttempt: 0, branchGeneration: 2 });
+    feed = step(start, { epoch: unknown, passId: "q", watermark: 30, done: false, journal: page });
+    expect(ids(feed)).toEqual(["e9", "e10"]);
+    expect(contents(feed)).toEqual(["streaming"]);
+    feed = step(feed, {
+      epoch: unknown,
+      passId: "q",
+      watermark: 30,
+      entities: [message("m", 29, null, "streaming on")],
+    });
+    expect(contents(feed)).toEqual(["streaming on"]);
+    expect(feed.conversation.losses).toEqual([]);
+  });
+
+  it("takes the entries a horizon supplies for a placeholder, not only those after its join", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 5,
+      journal: horizon(chain(["A", "B"], null)),
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 9,
+      journal: horizon(chain(["E", "F"], "D"), "before-E"),
+    });
+    expect([...nativeConversationGaps(feed.conversation)]).toEqual(["E"]);
+    feed = step(feed, {
+      epoch,
+      passId: "p3",
+      watermark: 12,
+      journal: horizon(chain(["B", "C", "D", "E", "F", "G"], "A"), "before-B"),
+    });
+    expect(ids(feed)).toEqual(["A", "B", "C", "D", "E", "F", "G"]);
+    expect(nativeConversationGaps(feed.conversation).size).toBe(0);
+  });
+
+  it("keeps a live row and its output anchor until the durable entry joins, across a rebuild", () => {
+    const toolCall = [{ type: "toolCall", id: "tool-1", name: "read" }];
+    const toolAt = (revision: number, status: string): NeoPiNativeEntity => ({
+      key: "tool:tool-1",
+      ordinal: 900,
+      revision,
+      value: { class: "tool", toolCallId: "tool-1", coverage: "since-build", state: { status } },
+    });
+    const tool = toolAt(6, "running");
+    const user = journalEntry("u", null);
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 6,
+      journal: horizon([user]),
+      entities: [message("m1", 5, null, toolCall), tool],
+    });
+    feed = output(feed, "output after the reply");
+    const replyRows = (value: NativeSessionFeed) =>
+      nativeTranscriptRows(value, false).flatMap((row) =>
+        row.kind === "entry" && row.entry.message !== undefined
+          ? [row.entry.id]
+          : row.kind === "command"
+            ? ["command"]
+            : [],
+      );
+    expect(replyRows(feed)).toEqual(["u", "live:m1", "command"]);
+
+    // The observation connection was replaced: revisions restart in a new domain.
+    const rebuilt = domain({ projectionIncarnation: 2 });
+    feed = step(feed, {
+      epoch: rebuilt,
+      passId: "q",
+      watermark: 4,
+      done: false,
+      entities: [message("m1", 3, "r", toolCall)],
+    });
+    // The alias alone retires nothing; the tool is not dropped mid-pass.
+    expect(replyRows(feed)).toEqual(["u", "live:m1", "command"]);
+    expect(feed.observation.entities.get("tool:tool-1")?.value).toEqual(tool.value);
+
+    feed = step(feed, {
+      epoch: rebuilt,
+      passId: "q",
+      watermark: 4,
+      journal: horizon([user, journalEntry("r", "u", toolCall)]),
+      entities: [toolAt(4, "done")],
+    });
+    expect(replyRows(feed)).toEqual(["u", "r", "command"]);
+    expect(feed.conversation.losses).toEqual([]);
+    expect(feed.conversation.entries.at(-1)?.message).toEqual({
+      role: "assistant",
+      content: toolCall,
+    });
+    expect(feed.observation.entities.get("tool:tool-1")?.revision).toBe(4);
+  });
+
+  it("does not show agents as interrupted when the stream is lost or the view rebuilds", () => {
+    let feed = reduceNativeSessionFeed(initial(), {
+      type: "subagents",
+      ref,
+      sessionId: session.sessionId,
+      epoch: initial().agentsEpoch,
+      revision: initial().agentsRevision,
+      agents: [{ id: "worker", status: "running", agent: "scout", index: 0 }],
+    });
+    feed = reduceNativeSessionFeed(feed, { type: "disconnected" });
+    // The successor watch describes the same session again.
+    feed = reduceNativeSessionFeed(feed, { type: "session", revision: 2, session });
+    expect(feed.agents.map((agent) => [agent.status, agent.native.disconnected])).toEqual([
+      ["running", false],
+    ]);
+
+    // Read path: the roster is replaced by key only when the rebase pass completes.
+    let observed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 9,
+      entities: [roster("a", 8), roster("b", 9)],
+    });
+    const successor = domain({ projectionIncarnation: 2 });
+    observed = step(observed, {
+      epoch: successor,
+      passId: "q",
+      watermark: 3,
+      done: false,
+      entities: [roster("a", 2, "running")],
+    });
+    expect(keys(observed)).toEqual(["roster:a", "roster:b"]);
+    expect(observed.observation.entities.get("roster:b")?.value).toEqual(roster("b", 9).value);
+    observed = step(observed, { epoch: successor, passId: "q", watermark: 3 });
+    expect(keys(observed)).toEqual(["roster:a"]);
+  });
+
+  it("applies a multi-part rebase without deleting by absence or regressing a newer revision", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 10,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [roster("a", 10), roster("b", 9), message("m1", 8, null, "body")],
+    });
+    // Behind the tombstone horizon: a full pass in the same domain, every key changing.
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 30,
+      done: false,
+      cut: 1,
+      entities: [roster("a", 25), message("m1", 26, "r", "body")],
+    });
+    expect(keys(feed)).toEqual(["message:m1", "roster:a", "roster:b"]);
+    expect(feed.conversation.pending.map((row) => row.messageId)).toEqual(["m1"]);
+    // A value older than one already held does not regress it.
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 30,
+      done: false,
+      cut: 2,
+      entities: [roster("a", 20, "stale")],
+      journal: horizon([journalEntry("u", null), journalEntry("r", "u", "body")]),
+    });
+    expect(feed.observation.entities.get("roster:a")?.revision).toBe(25);
+    // The durable entry joined with its alias: the body shows exactly once.
+    expect(transcript(feed).filter((content) => content === "body")).toHaveLength(1);
+    feed = step(feed, { epoch, passId: "p2", watermark: 30, entities: [roster("c", 31)] });
+    // Completion removes `b`, which the pass did not return; never `a` or `c`.
+    expect(keys(feed)).toEqual(["message:m1", "roster:a", "roster:c"]);
+  });
+
+  it("applies only the reply to the one outstanding read", () => {
+    const epoch = domain();
+    let feed = step(observing(), { epoch, passId: "p0", watermark: 2 });
+    feed = step(feed, {
+      epoch,
+      passId: "F",
+      watermark: 10,
+      done: false,
+      entities: [roster("a", 5)],
+    });
+    const [issued, readId] = issue(feed);
+    // A reply to no outstanding read, or to an older one, changes nothing.
+    expect(answer(issued, readId + 1, { epoch, passId: "G", watermark: 11 })).toBe(issued);
+    expect(answer(issued, readId - 1, { epoch, passId: "G", watermark: 11 })).toBe(issued);
+    feed = answer(issued, readId, {
+      epoch,
+      passId: "F",
+      watermark: 10,
+      entities: [roster("b", 6)],
+    });
+    expect(keys(feed)).toEqual(["roster:a", "roster:b"]);
+    // A competing or repeated reply to that same read, after it applied, changes nothing.
+    expect(answer(feed, readId, { epoch, passId: "F", watermark: 10 })).toBe(feed);
+    expect(answer(feed, readId, { epoch, passId: "H", watermark: 12 })).toBe(feed);
+  });
+
+  it.each([
+    ["reconnecting", { type: "lifecycle" as const, revision: 99, state: "reconnecting" as const }],
+    [
+      "owner-stopped",
+      { type: "lifecycle" as const, revision: 99, state: "owner-stopped" as const },
+    ],
+    ["disconnected", { type: "disconnected" as const }],
+  ])("drops the read outstanding when the owner or lease ends (%s)", (_name, lifecycle) => {
+    const retired = domain();
+    let feed = step(observing(), {
+      epoch: retired,
+      passId: "p1",
+      watermark: 4,
+      entities: [roster("a", 4)],
+    });
+    const held = feed.observation.cursor;
+    const [issued, stale] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, lifecycle);
+    const ended = feed;
+    // The old owner's reply arrives late, sent with the cursor still held.
+    expect(answer(feed, stale, { epoch: retired, passId: "p2", watermark: 9 })).toBe(ended);
+    expect(feed.observation.cursor).toBe(held);
+    const [again, readId] = issue(feed);
+    feed = answer(again, readId, {
+      epoch: domain({ ownerEpoch: 2 }),
+      passId: "q",
+      watermark: 3,
+      entities: [roster("a", 2), message("n", 3, null, "successor")],
+    });
+    expect(feed.observation.cursor?.epoch.ownerEpoch).toBe(2);
+    expect(contents(feed)).toEqual(["successor"]);
+  });
+
+  it("removes a key absent from a promoted full pass at exactly its watermark", () => {
+    const epoch = domain();
+    let feed = step(observing(), { epoch, passId: "p0", watermark: 10 });
+    feed = step(feed, {
+      epoch,
+      passId: "inc",
+      kind: "incremental",
+      watermark: 14,
+      done: false,
+      entities: [roster("a", 14)],
+    });
+    // Promoted at 14; `a` is deleted before the scan reaches it, so the pass omits it.
+    const [issued, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, {
+      type: "read",
+      readId,
+      result: { ...reply({ epoch, passId: "full", watermark: 14 }), promoted: true },
+    });
+    expect(keys(feed)).toEqual([]);
+  });
+
+  it("never resurrects a removed key from an older revision", () => {
+    const epoch = domain();
+    const incremental = { epoch, kind: "incremental" as const };
+    let feed = step(observing(), {
+      ...incremental,
+      passId: "p1",
+      watermark: 4,
+      entities: [roster("a", 4)],
+    });
+    const [replayed, firstRead] = issue(feed);
+    feed = answer(replayed, firstRead, { ...incremental, passId: "p0", watermark: 4 });
+    feed = step(feed, {
+      ...incremental,
+      passId: "p2",
+      watermark: 8,
+      done: false,
+      tombstones: [{ key: "roster:a", ordinal: roster("a", 0).ordinal, revision: 5 }],
+    });
+    expect(keys(feed)).toEqual([]);
+    const replay = { ...incremental, passId: "p1", watermark: 4, entities: [roster("a", 4)] };
+    expect(answer(feed, firstRead, replay)).toBe(feed);
+    // An older value later in the same pass stays behind its tombstone.
+    feed = step(feed, { ...incremental, passId: "p2", watermark: 8, entities: [roster("a", 4)] });
+    expect(keys(feed)).toEqual([]);
+  });
+
+  it("turns rows it cannot identify into continuity losses, never matching identical text", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 1,
+      journal: horizon([journalEntry("u", null)]),
+    });
+    // More live rows than the 256 recovery mappings, all with the same text.
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      kind: "incremental",
+      watermark: 2,
+      entities: Array.from({ length: 300 }, (_, index) => message(`m${index}`, 2, null, "same")),
+    });
+    feed = output(feed, "after the last row");
+    const durable = chain(
+      Array.from({ length: 300 }, (_, index) => `d${index}`),
+      "u",
+    ).map((entry) => ({ ...entry, message: { content: "same" } }));
+    feed = step(feed, {
+      epoch: domain({ projectionIncarnation: 2 }),
+      passId: "q",
+      watermark: 4,
+      journal: horizon([journalEntry("u", null), ...durable]),
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toHaveLength(300);
+    expect(new Set(feed.conversation.losses.map((loss) => loss.afterEntryId))).toEqual(
+      new Set(["d299"]),
+    );
+    expect(nativeTranscriptRows(feed, false).at(-1)).toMatchObject({ kind: "command" });
+  });
+
+  it("never carries the previous owner's message ids into the successor's", () => {
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("saved", 2, "s", "saved"), message("m1", 3, null, "old owner")],
+    });
+    feed = step(feed, {
+      epoch: domain({ ownerEpoch: 2, projectionIncarnation: 2 }),
+      passId: "q",
+      watermark: 2,
+      journal: horizon([journalEntry("u", null), journalEntry("s", "u", "saved")]),
+      entities: [message("m1", 2, null, "new owner")],
+    });
+    expect(contents(feed)).toEqual(["new owner"]);
+    // The identified row retired on its entry; the unidentified one reads from history.
+    expect(feed.conversation.losses).toEqual([{ messageId: "m1", afterEntryId: "s" }]);
+    expect(feed.conversation.persisted.size).toBe(0);
+  });
+
+  it.each([
+    { dropped: true, loaded: ["u", "x"] },
+    { dropped: false, loaded: ["u"] },
+  ])(
+    "loses a row waiting for an unloaded entry when a navigation's full pass ends (dropped history: $dropped)",
+    ({ loaded }) => {
+      let feed = step(observing(), {
+        epoch: domain(),
+        passId: "p1",
+        watermark: 3,
+        journal: horizon(chain(loaded, null)),
+        entities: [message("m", 3, "y", "abandoned reply")],
+      });
+      // Waiting on the same branch is indefinite: `y` may be in a range not loaded.
+      feed = step(feed, { epoch: domain(), passId: "p2", watermark: 4 });
+      expect(contents(feed)).toEqual(["abandoned reply"]);
+      const navigated = domain({ branchGeneration: 2 });
+      feed = step(feed, {
+        epoch: navigated,
+        passId: "q",
+        watermark: 6,
+        done: false,
+        journal: horizon(chain(["u", "z"], null)),
+      });
+      // Absence from a partial reply deletes nothing.
+      expect(contents(feed)).toEqual(["abandoned reply"]);
+      feed = step(feed, { epoch: navigated, passId: "q", watermark: 6 });
+      expect(feed.conversation.pending).toEqual([]);
+      expect(feed.conversation.losses).toEqual([{ messageId: "m", afterEntryId: "z" }]);
+    },
+  );
+
+  it("keeps a body whose durable entry is known but not loaded across an owner change", () => {
+    const start = output(
+      step(observing(), {
+        epoch: domain(),
+        passId: "p1",
+        watermark: 3,
+        journal: horizon([journalEntry("u", null)]),
+        entities: [message("m", 3, "E", "saved body")],
+      }),
+      "after the saved body",
+    );
+    const successor = domain({ ownerEpoch: 2, projectionIncarnation: 2 });
+    // The successor's own `m` is a different message.
+    let feed = step(start, {
+      epoch: successor,
+      passId: "q",
+      watermark: 2,
+      done: false,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 2, null, "successor body")],
+    });
+    expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
+    expect(feed.conversation.losses).toEqual([]);
+    const partial = feed;
+    // `E` joins before the pass ends: the row retires onto it with its output.
+    feed = step(partial, {
+      epoch: successor,
+      passId: "q",
+      watermark: 2,
+      journal: horizon([journalEntry("u", null), journalEntry("E", "u", "saved body")]),
+    });
+    expect(transcript(feed)).toEqual(["u", "saved body", "command", "successor body"]);
+    expect(ids(feed)).toEqual(["u", "E"]);
+    expect(feed.conversation.losses).toEqual([]);
+    // The successor's full pass ends with a disjoint page after `E`: `E` is in
+    // history not yet loaded, so the row is held, neither dropped nor lost.
+    feed = step(partial, {
+      epoch: successor,
+      passId: "q",
+      watermark: 2,
+      journal: horizon(chain(["F", "G"], "E"), "before-F"),
+    });
+    expect(transcript(feed)).toEqual(["u", "F", "G", "saved body", "command", "successor body"]);
+    expect(feed.conversation.losses).toEqual([]);
+    // A later page reaches `E`: the row retires onto it.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "r",
+      kind: "incremental",
+      watermark: 3,
+      journal: horizon(chain(["E", "F", "G"], "u")),
+    });
+    expect(ids(feed)).toEqual(["u", "E", "F", "G"]);
+    expect(transcript(feed)).toEqual(["u", "E", "command", "F", "G", "successor body"]);
+    expect(feed.conversation.losses).toEqual([]);
+  });
+
+  it("loses a held row only once its whole branch is loaded without its entry", () => {
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, "E", "saved body")],
+    });
+    const successor = domain({ ownerEpoch: 2, projectionIncarnation: 2, branchGeneration: 2 });
+    // A disjoint horizon with a placeholder before it: `E` may be in the gap.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "q",
+      watermark: 4,
+      journal: horizon(chain(["x", "y"], "w"), "before-x"),
+    });
+    expect(contents(feed)).toEqual(["saved body"]);
+    // The branch is loaded back to its root without `E`: it is not on this branch.
+    feed = step(feed, {
+      epoch: successor,
+      passId: "r",
+      kind: "full",
+      watermark: 5,
+      journal: horizon(chain(["v", "w", "x", "y"], null)),
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toEqual([{ messageId: "durable:E", afterEntryId: "y" }]);
+  });
+
+  it("keeps command output visible when a successor turns its live row into a loss", () => {
+    let feed = step(observing(), {
+      epoch: domain(),
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "old owner")],
+    });
+    feed = output(feed, "after the old row");
+    feed = step(feed, {
+      epoch: domain({ ownerEpoch: 2, projectionIncarnation: 2 }),
+      passId: "q",
+      watermark: 2,
+      done: false,
+      entities: [message("m", 2, null, "successor body")],
+    });
+    expect(transcript(feed)).toEqual(["u", "command", "successor body"]);
+    expect(feed.conversation.losses).toEqual([{ messageId: "m", afterEntryId: "u" }]);
+  });
+
+  it("shows a message once when its entry and its join arrive in one reply", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "reply")],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      kind: "incremental",
+      watermark: 5,
+      journal: { continuity: "append", leafId: "r", entries: [journalEntry("r", "u", "reply")] },
+      tombstones: [{ key: "message:m", ordinal: 1, revision: 5, joinEntryId: "r" }],
+    });
+    expect(transcript(feed)).toEqual(["u", "reply"]);
+  });
+
+  it("drops segment data of a transfer its pass did not finish", () => {
+    const epoch = domain();
+    const part = { key: "big", revision: 12, index: 0, count: 2, encodedBytes: 10, data: "{" };
+    let feed = step(observing(), { epoch, passId: "p0", watermark: 10 });
+    feed = step(feed, {
+      epoch,
+      passId: "inc",
+      kind: "incremental",
+      watermark: 14,
+      done: false,
+      segments: [part],
+    });
+    expect(feed.observation.segments.size).toBe(1);
+    // Promoted to a fresh full pass that never returns `big`.
+    const [issued, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(issued, {
+      type: "read",
+      readId,
+      result: { ...reply({ epoch, passId: "full", watermark: 15, done: false }), promoted: true },
+    });
+    expect(feed.observation.segments.size).toBe(0);
+    feed = step(feed, { epoch, passId: "full", watermark: 15, done: false, segments: [part] });
+    feed = step(feed, { epoch, passId: "full", watermark: 15 });
+    expect(feed.observation.segments.size).toBe(0);
+  });
+
+  it("keeps a row retired by its durable entry until that entry is held", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 3,
+      journal: horizon([journalEntry("u", null)]),
+      entities: [message("m", 3, null, "reply")],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      watermark: 5,
+      tombstones: [{ key: "message:m", ordinal: 1, revision: 5, joinEntryId: "r" }],
+    });
+    expect(contents(feed)).toEqual(["reply"]);
+    expect(feed.conversation.losses).toEqual([]);
+    feed = step(feed, {
+      epoch,
+      passId: "p3",
+      kind: "incremental",
+      watermark: 6,
+      journal: { continuity: "append", leafId: "r", entries: [journalEntry("r", "u", "reply")] },
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(transcript(feed)).toEqual(["u", "reply"]);
+  });
+
+  // Shaped on acc primary-stall-detailed-wire.json (reads 3, 5..58, 59, 60): long
+  // assistant messages streamed live, then a rebuilt full pass whose journal
+  // slice, capped by the reply budget, holds only the newest entries.
+  it("retires rows joined to entries older than the loaded history instead of leaving them live", () => {
+    const streaming = domain({ buildAttempt: 2, branchGeneration: 1 });
+    let feed = step(observing(), {
+      epoch: streaming,
+      passId: "full:42:11",
+      watermark: 42,
+      journal: horizon(chain(["u"], null)),
+      entities: [message("m0", 42, null, "loop 0 block 799")],
+    });
+    feed = step(feed, {
+      epoch: streaming,
+      passId: "incremental:44:12",
+      kind: "incremental",
+      watermark: 44,
+      entities: [message("m1", 44, null, "loop 1 block 10")],
+    });
+    // Read 59: parked, then `building`.
+    const [waiting, readId] = issue(feed);
+    feed = reduceNativeSessionFeed(waiting, { type: "read", readId, result: { type: "building" } });
+    // Read 60: the loop's entries are durable; both rows are joined to entries
+    // older than the slice, which ends at the leaf.
+    feed = step(feed, {
+      epoch: domain({ buildAttempt: 3, branchGeneration: 10 }),
+      passId: "full:9720:22",
+      watermark: 9720,
+      journal: horizon(chain(["tr1", "a2", "tr2", "a3"], "a1"), "before-tr1"),
+      tombstones: [
+        { key: "message:m0", ordinal: 1, revision: 9700, joinEntryId: "a0" },
+        { key: "message:m1", ordinal: 2, revision: 9701, joinEntryId: "a1" },
+      ],
+    });
+    expect(feed.conversation.pending).toEqual([]);
+    expect(feed.conversation.losses).toEqual([]);
+    expect(transcript(feed)).toEqual(["tr1", "a2", "tr2", "a3"]);
+    expect(feed.conversation.cursor).toBe("before-tr1");
+    // Their content is in the older range, loaded on demand.
+    feed = older(feed, chain(["u2", "a0", "tr0", "a1"], "u"));
+    expect(transcript(feed)).toEqual(["u2", "a0", "tr0", "a1", "tr1", "a2", "tr2", "a3"]);
+  });
+
+  it("keeps inbox gaps exact: what this view missed, once, in order", () => {
+    const epoch = domain();
+    const notice = (seq: number): NeoPiNativeInboxRecord => ({
+      type: "notice",
+      seq,
+      level: "info",
+      message: `notice ${seq}`,
+    });
+    const gap = (
+      fromSeq: number,
+      toSeq: number,
+      reason: "evicted" | "not-observed",
+      notices: number,
+      updates = 0,
+    ): NeoPiNativeInboxRecord => ({
+      type: "gap",
+      seq: toSeq,
+      reason,
+      fromSeq,
+      toSeq,
+      firstReceivedAt: fromSeq * 1000,
+      lastReceivedAt: toSeq * 1000,
+      notices,
+      toolStreams: updates ? [{ toolCallId: "t", toolName: "bash", updates }] : [],
+      toolStreamsTruncated: false,
+    });
+    const shape = (feed: NativeSessionFeed) =>
+      feed.observation.inbox.map((record) =>
+        record.type === "gap"
+          ? [record.fromSeq, record.toSeq, record.reason, record.notices, record.toolStreams.length]
+          : "seq" in record
+            ? record.seq
+            : record.type,
+      );
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 1,
+      inbox: [gap(1, 2, "evicted", 2), notice(3)],
+    });
+    // The server grew its gap over notice 3, which this view holds: only 4 was missed.
+    feed = step(feed, { epoch, passId: "p2", watermark: 2, inbox: [gap(1, 4, "evicted", 4)] });
+    expect(shape(feed)).toEqual([[1, 2, "evicted", 2, 0], 3, [4, 4, "evicted", 1, 0]]);
+    // Gaps of two reasons stay apart; a grown one counts only its new records.
+    feed = step(feed, {
+      epoch,
+      passId: "p3",
+      watermark: 3,
+      inbox: [gap(5, 6, "evicted", 2), gap(7, 8, "not-observed", 1, 1)],
+    });
+    feed = step(feed, {
+      epoch,
+      passId: "p4",
+      watermark: 4,
+      inbox: [gap(7, 9, "not-observed", 2, 1)],
+    });
+    expect(shape(feed).slice(3)).toEqual([
+      [5, 6, "evicted", 2, 0],
+      [7, 8, "not-observed", 1, 1],
+      [9, 9, "not-observed", 1, 0],
+    ]);
+    // A consumer may drain mapped records: a replay is still recognised, and a
+    // later grown gap still subtracts what this view held.
+    const drained = { ...feed, observation: { ...feed.observation, inbox: [] } };
+    feed = step(drained, {
+      epoch,
+      passId: "p5",
+      watermark: 5,
+      inbox: [notice(9), gap(7, 10, "not-observed", 3, 1)],
+    });
+    expect(shape(feed)).toEqual([[10, 10, "not-observed", 1, 0]]);
+    // A navigation in the same projection keeps sequence numbers.
+    feed = step(feed, {
+      epoch: domain({ branchGeneration: 2 }),
+      passId: "p6",
+      watermark: 6,
+      inbox: [gap(7, 10, "not-observed", 3, 1), notice(11)],
+    });
+    expect(shape(feed)).toEqual([[10, 10, "not-observed", 1, 0], 11]);
+    const held = feed.observation.inbox;
+    expect(step(feed, { epoch, passId: "p7", watermark: 7 }).observation.inbox).toBe(held);
   });
 });

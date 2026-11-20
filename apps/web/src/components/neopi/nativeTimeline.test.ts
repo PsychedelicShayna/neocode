@@ -1,7 +1,26 @@
-import type { NeoPiJournalEntry } from "@t3tools/contracts";
-import type { TranscriptRow } from "@t3tools/client-runtime/neopi-transcript";
+import {
+  TurnId,
+  type NeoPiJournalEntry,
+  type NeoPiNativeObservationDomain,
+} from "@t3tools/contracts";
+import {
+  createTranscriptProjector,
+  type TranscriptRow,
+} from "@t3tools/client-runtime/neopi-transcript";
 import { describe, expect, it } from "vite-plus/test";
-import { deriveMessagesTimelineRows } from "../chat/MessagesTimeline.logic";
+import {
+  computeStableMessagesTimelineRows,
+  deriveMessagesTimelineRows,
+  deriveMessagesTimelineRowsWithState,
+  type MessagesTimelineRow,
+  type MessagesTimelineRowsProjection,
+  type StableMessagesTimelineRowsState,
+} from "../chat/MessagesTimeline.logic";
+import {
+  emptyNativeSessionFeed,
+  reduceNativeSessionFeed,
+  type NativeSessionFeed,
+} from "@t3tools/client-runtime/neopi-native-sessions";
 import { projectNativeTimeline } from "./nativeTimeline";
 
 const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
@@ -49,8 +68,8 @@ const divider = (id: string, second: number): Row<"divider"> => ({
   text: "Other model",
 });
 
-function foldLabels(rows: readonly TranscriptRow[]) {
-  const timeline = projectNativeTimeline(rows, false);
+function foldLabels(rows: readonly TranscriptRow[], runPaused = false) {
+  const timeline = projectNativeTimeline(rows, false, undefined, runPaused);
   const derived = deriveMessagesTimelineRows({
     timelineEntries: timeline.entries,
     latestTurn: timeline.latestTurn,
@@ -65,6 +84,11 @@ function foldLabels(rows: readonly TranscriptRow[]) {
 
 describe("native turn duration", () => {
   const settled = [user("u1", 0), tool("t1", 20), assistant("a1", 69)];
+
+  it("leaves a paused native run unfolded until the terminal end", () => {
+    expect(foldLabels(settled, true)).toEqual([]);
+    expect(foldLabels(settled)).toEqual(["Worked for 1m 9s"]);
+  });
 
   it("ends at the last assistant activity, not at settings changed afterwards", () => {
     expect(foldLabels(settled)).toEqual(["Worked for 1m 9s"]);
@@ -156,6 +180,121 @@ describe("native timeline entry identity", () => {
   });
 });
 
+describe("native tool disclosure across persistence", () => {
+  it("keeps an expanded call's identity from a live message through its durable join and rebase", () => {
+    const projectRows = createTranscriptProjector();
+    const call = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "call", name: "bash", arguments: { command: "pwd" } }],
+    };
+    const prompt: NeoPiJournalEntry = {
+      id: "u1",
+      parentId: null,
+      type: "message",
+      timestamp: at(0),
+      message: { role: "user", content: "Go" },
+    };
+    const options = { debug: false };
+    const live = projectNativeTimeline(
+      projectRows(
+        {
+          entries: [prompt],
+          pending: [{ messageId: "m1", message: call }],
+          leafId: prompt.id,
+        },
+        options,
+      ),
+      true,
+    );
+    const liveCall = live.entries.find(
+      (item) => item.kind === "work" && item.entry.toolCallId === "call",
+    )!;
+    // This is the key MessagesTimeline uses to remember expanded tool entries.
+    const expanded = new Set([liveCall.id]);
+    const durable: NeoPiJournalEntry = {
+      id: "a1",
+      parentId: prompt.id,
+      type: "message",
+      timestamp: at(1),
+      message: call,
+    };
+    const result: NeoPiJournalEntry = {
+      id: "r1",
+      parentId: durable.id,
+      type: "message",
+      timestamp: at(2),
+      message: { role: "toolResult", toolCallId: "call", content: "/workspace" },
+    };
+    const shown = () =>
+      projectNativeTimeline(
+        projectRows(
+          {
+            entries: [prompt, { ...durable }, { ...result }],
+            pending: [],
+            leafId: result.id,
+          },
+          options,
+        ),
+        false,
+      );
+    for (const timeline of [shown(), shown()]) {
+      const joined = timeline.entries.filter(
+        (item) => item.kind === "work" && item.entry.toolCallId === "call",
+      );
+      expect(joined).toHaveLength(1);
+      expect(expanded.has(joined[0]!.id)).toBe(true);
+      expect(joined[0]).toMatchObject({ entry: { toolLifecycleStatus: "completed" } });
+    }
+  });
+
+  it("shows a missing-output marker inside its call without regrouping or folding the row", () => {
+    const finished = (id: string, second: number): Row<"tool"> => ({
+      ...tool(id, second),
+      result: {
+        entry: entry(`${id}:r`, "message"),
+        text: "ok",
+        images: [],
+        isError: false,
+        details: null,
+      },
+    });
+    const rows = [
+      user("u1", 0),
+      finished("call-a", 10),
+      assistant("a1", 11),
+      finished("call-b", 12),
+    ];
+    const derive = (losses?: ReadonlyMap<string, readonly { readonly text: string }[]>) => {
+      const timeline = projectNativeTimeline(rows, false, losses);
+      return deriveMessagesTimelineRows({
+        timelineEntries: timeline.entries,
+        latestTurn: timeline.latestTurn,
+        runningTurnId: timeline.runningTurnId,
+        // The reader opened the finished turn to see its calls.
+        expandedTurnIds: new Set([TurnId.make("native:u1")]),
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+    };
+    const shape = (derived: readonly MessagesTimelineRow[]) =>
+      derived.map((row) => `${row.kind}:${row.id}`);
+    const marked = derive(new Map([["call-a", [{ text: "missing output facts" }]]]));
+    // The standalone call keeps its own row (and so the disclosure keyed by its id).
+    expect(shape(marked)).toEqual(shape(derive()));
+    const callA = marked.find((row) => row.id === "tool:call-a");
+    expect(callA?.kind === "work" && callA.groupedEntries[0]?.detail).toContain(
+      "missing output facts",
+    );
+    const callB = marked.find((row) => row.id === "tool:call-b");
+    expect(callB?.kind).toBe("work");
+    expect((callB?.kind === "work" && callB.groupedEntries[0]?.detail) || "").not.toContain(
+      "missing output facts",
+    );
+  });
+});
+
 describe("native compaction row", () => {
   it("expands to the compaction summary through the context-compaction row", () => {
     const compaction: TranscriptRow = {
@@ -181,5 +320,116 @@ describe("native compaction row", () => {
       label: "Context compacted · 31k → 29k tokens",
       detail: "Kept the plan.",
     });
+  });
+});
+
+describe("projection reads through the incremental timeline window", () => {
+  it("shows every current message revision at a fixed row count without a reload", () => {
+    const epoch: NeoPiNativeObservationDomain = {
+      serverIncarnation: "server",
+      ownerEpoch: 1,
+      projectionIncarnation: 1,
+      buildAttempt: 1,
+      branchGeneration: 1,
+    };
+    const empty = emptyNativeSessionFeed();
+    let feed: NativeSessionFeed = {
+      ...empty,
+      busy: true,
+      conversation: {
+        ...empty.conversation,
+        identity: { sessionId: "session", sessionFile: "/session", leafId: "u1" },
+        entries: [
+          {
+            id: "u1",
+            parentId: null,
+            type: "message",
+            timestamp: at(0),
+            message: { role: "user", content: "Go" },
+          },
+        ],
+      },
+    };
+    const projectRows = createTranscriptProjector();
+    let previous: MessagesTimelineRowsProjection | null = null;
+    let stable: StableMessagesTimelineRowsState = {
+      byId: new Map(),
+      result: [],
+    };
+    let count = 0;
+    for (const [index, text] of ["a", "ab", "abc", "final body"].entries()) {
+      const revision = index + 1;
+      feed = reduceNativeSessionFeed(feed, { type: "read-issued" });
+      feed = reduceNativeSessionFeed(feed, {
+        type: "read",
+        readId: feed.observation.outstanding!.readId,
+        result: {
+          type: "pass",
+          kind: index === 0 ? "full" : "incremental",
+          promoted: false,
+          passId: `pass-${revision}`,
+          baseCursor: feed.observation.outstanding!.cursor ?? {
+            epoch,
+            base: 0,
+            pass: null,
+            inboxSeq: 0,
+            journalAt: null,
+          },
+          complete: true,
+          coveredThrough: revision,
+          continuation: { epoch, base: revision, pass: null, inboxSeq: 0, journalAt: null },
+          entities: [
+            {
+              key: "message:m1",
+              ordinal: 1,
+              revision,
+              value: {
+                class: "message",
+                messageId: "m1",
+                phase: "open",
+                entryId: null,
+                message: { role: "assistant", content: [{ type: "text", text }] },
+              },
+            },
+          ],
+          tombstones: [],
+          segments: [],
+          inbox: [],
+          journal: null,
+        },
+      });
+      const timeline = projectNativeTimeline(
+        projectRows(
+          {
+            entries: feed.conversation.entries,
+            pending: feed.conversation.pending,
+            leafId: null,
+          },
+          { debug: false },
+        ),
+        feed.busy,
+      );
+      previous = deriveMessagesTimelineRowsWithState(
+        {
+          timelineEntries: timeline.entries,
+          latestTurn: timeline.latestTurn,
+          runningTurnId: timeline.runningTurnId,
+          isWorking: true,
+          activeTurnStartedAt: null,
+          turnDiffSummaries: [],
+          supportsConversationRollback: false,
+        },
+        previous,
+      );
+      const next = computeStableMessagesTimelineRows(previous.rows, stable);
+      const shown = next.result.find(
+        (row) => row.kind === "message" && row.message.role === "assistant",
+      );
+      expect(shown?.kind === "message" && shown.message.text).toBe(text);
+      expect(next).not.toBe(stable);
+      if (index === 0) count = next.result.length;
+      else expect(next.result).toHaveLength(count);
+      stable = next;
+    }
   });
 });

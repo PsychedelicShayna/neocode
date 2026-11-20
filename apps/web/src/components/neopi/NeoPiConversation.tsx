@@ -1,7 +1,7 @@
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { projectTranscript } from "@t3tools/client-runtime/neopi-transcript";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "../ui/button";
 import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
@@ -23,20 +23,21 @@ export function NeoPiConversation({
   onOpenTree: () => void;
   ownerStatus: string | undefined;
 }) {
-  const { conversation, connection, loading, error, refresh, paging, loadOlder, busy } =
-    useNeoPiConversation(threadRef);
-  const connected = useRef(false);
-  connected.current = connection?.status === "connected";
+  const {
+    conversation,
+    connection,
+    loading,
+    error,
+    refresh,
+    paging,
+    loadOlder,
+    olderAvailable,
+    busy,
+  } = useNeoPiConversation(threadRef);
   useEffect(() => {
-    // The provider's running native session is the only source of its live
-    // messages. A new or replaced owner means the observer must reattach.
-    if (
-      ownerStatus &&
-      ownerStatus !== "starting" &&
-      ownerStatus !== "stopped" &&
-      !connected.current
-    )
-      refresh();
+    // Any change of the runtime re-reads the binding (a stop must not leave a stale "NeoCode
+    // runs it"); the watch re-attaches only when not attached, and never starts an owner.
+    if (ownerStatus && ownerStatus !== "starting") refresh();
   }, [ownerStatus, refresh]);
   useNativeDraftIdentity(threadRef, conversation.identity);
   const [pendingResume] = useNativeTreeField(
@@ -67,9 +68,6 @@ export function NeoPiConversation({
       ).label
     : undefined;
   const attached = connection?.status === "connected";
-  const olderAvailable =
-    conversation.identity !== null &&
-    (conversation.cursor !== undefined || conversation.cursorLeaf !== conversation.identity.leafId);
   const loadEarlier = useMemo(
     () =>
       olderAvailable && !conversation.needsSnapshot
@@ -84,9 +82,11 @@ export function NeoPiConversation({
     : connection?.ownership === "stopped"
       ? "Stopped session · read-only"
       : !attached
-        ? connection?.status === "disconnected" || connection?.status === "gap"
-          ? "Reconnecting to NeoPi"
-          : "Native conversation unavailable"
+        ? connection?.status === "identity_changed"
+          ? "Native session changed"
+          : connection?.status === "disconnected"
+            ? "Reconnecting to NeoPi"
+            : "Native conversation unavailable"
         : connection?.ownership === "terminal"
           ? "Following the terminal"
           : connection?.ownership === "gui"

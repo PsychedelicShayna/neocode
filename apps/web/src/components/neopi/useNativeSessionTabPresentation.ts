@@ -1,17 +1,20 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
+  NATIVE_RUN_PAUSE_LABELS,
   nativeRecord,
   type NativeSessionFeed,
   type NativeSessionTarget,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { nativeSessionAtoms } from "../../state/neopiNativeSessions";
+import { nativeSessionAtoms, usePageVisible } from "../../state/neopiNativeSessions";
 import { useEnvironmentQuery } from "../../state/query";
 
 export const TAB_STATUS = {
   attention: { label: "Waiting for your answer", dot: "bg-primary" },
   working: { label: "Working", dot: "bg-warning" },
+  continuation: { label: NATIVE_RUN_PAUSE_LABELS.continuation, dot: "bg-warning" },
+  "async-work": { label: NATIVE_RUN_PAUSE_LABELS["async-work"], dot: "bg-warning" },
   terminal: { label: "Following a terminal", dot: "bg-info" },
   ready: { label: "Ready", dot: "bg-success" },
   connecting: { label: "Connecting", dot: "bg-muted-foreground/50" },
@@ -34,6 +37,7 @@ const selectStatus = (result: FeedResult): TabStatus => {
   if (!feed.connected) return "offline";
   if (feed.dialogs.length > 0) return "attention";
   if (feed.busy) return "working";
+  if (feed.runPause) return feed.runPause;
   return feed.session?.attachment === "terminal" ? "terminal" : "ready";
 };
 const selectSessionName = (result: FeedResult): string => {
@@ -47,14 +51,17 @@ const selectSessionId = (result: FeedResult): string =>
 
 /**
  * What a session tab, and the Ctrl+Tab switcher, show for one session. Only a
- * `watched` tab holds the session open; the rest read the session inventory, so
- * NeoCode can release idle sessions that are merely open in the background.
+ * `watched` tab holds the session open, and only while the page is visible; the
+ * rest read the session inventory, so NeoCode can release idle sessions that are
+ * merely open in the background.
  */
 export function useNativeSessionTabPresentation(tab: NativeSessionTarget, watched: boolean) {
   const listedSessions = useEnvironmentQuery(
     nativeSessionAtoms.list({ environmentId: tab.environmentId, input: {} }),
   ).data?.sessions;
-  const feed: Atom.Atom<FeedResult> = watched
+  const visible = usePageVisible();
+  const observed = watched && visible;
+  const feed: Atom.Atom<FeedResult> = observed
     ? nativeSessionAtoms.watch({ environmentId: tab.environmentId, input: { ref: tab.ref } })
     : UNWATCHED;
   const watchedStatus = useAtomValue(feed, selectStatus);
@@ -77,7 +84,11 @@ export function useNativeSessionTabPresentation(tab: NativeSessionTarget, watche
       : undefined);
   const status =
     TAB_STATUS[
-      watched ? watchedStatus : listed?.live ? LISTED_TAB_STATUS[listed.live.state] : "idle"
+      observed
+        ? watchedStatus
+        : listed?.live
+          ? (listed.live.runPause ?? LISTED_TAB_STATUS[listed.live.state])
+          : "idle"
     ];
   const title =
     listed?.title || sessionName || listed?.firstMessage.split("\n")[0]?.trim() || "New session";

@@ -31,7 +31,7 @@ function native(overrides: Partial<NeoPiModelsConnection> = {}): NeoPiModelsConn
     capabilities: new Set(["themes_configuration"]),
     request: () => Effect.succeed(snapshot),
     respondUi: () => Effect.void,
-    ui: Stream.empty,
+    loginUi: () => Effect.succeed(Stream.empty),
     changes: Stream.empty,
     validate: Effect.void,
     ...overrides,

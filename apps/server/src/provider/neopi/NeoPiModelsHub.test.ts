@@ -25,7 +25,7 @@ const harness = Effect.gen(function* () {
     request: () => Effect.void,
     respondUi: () => Effect.void,
     validate: Effect.void,
-    ui: Stream.empty,
+    loginUi: () => Effect.succeed(Stream.empty),
     changes: Stream.fromPubSub(changes),
   };
   let failing = false;
@@ -72,7 +72,7 @@ describe("native Models hub", () => {
             request: () => Effect.void,
             respondUi: () => Effect.void,
             validate: Effect.void,
-            ui: Stream.empty,
+            loginUi: () => Effect.succeed(Stream.empty),
             changes: Stream.fromPubSub(changes),
           };
           return yield* makeNeoPiModelsHub(
@@ -161,7 +161,7 @@ describe("native Models hub", () => {
                 request: () => Effect.void,
                 respondUi: () => Effect.void,
                 validate: Effect.void,
-                ui: Stream.empty,
+                loginUi: () => Effect.succeed(Stream.empty),
                 changes: Stream.empty,
               } satisfies NeoPiModelsConnection;
             }),

@@ -22,6 +22,7 @@ const noop = () => {};
 export function NativeTimelineView(props: {
   readonly rows: readonly TranscriptRow[];
   readonly busy: boolean;
+  readonly runPaused?: boolean;
   /** The author label on the assistant's messages: the session's own name and designation. */
   readonly assistantName?: string;
   readonly environmentId: EnvironmentId;
@@ -41,6 +42,8 @@ export function NativeTimelineView(props: {
   readonly hideThinking?: boolean;
   /** Each new value toggles every tool call of the latest turn open or closed. */
   readonly toggleToolOutputSerial?: number;
+  /** Live output missing from shown tool calls, by call id, marked at each call. */
+  readonly toolLosses?: ReadonlyMap<string, readonly { readonly text: string }[]>;
 }) {
   const settings = useEnvironmentSettings(props.environmentId);
   const { resolvedTheme } = useTheme();
@@ -51,8 +54,8 @@ export function NativeTimelineView(props: {
     [props.rows, props.hideThinking],
   );
   const timeline = useMemo(
-    () => projectNativeTimeline(visibleRows, props.busy),
-    [visibleRows, props.busy],
+    () => projectNativeTimeline(visibleRows, props.busy, props.toolLosses, props.runPaused),
+    [visibleRows, props.busy, props.toolLosses, props.runPaused],
   );
   const [liveFollow, setLiveFollow] = useState(true);
   const onIsAtEndChange = useCallback((atEnd: boolean) => {

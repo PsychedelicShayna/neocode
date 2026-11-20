@@ -53,7 +53,7 @@ const connection = (overrides: Partial<NeoPiModelsConnection> = {}): NeoPiModels
   validate: Effect.void,
   request: () => Effect.succeed(response),
   respondUi: () => Effect.void,
-  ui: Stream.empty,
+  loginUi: () => Effect.succeed(Stream.empty),
   changes: Stream.empty,
   ...overrides,
 });

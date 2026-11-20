@@ -1,16 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
-import { ProviderInstanceId, ThreadId, type NeoPiNavigateTreeResult } from "@t3tools/contracts";
-import type { SessionEventFrame } from "effect-neopi-rpc/client";
-import { NeoPiRpcError } from "effect-neopi-rpc/errors";
+import { ThreadId, type NeoPiNavigateTreeResult } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Stream from "effect/Stream";
-import {
-  makeNeoPiNativeConversationWith,
-  observeNeoPiNativeOwner,
-} from "./NeoPiNativeConversation.ts";
-import { makeNeoPiNativeEventHub } from "./NeoPiNativeEventHub.ts";
+import { makeNeoPiNativeConversationWith } from "./NeoPiNativeConversation.ts";
 import type { NeoPiNativeOwner } from "./NeoPiNativeOwner.ts";
 
 const identity = { sessionId: "native", sessionFile: "/sessions/native.jsonl" };
@@ -27,26 +20,15 @@ const capabilities = new Set([
   "session_journal_events",
   "session_tree_navigation",
 ]);
-const canonical = (type: string, extra: Record<string, unknown> = {}): SessionEventFrame => ({
-  type,
-  ...identity,
-  leafId: "e1",
-  ...extra,
-});
 const threadId = ThreadId.make("thread");
 const expected = {
   expectedSessionId: identity.sessionId,
   expectedSessionFile: identity.sessionFile,
   expectedLeafId: "e1",
 };
-const resolveFile = (file: string) => Effect.succeed(file);
-const makeOwner = (
-  events: NeoPiNativeOwner["events"],
-  request?: NeoPiNativeOwner["request"],
-): NeoPiNativeOwner => ({
+const makeOwner = (request?: NeoPiNativeOwner["request"]): NeoPiNativeOwner => ({
   ownership: "terminal",
   capabilities,
-  events,
   request:
     request ??
     ((command) =>
@@ -54,148 +36,6 @@ const makeOwner = (
 });
 
 describe("native conversation authority", () => {
-  it.effect("subscribes before snapshot and deduplicates a commit during reconciliation", () =>
-    Effect.gen(function* () {
-      const hub = makeNeoPiNativeEventHub();
-      const events = yield* hub.subscribe;
-      let reads = 0;
-      const owner = makeOwner(events, (command) =>
-        Effect.gen(function* () {
-          if (command.type === "get_state" || command.type === "snapshot_session_journal")
-            return { ...identity, leafId: "e1" };
-          reads++;
-          yield* hub.publish(canonical("journal_entry", { entry }));
-          yield* hub.publish(canonical("message_persisted", { messageId: "msg-1", entryId: "e1" }));
-          yield* hub.publish({ type: "neocode_connection_closed" });
-          return page;
-        }),
-      );
-      const result = yield* Stream.runCollect(
-        observeNeoPiNativeOwner(owner, identity, resolveFile),
-      );
-      assert.equal(reads, 1);
-      assert.equal(result[0]?.type, "connection");
-      assert.equal(result[1]?.type, "snapshot");
-      assert.equal(
-        result.filter((frame) => frame.type === "native" && frame.event.type === "journal_entry")
-          .length,
-        0,
-      );
-      assert.equal(
-        result.filter(
-          (frame) => frame.type === "native" && frame.event.type === "message_persisted",
-        ).length,
-        1,
-      );
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("keeps external native message identities without inventing GUI turns", () =>
-    Effect.gen(function* () {
-      const frames = [
-        { type: "message_start", messageId: "msg-42", message: { role: "assistant", content: [] } },
-        {
-          type: "message_update",
-          messageId: "msg-42",
-          assistantMessageEvent: { type: "text_delta", delta: "external" },
-        },
-        {
-          type: "message_end",
-          messageId: "msg-42",
-          message: { role: "assistant", content: [{ type: "text", text: "external" }] },
-        },
-        canonical("message_persisted", { messageId: "msg-42", entryId: "durable-42" }),
-      ];
-      const result = yield* Stream.runCollect(
-        observeNeoPiNativeOwner(makeOwner(Stream.fromIterable(frames)), identity, resolveFile),
-      );
-      assert.deepEqual(
-        result
-          .filter((frame) => frame.type === "native")
-          .map((frame) => (frame.type === "native" ? frame.event : undefined)),
-        frames,
-      );
-      assert.equal(
-        result.some((frame) => frame.type === "native" && "turnId" in frame.event),
-        false,
-      );
-    }),
-  );
-
-  it.effect("invalidates a foreign canonical identity before forwarding its content", () =>
-    Effect.gen(function* () {
-      const result = yield* Stream.runCollect(
-        observeNeoPiNativeOwner(
-          makeOwner(
-            Stream.fromIterable([
-              canonical("journal_state", {
-                reason: "identity",
-                sessionFile: "/sessions/copied.jsonl",
-              }),
-              canonical("journal_entry", { entry: { ...entry, id: "foreign" } }),
-            ]),
-          ),
-          identity,
-          resolveFile,
-        ),
-      );
-      assert.equal(
-        result.some((frame) => frame.type === "connection" && frame.status === "identity_changed"),
-        true,
-      );
-      assert.equal(
-        result.some((frame) => frame.type === "native"),
-        false,
-      );
-    }),
-  );
-
-  it.effect("reports native cursor errors as a reconciliation gap", () =>
-    Effect.gen(function* () {
-      const owner = makeOwner(Stream.empty, (command) =>
-        command.type === "get_state" || command.type === "snapshot_session_journal"
-          ? Effect.succeed({ ...identity, leafId: "e1" })
-          : Effect.fail(
-              new NeoPiRpcError({ code: "leaf_changed", message: "Native leaf changed" }),
-            ),
-      );
-      const result = yield* Stream.runCollect(
-        observeNeoPiNativeOwner(owner, identity, resolveFile),
-      );
-      assert.equal(result.length, 1);
-      assert.equal(result[0]?.type === "connection" && result[0].status, "gap");
-    }),
-  );
-
-  it.effect("reconnects with a new snapshot and keeps terminal ownership read-only", () =>
-    Effect.gen(function* () {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const result = yield* Stream.runCollect(
-          observeNeoPiNativeOwner(makeOwner(Stream.empty), identity, resolveFile),
-        );
-        assert.equal(result[0]?.type === "connection" && result[0].ownership, "terminal");
-        assert.equal(result[1]?.type, "snapshot");
-        const last = result.at(-1);
-        assert.equal(last?.type === "connection" && last.status, "disconnected");
-      }
-    }),
-  );
-
-  it.effect("bounds a stalled observer and gives the next connection a fresh queue", () =>
-    Effect.gen(function* () {
-      const hub = makeNeoPiNativeEventHub();
-      const stalled = yield* hub.subscribe;
-      for (let i = 0; i < 260; i++)
-        yield* hub.publish({ type: "message_update", messageId: "msg", delta: String(i) });
-      const failed = yield* Stream.runDrain(stalled).pipe(Effect.result);
-      assert.equal(failed._tag, "Failure");
-      const fresh = yield* hub.subscribe;
-      yield* hub.publish(canonical("journal_state", { reason: "snapshot" }));
-      const result = yield* Stream.runCollect(fresh.pipe(Stream.take(1)));
-      assert.equal(result.length, 1);
-    }).pipe(Effect.scoped),
-  );
-
   it.effect("forwards same-file drafts, ordered images and asks without automatic resume", () =>
     Effect.gen(function* () {
       const calls: Array<Record<string, unknown>> = [];
@@ -212,15 +52,14 @@ describe("native conversation authority", () => {
         askReanswerCommitted: true,
         resumeToken: "native-token",
       };
-      const owner = makeOwner(Stream.empty, (command) =>
+      const owner = makeOwner((command) =>
         Effect.sync(() => {
           calls.push(command);
           return command.type === "resume_tree" ? { resumed: true } : native;
         }),
       );
-      const service = yield* makeNeoPiNativeConversationWith(
-        () => Effect.succeed({ owner, expected: identity }),
-        resolveFile,
+      const service = yield* makeNeoPiNativeConversationWith(() =>
+        Effect.succeed({ owner, expected: identity }),
       );
       const input = {
         threadId,
@@ -259,7 +98,7 @@ describe("native conversation authority", () => {
       const admitted = yield* Deferred.make<void>();
       const done = yield* Deferred.make<unknown>();
       const calls: string[] = [];
-      const owner = makeOwner(Stream.empty, (command) =>
+      const owner = makeOwner((command) =>
         Effect.gen(function* () {
           calls.push(command.type);
           if (command.type === "navigate_tree") {
@@ -276,9 +115,8 @@ describe("native conversation authority", () => {
           return {};
         }),
       );
-      const service = yield* makeNeoPiNativeConversationWith(
-        () => Effect.succeed({ owner, expected: identity }),
-        resolveFile,
+      const service = yield* makeNeoPiNativeConversationWith(() =>
+        Effect.succeed({ owner, expected: identity }),
       );
       assert.equal((yield* service.cancel(threadId)).status, "unavailable");
       const run = yield* service
@@ -296,24 +134,20 @@ describe("native conversation authority", () => {
 
   it.effect("does not start stopped sessions or forward foreign navigation", () =>
     Effect.gen(function* () {
-      const stopped = yield* makeNeoPiNativeConversationWith(
-        () => Effect.succeed(undefined),
-        resolveFile,
-      );
+      const stopped = yield* makeNeoPiNativeConversationWith(() => Effect.succeed(undefined));
       assert.equal(
         (yield* stopped.navigate({ threadId, ...expected, targetId: "e1" })).status,
         "unavailable",
       );
       let called = false;
-      const owner = makeOwner(Stream.empty, () =>
+      const owner = makeOwner(() =>
         Effect.sync(() => {
           called = true;
           return {};
         }),
       );
-      const service = yield* makeNeoPiNativeConversationWith(
-        () => Effect.succeed({ owner, expected: identity }),
-        resolveFile,
+      const service = yield* makeNeoPiNativeConversationWith(() =>
+        Effect.succeed({ owner, expected: identity }),
       );
       const result = yield* service.navigate({
         threadId,
@@ -326,11 +160,11 @@ describe("native conversation authority", () => {
     }),
   );
 
-  it.effect("loads canonical history without starting and starts only on explicit navigation", () =>
+  it.effect("starts a stopped session only on explicit navigation", () =>
     Effect.gen(function* () {
       let started = false;
       const calls: Array<Record<string, unknown>> = [];
-      const owner = makeOwner(Stream.empty, (command) =>
+      const owner = makeOwner((command) =>
         Effect.sync(() => {
           calls.push(command);
           return { ...identity, leafId: "e1", outcome: "unchanged", cancelled: false };
@@ -338,21 +172,11 @@ describe("native conversation authority", () => {
       );
       const service = yield* makeNeoPiNativeConversationWith(
         () => Effect.succeed(started ? { owner, expected: identity } : undefined),
-        resolveFile,
         () =>
           Effect.sync(() => {
             started = true;
           }),
-        () =>
-          Effect.succeed({
-            status: "available",
-            providerInstanceId: ProviderInstanceId.make("neopi"),
-            page,
-          }),
       );
-      const history = yield* Stream.runCollect(service.watch(threadId));
-      assert.equal(started, false);
-      assert.deepEqual(history[1], { type: "snapshot", page });
       assert.equal(
         (yield* service.navigate({ threadId, ...expected, targetId: "e1" })).status,
         "unavailable",
@@ -370,75 +194,6 @@ describe("native conversation authority", () => {
         calls.some((command) => command.type === "prompt"),
         false,
       );
-    }),
-  );
-
-  it.effect(
-    "requests an ordered native partial snapshot for every quiet GUI transport watcher",
-    () =>
-      Effect.gen(function* () {
-        const native = canonical("message_start", {
-          snapshot: true,
-          messageId: "msg-live",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "native reasoning" },
-              { type: "text", text: "already emitted, no new tokens" },
-            ],
-            future: { kept: true },
-          },
-        });
-        for (let attempt = 0; attempt < 2; attempt++) {
-          yield* Effect.scoped(
-            Effect.gen(function* () {
-              const hub = makeNeoPiNativeEventHub();
-              const events = yield* hub.subscribe;
-              const commands: string[] = [];
-              const owner: NeoPiNativeOwner = {
-                ...makeOwner(events),
-                ownership: "gui",
-                request: (command) =>
-                  Effect.gen(function* () {
-                    commands.push(command.type);
-                    if (command.type === "snapshot_session_journal") {
-                      yield* hub.publish(canonical("journal_state", { reason: "snapshot" }));
-                      yield* hub.publish(native);
-                      return { ...identity, leafId: "e1" };
-                    }
-                    return command.type === "get_state" ? { ...identity, isStreaming: true } : page;
-                  }),
-              };
-              const output = yield* Stream.runCollect(
-                observeNeoPiNativeOwner(owner, identity, resolveFile).pipe(Stream.take(4)),
-              );
-              assert.equal(commands[0], "snapshot_session_journal");
-              assert.equal(output[0]?.type === "connection" && output[0].ownership, "gui");
-              assert.deepEqual(output[3], { type: "native", event: native });
-              assert.equal(
-                commands.some((command) => command === "prompt" || command.startsWith("set_")),
-                false,
-              );
-            }),
-          );
-        }
-      }),
-  );
-
-  it.effect("rejects a foreign snapshot boundary before reading the native page", () =>
-    Effect.gen(function* () {
-      const commands: string[] = [];
-      const owner = makeOwner(Stream.empty, (command) =>
-        Effect.sync(() => {
-          commands.push(command.type);
-          return { ...identity, sessionFile: "/sessions/foreign.jsonl", leafId: "e1" };
-        }),
-      );
-      const output = yield* Stream.runCollect(
-        observeNeoPiNativeOwner(owner, identity, resolveFile),
-      );
-      assert.equal(output[0]?.type === "connection" && output[0].status, "identity_changed");
-      assert.deepEqual(commands, ["snapshot_session_journal"]);
     }),
   );
 });

@@ -1,6 +1,8 @@
+import { workspaceKey } from "@t3tools/client-runtime/environment";
 import { nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import {
   nativeAgentHubAgents,
+  NATIVE_ROSTER_UNAVAILABLE_NOTE,
   SUBAGENT_MODEL_CAPABILITY,
   type AgentHubModelSelector,
   type AgentHubSource,
@@ -12,9 +14,8 @@ import {
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { createContext, use, useCallback, useEffect, useMemo, type ReactNode } from "react";
 
-import type { useNativeSession } from "../../../state/neopiNativeSessions";
+import { nativeSessionAtoms, type useNativeSession } from "../../../state/neopiNativeSessions";
 import { selectAgentView, useAgentViewStore } from "./agentViewStore";
-
 type Request = ReturnType<typeof useNativeSession>["request"];
 
 const AgentHubSourceContext = createContext<AgentHubSource | null>(null);
@@ -46,6 +47,7 @@ export function useNativeAgentHubSource({
   request: Request;
 }): AgentHubSource {
   const key = nativeSessionKey(target);
+  const viewKey = workspaceKey(target);
   const sessionId = feed.session?.sessionId;
   const sessionFile = target.ref.sessionFile;
   const agents = useMemo(
@@ -57,6 +59,7 @@ export function useNativeAgentHubSource({
       ),
     [feed.agents, feed.agentTicks, sessionId, sessionFile],
   );
+  const rosterWarning = feed.agentsNote ? NATIVE_ROSTER_UNAVAILABLE_NOTE : null;
   const modelControlUnavailable = feed.session?.capabilities.includes(SUBAGENT_MODEL_CAPABILITY)
     ? null
     : "This NeoPi cannot change a running agent's model yet.";
@@ -107,20 +110,36 @@ export function useNativeAgentHubSource({
     [request],
   );
 
-  // Streaming child events only flow while someone is reading a child.
-  const childOpen = useAgentViewStore((store) => selectAgentView(key)(store).mode === "agent");
+  // An open child view adds that child to the session's demand; the server
+  // raises NeoPi's subscription for it. A child known only from the inventory
+  // has no run token yet; it is held by id and re-held once its run is named.
+  const openChild = useAgentViewStore((store) => {
+    const view = selectAgentView(viewKey)(store);
+    return view.mode === "agent" ? view.selectedId : null;
+  });
+  const rosterEntry = openChild
+    ? feed.observation.entities.get(`roster:${openChild}`)?.value
+    : undefined;
+  const childRunToken = rosterEntry?.class === "roster" ? rosterEntry.value.runToken : undefined;
+  const { environmentId } = target;
+  const { providerInstanceId } = target.ref;
   useEffect(() => {
-    if (!childOpen || !feed.connected) return;
-    void request({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
-    return () => {
-      void request({ type: "set_subagent_subscription", level: "progress" }).catch(() => {});
-    };
-  }, [childOpen, feed.connected, feed.agentsEpoch, request]);
+    if (openChild === null) return;
+    return nativeSessionAtoms.holdDemand(
+      { environmentId, ref: { providerInstanceId, sessionFile } },
+      [
+        typeof childRunToken === "string"
+          ? { kind: "child", childId: openChild, runToken: childRunToken }
+          : { kind: "child", childId: openChild },
+      ],
+    );
+  }, [environmentId, providerInstanceId, sessionFile, openChild, childRunToken]);
 
   return useMemo(
     () => ({
       key,
       agents,
+      rosterWarning,
       modelControlUnavailable,
       readTranscript,
       steer,
@@ -132,6 +151,7 @@ export function useNativeAgentHubSource({
     [
       key,
       agents,
+      rosterWarning,
       modelControlUnavailable,
       readTranscript,
       steer,

@@ -155,9 +155,33 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
   };
 });
 
+/** A sink for tests that reads every frame family back in order through queues. */
+const queueingSink = Effect.gen(function* () {
+  const events = yield* Queue.unbounded<Client.SessionEventFrame>();
+  const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
+  const tools = yield* Queue.unbounded<Client.HostToolCallFrame | Client.HostToolCancelFrame>();
+  const uris = yield* Queue.unbounded<Client.HostUriRequestFrame>();
+  const sink: Client.NeoPiRpcFrameSink = {
+    event: (frame) => {
+      Queue.offerUnsafe(events, frame);
+    },
+    uiRequest: (frame) => {
+      Queue.offerUnsafe(ui, frame);
+    },
+    hostToolCall: (frame) => {
+      Queue.offerUnsafe(tools, frame);
+    },
+    hostUriRequest: (frame) => {
+      Queue.offerUnsafe(uris, frame);
+    },
+  };
+  return { events, ui, tools, uris, sink };
+});
+
 const makeClient = (
   peer: { readonly handle: ChildProcessSpawner.ChildProcessHandle },
   requestTimeoutMs = 2_000,
+  sink?: Client.NeoPiRpcFrameSink,
 ) =>
   Effect.gen(function* () {
     const client = yield* Client.make({
@@ -167,6 +191,7 @@ const makeClient = (
       cwd: "/tmp",
       env: {},
       requestTimeoutMs,
+      ...(sink ? { sink } : {}),
     });
     yield* Effect.addFinalizer(() => client.close(20));
     return client;
@@ -414,11 +439,9 @@ it.live("delivers a late failure for an already admitted prompt in event order",
             Effect.flatMap((handled) => (handled ? Effect.void : Queue.offer(commands, message))),
           ),
       });
-      const client = yield* makeClient(peer);
-      const received = yield* Queue.unbounded<Client.SessionEventFrame>();
-      yield* Stream.runForEach(client.events, (frame) => Queue.offer(received, frame)).pipe(
-        Effect.forkScoped,
-      );
+      const frames = yield* queueingSink;
+      const received = frames.events;
+      const client = yield* makeClient(peer, 2_000, frames.sink);
       const handle = yield* client.prompt({ type: "prompt", message: "say hi" });
       const prompt = yield* Queue.take(commands);
       yield* peer.emit({
@@ -459,11 +482,9 @@ it.live("fails admitted work and kills a peer that sends a malformed chunk", () 
             Effect.flatMap((handled) => (handled ? Effect.void : Queue.offer(commands, message))),
           ),
       });
-      const client = yield* makeClient(peer);
-      const frames = yield* Queue.unbounded<Client.SessionEventFrame>();
-      yield* Stream.runForEach(client.events, (frame) => Queue.offer(frames, frame)).pipe(
-        Effect.forkScoped,
-      );
+      const queued = yield* queueingSink;
+      const frames = queued.events;
+      const client = yield* makeClient(peer, 2_000, queued.sink);
       const prompt = yield* client.prompt({ type: "prompt", message: "work" });
       const command = yield* Queue.take(commands);
       yield* peer.emit({
@@ -574,20 +595,10 @@ it.live("routes side channels and writes single-line host replies", () =>
           }).pipe(Effect.andThen(negotiate(message, emit)));
         },
       });
-      const client = yield* makeClient(peer);
-      const ui = yield* Queue.unbounded<{ id: string }>();
-      const tools = yield* Queue.unbounded<{ id: string }>();
-      const uris = yield* Queue.unbounded<{ id: string }>();
-      yield* Stream.runForEach(client.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
-        Effect.forkScoped,
-      );
-      yield* Stream.runForEach(client.hostToolCalls, (frame) => Queue.offer(tools, frame)).pipe(
-        Effect.forkScoped,
-      );
-      yield* Stream.runForEach(client.hostUriRequests, (frame) => Queue.offer(uris, frame)).pipe(
-        Effect.forkScoped,
-      );
-      yield* Effect.yieldNow;
+      const { ui, tools, sink } = yield* queueingSink;
+      // No host URI handler: every URI request, before and after ready, is refused.
+      const { hostUriRequest: _, ...withoutUri } = sink;
+      const client = yield* makeClient(peer, 2_000, withoutUri);
 
       yield* peer.emit({
         type: "extension_ui_request",
@@ -613,23 +624,23 @@ it.live("routes side channels and writes single-line host replies", () =>
       const toolFrame = yield* Queue.take(tools);
       assert.equal(uiFrame.id, "ui-1");
       assert.equal(toolFrame.id, "tool-1");
-      const handledUri = yield* Queue.take(uris);
-      assert.equal(handledUri.id, "uri-2");
 
       yield* client.respondUi({ id: "ui-1", confirmed: true });
       yield* client.hostToolResult("tool-1", {
         content: [{ type: "text", text: "ok" }],
       });
 
-      const parsed = yield* readLines(peer.stdin, 4).pipe(
+      const parsed = yield* readLines(peer.stdin, 5).pipe(
         Effect.timeout("2 seconds"),
         Effect.orDie,
       );
-      const uriError = parsed.find(
-        (frame) => frame.type === "host_uri_result" && frame.id === "uri-1",
-      );
-      assert.equal(uriError?.isError, true);
-      assert.equal(uriError?.error, "unsupported");
+      for (const id of ["uri-1", "uri-2"]) {
+        const uriError = parsed.find(
+          (frame) => frame.type === "host_uri_result" && frame.id === id,
+        );
+        assert.equal(uriError?.isError, true);
+        assert.equal(uriError?.error, "unsupported");
+      }
       const uiReply = parsed.find((frame) => frame.type === "extension_ui_response");
       assert.equal(uiReply?.id, "ui-1");
       assert.equal(uiReply?.confirmed, true);
@@ -692,7 +703,6 @@ it.live("pauses negotiation while a startup confirmation awaits the user, then r
           return Effect.void;
         },
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startupTransport = yield* Deferred.make<Client.NeoPiRpcTransport>();
       const clientFiber = yield* Client.make({
@@ -702,15 +712,14 @@ it.live("pauses negotiation while a startup confirmation awaits the user, then r
         cwd: "/tmp",
         env: {},
         requestTimeoutMs: 60,
+        sink: {
+          event: () => {},
+          uiRequest: (frame) => {
+            Queue.offerUnsafe(ui, frame);
+          },
+        },
         onTransportReady: (transport) =>
-          Deferred.succeed(startupTransport, transport).pipe(
-            Effect.andThen(
-              Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
-                Effect.forkIn(scope),
-              ),
-            ),
-            Effect.asVoid,
-          ),
+          Deferred.succeed(startupTransport, transport).pipe(Effect.asVoid),
       }).pipe(Effect.forkScoped);
       const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
       assert.equal(confirmation.id, "startup-confirm");
@@ -776,7 +785,6 @@ it.live("resumes the negotiation deadline when a startup dialog is cancelled", (
             ? emit({ type: "extension_ui_request", id: "cancel-me", method: "confirm" })
             : Effect.void,
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startup = yield* Client.make({
         spawn: () => Effect.succeed(peer.handle),
@@ -785,11 +793,12 @@ it.live("resumes the negotiation deadline when a startup dialog is cancelled", (
         cwd: "/tmp",
         env: {},
         requestTimeoutMs: 60,
-        onTransportReady: (transport) =>
-          Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
-            Effect.forkIn(scope),
-            Effect.asVoid,
-          ),
+        sink: {
+          event: () => {},
+          uiRequest: (frame) => {
+            Queue.offerUnsafe(ui, frame);
+          },
+        },
       }).pipe(Effect.forkScoped);
       const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
       assert.equal(confirmation.id, "cancel-me");
@@ -817,7 +826,6 @@ it.live("fails promptly when a peer exits during a pending startup dialog", () =
             ? emit({ type: "extension_ui_request", id: "abandoned", method: "confirm" })
             : Effect.void,
       });
-      const scope = yield* Effect.scope;
       const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
       const startup = yield* Client.make({
         spawn: () => Effect.succeed(peer.handle),
@@ -826,11 +834,12 @@ it.live("fails promptly when a peer exits during a pending startup dialog", () =
         cwd: "/tmp",
         env: {},
         requestTimeoutMs: 60,
-        onTransportReady: (transport) =>
-          Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
-            Effect.forkIn(scope),
-            Effect.asVoid,
-          ),
+        sink: {
+          event: () => {},
+          uiRequest: (frame) => {
+            Queue.offerUnsafe(ui, frame);
+          },
+        },
       }).pipe(Effect.forkScoped);
       assert.equal((yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"))).id, "abandoned");
       yield* peer.finish({ code: 1, signal: null });
@@ -1033,6 +1042,7 @@ it.live("rejects malformed ready while accepting a startup UI response during ne
       });
       yield* peer.emit({ type: "extension_ui_request", id: "startup-ui", method: "confirm" });
       const scope = yield* Effect.scope;
+      const startupUi = yield* Queue.unbounded<Client.UiRequestFrame>();
       const client = yield* Client.make({
         spawn: () => Effect.succeed(peer.handle),
         command: "npi",
@@ -1040,10 +1050,18 @@ it.live("rejects malformed ready while accepting a startup UI response during ne
         cwd: "/tmp",
         env: {},
         requestTimeoutMs: 2_000,
+        sink: {
+          event: () => {},
+          uiRequest: (frame) => {
+            Queue.offerUnsafe(startupUi, frame);
+          },
+        },
         onTransportReady: (transport) =>
-          Stream.runForEach(transport.uiRequests, (frame) =>
-            transport.respondUi({ id: frame.id, confirmed: true }),
-          ).pipe(Effect.forkIn(scope), Effect.asVoid),
+          Stream.fromQueue(startupUi).pipe(
+            Stream.runForEach((frame) => transport.respondUi({ id: frame.id, confirmed: true })),
+            Effect.forkIn(scope),
+            Effect.asVoid,
+          ),
       });
       yield* Effect.addFinalizer(() => client.close(20));
       assert.equal(client.capabilities.has("v2"), true);
@@ -1054,7 +1072,11 @@ it.live("rejects malformed ready while accepting a startup UI response during ne
 
 const peerPath = new URL("../test/fixtures/neopi-mock-peer.ts", import.meta.url);
 
-const spawnClient = (env: Record<string, string>, args: ReadonlyArray<string> = []) =>
+const spawnClient = (
+  env: Record<string, string>,
+  args: ReadonlyArray<string> = [],
+  sink?: Client.NeoPiRpcFrameSink,
+) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const client = yield* Client.make({
@@ -1064,6 +1086,7 @@ const spawnClient = (env: Record<string, string>, args: ReadonlyArray<string> = 
       cwd: new URL("..", import.meta.url).pathname,
       env,
       requestTimeoutMs: 20_000,
+      ...(sink ? { sink } : {}),
     });
     yield* Effect.addFinalizer(() => client.close(50));
     return client;
@@ -1106,11 +1129,12 @@ it.live("closes with EOF, drains stdout, then SIGTERM and SIGKILL", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
-        const client = yield* spawnClient({ NEOPI_MOCK_MODE: "hang" });
         const seen = yield* Queue.unbounded<string>();
-        yield* Stream.runForEach(client.events, (frame) =>
-          Queue.offer(seen, `${frame.type}:${String(frame.message ?? "")}`),
-        ).pipe(Effect.forkScoped);
+        const client = yield* spawnClient({ NEOPI_MOCK_MODE: "hang" }, [], {
+          event: (frame) => {
+            Queue.offerUnsafe(seen, `${frame.type}:${String(frame.message ?? "")}`);
+          },
+        });
         const pending = yield* Effect.forkScoped(client.request({ type: "get_state" }));
         yield* Effect.yieldNow;
         yield* client.close(200);
@@ -1137,57 +1161,6 @@ it.live("closes with EOF, drains stdout, then SIGTERM and SIGKILL", () =>
         assert.equal(exit.code === 0 && exit.signal === null, false);
       }),
     ),
-  ),
-);
-
-it.live("closes a bounded native observer even with an undrained event and active prompt", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const peer = yield* scriptedPeer({
-        ready: v2Ready,
-        onLine: (command, emit) =>
-          Effect.gen(function* () {
-            if (yield* negotiate(command, emit)) return;
-            if (command.type === "prompt") {
-              yield* emit({
-                type: "response",
-                id: command.id,
-                command: "prompt",
-                success: true,
-                data: { agentInvoked: true },
-              });
-              yield* emit({
-                type: "message_start",
-                messageId: "msg-stalled",
-                message: { role: "assistant", content: [] },
-              });
-            } else if (command.type === "get_state") {
-              yield* emit({
-                type: "response",
-                id: command.id,
-                command: "get_state",
-                success: true,
-                data: { isStreaming: true },
-              });
-            }
-          }),
-      });
-      const client = yield* Client.make({
-        spawn: () => Effect.succeed(peer.handle),
-        command: "npi",
-        args: ["ctl", "pipe", "owner"],
-        cwd: "/unused",
-        env: {},
-        eventQueueCapacity: 1,
-      });
-      const prompt = yield* client.prompt({ type: "prompt", message: "pending" });
-      yield* Deferred.await(prompt.outcome);
-      // The response is behind message_start on stdout, so this is a receipt
-      // that the single-slot event queue is full without sleeping or polling.
-      yield* client.request({ type: "get_state" });
-      yield* client.close(0);
-      assert.equal((yield* Deferred.await(client.exit)).code, null);
-    }),
   ),
 );
 
@@ -1238,11 +1211,9 @@ it.live("carries a dictation capture: both commands and every frame in order", (
             }),
           ),
       });
-      const client = yield* makeClient(peer);
-      const received = yield* Queue.unbounded<Client.SessionEventFrame>();
-      yield* Stream.runForEach(client.events, (frame) => Queue.offer(received, frame)).pipe(
-        Effect.forkScoped,
-      );
+      const frames = yield* queueingSink;
+      const received = frames.events;
+      const client = yield* makeClient(peer, 2_000, frames.sink);
       yield* client.request({ type: "dictation_start", captureId: "capture-1" });
       assert.deepEqual(yield* client.request({ type: "dictation_stop" }), { text: "hello world" });
       assert.deepEqual(yield* Queue.take(received), {
@@ -1260,6 +1231,150 @@ it.live("carries a dictation capture: both commands and every frame in order", (
         captureId: "capture-1",
         text: "hello world",
       });
+    }),
+  ),
+);
+
+const sinkClient = (
+  peer: { readonly handle: ChildProcessSpawner.ChildProcessHandle },
+  delivered: Array<string>,
+) =>
+  Client.make({
+    spawn: () => Effect.succeed(peer.handle),
+    command: "npi",
+    args: ["--mode", "rpc-ui"],
+    cwd: "/tmp",
+    env: {},
+    sink: {
+      event: (frame) => delivered.push(`event:${frame.type}:${String(frame.seq ?? "")}`),
+      uiRequest: (frame) => delivered.push(`ui:${frame.id}`),
+      hostToolCall: (frame) => delivered.push(`${frame.type}:${frame.id}`),
+      hostUriRequest: (frame) => delivered.push(`uri:${frame.id}`),
+    },
+  });
+
+it.live("delivers every frame family to the sink in wire order before the next reply", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            yield* emit({ type: "message_update", seq: 1 });
+            yield* emit({ type: "extension_ui_request", id: "ui-1", method: "confirm" });
+            yield* emit({
+              type: "host_tool_call",
+              id: "tool-1",
+              toolCallId: "call-1",
+              toolName: "preview",
+              arguments: {},
+            });
+            yield* emit({ type: "host_tool_cancel", id: "cancel-1", targetId: "tool-1" });
+            yield* emit({ type: "host_uri_request", id: "uri-1", operation: "read", url: "x://y" });
+            yield* emit({ type: "message_update", seq: 2 });
+            yield* emit({
+              id: message.id,
+              type: "response",
+              command: "get_state",
+              success: true,
+              data: {},
+            });
+          }),
+      });
+      const delivered: Array<string> = [];
+      const client = yield* sinkClient(peer, delivered);
+      yield* Effect.addFinalizer(() => client.close(20));
+      yield* client.request({ type: "get_state" });
+      // No yield between the reply and this read: a queue with its own consumer could not
+      // promise that the frames written before the reply have been applied.
+      assert.deepEqual(delivered, [
+        "event:message_update:1",
+        "ui:ui-1",
+        "host_tool_call:tool-1",
+        "host_tool_cancel:cancel-1",
+        "uri:uri-1",
+        "event:message_update:2",
+      ]);
+    }),
+  ),
+);
+
+it.live("delivers a fast producer's burst to the sink before the reply that follows it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const burst = 10_000;
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            for (let seq = 0; seq < burst; seq++) yield* emit({ type: "message_update", seq });
+            yield* emit({ type: "extension_ui_request", id: "ui-1", method: "confirm" });
+            yield* emit({
+              type: "host_tool_call",
+              id: "tool-1",
+              toolCallId: "call-1",
+              toolName: "preview",
+              arguments: {},
+            });
+            yield* emit({ type: "host_uri_request", id: "uri-1", operation: "read", url: "x://y" });
+            yield* emit({
+              id: message.id,
+              type: "response",
+              command: "get_state",
+              success: true,
+              data: {},
+            });
+          }),
+      });
+      const delivered: Array<string> = [];
+      const client = yield* sinkClient(peer, delivered);
+      yield* client.request({ type: "get_state" });
+      // The client holds no frame queue: everything the burst carried reached the sink
+      // before the reply that followed it.
+      assert.equal(delivered.length, burst + 3);
+    }),
+  ),
+);
+
+it.live("fails pending requests and stops the peer when the sink throws", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          Effect.gen(function* () {
+            if (yield* negotiate(message, emit)) return;
+            if (message.type !== "get_state") return;
+            // The sink throws on this event; the reply after it must not be awaited forever.
+            yield* emit({ type: "message_update", seq: 1 });
+            yield* emit({ id: message.id, type: "response", command: "get_state", success: true });
+          }),
+      });
+      const client = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 60_000,
+        sink: {
+          event: (frame) => {
+            if (frame.type === "message_update") throw new Error("sink broke");
+          },
+        },
+      });
+      // The reply value is irrelevant: the request must fail.
+      const error = yield* client.request({ type: "get_state" }).pipe(Effect.asVoid, Effect.flip);
+      assert.equal(error.code, "sink_failed");
+      assert.include(error.message, "sink broke");
+      // The kill is forked into the client's lifetime; its receipt is the recorded signal.
+      yield* Effect.gen(function* () {
+        while (!peer.signals.includes("SIGTERM")) yield* Effect.sleep("10 millis");
+      }).pipe(Effect.timeout("1 second"));
     }),
   ),
 );

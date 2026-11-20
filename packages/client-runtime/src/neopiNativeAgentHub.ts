@@ -16,7 +16,18 @@ export interface AgentHubAgent {
   readonly identity: AgentIdentity;
   readonly title: string;
   readonly role: string | null;
+  /**
+   * `interrupted` with `unobservedSince` set means finished while no view
+   * watched, outcome unknown: show and count it as finished, never as interrupted.
+   */
   readonly status: RuntimeSubagentStatus;
+  /** When the last view left, for a child that finished unseen; null otherwise. */
+  readonly unobservedSince: number | null;
+  /**
+   * Finished, known only from history that records no outcome: status
+   * `interrupted`; show it as finished (neutral) and count it as done.
+   */
+  readonly outcomeUnrecorded: boolean;
   /** Working: the agent is running or waiting, so steering and live controls apply. */
   readonly live: boolean;
   readonly model: string | null;
@@ -44,6 +55,8 @@ export interface AgentHubSource {
   /** Identifies this source, and so its transcripts, among every source the hub can show. */
   readonly key: string;
   readonly agents: readonly AgentHubAgent[];
+  /** Present only when NeoPi refused the requested live roster subscription. */
+  readonly rosterWarning?: string | null;
   /** Why the model control is unavailable; `null` when NeoPi can change a child's model. */
   readonly modelControlUnavailable: string | null;
   /** Rejects with the harness message. `fromByte` is the previous result's `nextByte`. */
@@ -54,6 +67,9 @@ export interface AgentHubSource {
   setModel(agentId: string, selector: AgentHubModelSelector): Promise<void>;
   cancel(agentId: string): Promise<void>;
 }
+
+export const NATIVE_ROSTER_UNAVAILABLE_NOTE =
+  "Live agent updates are unavailable from this session's NeoPi. The list is as of the last refresh.";
 
 export type AgentHubModelSelector =
   | { readonly kind: "role"; readonly role: string }
@@ -87,6 +103,8 @@ export function nativeAgentHubAgents(
         title: agent.title,
         role: agent.role,
         status: agent.status,
+        unobservedSince: agent.native.unobservedSince,
+        outcomeUnrecorded: agent.native.outcomeUnrecorded,
         live: isActiveSubagentStatus(agent.status),
         model: agent.model,
         effort: agent.effort,
@@ -138,7 +156,13 @@ export function summarizeAgentHub(agents: readonly AgentHubAgent[]): AgentHubSum
   for (const agent of agents) {
     if (agent.live) working++;
     else if (agent.status === "idle") idle++;
-    else if (agent.status === "completed") done++;
+    // Finished unseen counts as done (outcome unknown), never as stopped.
+    else if (
+      agent.status === "completed" ||
+      agent.unobservedSince !== null ||
+      agent.outcomeUnrecorded
+    )
+      done++;
     else if (agent.status === "failed") failed++;
     else stopped++;
     tokens += agent.tokens ?? 0;

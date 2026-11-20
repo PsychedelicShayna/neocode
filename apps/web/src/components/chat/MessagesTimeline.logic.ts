@@ -193,6 +193,32 @@ export function rowsWerePrepended(
 }
 
 /**
+ * LegendList can hold a row below the streaming reply in place. That moves
+ * the content at the reader's viewport top when they are inside the reply.
+ * Keep anchoring elsewhere, including deliberate history/disclosure changes.
+ */
+export function shouldAnchorTimelineContent(input: {
+  readonly following: boolean;
+  readonly prepended: boolean;
+  readonly disclosureSettling: boolean;
+  readonly streamingRow: {
+    readonly top: number;
+    readonly bottom: number;
+    readonly viewportTop: number;
+  } | null;
+}): boolean {
+  const { following, prepended, disclosureSettling, streamingRow } = input;
+  return (
+    following ||
+    prepended ||
+    disclosureSettling ||
+    streamingRow === null ||
+    streamingRow.viewportTop <= streamingRow.top ||
+    streamingRow.viewportTop >= streamingRow.bottom
+  );
+}
+
+/**
  * A scroll the reader made that moved the viewport up and off the live edge is
  * the reader leaving it. Growth under a pinned viewport only ever raises
  * scrollTop; the list itself also lowers it (a row estimate corrected, a size

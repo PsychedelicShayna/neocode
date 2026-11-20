@@ -68,6 +68,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
@@ -191,6 +192,7 @@ import {
   rowsWerePrepended,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
+  shouldAnchorTimelineContent,
   toolGroupAction,
   turnToolDisclosureKeys,
   workEntryDisplayLabel,
@@ -631,15 +633,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     return disclosureAnchorKey === null || row.id === disclosureAnchorKey;
   }, []);
 
-  const maintainVisibleContentPosition = useMemo(
-    () => ({
-      data: true,
-      size: true,
-      shouldRestorePosition: shouldRestoreVisibleContentPosition,
-    }),
-    [shouldRestoreVisibleContentPosition],
-  );
-
   const onToggleTurnFold = useCallback(
     (turnId: TurnId) => {
       suspendEndScrollMaintenanceForDisclosure(`turn-fold:${turnId}`);
@@ -811,14 +804,67 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // they scroll back down. Rows are only recorded after commit, so a
   // discarded render cannot lose the comparison.
   const previousRowsRef = useRef(rows);
+  const prepended =
+    previousRowsRef.current !== rows && rowsWerePrepended(previousRowsRef.current, rows);
   const prependedAwayFromEnd =
-    previousRowsRef.current !== rows &&
-    rowsWerePrepended(previousRowsRef.current, rows) &&
-    resolveTimelineIsAtEnd(listRef.current?.getState()) === false;
+    prepended && resolveTimelineIsAtEnd(listRef.current?.getState()) === false;
   useLayoutEffect(() => {
     previousRowsRef.current = rows;
     if (prependedAwayFromEnd) onManualNavigation();
   }, [rows, prependedAwayFromEnd, onManualNavigation]);
+  const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
+    null,
+  );
+  const streamingRowId = liveFollowEnabled
+    ? undefined
+    : rows.findLast(
+        (row) =>
+          row.kind === "message" && row.message.role === "assistant" && row.message.streaming,
+      )?.id;
+  const readAnchoring = useCallback(() => {
+    const list = streamingRowId === undefined ? undefined : listRef.current;
+    const state = list?.getState();
+    const index = streamingRowId === undefined ? undefined : state?.indexByKey?.(streamingRowId);
+    const viewport: HTMLElement | undefined = list?.getScrollableNode();
+    const row: HTMLElement | undefined =
+      index === undefined ? undefined : state?.elementAtIndex(index);
+    const bounds = row?.getBoundingClientRect();
+    return shouldAnchorTimelineContent({
+      following: liveFollowEnabled,
+      prepended,
+      disclosureSettling: disclosureToggleSettling,
+      streamingRow:
+        viewport && bounds
+          ? {
+              viewportTop: viewport.getBoundingClientRect().top,
+              top: bounds.top,
+              bottom: bounds.bottom,
+            }
+          : null,
+    });
+  }, [streamingRowId, listRef, liveFollowEnabled, prepended, disclosureToggleSettling]);
+  // Read the virtualizer's committed DOM geometry. The snapshot only changes
+  // when the reader crosses a boundary, not on every scroll or stream update.
+  const subscribeToScroll = useCallback(
+    (notify: () => void) => {
+      if (!timelineViewportElement || streamingRowId === undefined) return () => {};
+      const onScroll = (event: Event) => {
+        if (event.target === listRef.current?.getScrollableNode()) notify();
+      };
+      timelineViewportElement.addEventListener("scroll", onScroll, true);
+      return () => timelineViewportElement.removeEventListener("scroll", onScroll, true);
+    },
+    [listRef, streamingRowId, timelineViewportElement],
+  );
+  const anchorVisibleContent = useSyncExternalStore(subscribeToScroll, readAnchoring, () => true);
+  const maintainVisibleContentPosition = useMemo(
+    () => ({
+      data: anchorVisibleContent,
+      size: anchorVisibleContent,
+      shouldRestorePosition: shouldRestoreVisibleContentPosition,
+    }),
+    [anchorVisibleContent, shouldRestoreVisibleContentPosition],
+  );
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
@@ -944,9 +990,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     rows,
   ]);
 
-  const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
-    null,
-  );
   // Re-measure the minimap gutter when the chat column changes width without a viewport resize.
   const chatWidth = useClientSettings((settings) => settings.chatWidth);
   const {

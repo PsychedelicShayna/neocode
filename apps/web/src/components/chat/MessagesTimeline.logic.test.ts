@@ -31,6 +31,7 @@ import {
   rowsWerePrepended,
   scrollMovedAwayFromEnd,
   settleUpwardGesture,
+  shouldAnchorTimelineContent,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   turnToolDisclosureKeys,
@@ -47,6 +48,39 @@ import {
   type TimelineEntriesProjection,
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
+
+describe("streaming reader anchoring", () => {
+  it.each([
+    ["above the reply", 99, true],
+    ["at the beginning of the reply", 100, true],
+    ["inside the reply", 101, false],
+    ["at the end of the reply", 900, true],
+  ] as const)("anchors appropriately %s", (_description, viewportTop, expected) => {
+    expect(
+      shouldAnchorTimelineContent({
+        following: false,
+        prepended: false,
+        disclosureSettling: false,
+        streamingRow: { top: 100, bottom: 900, viewportTop },
+      }),
+    ).toBe(expected);
+  });
+
+  it.each(["following", "prepended", "disclosureSettling"] as const)(
+    "preserves anchoring inside the reply while %s",
+    (reason) => {
+      expect(
+        shouldAnchorTimelineContent({
+          following: false,
+          prepended: false,
+          disclosureSettling: false,
+          streamingRow: { top: 100, bottom: 900, viewportTop: 800 },
+          [reason]: true,
+        }),
+      ).toBe(true);
+    },
+  );
+});
 
 describe("streaming row projection", () => {
   function fixture(text = "") {

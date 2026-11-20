@@ -4,12 +4,13 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import { NeoPiNativeSessionRef, NeoPiNativeSessionsError } from "@t3tools/contracts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
-const tmux = "/usr/bin/tmux";
+const isNativeSessionsError = Schema.is(NeoPiNativeSessionsError);
 
 // First slice: configure one already-running owner. No client may supply a socket or tmux command.
 const Config = Schema.fromJsonString(
@@ -20,9 +21,16 @@ const Config = Schema.fromJsonString(
   }),
 );
 const decodeConfig = Schema.decodeUnknownSync(Config);
-export const managedTmuxConfig = (value: string | undefined) =>
-  value === undefined ? undefined : decodeConfig(value);
-export type ManagedTmuxConfig = typeof Config.Type;
+export type ManagedTmuxConfig = typeof Config.Type & { readonly executable: string | undefined };
+export const managedTmuxConfig = Effect.fnUntraced(function* (value: string | undefined) {
+  if (value === undefined) return undefined;
+  const config = decodeConfig(value);
+  const platform = yield* HostProcessPlatform;
+  const env = yield* HostProcessEnvironment;
+  const resolveExecutable = yield* SpawnExecutableResolution;
+  const tmux = platform === "win32" ? undefined : resolveExecutable("tmux", platform, env);
+  return { ...config, executable: tmux === undefined ? undefined : NodePath.posix.resolve(tmux) };
+});
 
 const ControlStatus = Schema.Struct({
   instanceId: Schema.String,
@@ -61,6 +69,7 @@ const decodeStatus = Schema.decodeUnknownOption(ControlStatus);
 const decodeRegistry = Schema.decodeUnknownOption(Registry);
 
 interface ManagedPane {
+  readonly executable: string;
   readonly session: string;
   readonly window: string;
   readonly pane: string;
@@ -151,7 +160,7 @@ export function bindManagedTmuxOwner(
 
 const tmuxMissing = () =>
   new NeoPiNativeSessionsError({
-    message: "The managed TUI view requires tmux at /usr/bin/tmux on a Unix host.",
+    message: "The managed TUI view requires tmux on the server's PATH on a Unix host.",
     code: "tmux_unavailable",
   });
 
@@ -164,12 +173,10 @@ const tmuxMissing = () =>
  * not a security boundary. This probe never starts or changes a tmux server.
  */
 const readPane = Effect.fnUntraced(function* (config: ManagedTmuxConfig) {
-  if ((yield* HostProcessPlatform) === "win32") return yield* tmuxMissing();
+  const { executable } = config;
+  if (executable === undefined) return yield* tmuxMissing();
   return yield* Effect.tryPromise({
     try: async (signal) => {
-      await NodeFSP.lstat(tmux).catch(() => {
-        throw tmuxMissing();
-      });
       if (!NodePath.isAbsolute(config.socket)) throw noOwner();
       const [path, socket, directory] = await Promise.all([
         NodeFSP.realpath(config.socket),
@@ -187,7 +194,7 @@ const readPane = Effect.fnUntraced(function* (config: ManagedTmuxConfig) {
         throw noOwner();
       }
       const { stdout } = await exec(
-        tmux,
+        executable,
         [
           "-N",
           "-S",
@@ -195,7 +202,7 @@ const readPane = Effect.fnUntraced(function* (config: ManagedTmuxConfig) {
           "list-panes",
           "-s",
           "-t",
-          `=${config.session}`,
+          `=${config.session}:`,
           "-F",
           "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{allow-passthrough}",
         ],
@@ -204,13 +211,14 @@ const readPane = Effect.fnUntraced(function* (config: ManagedTmuxConfig) {
       const matched = /^(\$\d+)\|(@\d+)\|(%\d+)\|([1-9]\d*)\|0\|(?:off|0)\n?$/.exec(stdout);
       if (!matched) throw noOwner();
       return {
+        executable,
         session: matched[1]!,
         window: matched[2]!,
         pane: matched[3]!,
         pid: Number(matched[4]),
       };
     },
-    catch: (cause) => (cause instanceof NeoPiNativeSessionsError ? cause : noOwner()),
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : noOwner()),
   });
 });
 
@@ -224,7 +232,7 @@ export const sameManagedTmuxOwner = (a: ManagedTmuxOwner, b: ManagedTmuxOwner) =
   a.pid === b.pid;
 
 export const managedTmuxClient = (config: ManagedTmuxConfig, owner: ManagedTmuxOwner) => ({
-  executable: tmux,
+  executable: owner.executable,
   args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", owner.session],
 });
 
@@ -269,6 +277,6 @@ export const resolveManagedTmuxOwner = Effect.fnUntraced(function* (
   );
   return yield* Effect.try({
     try: () => bindManagedTmuxOwner(requested, pane, candidates),
-    catch: (cause) => (cause instanceof NeoPiNativeSessionsError ? cause : unavailable()),
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : unavailable()),
   });
 });

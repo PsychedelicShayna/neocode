@@ -619,7 +619,9 @@ describe("canonical native session lifecycle", () => {
   it.effect("opens the managed graphical view via the attach-only connection", () =>
     Effect.gen(function* () {
       const { native, dependencies } = yield* fixture("terminal");
+      const executable = "/test-bin/tmux";
       const owner = {
+        executable,
         session: "$0",
         window: "@0",
         pane: "%0",
@@ -628,7 +630,6 @@ describe("canonical native session lifecycle", () => {
         imageId: "control-image",
         sessionId: native.sessionId,
       };
-      const executable = "/usr/bin/tmux";
       const args = ["-N", "-S", "/private/owner.sock", "attach-session", "-E", "-t", "$0"];
       const modes: Array<string | undefined> = [];
       const service = yield* makeNeoPiNativeSessionsWith({

@@ -37,7 +37,7 @@ different preference when needed.
 
 ### Attach a prestarted NeoPi TUI
 
-On a Unix host with `/usr/bin/tmux`, opt in by setting the NeoCode **server's**
+On a Unix host with `tmux` on the NeoCode server's `PATH`, opt in by setting the server's
 `T3CODE_NEOPI_MANAGED_TMUX` to a JSON binding for one existing native session:
 
 ```json

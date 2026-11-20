@@ -2705,7 +2705,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const config = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
-  const managedConfig = managedTmuxConfig(process.env.T3CODE_NEOPI_MANAGED_TMUX);
+  const managedConfig = yield* managedTmuxConfig(process.env.T3CODE_NEOPI_MANAGED_TMUX);
   const canonicalize = Effect.fnUntraced(function* (file: string) {
     if (!NodePath.isAbsolute(file))
       return yield* fail("A native session file must be an absolute path.", "invalid_path");

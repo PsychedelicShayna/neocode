@@ -10,7 +10,7 @@ import { act, createRef, type ReactNode, type Ref } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { LegendListRef, MaintainScrollAtEndOptions } from "@legendapp/list/react";
+import type { LegendListRef } from "@legendapp/list/react";
 
 vi.mock("@legendapp/list/react", async () => {
   const legendListTestId = "legend-list";
@@ -29,7 +29,6 @@ vi.mock("@legendapp/list/react", async () => {
     };
     contentInsetEndAdjustment?: number;
     className?: string;
-    maintainScrollAtEnd?: boolean | MaintainScrollAtEndOptions;
     maintainVisibleContentPosition?:
       | boolean
       | {
@@ -51,32 +50,6 @@ vi.mock("@legendapp/list/react", async () => {
         data-anchor-on-ready={Boolean(props.anchoredEndSpace?.onReady)}
         data-content-inset-end={props.contentInsetEndAdjustment}
         data-class-name={props.className}
-        data-maintain-scroll-at-end={props.maintainScrollAtEnd ? "enabled" : undefined}
-        data-maintain-scroll-at-end-animated={
-          typeof props.maintainScrollAtEnd === "object"
-            ? props.maintainScrollAtEnd.animated
-            : undefined
-        }
-        data-maintain-scroll-at-end-data-change={
-          typeof props.maintainScrollAtEnd === "object"
-            ? props.maintainScrollAtEnd.on?.dataChange
-            : undefined
-        }
-        data-maintain-scroll-at-end-footer-layout={
-          typeof props.maintainScrollAtEnd === "object"
-            ? props.maintainScrollAtEnd.on?.footerLayout
-            : undefined
-        }
-        data-maintain-scroll-at-end-item-layout={
-          typeof props.maintainScrollAtEnd === "object"
-            ? props.maintainScrollAtEnd.on?.itemLayout
-            : undefined
-        }
-        data-maintain-scroll-at-end-layout={
-          typeof props.maintainScrollAtEnd === "object"
-            ? props.maintainScrollAtEnd.on?.layout
-            : undefined
-        }
         data-maintain-visible-content-position={
           typeof props.maintainVisibleContentPosition === "object"
             ? "object"
@@ -286,6 +259,112 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("keeps the live edge when streaming content grows by more than a viewport in one frame", async () => {
+    const props = buildProps();
+    const viewport = { clientHeight: 710, scrollHeight: 1676, scrollTop: 966 };
+    const sizeListeners = new Set<() => void>();
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    props.listRef.current = {
+      getScrollableNode: () => viewport,
+      getState: () => ({
+        listen: (key: string, listener: () => void) => {
+          if (key !== "totalSize") return () => {};
+          sizeListeners.add(listener);
+          return () => sizeListeners.delete(listener);
+        },
+      }),
+    } as unknown as LegendListRef;
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (frame: number) => frames.delete(frame));
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const flushFrame = () => {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      for (const callback of callbacks) callback(0);
+    };
+    const grow = (height: number) => {
+      viewport.scrollHeight = height;
+      for (const listener of sizeListeners) listener();
+    };
+    const prompt = buildUserTimelineEntry("First prompt");
+    const answer = buildAssistantTimelineEntry("Streaming answer");
+    const timelineEntries = [
+      prompt,
+      {
+        ...answer,
+        id: "entry-2",
+        message: { ...answer.message, id: MessageId.make("message-2"), streaming: true },
+      },
+    ];
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
+      });
+      flushFrame();
+
+      grow(2633); // 957 px in a 710 px viewport, as in the fast-output trace.
+      flushFrame();
+      expect(viewport.scrollTop).toBe(1923);
+
+      grow(3600);
+      await act(() => {
+        renderer?.update(
+          <MessagesTimeline
+            {...props}
+            timelineEntries={timelineEntries}
+            liveFollowEnabled={false}
+          />,
+        );
+      });
+      viewport.scrollTop = 1310; // Reader scrolled up before the queued pin.
+      flushFrame();
+      expect(viewport.scrollTop).toBe(1310);
+
+      viewport.scrollTop = 2890; // Reader returned to the end.
+      await act(() => {
+        renderer?.update(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
+      });
+      grow(4600);
+      flushFrame();
+      expect(viewport.scrollTop).toBe(3890);
+
+      await act(() => {
+        renderer?.update(
+          <MessagesTimeline
+            {...props}
+            timelineEntries={timelineEntries}
+            anchorMessageId={prompt.message.id}
+          />,
+        );
+      });
+      grow(5600);
+      flushFrame();
+      expect(viewport.scrollTop).toBe(3890); // The send anchor owns the viewport.
+
+      await act(() => {
+        renderer?.update(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
+      });
+      grow(6600);
+      flushFrame();
+      expect(viewport.scrollTop).toBe(5890);
+    } finally {
+      await act(() => renderer?.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("renders previous and next controls with the minimap", () => {
     const first = buildUserTimelineEntry("First turn");
     const secondBase = buildUserTimelineEntry("Second turn");
@@ -633,7 +712,6 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("data-anchor-max-size=");
     expect(markup).toContain('data-content-inset-end="144"');
     expect(markup).toContain("[overflow-anchor:none]");
-    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
     expect(markup).toContain('data-maintain-visible-content-position="object"');
     expect(markup).toContain('data-maintain-visible-content-position-data="true"');
     expect(markup).toContain('data-maintain-visible-content-position-size="true"');
@@ -679,7 +757,6 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).not.toContain("data-anchor-index=");
-    expect(markup).toContain('data-maintain-scroll-at-end="enabled"');
     expect(onAnchorReady).not.toHaveBeenCalled();
   });
 
@@ -884,57 +961,6 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toContain('data-anchor-index="0"');
-    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
-  });
-
-  it("hands end-following back to the list once the send anchor is released", () => {
-    const firstEntry = buildUserTimelineEntry("First prompt.");
-    const secondEntry = {
-      ...buildUserTimelineEntry("Newest prompt."),
-      id: "entry-2",
-      message: {
-        ...buildUserTimelineEntry("Newest prompt.").message,
-        id: MessageId.make("message-2"),
-      },
-    };
-    const timelineEntries = [firstEntry, secondEntry];
-
-    // While the send anchor holds the end space open, ChatView owns streaming
-    // scrolls and LegendList must not re-pin behind it.
-    expect(
-      renderToStaticMarkup(
-        <MessagesTimeline
-          {...buildProps()}
-          anchorMessageId={firstEntry.message.id}
-          timelineEntries={timelineEntries}
-        />,
-      ),
-    ).not.toContain('data-maintain-scroll-at-end="enabled"');
-
-    // Dropping the anchor is what actually gives end-following back, so
-    // returning to the live edge has to release it — re-enabling live follow
-    // alone leaves nothing pinned to the stream.
-    expect(
-      renderToStaticMarkup(
-        <MessagesTimeline
-          {...buildProps()}
-          anchorMessageId={null}
-          timelineEntries={timelineEntries}
-        />,
-      ),
-    ).toContain('data-maintain-scroll-at-end="enabled"');
-
-    // Reading history still wins over both.
-    expect(
-      renderToStaticMarkup(
-        <MessagesTimeline
-          {...buildProps()}
-          anchorMessageId={null}
-          liveFollowEnabled={false}
-          timelineEntries={timelineEntries}
-        />,
-      ),
-    ).not.toContain('data-maintain-scroll-at-end="enabled"');
   });
 
   it("renders collapse controls for long user messages", () => {
@@ -946,12 +972,6 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toContain("Show full message");
-    expect(markup).toContain('data-maintain-scroll-at-end="enabled"');
-    expect(markup).toContain('data-maintain-scroll-at-end-animated="false"');
-    expect(markup).toContain('data-maintain-scroll-at-end-data-change="true"');
-    expect(markup).toContain('data-maintain-scroll-at-end-footer-layout="false"');
-    expect(markup).toContain('data-maintain-scroll-at-end-item-layout="true"');
-    expect(markup).toContain('data-maintain-scroll-at-end-layout="true"');
     expect(markup).toContain('data-user-message-collapsed="true"');
     expect(markup).toContain('data-user-message-fade="true"');
     expect(markup).toContain('data-user-message-footer="true"');

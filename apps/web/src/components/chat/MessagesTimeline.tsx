@@ -72,11 +72,7 @@ import {
   type MouseEvent,
   type ReactNode,
 } from "react";
-import {
-  LegendList,
-  type LegendListRef,
-  type MaintainScrollAtEndOptions,
-} from "@legendapp/list/react";
+import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import { DiffWorkerPoolProvider } from "../DiffWorkerPoolProvider";
 import {
@@ -390,18 +386,6 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
-const TIMELINE_MAINTAIN_SCROLL_AT_END = {
-  animated: false,
-  on: {
-    dataChange: true,
-    // Composer inset changes must not move already-visible messages. New
-    // rows and row growth still keep live-follow pinned through the other
-    // triggers below.
-    footerLayout: false,
-    itemLayout: true,
-    layout: true,
-  },
-} as const satisfies MaintainScrollAtEndOptions;
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -456,10 +440,8 @@ interface MessagesTimelineProps {
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   contentInsetEndAdjustment: number;
   /**
-   * Whether the timeline should keep pinning to the live edge as content
-   * grows. Off while the user is reading history; LegendList's own
-   * maintainScrollAtEnd would otherwise re-pin regardless of ChatView's
-   * scroll-mode refs whenever the user drifts near the bottom.
+   * Whether to keep pinning as content grows. The host owns reader intent;
+   * the current gap to the end does not tell us if the reader scrolled away.
    */
   liveFollowEnabled: boolean;
   onIsAtEndChange: (isAtEnd: boolean) => void;
@@ -1008,6 +990,49 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     () => <TimelineListFooter composerInset={anchoredEndSpace ? 0 : contentInsetEndAdjustment} />,
     [anchoredEndSpace, contentInsetEndAdjustment],
   );
+  const hasTimelineList = rows.length > 0 || isWorking;
+  const followContentGrowth =
+    liveFollowEnabled &&
+    !citationPositioning &&
+    !(restoringThreadPosition && rememberedPosition?.atEnd === false) &&
+    !anchoredEndSpace &&
+    !prependedAwayFromEnd &&
+    !disclosureToggleSettling;
+  useLayoutEffect(() => {
+    if (!followContentGrowth || !hasTimelineList) return;
+    const list = listRef.current;
+    const viewport = list?.getScrollableNode();
+    if (!list || !viewport) return;
+
+    let frame: number | null = null;
+    const schedulePin = () => {
+      if (frame !== null) return;
+      // Wait for the virtualizer to commit its new extent. One instant pin
+      // per layout frame, only when the row sizes or viewport height change.
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        if (listIdentityRef.current !== listIdentityKey) return;
+        const bottom = viewport.scrollHeight - viewport.clientHeight;
+        if (bottom - viewport.scrollTop > 1) viewport.scrollTop = bottom;
+      });
+    };
+    // LegendList's maintain-at-end band can be crossed by a single output
+    // update. Observe the row extent instead; footer-only changes do not pin.
+    const unsubscribe = list.getState().listen("totalSize", schedulePin);
+    let viewportHeight = viewport.clientHeight;
+    const resize = new ResizeObserver(() => {
+      const height = viewport.clientHeight;
+      if (height === viewportHeight) return;
+      viewportHeight = height;
+      schedulePin();
+    });
+    resize.observe(viewport);
+    return () => {
+      unsubscribe();
+      resize.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [followContentGrowth, hasTimelineList, listIdentityKey, listRef]);
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -1253,7 +1278,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [],
   );
 
-  if (rows.length === 0 && !isWorking) {
+  if (!hasTimelineList) {
     if (hideEmptyPlaceholder) {
       // Occupy the pane with the theme surface so a thread switch cannot
       // punch a hole through to the window chrome (white in light mode).
@@ -1296,27 +1321,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             onLoad={onCitationListLoad}
             {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
             contentInsetEndAdjustment={anchoredEndSpace ? contentInsetEndAdjustment : 0}
-            // Always the instant pin. A smooth one locks out the next pin for
-            // 500 ms, so fast output outgrows the re-pin band and follow stops,
-            // and the browser folds a reader's wheel into its animation, so the
-            // list pulled the reader back.
-            maintainScrollAtEnd={
-              citationPositioning ||
-              (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
-              anchoredEndSpace ||
-              !liveFollowEnabled ||
-              prependedAwayFromEnd ||
-              disclosureToggleSettling
-                ? false
-                : TIMELINE_MAINTAIN_SCROLL_AT_END
-            }
             maintainVisibleContentPosition={
               citationPositioning ||
               (restoringThreadPosition && rememberedPosition?.atEnd === false)
                 ? false
                 : maintainVisibleContentPosition
             }
-            maintainScrollAtEndThreshold={1}
             onScroll={handleScroll}
             className={cn(
               "scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5",

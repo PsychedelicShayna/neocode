@@ -5182,9 +5182,7 @@ export default function ChatView(props: ChatViewProps) {
   );
   const timelineScrollIntentRef = useRef<"toward-end" | "away-from-end" | null>(null);
   const timelineScrollModeRef = useRef<TimelineScrollMode>("following-end");
-  // State mirror of the follow mode refs. LegendList's maintainScrollAtEnd
-  // re-pins on its own (independent of the refs), so the timeline needs a
-  // render-visible flag to switch it off once the user scrolls away.
+  // Give MessagesTimeline a render-visible copy of the reader's follow intent.
   const [timelineLiveFollowEnabled, setTimelineLiveFollowEnabled] = useState(true);
   const pendingTimelineAnchorRef = useRef<MessageId | null>(null);
   const positionedTimelineAnchorRef = useRef<MessageId | null>(null);
@@ -5333,10 +5331,8 @@ export default function ChatView(props: ChatViewProps) {
           cancelTimelineLiveFollowForUserNavigationRef.current();
         };
         // The gestures below must only break follow when they can actually
-        // move the viewport away from the live edge. Follow now gates
-        // LegendList's maintainScrollAtEnd, so a spurious break while pinned
-        // at the end produces no scroll event, never re-arms, and streaming
-        // silently stops following. Underflowing content can't scroll at all,
+        // move the viewport away from the live edge. A spurious break while pinned
+        // produces no scroll event to re-arm following. Underflowing content can't scroll at all,
         // so nothing there should break follow.
         const contentScrollsUp = () => timelineRealContentOverflowsViewport();
         // The follow re-arm band, not the strict flag: streaming growth makes
@@ -5537,9 +5533,8 @@ export default function ChatView(props: ChatViewProps) {
     }
   }, []);
 
-  // Anchored end space intentionally disables LegendList's normal end-follow so
-  // the sent message can stay near the top. T3 only owns streaming adjustments
-  // during that mode; LegendList owns ordinary end-follow everywhere else.
+  // Anchored end space disables ordinary end-follow so the sent message stays
+  // near the top. ChatView owns the streaming adjustments only in this mode.
   useEffect(() => {
     if (!activeThread?.id) {
       return;

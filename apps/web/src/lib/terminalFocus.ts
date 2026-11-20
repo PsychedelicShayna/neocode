@@ -16,6 +16,55 @@ export function isTerminalFocused(): boolean {
   return getTerminalFocusOwner() !== null;
 }
 
+/** One terminal, identified as its viewport names it. */
+export interface TerminalIdentity {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly terminalId: string;
+}
+
+function readFocusedTerminal(): TerminalIdentity | null {
+  if (typeof document === "undefined") return null;
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof HTMLElement) || !activeElement.isConnected) return null;
+  const viewport = activeElement.closest<HTMLElement>("[data-terminal-id]");
+  const { terminalId, terminalThreadId, terminalEnvironmentId } = viewport?.dataset ?? {};
+  if (!terminalId || !terminalThreadId || !terminalEnvironmentId) return null;
+  return { environmentId: terminalEnvironmentId, threadId: terminalThreadId, terminalId };
+}
+
+let lastFocusedTerminal: TerminalIdentity | null = null;
+if (typeof document !== "undefined") {
+  document.addEventListener(
+    "focusin",
+    () => {
+      lastFocusedTerminal = readFocusedTerminal() ?? lastFocusedTerminal;
+    },
+    true,
+  );
+}
+
+/**
+ * The terminal that has focus, or else the one that had it last. The Ex line
+ * acts on this one; the caller checks that it still exists.
+ */
+export function getLastFocusedTerminal(): TerminalIdentity | null {
+  return readFocusedTerminal() ?? lastFocusedTerminal;
+}
+
+/**
+ * A terminal was closed: the record of it having had focus dies with it, so a
+ * terminal later created under the same id is never taken for it.
+ */
+export function forgetFocusedTerminal(terminal: TerminalIdentity): void {
+  if (
+    lastFocusedTerminal?.environmentId === terminal.environmentId &&
+    lastFocusedTerminal.threadId === terminal.threadId &&
+    lastFocusedTerminal.terminalId === terminal.terminalId
+  )
+    lastFocusedTerminal = null;
+}
+
 /**
  * Whether a terminal's own keyboard input has focus, so every key belongs to
  * the program running in it. Focus on a terminal's toolbar or tab list does

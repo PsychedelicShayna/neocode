@@ -5,6 +5,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
+import { isExLineFocused, isGuardedRepeat } from "../../lib/exLineFocus";
 import { isTerminalInputFocused } from "../../lib/terminalFocus";
 import type { ChatComposerHandle } from "../chat/ChatComposer";
 import type {
@@ -134,7 +135,9 @@ export function useNativeDictation(input: {
   useEffect(() => {
     if (!capture) return;
     const cancel = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || isTerminalInputFocused()) return;
+      if (event.key !== "Escape" || isTerminalInputFocused() || isExLineFocused()) return;
+      // The Escape that just closed the Ex line is still held; its repeats do not discard dictation.
+      if (isGuardedRepeat(event)) return;
       event.preventDefault();
       event.stopPropagation();
       stop(true);

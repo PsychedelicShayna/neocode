@@ -20,20 +20,16 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import type { ComposerImageAttachment } from "~/composerDraftStore";
-import { isCommandPaletteOpen } from "~/commandPaletteBus";
 import { requestConfirmDialog } from "~/confirmDialog";
-import { isElectron } from "~/env";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
-import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
+import { useCommandHandlers, type CommandInvocation } from "~/commandTable";
+import { shortcutLabelForCommand } from "~/keybindings";
+import { isModalSurfaceOpen } from "~/lib/exLineFocus";
 import { getTerminalFocusOwner } from "~/lib/terminalFocus";
-import { isPreviewFocused } from "~/lib/previewFocus";
-import { confirmTerminalClose, isTerminalCloseConfirmPending } from "~/lib/terminalCloseConfirm";
-import {
-  preventRepeatedTerminalCloseShortcut,
-  preventTerminalCloseShortcut,
-} from "~/lib/terminalCloseShortcut";
+import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import type { TerminalContextSelection } from "~/lib/terminalContext";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
 import {
@@ -71,9 +67,12 @@ import { subscribePreviewAction } from "../preview/previewActionBus";
 import { ThreadPreviewMiniPlayer } from "../preview/ThreadPreviewMiniPlayer";
 import { usePreviewSession } from "../preview/usePreviewSession";
 import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
+import { closeNativeTerminal } from "./closeNativeTerminal";
+import { ExLine } from "./ExLine";
+import { ExLineAnchorContext } from "./ExLineAnchor";
 import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
-import { isNativeSessionCommand, type NativeSessionCommand } from "./nativeSessionShortcuts";
 import { useNativePendingFiles } from "./useNativePendingFiles";
+import { useNativeWorkspaceKeys } from "./useNativeWorkspaceKeys";
 
 /** Escape belongs to these while one is open; it must not also interrupt the turn. */
 const ESCAPE_OWNING_OVERLAYS = [
@@ -113,7 +112,6 @@ export function NativeSessionWorkspacePanels({
   onTreeNavigated,
   onOpenModels,
   onInterrupt,
-  onNativeCommand,
   busy,
   onToggleDictation,
   dictationActive,
@@ -138,8 +136,6 @@ export function NativeSessionWorkspacePanels({
   onTreeNavigated: (result: Record<string, unknown>) => void;
   onOpenModels: () => void;
   onInterrupt: () => void;
-  /** Runs a keybinding command that only the native session implements. */
-  onNativeCommand: (command: NativeSessionCommand) => void;
   busy: boolean;
   /** Absent outside the desktop app, which has no microphone control. */
   onToggleDictation: (() => void) | undefined;
@@ -199,7 +195,11 @@ export function NativeSessionWorkspacePanels({
   const [maximized, setMaximized] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const drawerRef = useRef<NativeSessionTerminalHandle | null>(null);
-  const panelRef = useRef<NativeSessionTerminalHandle | null>(null);
+  /** Every right-panel terminal surface's controller, by surface id. */
+  const panelControllers = useRef(new Map<string, NativeSessionTerminalHandle>());
+  const [exLineOpen, setExLineOpen] = useState(false);
+  const exLineInputRef = useRef<HTMLInputElement>(null);
+  const [statusBarRow, setStatusBarRow] = useState<HTMLDivElement | null>(null);
   const sheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
   const activeSurface =
     panel.surfaces.find((surface) => surface.id === panel.activeSurfaceId) ??
@@ -295,16 +295,16 @@ export function NativeSessionWorkspacePanels({
         if (surface.kind === "terminal") {
           let failed = false;
           for (const terminalId of surface.terminalIds) {
-            const result = await closeTerminal({
-              environmentId: target.environmentId,
-              input: { threadId: resourceId, terminalId, deleteHistory: true },
+            const result = await closeNativeTerminal({
+              close: closeTerminal,
+              target,
+              threadId: resourceId,
+              terminalId,
+              surfaceId: surface.id,
             });
             if (result._tag === "Failure") {
               report(squashAtomCommandFailure(result));
               failed = true;
-            } else {
-              useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
-              useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
             }
           }
           if (failed) continue;
@@ -336,140 +336,176 @@ export function NativeSessionWorkspacePanels({
       }),
     [target],
   );
-  useEffect(() => {
-    const handle = (event: KeyboardEvent) => {
-      if (
-        preventRepeatedTerminalCloseShortcut(event, keybindings) ||
-        (isTerminalCloseConfirmPending() && preventTerminalCloseShortcut(event, keybindings))
-      ) {
-        event.stopPropagation();
-        return;
-      }
-      if (isCommandPaletteOpen()) return;
-      const terminalFocus = getTerminalFocusOwner();
-      if (event.defaultPrevented && terminalFocus === null) return;
-      const command = resolveShortcutCommand(event, keybindings, {
-        context: {
-          terminalFocus: terminalFocus !== null,
-          terminalOpen: terminalUi.terminalOpen,
-          previewFocus: isPreviewFocused(),
-          previewOpen: panel.isOpen && activeSurface?.kind === "preview",
-          modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
-          editableFocus:
-            event.target instanceof HTMLElement &&
-            Boolean(event.target.closest("input,textarea,select,[contenteditable=true]")),
-          isWeb: !isElectron,
-          isDesktop: isElectron,
-          nativeSession: true,
-          composerFocus:
-            event.target instanceof HTMLElement &&
-            event.target.closest("[data-composer-rich-text]") !== null,
-        },
-      });
-      let action: (() => void) | null = null;
-      const terminalController =
-        terminalFocus === "right-panel" ? panelRef.current : drawerRef.current;
-      switch (command) {
-        case "terminal.toggle":
-          action = () =>
-            useTerminalUiStateStore.getState().setTerminalOpen(target, !terminalUi.terminalOpen);
-          break;
-        case "rightPanel.toggle":
-          action = () => useRightPanelStore.getState().toggleVisibility(target);
-          break;
-        case "rightPanel.toggleMaximized":
-          action = () => setMaximized((value) => !value);
-          break;
-        case "rightPanel.close":
-          if (panel.isOpen && activeSurface) action = () => void closeSurfaces([activeSurface]);
-          break;
-        case "terminal.new":
-          if (cwd)
-            action = () => {
-              if (terminalFocus === "right-panel") createTerminal();
-              else {
-                useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-                terminalController?.newTerminal();
-              }
-            };
-          break;
-        case "terminal.split":
-        case "terminal.splitVertical":
-          if (cwd)
-            action = () => {
-              if (terminalFocus !== "right-panel")
-                useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-              terminalController?.splitTerminal(
-                command === "terminal.splitVertical" ? "vertical" : "horizontal",
-              );
-            };
-          break;
-        case "terminal.close":
-          if (terminalFocus || terminalUi.terminalOpen)
-            action = () => terminalController?.closeActiveTerminal();
-          break;
-        case "diff.toggle":
-          if (gitStatus.data?.isRepo)
-            action = () => useRightPanelStore.getState().toggle(target, "diff");
-          break;
-        case "modelPicker.toggle":
-          action = onOpenModels;
-          break;
-        case "composer.effort":
-        case "composer.mode":
-          action = () => composerRef.current?.openControl(command);
-          break;
-        case "composer.dictation.toggle":
-          action = onToggleDictation ?? null;
-          break;
-        case "agents.panel.toggle":
-          action = () => useRightPanelStore.getState().toggle(target, "agents");
-          break;
-        case "agents.hub.toggle":
-          action = () => useAgentViewStore.getState().dispatch(key, { type: "toggleHub" });
-          break;
-        case "thread.stop":
-          // The hub and an opened agent own Escape: it leaves them, never interrupts the session behind.
-          if (
-            busy &&
-            !agentViewActive &&
-            !dictationActive &&
-            !event.isComposing &&
-            !composerRef.current?.isMenuOpen() &&
-            !document.querySelector(ESCAPE_OWNING_OVERLAYS)
-          )
-            action = onInterrupt;
-          break;
-        default:
-          if (isNativeSessionCommand(command)) action = () => onNativeCommand(command);
-          break;
-      }
-      if (!action) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (!event.repeat) action();
-    };
-    window.addEventListener("keydown", handle, true);
-    return () => window.removeEventListener("keydown", handle, true);
-  }, [
-    target,
-    keybindings,
-    terminalUi.terminalOpen,
-    panel.isOpen,
-    activeSurface,
-    composerRef,
-    cwd,
-    createTerminal,
-    closeSurfaces,
-    gitStatus.data?.isRepo,
-    onOpenModels,
-    onNativeCommand,
-    onInterrupt,
-    busy,
-    onToggleDictation,
-    dictationActive,
-    agentViewActive,
-  ]);
+  // A keybinding or palette item acts on the terminal where focus is, the drawer
+  // unless the right panel's terminal has it. The Ex line names the terminal
+  // focused last instead, which must still exist in this workspace.
+  const focusedTerminalController = () =>
+    getTerminalFocusOwner() === "right-panel"
+      ? (panelControllers.current.get(activeSurface?.id ?? "") ?? null)
+      : drawerRef.current;
+  const locateTerminal = (invocation: CommandInvocation | undefined) => {
+    const terminal = invocation?.terminal;
+    if (
+      !terminal ||
+      terminal.environmentId !== target.environmentId ||
+      terminal.threadId !== resourceId
+    )
+      return null;
+    const surface = panel.surfaces.find(
+      (candidate) =>
+        candidate.kind === "terminal" && candidate.terminalIds.includes(terminal.terminalId),
+    );
+    if (surface) return { surfaceId: surface.id, terminalId: terminal.terminalId };
+    return terminalUi.terminalIds.includes(terminal.terminalId)
+      ? { surfaceId: null, terminalId: terminal.terminalId }
+      : null;
+  };
+  const splitTerminal = (
+    direction: "horizontal" | "vertical",
+    invocation: CommandInvocation | undefined,
+  ) => {
+    const located = locateTerminal(invocation);
+    if (located?.surfaceId) {
+      useRightPanelStore.getState().activateSurface(target, located.surfaceId);
+      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction);
+      return;
+    }
+    if (located) {
+      useTerminalUiStateStore.getState().setActiveTerminal(target, located.terminalId);
+      useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+      drawerRef.current?.splitTerminal(direction);
+      return;
+    }
+    if (getTerminalFocusOwner() !== "right-panel")
+      useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+    focusedTerminalController()?.splitTerminal(direction);
+  };
+  useCommandHandlers("workspace", {
+    "terminal.toggle": {
+      label: "Toggle terminal",
+      available: () => true,
+      run: () =>
+        useTerminalUiStateStore.getState().setTerminalOpen(target, !terminalUi.terminalOpen),
+    },
+    "rightPanel.toggle": {
+      label: "Toggle right panel",
+      available: () => true,
+      run: () => useRightPanelStore.getState().toggleVisibility(target),
+    },
+    "rightPanel.toggleMaximized": {
+      label: "Maximize right panel",
+      available: () => true,
+      run: () => setMaximized((value) => !value),
+    },
+    "rightPanel.close": {
+      label: "Close right panel tab",
+      available: () => panel.isOpen && activeSurface !== null,
+      run: () => {
+        if (activeSurface) void closeSurfaces([activeSurface]);
+      },
+    },
+    "terminal.new": {
+      label: "New terminal",
+      available: () => cwd !== null,
+      run: (invocation) => {
+        const located = locateTerminal(invocation);
+        if (located ? located.surfaceId !== null : getTerminalFocusOwner() === "right-panel") {
+          createTerminal();
+          return;
+        }
+        useTerminalUiStateStore.getState().setTerminalOpen(target, true);
+        drawerRef.current?.newTerminal();
+      },
+    },
+    "terminal.split": {
+      label: "Split terminal",
+      available: () => cwd !== null,
+      run: (invocation) => splitTerminal("horizontal", invocation),
+    },
+    "terminal.splitVertical": {
+      label: "Split terminal vertically",
+      available: () => cwd !== null,
+      run: (invocation) => splitTerminal("vertical", invocation),
+    },
+    "terminal.close": {
+      label: "Close terminal",
+      available: (invocation) =>
+        invocation
+          ? locateTerminal(invocation) !== null
+          : getTerminalFocusOwner() !== null || terminalUi.terminalOpen,
+      run: (invocation) => {
+        if (!invocation) {
+          focusedTerminalController()?.closeActiveTerminal();
+          return;
+        }
+        const located = locateTerminal(invocation);
+        if (!located) return;
+        const controller =
+          located.surfaceId === null
+            ? drawerRef.current
+            : panelControllers.current.get(located.surfaceId);
+        controller?.closeTerminal(located.terminalId);
+      },
+    },
+    "diff.toggle": {
+      label: "Toggle diff",
+      available: () => gitStatus.data?.isRepo === true,
+      run: () => useRightPanelStore.getState().toggle(target, "diff"),
+    },
+    "modelPicker.toggle": {
+      label: "Choose model",
+      available: () => true,
+      run: onOpenModels,
+    },
+    "composer.effort": {
+      label: "Choose effort",
+      available: () => true,
+      run: () => composerRef.current?.openControl("composer.effort"),
+    },
+    "composer.mode": {
+      label: "Choose access mode",
+      available: () => true,
+      run: () => composerRef.current?.openControl("composer.mode"),
+    },
+    "composer.dictation.toggle": {
+      label: "Toggle dictation",
+      available: () => onToggleDictation !== undefined,
+      run: () => onToggleDictation?.(),
+    },
+    "agents.panel.toggle": {
+      label: "Toggle agents panel",
+      available: () => true,
+      run: () => useRightPanelStore.getState().toggle(target, "agents"),
+    },
+    "agents.hub.toggle": {
+      label: "Toggle Agent Hub",
+      available: () => true,
+      run: () => useAgentViewStore.getState().dispatch(key, { type: "toggleHub" }),
+    },
+    "thread.stop": {
+      label: "Stop the running turn",
+      // The hub and an opened agent own Escape: it leaves them, never interrupts the session behind.
+      available: () =>
+        busy &&
+        !agentViewActive &&
+        !dictationActive &&
+        !composerRef.current?.isMenuOpen() &&
+        !document.querySelector(ESCAPE_OWNING_OVERLAYS),
+      run: onInterrupt,
+    },
+    "exLine.open": {
+      label: "Open command line",
+      // A modal keeps the keyboard, so the line could not take it.
+      available: () => !isModalSurfaceOpen(),
+      // Asked for again while open, it takes the keyboard back.
+      run: () => (exLineInputRef.current ? exLineInputRef.current.focus() : setExLineOpen(true)),
+    },
+  });
+  useNativeWorkspaceKeys(keybindings, () => ({
+    terminalOpen: terminalUi.terminalOpen,
+    previewOpen: panel.isOpen && activeSurface?.kind === "preview",
+    modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
+  }));
 
   const openFile = (path: string) => useRightPanelStore.getState().openFile(target, path);
   const active = (surface: RightPanelSurface) => panel.isOpen && activeSurface?.id === surface.id;
@@ -593,7 +629,10 @@ export function NativeSessionWorkspacePanels({
                 surface={surface}
                 visible={active(surface)}
                 onAddTerminalContext={onAddTerminalContext}
-                {...(activeSurface?.id === surface.id ? { controllerRef: panelRef } : {})}
+                controllerRef={(handle: NativeSessionTerminalHandle | null) => {
+                  if (handle) panelControllers.current.set(surface.id, handle);
+                  else panelControllers.current.delete(surface.id);
+                }}
               />
             </div>
           ) : surface.kind === "file" || surface.kind === "files" ? (
@@ -696,7 +735,7 @@ export function NativeSessionWorkspacePanels({
           data-workspace-file-drag-active={dragActive || undefined}
         >
           <div className="flex min-h-0 flex-1 flex-col" inert={agentViewActive}>
-            {children}
+            <ExLineAnchorContext value={setStatusBarRow}>{children}</ExLineAnchorContext>
           </div>
           <NativeAgentOverlay target={target} viewKey={key} cwd={cwd} />
           {miniPlayer ? (
@@ -728,6 +767,23 @@ export function NativeSessionWorkspacePanels({
         ) : (
           tabs
         )}
+        {exLineOpen
+          ? (() => {
+              const line = (
+                <ExLine
+                  inputRef={exLineInputRef}
+                  activePanelSurfaceIsTerminal={panel.isOpen && activeSurface?.kind === "terminal"}
+                  onClose={() => setExLineOpen(false)}
+                />
+              );
+              // Over the status bar's row, wherever the drawer puts it. A maximised
+              // panel hides that row and the Agent Hub makes it inert; then the line
+              // is laid over the foot of the workspace, which stays on screen.
+              const statusBarShown =
+                statusBarRow !== null && !agentViewActive && !(maximized && panel.isOpen && !sheet);
+              return statusBarShown ? createPortal(line, statusBarRow) : line;
+            })()
+          : null}
       </div>
     </div>
   );

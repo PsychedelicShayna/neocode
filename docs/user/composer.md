@@ -12,8 +12,9 @@ in place.
 
 At the end of the conversation, NeoCode keeps the latest text in view as the
 reply streams. Scroll up to read earlier text without being pulled back down.
-Scroll back to the end, or press `End` with focus outside the composer, to resume
-following the reply.
+Scroll back to the end, or press `End` while focus is on the page or the
+conversation, to resume following the reply. In a text field, `End` moves the
+caret as usual.
 
 To give a long draft more room, drag the composer's top edge, or focus **Resize
 prompt** with `Tab` and use `Up` or `Down`. The chosen height is remembered but

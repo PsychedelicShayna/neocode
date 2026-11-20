@@ -246,7 +246,15 @@ function ContextMeter({
  * come from the shared projection's state key; a value NeoPi did not report is
  * left out rather than guessed.
  */
-export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget }) {
+export function NativeSessionStatusBar({
+  target,
+  tuiOpen,
+  onToggleTui,
+}: {
+  target: NativeSessionTarget;
+  tuiOpen: boolean;
+  onToggleTui: () => void;
+}) {
   const state = useNativeSessionSlice(target, selectState);
   const cwd = useNativeSessionSlice(target, selectCwd);
   const disconnected = useNativeSessionSlice(target, selectDisconnected);
@@ -330,6 +338,15 @@ export function NativeSessionStatusBar({ target }: { target: NativeSessionTarget
         <SubagentChip target={target} />
         <JobsChip target={target} reportedRunning={facts?.runningJobCount ?? null} />
       </span>
+      <button
+        type="button"
+        aria-label={tuiOpen ? "Hide NeoPi TUI" : "Show NeoPi TUI"}
+        aria-pressed={tuiOpen}
+        onClick={onToggleTui}
+        className="shrink-0 rounded px-1.5 font-semibold hover:bg-muted hover:text-foreground aria-pressed:text-foreground"
+      >
+        TUI
+      </button>
     </div>
   );
 }

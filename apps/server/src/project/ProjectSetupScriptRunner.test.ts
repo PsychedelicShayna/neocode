@@ -65,6 +65,7 @@ type TerminalOverrides = Pick<TerminalManager.TerminalManager["Service"], "open"
 
 const makeTerminalManagerLayer = (overrides: TerminalOverrides) =>
   Layer.succeed(TerminalManager.TerminalManager, {
+    openTmuxView: () => Effect.die(new Error("unused")),
     attachStream: () => Effect.die(new Error("unused")),
     getSnapshot: () => Effect.succeed(null),
     resize: () => Effect.void,

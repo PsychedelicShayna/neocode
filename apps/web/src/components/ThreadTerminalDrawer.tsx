@@ -23,7 +23,12 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-react";
-import { type ContextMenuItem, type ProviderInstanceId } from "@t3tools/contracts";
+import {
+  MANAGED_TMUX_TERMINAL_ID,
+  type ContextMenuItem,
+  type NeoPiNativeSessionRef,
+  type ProviderInstanceId,
+} from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import * as Schema from "effect/Schema";
 import {
@@ -336,6 +341,7 @@ interface TerminalViewportProps {
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   providerInstanceId?: ProviderInstanceId;
+  managedTmux?: NeoPiNativeSessionRef;
   onSessionExited: () => void;
   onAddTerminalContext?: (selection: TerminalContextSelection) => void;
   focusRequestId: number;
@@ -360,6 +366,7 @@ export function TerminalViewport({
   worktreePath,
   runtimeEnv,
   providerInstanceId,
+  managedTmux,
   onSessionExited,
   onAddTerminalContext,
   focusRequestId,
@@ -372,7 +379,10 @@ export function TerminalViewport({
   const terminalRef = useRef<GhosttyTerminalSurface | null>(null);
   const visibleRef = useRef(visible);
   const environmentId = threadRef.environmentId;
-  const threadId = useMemo(() => workspaceResourceId(threadRef), [threadRef]);
+  const threadId = useMemo(() => {
+    const id = workspaceResourceId(threadRef);
+    return managedTmux ? `${MANAGED_TMUX_TERMINAL_ID}:${id}` : id;
+  }, [managedTmux, threadRef]);
   const shellProviderInstanceId =
     providerInstanceId ?? ("ref" in threadRef ? threadRef.ref.providerInstanceId : undefined);
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
@@ -440,10 +450,14 @@ export function TerminalViewport({
     terminal: {
       threadId,
       terminalId,
-      cwd,
-      ...(worktreePath !== undefined ? { worktreePath } : {}),
-      ...(runtimeEnv ? { env: runtimeEnv } : {}),
-      ...(shellProviderInstanceId ? { providerInstanceId: shellProviderInstanceId } : {}),
+      ...(managedTmux
+        ? { managedTmux }
+        : {
+            cwd,
+            ...(worktreePath !== undefined ? { worktreePath } : {}),
+            ...(runtimeEnv ? { env: runtimeEnv } : {}),
+            ...(shellProviderInstanceId ? { providerInstanceId: shellProviderInstanceId } : {}),
+          }),
     },
   });
   const writeTerminal = useEffectEvent((data: string) =>
@@ -1013,14 +1027,24 @@ export function TerminalViewport({
     };
   }, [drawerHeight, environmentId, resizeEpoch, terminalId, threadId]);
   return (
-    <div
-      ref={containerRef}
-      tabIndex={-1}
-      data-terminal-id={terminalId}
-      data-terminal-thread-id={threadId}
-      data-terminal-environment-id={environmentId}
-      className="relative h-full w-full overflow-hidden bg-(--terminal-background)"
-    />
+    <>
+      <div
+        ref={containerRef}
+        tabIndex={-1}
+        data-terminal-id={terminalId}
+        data-terminal-thread-id={threadId}
+        data-terminal-environment-id={environmentId}
+        className="relative h-full w-full overflow-hidden bg-(--terminal-background)"
+      />
+      {managedTmux && terminalError ? (
+        <p
+          role="alert"
+          className="absolute inset-x-0 top-0 bg-background px-3 py-2 text-sm text-destructive"
+        >
+          {terminalError}
+        </p>
+      ) : null}
+    </>
   );
 }
 

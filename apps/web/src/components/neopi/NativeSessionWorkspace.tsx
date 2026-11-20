@@ -54,6 +54,7 @@ import { SidebarInset } from "../ui/sidebar";
 import { Dialog, DialogPopup, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { ExLineAnchor } from "./ExLineAnchor";
 import { NativeSessionStatusBar } from "./NativeSessionStatusBar";
+import { NativeManagedTuiView } from "./NativeSessionTerminal";
 import { NativeSessionTabBar } from "./NativeSessionTabBar";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
 import { NativeTimelineView, nativeTimelineKey } from "./NativeTimelineView";
@@ -216,8 +217,10 @@ export function NativeSessionView({
   const { feed, session, conversation, request, error } = useNativeSession(target);
   // Dismissing hides that one message; a different failure shows again.
   const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const [tuiOpenFor, setTuiOpenFor] = useState<string | null>(null);
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const key = nativeSessionKey(target);
+  const tuiOpen = tuiOpenFor === key;
   const assistantName = agentIdentity(
     nativeSessionIdentityKey({
       sessionId: session?.sessionId,
@@ -1081,8 +1084,15 @@ export function NativeSessionView({
             onReturnFocus={focusComposer}
           />
         </ComposerSurface.Shell>
+        {tuiOpen ? (
+          <NativeManagedTuiView key={key} target={target} cwd={session?.cwd ?? ""} />
+        ) : null}
         <ExLineAnchor>
-          <NativeSessionStatusBar target={target} />
+          <NativeSessionStatusBar
+            target={target}
+            tuiOpen={tuiOpen}
+            onToggleTui={() => setTuiOpenFor(tuiOpen ? null : key)}
+          />
         </ExLineAnchor>
       </NativeSessionWorkspacePanels>
       {expandedImage ? (

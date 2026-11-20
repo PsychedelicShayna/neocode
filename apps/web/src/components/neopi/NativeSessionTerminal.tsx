@@ -1,5 +1,6 @@
 import { workspaceKey, workspaceResourceId } from "@t3tools/client-runtime/environment";
 import type { NativeSessionTarget } from "@t3tools/client-runtime/neopi-native-sessions";
+import { MANAGED_TMUX_TERMINAL_ID } from "@t3tools/contracts";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
 import {
   useCallback,
@@ -15,7 +16,7 @@ import { useKnownTerminalSessions } from "~/state/terminalSessions";
 import { terminalEnvironment } from "~/state/terminal";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "~/terminalUiStateStore";
-import ThreadTerminalDrawer from "../ThreadTerminalDrawer";
+import ThreadTerminalDrawer, { TerminalViewport } from "../ThreadTerminalDrawer";
 import {
   selectThreadRightPanelState,
   useRightPanelStore,
@@ -51,6 +52,38 @@ export interface NativeSessionTerminalProps {
 /** A native workspace uses the stock drawer and PTY lifecycle, never SQL session state. */
 export function NativeSessionTerminal(props: NativeSessionTerminalProps) {
   return <NativeSessionTerminalBody key={workspaceKey(props.target)} {...props} />;
+}
+
+/** Mounting the TUI subscribes to its client PTY; unmounting detaches only that client. */
+export function NativeManagedTuiView({
+  target,
+  cwd,
+}: {
+  target: NativeSessionTarget;
+  cwd: string;
+}) {
+  return (
+    <section
+      aria-label="Managed NeoPi TUI"
+      data-thread-terminal-drawer
+      className="relative h-[min(40dvh,24rem)] shrink-0 overflow-hidden border-t border-border"
+    >
+      <TerminalViewport
+        advancedTypography={false}
+        threadRef={target}
+        terminalId={MANAGED_TMUX_TERMINAL_ID}
+        terminalLabel="NeoPi TUI"
+        managedTmux={target.ref}
+        cwd={cwd}
+        onSessionExited={() => {}}
+        focusRequestId={0}
+        autoFocus
+        visible
+        resizeEpoch={0}
+        drawerHeight={0}
+      />
+    </section>
+  );
 }
 
 function NativeSessionTerminalBody({

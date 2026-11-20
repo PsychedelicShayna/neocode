@@ -616,6 +616,44 @@ describe("canonical native session lifecycle", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("opens the managed graphical view via the attach-only connection", () =>
+    Effect.gen(function* () {
+      const { native, dependencies } = yield* fixture("terminal");
+      const owner = {
+        session: "$0",
+        window: "@0",
+        pane: "%0",
+        pid: 123,
+        instanceId: "control-instance",
+        imageId: "control-image",
+        sessionId: native.sessionId,
+      };
+      const executable = "/usr/bin/tmux";
+      const args = ["-N", "-S", "/private/owner.sock", "attach-session", "-E", "-t", "$0"];
+      const modes: Array<string | undefined> = [];
+      const service = yield* makeNeoPiNativeSessionsWith({
+        ...dependencies,
+        managedTmuxView: () => Effect.succeed({ owner, executable, args }),
+        connect: (profile, input, observer, mode) => {
+          modes.push(mode);
+          return dependencies
+            .connect(profile, input, observer, mode)
+            .pipe(Effect.map((connection) => ({ ...connection, managedTmux: owner })));
+        },
+      });
+      assert.deepEqual(yield* service.managedTmuxView(originalRef), {
+        cwd: native.cwd,
+        executable,
+        args,
+      });
+      assert.deepEqual(modes, ["attach"]);
+      yield* service.close({ ref: originalRef });
+      assert.equal(native.detaches, 1);
+      assert.equal(native.disposals, 0);
+      assert.equal(native.running, true);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "keeps native-created lazy identities discoverable without a project or persisted journal",
     () =>

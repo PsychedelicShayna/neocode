@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   DEFAULT_TERMINAL_ID,
+  MANAGED_TMUX_TERMINAL_ID,
   type TerminalAttachStreamEvent,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
@@ -416,6 +417,44 @@ it.layer(
   Layer.merge(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
   { excludeTestServices: true },
 )("TerminalManager", (it) => {
+  it.effect("shares one attach-only client until the last scoped TUI view closes", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = openInput({ terminalId: MANAGED_TMUX_TERMINAL_ID });
+      const args = ["-N", "-S", "/private/tmux.sock", "attach-session", "-E", "-t", "$2"];
+      yield* Effect.gen(function* () {
+        yield* manager.openTmuxView(input, { executable: "/usr/bin/tmux", args });
+        yield* manager
+          .openTmuxView(input, { executable: "/usr/bin/tmux", args })
+          .pipe(Effect.scoped);
+        expect(ptyAdapter.spawnInputs).toHaveLength(1);
+        expect(ptyAdapter.spawnInputs[0]).toMatchObject({ shell: "/usr/bin/tmux", args });
+        expect(ptyAdapter.processes[0]?.killed).toBe(false);
+      }).pipe(Effect.scoped);
+      expect(ptyAdapter.processes[0]?.killed).toBe(true);
+      expect(yield* manager.getSnapshot(input)).toBeNull();
+      yield* manager.openTmuxView(input, { executable: "/usr/bin/tmux", args }).pipe(Effect.scoped);
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    }),
+  );
+
+  it.effect("cannot start a reserved managed view as a shell through generic terminal calls", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const input = openInput({ terminalId: MANAGED_TMUX_TERMINAL_ID });
+      assert.equal((yield* Effect.flip(manager.open(input)))._tag, "TerminalManagedTmuxError");
+      assert.equal(
+        (yield* Effect.flip(manager.restart(restartInput({ terminalId: input.terminalId }))))._tag,
+        "TerminalManagedTmuxError",
+      );
+      assert.equal(
+        (yield* Effect.flip(manager.attachStream(input, () => Effect.void)))._tag,
+        "TerminalSessionLookupError",
+      );
+      expect(ptyAdapter.spawnInputs).toHaveLength(0);
+    }),
+  );
+
   it.effect("spawns lazily and reuses running terminal per thread", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();

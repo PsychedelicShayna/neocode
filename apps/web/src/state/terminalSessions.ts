@@ -124,9 +124,12 @@ export function useAttachedTerminalSession(input: {
   readonly environmentId: EnvironmentId | null;
   readonly terminal: TerminalAttachInput | null;
 }): TerminalSessionState {
+  const attachAtom = input.terminal?.managedTmux
+    ? terminalEnvironment.attachManagedTmux
+    : terminalEnvironment.attach;
   const attach = useEnvironmentQuery(
     input.environmentId !== null && input.terminal !== null
-      ? terminalEnvironment.attach({
+      ? attachAtom({
           environmentId: input.environmentId,
           input: input.terminal,
         })

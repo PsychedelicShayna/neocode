@@ -9,12 +9,14 @@
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
+  MANAGED_TMUX_TERMINAL_ID,
   TerminalCwdError,
   TerminalCwdNotDirectoryError,
   TerminalCwdNotFoundError,
   TerminalCwdStatError,
   TerminalError,
   TerminalHistoryError,
+  TerminalManagedTmuxError,
   TerminalNotRunningError,
   TerminalProviderInstanceNotFoundError,
   TerminalProviderEnvironmentError,
@@ -150,6 +152,11 @@ export class TerminalManager extends Context.Service<
     readonly open: (
       input: TerminalOpenInput,
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
+    /** A server-resolved tmux client, owned only while its view stream is subscribed. */
+    readonly openTmuxView: (
+      input: TerminalOpenInput,
+      target: { readonly executable: string; readonly args: string[] },
+    ) => Effect.Effect<void, TerminalError, Scope.Scope>;
 
     /**
      * Attach to a terminal and stream its initial snapshot followed by live events.
@@ -296,6 +303,7 @@ interface TerminalSessionState {
   /** Normalized child command name when `hasRunningSubprocess`; cleared when idle. */
   childCommandLabel: string | null;
   runtimeEnv: Record<string, string> | null;
+  tmuxClient?: ShellCandidate;
 }
 
 interface PersistHistoryRequest {
@@ -2227,8 +2235,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       increment(terminalSessionsTotal, { lifecycle: eventType }).pipe(
         Effect.andThen(
           Effect.gen(function* () {
-            const shellCandidates = resolveShellCandidates(shellResolver, platform, baseEnv);
+            const shellCandidates = session.tmuxClient
+              ? [session.tmuxClient]
+              : resolveShellCandidates(shellResolver, platform, baseEnv);
             const terminalEnv = createTerminalSpawnEnv(baseEnv, session.runtimeEnv);
+            if (session.tmuxClient) {
+              delete terminalEnv.TMUX;
+              delete terminalEnv.TMUX_PANE;
+            }
             const spawnResult = yield* trySpawn(shellCandidates, terminalEnv, session);
             ptyProcess = spawnResult.process;
             startedShell = spawnResult.shellLabel;
@@ -2532,6 +2546,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
     input: TerminalOpenInput,
+    tmuxClient?: ShellCandidate,
   ) {
     const terminalId = input.terminalId;
     yield* assertValidCwd(input.cwd);
@@ -2539,8 +2554,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     const sessionKey = toSessionKey(input.threadId, terminalId);
     const existing = yield* getSession(input.threadId, terminalId);
     if (Option.isNone(existing)) {
-      yield* flushPersist(input.threadId, terminalId);
-      const history = yield* readHistory(input.threadId, terminalId);
+      if (!tmuxClient) yield* flushPersist(input.threadId, terminalId);
+      const history = tmuxClient
+        ? new BoundedTerminalHistory(historyLineLimit, "", historyByteLimit)
+        : yield* readHistory(input.threadId, terminalId);
       const cols = input.cols ?? DEFAULT_OPEN_COLS;
       const rows = input.rows ?? DEFAULT_OPEN_ROWS;
       const session: TerminalSessionState = {
@@ -2567,6 +2584,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         hasRunningSubprocess: false,
         childCommandLabel: null,
         runtimeEnv: normalizedRuntimeEnv(input.env),
+        ...(tmuxClient ? { tmuxClient } : {}),
       };
 
       const createdSession = session;
@@ -2660,10 +2678,49 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     );
 
   const open: TerminalManager["Service"]["open"] = (input) =>
-    withThreadLock(
-      input.threadId,
-      resolveLaunchInputEnvironment(input).pipe(Effect.flatMap(openLocked)),
+    input.terminalId === MANAGED_TMUX_TERMINAL_ID
+      ? Effect.fail(
+          new TerminalManagedTmuxError({
+            message: "The managed terminal requires a verified tmux owner.",
+          }),
+        )
+      : withThreadLock(
+          input.threadId,
+          resolveLaunchInputEnvironment(input).pipe(Effect.flatMap(openLocked)),
+        );
+
+  const tmuxViewSubscribers = new Map<string, number>();
+  const openTmuxView: TerminalManager["Service"]["openTmuxView"] = (input, target) => {
+    const { threadId, terminalId } = input;
+    if (terminalId !== MANAGED_TMUX_TERMINAL_ID)
+      return Effect.fail(
+        new TerminalManagedTmuxError({ message: "Invalid managed tmux terminal id." }),
+      );
+    return Effect.acquireRelease(
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          yield* withWorkspaceLease(
+            path.resolve(input.cwd),
+            openWithWorkspaceLease(input, { shell: target.executable, args: target.args }),
+          );
+          tmuxViewSubscribers.set(threadId, (tmuxViewSubscribers.get(threadId) ?? 0) + 1);
+        }),
+      ),
+      () =>
+        withThreadLock(
+          threadId,
+          Effect.gen(function* () {
+            const remaining = (tmuxViewSubscribers.get(threadId) ?? 1) - 1;
+            if (remaining > 0) tmuxViewSubscribers.set(threadId, remaining);
+            else {
+              tmuxViewSubscribers.delete(threadId);
+              yield* closeSession(threadId, terminalId, true);
+            }
+          }),
+        ).pipe(Effect.ignoreCause({ log: true })),
     );
+  };
 
   const openOrAttachForStream = (input: TerminalAttachInput) =>
     withThreadLock(
@@ -2673,7 +2730,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         const existing = yield* getSession(input.threadId, terminalId);
 
         if (Option.isNone(existing)) {
-          if (!input.cwd) {
+          if (!input.cwd || terminalId === MANAGED_TMUX_TERMINAL_ID) {
             return yield* new TerminalSessionLookupError({
               threadId: input.threadId,
               terminalId,
@@ -2692,7 +2749,12 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         const targetCols = input.cols ?? session.cols;
         const targetRows = input.rows ?? session.rows;
 
-        if (!session.process && input.cwd && input.restartIfNotRunning === true) {
+        if (
+          !session.process &&
+          input.cwd &&
+          input.restartIfNotRunning === true &&
+          !session.tmuxClient
+        ) {
           const resolvedInput = yield* resolveLaunchInputEnvironment({
             ...input,
             terminalId,
@@ -3029,17 +3091,23 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     });
 
   const restart: TerminalManager["Service"]["restart"] = (input) =>
-    withThreadLock(
-      input.threadId,
-      resolveLaunchInputEnvironment(input).pipe(
-        Effect.flatMap((resolved) =>
-          withWorkspaceLease(
-            path.resolve(resolved.worktreePath ?? resolved.cwd),
-            restartResolved(resolved),
+    input.terminalId === MANAGED_TMUX_TERMINAL_ID
+      ? Effect.fail(
+          new TerminalManagedTmuxError({
+            message: "Reconnect the managed TUI view to revalidate its owner.",
+          }),
+        )
+      : withThreadLock(
+          input.threadId,
+          resolveLaunchInputEnvironment(input).pipe(
+            Effect.flatMap((resolved) =>
+              withWorkspaceLease(
+                path.resolve(resolved.worktreePath ?? resolved.cwd),
+                restartResolved(resolved),
+              ),
+            ),
           ),
-        ),
-      ),
-    );
+        );
 
   const close: TerminalManager["Service"]["close"] = (input) =>
     withThreadLock(
@@ -3111,6 +3179,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   return TerminalManager.of({
     open,
+    openTmuxView,
     attachStream,
     getSnapshot: (input) =>
       getSession(input.threadId, input.terminalId).pipe(

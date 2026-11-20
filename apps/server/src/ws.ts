@@ -19,6 +19,8 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
+  MANAGED_TMUX_TERMINAL_ID,
+  TerminalManagedTmuxError,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
@@ -77,6 +79,7 @@ import {
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import { nativeWorkspaceResourceId } from "@t3tools/shared/neopiWorkspace";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
@@ -3520,7 +3523,29 @@ const makeWsRpcLayer = (
         [WS_METHODS.terminalAttach]: (input) =>
           observeRpcStream(
             WS_METHODS.terminalAttach,
-            terminalAttachStream(terminalManager, input),
+            input.managedTmux
+              ? Stream.unwrap(
+                  Effect.gen(function* () {
+                    const ref = input.managedTmux!;
+                    const threadId = `${MANAGED_TMUX_TERMINAL_ID}:${nativeWorkspaceResourceId(ref)}`;
+                    const terminalId = MANAGED_TMUX_TERMINAL_ID;
+                    if (input.threadId !== threadId || input.terminalId !== terminalId)
+                      return yield* new TerminalManagedTmuxError({
+                        message: "Invalid managed TUI view identity.",
+                      });
+                    const target = yield* neopiNativeSessions
+                      .managedTmuxView(ref)
+                      .pipe(
+                        Effect.mapError(
+                          (error) => new TerminalManagedTmuxError({ message: error.message }),
+                        ),
+                      );
+                    const identity = { threadId, terminalId };
+                    yield* terminalManager.openTmuxView({ ...identity, cwd: target.cwd }, target);
+                    return terminalAttachStream(terminalManager, identity);
+                  }),
+                )
+              : terminalAttachStream(terminalManager, input),
             { "rpc.aggregate": "terminal" },
           ),
         [WS_METHODS.terminalWrite]: (input) =>

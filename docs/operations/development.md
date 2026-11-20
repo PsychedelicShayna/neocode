@@ -35,6 +35,36 @@ Read ports from the `[dev-runner]` output. Worktrees derive stable preferences f
 but occupied ports can shift them. `T3CODE_PORT_OFFSET` or `T3CODE_DEV_INSTANCE` can select a
 different preference when needed.
 
+### Attach a prestarted NeoPi TUI
+
+On a Unix host with `/usr/bin/tmux`, opt in by setting the NeoCode **server's**
+`T3CODE_NEOPI_MANAGED_TMUX` to a JSON binding for one existing native session:
+
+```json
+{
+  "providerInstanceId": "neopi",
+  "sessionFile": "/absolute/path/to/session.jsonl",
+  "socket": "/absolute/private/directory/neocode.sock",
+  "session": "owner"
+}
+```
+
+The dedicated socket must be in a directory owned by the server user and
+inaccessible to other users. Start the owner with the same NeoPi profile and
+control registry as the configured provider instance. Run NeoPi directly as the
+only pane in the only window of the configured tmux session; do not leave a
+wrapper process as the pane's PID. Leave control enabled. Set `exit-unattached
+off`, `destroy-unattached off`, `allow-passthrough off`, `window-size latest`,
+and `aggressive-resize off` in the dedicated tmux configuration.
+
+Open the existing native session and select **TUI** at the far right of its
+status bar. Closing the view detaches its tmux client, not the NeoPi owner.
+Reopening NeoCode rechecks the same binding. The managed path reports an
+unavailable or conflicting owner and never falls back to launching one.
+For external recovery, link the window into a separate tmux session with
+independent window selection and attach there with `-f ignore-size`; don't
+attach directly to the embedded view's session.
+
 ### Sharing and remote debugging
 
 `vp run dev --share` publishes the web port over the machine's tailnet and prints a pairing URL

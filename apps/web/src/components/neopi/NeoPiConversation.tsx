@@ -1,4 +1,5 @@
 import type { ScopedThreadRef } from "@t3tools/contracts";
+import { nativeRowKeys } from "@t3tools/client-runtime/neopi-native-sessions";
 import { projectTranscript } from "@t3tools/client-runtime/neopi-transcript";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import { useEffect, useMemo, useState } from "react";
@@ -46,6 +47,11 @@ export function NeoPiConversation({
   );
   const [debug, setDebug] = useState(false);
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
+  // A persisted message keeps its live row's key while this view is mounted, so
+  // the list's position keeping never throws a reader who scrolled up to the end.
+  const [shownRowKeys, setShownRowKeys] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const rowKeys = nativeRowKeys(conversation, shownRowKeys);
+  if (rowKeys !== shownRowKeys) setShownRowKeys(rowKeys);
   const rows = useMemo(
     () =>
       projectTranscript(
@@ -54,9 +60,9 @@ export function NeoPiConversation({
           pending: conversation.pending,
           leafId: conversation.identity?.leafId ?? null,
         },
-        { debug },
+        { debug, rowKeys },
       ),
-    [conversation.entries, conversation.pending, conversation.identity?.leafId, debug],
+    [conversation.entries, conversation.pending, conversation.identity?.leafId, debug, rowKeys],
   );
   const identity = conversation.identity;
   const assistantName = identity

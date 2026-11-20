@@ -1816,8 +1816,10 @@ function firstToolCallId(entry: NeoPiJournalEntry): string | null {
  * so its row (and what the reader expanded in it) survives the live row becoming
  * durable and any rebase; a repeated call id falls back to the entry.
  *
- * `previous` is the last result: a streaming message keeps the key it was shown
- * under when it gains its first call, and that call's rows keep it afterwards.
+ * `previous` is the last result: a row keeps the key it was shown under. A
+ * streaming message keeps it when it gains its first call, and its durable entry
+ * takes it over when the message persists, so the list never sees the row the
+ * reader is looking at removed and a new one inserted.
  */
 export function nativeTranscriptRows(
   feed: Pick<NativeSessionFeed, "conversation" | "commandOutputs">,
@@ -1829,11 +1831,14 @@ export function nativeTranscriptRows(
   const shownAs = new Map<string, string>();
   for (const row of previous) {
     if (row.kind !== "entry") continue;
-    if (row.entry.id.startsWith("live:")) shownAs.set(row.entry.id, row.id);
+    shownAs.set(row.entry.id, row.id);
     const callId = firstToolCallId(row.entry);
     // A repeated call id: the first row with it holds the call's key, as below.
     if (callId && !shownAs.has(`tool:${callId}`)) shownAs.set(`tool:${callId}`, row.id);
   }
+  const persistedFrom = new Map<string, string>();
+  for (const [messageId, entryId] of feed.conversation.persisted)
+    persistedFrom.set(entryId, `live:${messageId}`);
   // Output follows its live row until that row retires onto its durable entry.
   const live = new Set(feed.conversation.pending.map((message) => message.messageId));
   for (const output of feed.commandOutputs) {
@@ -1862,10 +1867,15 @@ export function nativeTranscriptRows(
     ) {
       const callId = firstToolCallId(entry);
       const tool = callId ? `tool:${callId}` : null;
+      const liveKey = persistedFrom.get(entry.id);
       const id =
-        [shownAs.get(entry.id), tool && shownAs.get(tool), tool].find(
-          (key): key is string => typeof key === "string" && !keys.has(key),
-        ) ?? `entry:${entry.id}`;
+        [
+          shownAs.get(entry.id),
+          liveKey && shownAs.get(liveKey),
+          tool && shownAs.get(tool),
+          tool,
+        ].find((key): key is string => typeof key === "string" && !keys.has(key)) ??
+        `entry:${entry.id}`;
       rows.push({ kind: "entry", id, entry });
       keys.add(id);
     }
@@ -1874,6 +1884,35 @@ export function nativeTranscriptRows(
     appendOutputs(entry.id);
   }
   return rows;
+}
+
+/**
+ * Row keys for the web transcript (`TranscriptOptions.rowKeys`): a durable
+ * message takes over the key its live row was shown under, so the list never
+ * sees the row the reader is looking at removed and a new one inserted. `shown`
+ * is the previous result, kept for as long as the view is mounted; the pairs
+ * outlive the conversation's own maps, across a rebase too. A new map is
+ * returned only when a key was added.
+ */
+export function nativeRowKeys(
+  conversation: NativeConversation,
+  shown: ReadonlyMap<string, string>,
+): ReadonlyMap<string, string> {
+  let next: Map<string, string> | null = null;
+  const add = (entryId: string, key: string) => {
+    next ??= new Map(shown);
+    next.set(entryId, key);
+  };
+  for (const { messageId } of conversation.pending) {
+    const live = `live:${messageId}`;
+    if (!shown.has(live)) add(live, live);
+  }
+  const current = () => next ?? shown;
+  for (const [messageId, entryId] of conversation.persisted) {
+    const key = current().get(`live:${messageId}`);
+    if (key !== undefined && !current().has(entryId)) add(entryId, key);
+  }
+  return current();
 }
 
 export interface NativeCatalogModel {

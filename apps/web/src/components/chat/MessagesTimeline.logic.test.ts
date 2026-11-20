@@ -30,6 +30,8 @@ import {
   resolveWorkGroupScrollIndex,
   rowsWerePrepended,
   scrollMovedAwayFromEnd,
+  settleUpwardGesture,
+  shouldAnchorTimelineContent,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   turnToolDisclosureKeys,
@@ -46,6 +48,39 @@ import {
   type TimelineEntriesProjection,
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
+
+describe("streaming reader anchoring", () => {
+  it.each([
+    ["above the reply", 99, true],
+    ["at the beginning of the reply", 100, true],
+    ["inside the reply", 101, false],
+    ["at the end of the reply", 900, true],
+  ] as const)("anchors appropriately %s", (_description, viewportTop, expected) => {
+    expect(
+      shouldAnchorTimelineContent({
+        following: false,
+        prepended: false,
+        disclosureSettling: false,
+        streamingRow: { top: 100, bottom: 900, viewportTop },
+      }),
+    ).toBe(expected);
+  });
+
+  it.each(["following", "prepended", "disclosureSettling"] as const)(
+    "preserves anchoring inside the reply while %s",
+    (reason) => {
+      expect(
+        shouldAnchorTimelineContent({
+          following: false,
+          prepended: false,
+          disclosureSettling: false,
+          streamingRow: { top: 100, bottom: 900, viewportTop: 800 },
+          [reason]: true,
+        }),
+      ).toBe(true);
+    },
+  );
+});
 
 describe("streaming row projection", () => {
   function fixture(text = "") {
@@ -4011,12 +4046,78 @@ describe("older history paging", () => {
   });
 
   it("treats only an upward scroll off the live edge as the reader leaving it", () => {
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: false })).toBe(true);
+    const byUser = true;
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: false, byUser })).toBe(
+      true,
+    );
     // Streaming growth under a pinned viewport raises scrollTop.
-    expect(scrollMovedAwayFromEnd({ previousTop: 700, top: 900, isAtEnd: false })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 700, top: 900, isAtEnd: false, byUser })).toBe(
+      false,
+    );
     // A small drop that stays inside the live-edge band keeps following.
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 880, isAtEnd: true })).toBe(false);
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 899.5, isAtEnd: false })).toBe(false);
-    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: undefined })).toBe(false);
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 880, isAtEnd: true, byUser })).toBe(
+      false,
+    );
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 899.5, isAtEnd: false, byUser })).toBe(
+      false,
+    );
+    expect(scrollMovedAwayFromEnd({ previousTop: 900, top: 700, isAtEnd: undefined, byUser })).toBe(
+      false,
+    );
+  });
+
+  it("does not take the list's own scroll adjustment for the reader leaving", () => {
+    // Real trace: a sudden page-metric change briefly put the end 1.2 M px away,
+    // and the list nudged scrollTop up by 4 px. No gesture preceded it.
+    expect(
+      scrollMovedAwayFromEnd({ previousTop: 39965, top: 39961, isAtEnd: false, byUser: false }),
+    ).toBe(false);
+  });
+
+  describe("settleUpwardGesture", () => {
+    it("resumes following after a nudge that stayed in the follow band", () => {
+      // A touchpad nudge of 30 px from the live edge; the view still looks at the end.
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 4970,
+          top: 4970,
+        }),
+      ).toEqual({ kind: "resume" });
+    });
+
+    it("stays where the reader put it after a real scroll up", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 3800,
+          top: 3800,
+        }),
+      ).toEqual({ kind: "stay" });
+    });
+
+    it("undoes a pin that pulled a real scroll up back down", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: true,
+          startTop: 5000,
+          highestTop: 4600,
+          top: 5100,
+        }),
+      ).toEqual({ kind: "restore", top: 4600 });
+    });
+
+    it("never resumes a gesture that began away from the end", () => {
+      expect(
+        settleUpwardGesture({
+          startedFollowing: false,
+          startTop: 2000,
+          highestTop: 1990,
+          top: 1990,
+        }),
+      ).toEqual({ kind: "stay" });
+    });
   });
 });

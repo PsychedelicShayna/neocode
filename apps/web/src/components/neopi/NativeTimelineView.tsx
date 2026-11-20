@@ -58,13 +58,12 @@ export function NativeTimelineView(props: {
     [visibleRows, props.busy, props.toolLosses, props.runPaused],
   );
   const [liveFollow, setLiveFollow] = useState(true);
-  const onIsAtEndChange = useCallback((atEnd: boolean) => {
-    if (atEnd) setLiveFollow(true);
-  }, []);
-  const onManualNavigation = useCallback(() => setLiveFollow(false), []);
-  // Nothing else tells this view the reader scrolled up, and the list re-pins
-  // to the end on every layout while follow is on.
-  useLeaveLiveEdgeOnScroll(listRef, onManualNavigation);
+  const onLeave = useCallback(() => setLiveFollow(false), []);
+  const onReturn = useCallback(() => setLiveFollow(true), []);
+  // Leaving and coming back are both read from the reader's input. Arriving at
+  // the end by itself never resumes follow: a pin already in flight when the
+  // reader left (a new message starting) lands there and must not take them back.
+  useLeaveLiveEdgeOnScroll(listRef, liveFollow, onLeave, onReturn);
   const followSignal = props.followSignal ?? 0;
   useEffect(() => {
     if (followSignal === 0) return;
@@ -97,8 +96,8 @@ export function NativeTimelineView(props: {
         onAnchorReady={noop}
         contentInsetEndAdjustment={props.composerInset ?? 0}
         liveFollowEnabled={liveFollow}
-        onIsAtEndChange={onIsAtEndChange}
-        onManualNavigation={onManualNavigation}
+        onIsAtEndChange={noop}
+        onManualNavigation={onLeave}
         loadEarlier={props.loadEarlier}
         {...(props.assistantName ? { assistantName: props.assistantName } : {})}
         {...(props.queuedMessages ? { queuedMessages: props.queuedMessages } : {})}

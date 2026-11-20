@@ -193,16 +193,72 @@ export function rowsWerePrepended(
 }
 
 /**
- * A scroll that moved the viewport up and off the live edge is the reader
- * leaving it. Growth under a pinned viewport only ever raises scrollTop, so a
- * drop is never the list following the stream.
+ * LegendList can hold a row below the streaming reply in place. That moves
+ * the content at the reader's viewport top when they are inside the reply.
+ * Keep anchoring elsewhere, including deliberate history/disclosure changes.
+ */
+export function shouldAnchorTimelineContent(input: {
+  readonly following: boolean;
+  readonly prepended: boolean;
+  readonly disclosureSettling: boolean;
+  readonly streamingRow: {
+    readonly top: number;
+    readonly bottom: number;
+    readonly viewportTop: number;
+  } | null;
+}): boolean {
+  const { following, prepended, disclosureSettling, streamingRow } = input;
+  return (
+    following ||
+    prepended ||
+    disclosureSettling ||
+    streamingRow === null ||
+    streamingRow.viewportTop <= streamingRow.top ||
+    streamingRow.viewportTop >= streamingRow.bottom
+  );
+}
+
+/**
+ * A scroll the reader made that moved the viewport up and off the live edge is
+ * the reader leaving it. Growth under a pinned viewport only ever raises
+ * scrollTop; the list itself also lowers it (a row estimate corrected, a size
+ * adjustment), so a drop counts only when a gesture of the reader caused it.
  */
 export function scrollMovedAwayFromEnd(input: {
   readonly previousTop: number;
   readonly top: number;
   readonly isAtEnd: boolean | undefined;
+  readonly byUser: boolean;
 }): boolean {
-  return input.isAtEnd === false && input.top < input.previousTop - 1;
+  return input.byUser && input.isAtEnd === false && input.top < input.previousTop - 1;
+}
+
+export type UpwardGestureOutcome =
+  | { readonly kind: "resume" }
+  | { readonly kind: "stay" }
+  | { readonly kind: "restore"; readonly top: number };
+
+/**
+ * How an upward gesture that stopped follow ends once its scrolling settles.
+ * `highestTop` is the smallest scrollTop since its first input, where the
+ * reader took the view; growth below never changes scrollTop, and only the
+ * list's pin moves it back down. From the live edge, a nudge that stayed in
+ * the follow band resumes following, so the view never looks frozen at the
+ * end; a real scroll up stays where the reader put it, and a pin that was
+ * already in flight when they left is undone.
+ */
+export function settleUpwardGesture(input: {
+  readonly startedFollowing: boolean;
+  readonly startTop: number;
+  readonly highestTop: number;
+  readonly top: number;
+}): UpwardGestureOutcome {
+  if (!input.startedFollowing) return { kind: "stay" };
+  if (input.startTop - input.highestTop <= TIMELINE_FOLLOW_REARM_THRESHOLD_PX)
+    return { kind: "resume" };
+  return input.top > input.highestTop + 1
+    ? { kind: "restore", top: input.highestTop }
+    : { kind: "stay" };
 }
 
 export function shouldPreserveAssistantLineBreaks(text: string): boolean {

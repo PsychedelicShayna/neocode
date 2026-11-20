@@ -68,15 +68,12 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
 } from "react";
-import {
-  LegendList,
-  type LegendListRef,
-  type MaintainScrollAtEndOptions,
-} from "@legendapp/list/react";
+import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import { DiffWorkerPoolProvider } from "../DiffWorkerPoolProvider";
 import {
@@ -195,6 +192,7 @@ import {
   rowsWerePrepended,
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
+  shouldAnchorTimelineContent,
   toolGroupAction,
   turnToolDisclosureKeys,
   workEntryDisplayLabel,
@@ -244,7 +242,6 @@ import { createContextPresentationRegistry } from "../contextPresentationRegistr
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import { useClientSettings } from "~/hooks/useSettings";
 import type { ChatMarkdownContextReference } from "../ChatMarkdown";
-import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
@@ -391,25 +388,6 @@ function TimelineListFooter({ composerInset }: { readonly composerInset: number 
   );
 }
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
-const TIMELINE_MAINTAIN_SCROLL_AT_END = {
-  animated: false,
-  on: {
-    dataChange: true,
-    // Composer inset changes must not move already-visible messages. New
-    // rows and row growth still keep live-follow pinned through the other
-    // triggers below.
-    footerLayout: false,
-    itemLayout: true,
-    layout: true,
-  },
-} as const satisfies MaintainScrollAtEndOptions;
-// Streamed text lands a paragraph at a time. A smooth scroll to the end
-// turns each landing into a short glide instead of a jump. Thread switches
-// and layout settles keep the instant variant so nothing visibly travels.
-const TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH = {
-  ...TIMELINE_MAINTAIN_SCROLL_AT_END,
-  animated: true,
-} as const satisfies MaintainScrollAtEndOptions;
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -464,10 +442,8 @@ interface MessagesTimelineProps {
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   contentInsetEndAdjustment: number;
   /**
-   * Whether the timeline should keep pinning to the live edge as content
-   * grows. Off while the user is reading history; LegendList's own
-   * maintainScrollAtEnd would otherwise re-pin regardless of ChatView's
-   * scroll-mode refs whenever the user drifts near the bottom.
+   * Whether to keep pinning as content grows. The host owns reader intent;
+   * the current gap to the end does not tell us if the reader scrolled away.
    */
   liveFollowEnabled: boolean;
   onIsAtEndChange: (isAtEnd: boolean) => void;
@@ -572,12 +548,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     rememberedPosition?.atEnd === false ? null : listIdentityKey,
   );
   const restoringThreadPosition = positionedThreadKey !== listIdentityKey;
-  const prefersReducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const listIdentityRef = useRef(listIdentityKey);
   const previousLatestTurnRef = useRef(latestTurn);
-  // The list stays mounted across thread switches. Its first end pins on the
-  // new thread must snap, not glide, even if that thread is mid-turn.
-  const [settlingListIdentity, setSettlingListIdentity] = useState<string | null>(null);
   let paintedExpandedTurnIds = expandedTurnIds;
   let paintedExpandedWorkGroupIds = expandedWorkGroupIds;
   let paintedExpandedSpawnEntryIds = expandedSpawnEntryIds;
@@ -586,7 +558,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     listIdentityRef.current = listIdentityKey;
     setPositionedThreadKey(null);
     previousLatestTurnRef.current = latestTurn;
-    setSettlingListIdentity(listIdentityKey);
     paintedExpandedTurnIds = rememberedPosition?.disclosures?.turns ?? new Set();
     paintedExpandedWorkGroupIds = rememberedPosition?.disclosures?.workGroups ?? new Set();
     paintedExpandedSpawnEntryIds = rememberedPosition?.disclosures?.spawnEntries ?? new Set();
@@ -638,21 +609,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     };
   }, []);
 
-  useEffect(() => {
-    if (settlingListIdentity === null) return;
-    // Two frames covers the fresh-data layout pass and the initial end pin.
-    let second: number | null = null;
-    const first = requestAnimationFrame(() => {
-      second = requestAnimationFrame(() => {
-        setSettlingListIdentity((current) => (current === settlingListIdentity ? null : current));
-      });
-    });
-    return () => {
-      cancelAnimationFrame(first);
-      if (second !== null) cancelAnimationFrame(second);
-    };
-  }, [settlingListIdentity]);
-
   const suspendEndScrollMaintenanceForDisclosure = useCallback((anchorKey: string) => {
     disclosureAnchorKeyRef.current = anchorKey;
     setDisclosureToggleSettling(true);
@@ -676,15 +632,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     const disclosureAnchorKey = disclosureAnchorKeyRef.current;
     return disclosureAnchorKey === null || row.id === disclosureAnchorKey;
   }, []);
-
-  const maintainVisibleContentPosition = useMemo(
-    () => ({
-      data: true,
-      size: true,
-      shouldRestorePosition: shouldRestoreVisibleContentPosition,
-    }),
-    [shouldRestoreVisibleContentPosition],
-  );
 
   const onToggleTurnFold = useCallback(
     (turnId: TurnId) => {
@@ -857,14 +804,67 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // they scroll back down. Rows are only recorded after commit, so a
   // discarded render cannot lose the comparison.
   const previousRowsRef = useRef(rows);
+  const prepended =
+    previousRowsRef.current !== rows && rowsWerePrepended(previousRowsRef.current, rows);
   const prependedAwayFromEnd =
-    previousRowsRef.current !== rows &&
-    rowsWerePrepended(previousRowsRef.current, rows) &&
-    resolveTimelineIsAtEnd(listRef.current?.getState()) === false;
+    prepended && resolveTimelineIsAtEnd(listRef.current?.getState()) === false;
   useLayoutEffect(() => {
     previousRowsRef.current = rows;
     if (prependedAwayFromEnd) onManualNavigation();
   }, [rows, prependedAwayFromEnd, onManualNavigation]);
+  const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
+    null,
+  );
+  const streamingRowId = liveFollowEnabled
+    ? undefined
+    : rows.findLast(
+        (row) =>
+          row.kind === "message" && row.message.role === "assistant" && row.message.streaming,
+      )?.id;
+  const readAnchoring = useCallback(() => {
+    const list = streamingRowId === undefined ? undefined : listRef.current;
+    const state = list?.getState();
+    const index = streamingRowId === undefined ? undefined : state?.indexByKey?.(streamingRowId);
+    const viewport: HTMLElement | undefined = list?.getScrollableNode();
+    const row: HTMLElement | undefined =
+      index === undefined ? undefined : state?.elementAtIndex(index);
+    const bounds = row?.getBoundingClientRect();
+    return shouldAnchorTimelineContent({
+      following: liveFollowEnabled,
+      prepended,
+      disclosureSettling: disclosureToggleSettling,
+      streamingRow:
+        viewport && bounds
+          ? {
+              viewportTop: viewport.getBoundingClientRect().top,
+              top: bounds.top,
+              bottom: bounds.bottom,
+            }
+          : null,
+    });
+  }, [streamingRowId, listRef, liveFollowEnabled, prepended, disclosureToggleSettling]);
+  // Read the virtualizer's committed DOM geometry. The snapshot only changes
+  // when the reader crosses a boundary, not on every scroll or stream update.
+  const subscribeToScroll = useCallback(
+    (notify: () => void) => {
+      if (!timelineViewportElement || streamingRowId === undefined) return () => {};
+      const onScroll = (event: Event) => {
+        if (event.target === listRef.current?.getScrollableNode()) notify();
+      };
+      timelineViewportElement.addEventListener("scroll", onScroll, true);
+      return () => timelineViewportElement.removeEventListener("scroll", onScroll, true);
+    },
+    [listRef, streamingRowId, timelineViewportElement],
+  );
+  const anchorVisibleContent = useSyncExternalStore(subscribeToScroll, readAnchoring, () => true);
+  const maintainVisibleContentPosition = useMemo(
+    () => ({
+      data: anchorVisibleContent,
+      size: anchorVisibleContent,
+      shouldRestorePosition: shouldRestoreVisibleContentPosition,
+    }),
+    [anchorVisibleContent, shouldRestoreVisibleContentPosition],
+  );
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
@@ -990,9 +990,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     rows,
   ]);
 
-  const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
-    null,
-  );
   // Re-measure the minimap gutter when the chat column changes width without a viewport resize.
   const chatWidth = useClientSettings((settings) => settings.chatWidth);
   const {
@@ -1036,6 +1033,49 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     () => <TimelineListFooter composerInset={anchoredEndSpace ? 0 : contentInsetEndAdjustment} />,
     [anchoredEndSpace, contentInsetEndAdjustment],
   );
+  const hasTimelineList = rows.length > 0 || isWorking;
+  const followContentGrowth =
+    liveFollowEnabled &&
+    !citationPositioning &&
+    !(restoringThreadPosition && rememberedPosition?.atEnd === false) &&
+    !anchoredEndSpace &&
+    !prependedAwayFromEnd &&
+    !disclosureToggleSettling;
+  useLayoutEffect(() => {
+    if (!followContentGrowth || !hasTimelineList) return;
+    const list = listRef.current;
+    const viewport = list?.getScrollableNode();
+    if (!list || !viewport) return;
+
+    let frame: number | null = null;
+    const schedulePin = () => {
+      if (frame !== null) return;
+      // Wait for the virtualizer to commit its new extent. One instant pin
+      // per layout frame, only when the row sizes or viewport height change.
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        if (listIdentityRef.current !== listIdentityKey) return;
+        const bottom = viewport.scrollHeight - viewport.clientHeight;
+        if (bottom - viewport.scrollTop > 1) viewport.scrollTop = bottom;
+      });
+    };
+    // LegendList's maintain-at-end band can be crossed by a single output
+    // update. Observe the row extent instead; footer-only changes do not pin.
+    const unsubscribe = list.getState().listen("totalSize", schedulePin);
+    let viewportHeight = viewport.clientHeight;
+    const resize = new ResizeObserver(() => {
+      const height = viewport.clientHeight;
+      if (height === viewportHeight) return;
+      viewportHeight = height;
+      schedulePin();
+    });
+    resize.observe(viewport);
+    return () => {
+      unsubscribe();
+      resize.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [followContentGrowth, hasTimelineList, listIdentityKey, listRef]);
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -1281,7 +1321,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [],
   );
 
-  if (rows.length === 0 && !isWorking) {
+  if (!hasTimelineList) {
     if (hideEmptyPlaceholder) {
       // Occupy the pane with the theme surface so a thread switch cannot
       // punch a hole through to the window chrome (white in light mode).
@@ -1324,25 +1364,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             onLoad={onCitationListLoad}
             {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
             contentInsetEndAdjustment={anchoredEndSpace ? contentInsetEndAdjustment : 0}
-            maintainScrollAtEnd={
-              citationPositioning ||
-              (restoringThreadPosition && rememberedPosition?.atEnd === false) ||
-              anchoredEndSpace ||
-              !liveFollowEnabled ||
-              prependedAwayFromEnd ||
-              disclosureToggleSettling
-                ? false
-                : isWorking && !prefersReducedMotion && settlingListIdentity === null
-                  ? TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH
-                  : TIMELINE_MAINTAIN_SCROLL_AT_END
-            }
             maintainVisibleContentPosition={
               citationPositioning ||
               (restoringThreadPosition && rememberedPosition?.atEnd === false)
                 ? false
                 : maintainVisibleContentPosition
             }
-            maintainScrollAtEndThreshold={1}
             onScroll={handleScroll}
             className={cn(
               "scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5",
@@ -2481,10 +2508,7 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           {ctx.assistantName}
         </p>
       ) : null}
-      <div
-        data-bubble="assistant"
-        className="chat-bubble min-w-0 w-fit max-w-[85%] px-3.5 py-2.5"
-      >
+      <div data-bubble="assistant" className="chat-bubble min-w-0 w-fit max-w-[85%] px-3.5 py-2.5">
         <AssistantCitationSource
           messageId={row.message.id}
           {...(ctx.threadRef ? { threadRef: ctx.threadRef } : {})}

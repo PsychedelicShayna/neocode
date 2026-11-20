@@ -12,6 +12,7 @@ import {
   nativeInboxLossWarnings,
   nativeObservationNotice,
   nativeOwnerNotice,
+  nativeRowKeys,
   nativeSlashCommands,
   type NativeSessionTarget,
   type NativeSlashCommand,
@@ -97,6 +98,7 @@ import {
 import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import { createPageScrollController } from "../chat/pageScrollController";
+import { notifyTimelinePageScroll } from "../chat/useLeaveLiveEdgeOnScroll";
 import type { NativeModelChoice } from "../chat/neopiModelSwitcher";
 import { NativeSessionModelPicker } from "./NativeSessionModelPicker";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -277,6 +279,10 @@ export function NativeSessionView({
       createPageScrollController({
         getContainer: () => timelineRef.current?.getScrollableNode() ?? null,
         getScrollPaddingBottomPx: () => 0,
+        onScrollStart: (key) => {
+          const node = timelineRef.current?.getScrollableNode();
+          if (node) notifyTimelinePageScroll(node, key);
+        },
       }),
     [],
   );
@@ -486,6 +492,12 @@ export function NativeSessionView({
   }, [feed.commandOutputs, conversation.persisted]);
   // Streaming replaces only live messages; the projector keeps the rest of the rows as they were.
   const [projectRows] = useState(createTranscriptProjector);
+  // A persisted message keeps its live row's key for as long as this view is
+  // mounted: a re-keyed row is, to the list, a removal plus an insertion above
+  // the reader, and its position keeping would throw them to the end.
+  const [shownRowKeys, setShownRowKeys] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const rowKeys = nativeRowKeys(conversation, shownRowKeys);
+  if (rowKeys !== shownRowKeys) setShownRowKeys(rowKeys);
   const rows = useMemo(
     () =>
       projectRows(
@@ -494,7 +506,7 @@ export function NativeSessionView({
           pending: conversation.pending,
           leafId: conversation.identity?.leafId ?? null,
         },
-        { debug, commandOutputs },
+        { debug, commandOutputs, rowKeys },
       ),
     [
       projectRows,
@@ -503,6 +515,7 @@ export function NativeSessionView({
       conversation.identity?.leafId,
       debug,
       commandOutputs,
+      rowKeys,
     ],
   );
   // Missing live output of a call on screen is marked at that call; every gap is

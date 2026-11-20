@@ -135,6 +135,11 @@ export interface TranscriptOptions {
   readonly debug: boolean;
   /** Local command outputs keyed by the entry id they follow (`null` = before everything). */
   readonly commandOutputs?: ReadonlyMap<string | null, ReadonlyArray<CommandRow>>;
+  /**
+   * Row key per entry id, for a durable message that takes over the key of its
+   * live row (`nativeRowKeys`); absent entries are keyed by their own id.
+   */
+  readonly rowKeys?: ReadonlyMap<string, string>;
 }
 
 export function blockText(content: unknown): string {
@@ -402,6 +407,8 @@ function createPass(
   const push = (row: TranscriptRow) => {
     rows.push(row);
   };
+  /** A message's rows are keyed by the key it was first shown under (`rowKeys`). */
+  const rowKey = (entry: NeoPiJournalEntry) => options.rowKeys?.get(entry.id) ?? entry.id;
 
   const errorNote = (
     base: { entry: NeoPiJournalEntry; timestamp: string; live: boolean },
@@ -409,7 +416,7 @@ function createPass(
   ): NoteRow => ({
     ...base,
     kind: "note",
-    id: `${base.entry.id}:error`,
+    id: `${rowKey(base.entry)}:error`,
     label: meta.stopReason === "aborted" ? "Interrupted" : "Model error",
     text: meta.errorMessage ?? "",
     tone: meta.stopReason === "aborted" ? "system" : "error",
@@ -424,7 +431,7 @@ function createPass(
       push({
         ...base,
         kind: "user",
-        id: `${entry.id}:user`,
+        id: `${rowKey(entry)}:user`,
         text: blockText(message.content),
         images: [...blockImages(message.content), ...blockImages(message.images)],
         files: messageFiles(message.files),
@@ -439,7 +446,7 @@ function createPass(
       let lastProse = -1;
       content.forEach((value, index) => {
         const block = journalRecord(value);
-        const id = `${entry.id}:${index}`;
+        const id = `${rowKey(entry)}:${index}`;
         if (block.type === "text" && typeof block.text === "string") {
           if (block.text.trim().length === 0) return;
           push({ ...base, kind: "assistant", id, text: block.text, images: [], meta: null });
@@ -495,7 +502,7 @@ function createPass(
         push({
           ...base,
           kind: "record",
-          id: `${entry.id}:record`,
+          id: `${rowKey(entry)}:record`,
           label: "Empty assistant message",
         });
       return;
@@ -522,7 +529,7 @@ function createPass(
         intent: null,
         arguments: {},
       };
-      const id = `${entry.id}:result`;
+      const id = `${rowKey(entry)}:result`;
       rows.push({
         ...base,
         kind: "tool",
@@ -553,7 +560,7 @@ function createPass(
         message.cancelled === true ? "\n… cancelled" : "",
         exitCode !== null && exitCode !== 0 ? `\nexit ${exitCode}` : "",
       ].join("");
-      const id = `${entry.id}:execution`;
+      const id = `${rowKey(entry)}:execution`;
       rows.push({
         ...base,
         kind: "tool",
@@ -571,7 +578,7 @@ function createPass(
       push({
         ...base,
         kind: "note",
-        id: `${entry.id}:note`,
+        id: `${rowKey(entry)}:note`,
         label:
           role === "developer"
             ? "System notice"
@@ -585,7 +592,7 @@ function createPass(
       push({
         ...base,
         kind: "record",
-        id: `${entry.id}:record`,
+        id: `${rowKey(entry)}:record`,
         label: role ? `${role} message` : "Native message",
       });
   };
@@ -757,6 +764,7 @@ interface PersistedProjection {
   readonly entries: ReadonlyArray<NeoPiJournalEntry>;
   readonly debug: boolean;
   readonly commandOutputs: TranscriptOptions["commandOutputs"];
+  readonly rowKeys: TranscriptOptions["rowKeys"];
   readonly rows: TranscriptRow[];
   /** Unjoined tool calls after the last entry, for live results that join them. */
   readonly pendingTools: Map<string, number>;
@@ -803,6 +811,7 @@ function projectPersisted(
     entries,
     debug: options.debug,
     commandOutputs: options.commandOutputs,
+    rowKeys: options.rowKeys,
     rows,
     pendingTools,
     iterationEntry,
@@ -861,6 +870,7 @@ export function createTranscriptProjector() {
     const reusable =
       cached !== null &&
       cached.debug === options.debug &&
+      cached.rowKeys === options.rowKeys &&
       sameCommandOutputs(cached.commandOutputs, options.commandOutputs);
     let persisted: PersistedProjection;
     if (reusable && sameEntries(cached!.entries, entries))

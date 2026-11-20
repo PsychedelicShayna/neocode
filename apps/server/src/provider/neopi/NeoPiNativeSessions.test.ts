@@ -637,9 +637,12 @@ describe("canonical native session lifecycle", () => {
         managedTmuxView: () => Effect.succeed({ owner, executable, args }),
         connect: (profile, input, observer, mode) => {
           modes.push(mode);
-          return dependencies
-            .connect(profile, input, observer, mode)
-            .pipe(Effect.map((connection) => ({ ...connection, managedTmux: owner })));
+          return dependencies.connect(profile, input, observer, mode).pipe(
+            Effect.map((connection) => ({
+              ...connection,
+              managedTmux: { ...owner, sessionFile: originalRef.sessionFile },
+            })),
+          );
         },
       });
       assert.deepEqual(yield* service.managedTmuxView(originalRef), {

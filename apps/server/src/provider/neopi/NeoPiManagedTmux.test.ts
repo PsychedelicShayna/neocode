@@ -1,3 +1,4 @@
+import { it as effectIt } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { SpawnExecutableResolution, type SpawnExecutableResolver } from "@t3tools/shared/shell";
@@ -5,6 +6,10 @@ import * as Effect from "effect/Effect";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   bindManagedTmuxOwner,
+  bindOrStartManagedTmux,
+  makeManagedTmuxHost,
+  managedTmuxLaunchPlan,
+  verifyManagedTmuxLease,
   managedTmuxClient,
   managedTmuxConfig,
   resolveManagedTmuxOwner,
@@ -17,14 +22,21 @@ vi.mock("node:child_process", () => ({
 }));
 
 const socket = "/private/owner.sock";
+const ownedState = "/feature-state";
+const ownedDirectory = `${ownedState}/nt`;
+const ownedSocket = `${ownedDirectory}/s`;
 vi.mock("node:fs/promises", () => ({
   realpath: vi.fn(async (path: string) => path),
   lstat: vi.fn(async (path: string) => ({
-    isSocket: () => path === socket,
-    isDirectory: () => path === "/private",
+    isSocket: () => path === socket || path === ownedSocket,
+    isDirectory: () => path === "/private" || path === ownedDirectory,
     uid: process.getuid?.(),
     mode: 0o700,
   })),
+  mkdir: vi.fn(async () => {}),
+  writeFile: vi.fn(async () => {}),
+  rename: vi.fn(async () => {}),
+  rm: vi.fn(async () => {}),
 }));
 
 const executable = "/server-path/bin/tmux";
@@ -161,5 +173,149 @@ describe("managed tmux pane lookup", () => {
     resolveExecutable.mockReturnValue(undefined);
     await expect(lookup(await prepare())).rejects.toMatchObject({ code: "tmux_unavailable" });
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("managed tmux owner startup", () => {
+  const source = {
+    binary: "/opt/npi nightly",
+    cwd: "/workspace dir",
+    extra: ["--model", "fixture"],
+    executable,
+  };
+  const owner = {
+    ...pane,
+    instanceId: publication.instanceId,
+    imageId: publication.imageId,
+    sessionId: publication.sessionId,
+  };
+  const binding = { socket, session: "owner", sessionFile, owner };
+
+  effectIt.effect(
+    "launches an interactive process with explicit fresh or exact-file selection",
+    () =>
+      Effect.gen(function* () {
+        expect(yield* managedTmuxLaunchPlan(source)).toEqual([
+          "/opt/npi nightly",
+          "--cwd",
+          "/workspace dir",
+          "--no-title",
+          "--model",
+          "fixture",
+          "--new-session",
+        ]);
+        expect(yield* managedTmuxLaunchPlan({ ...source, sessionFile })).toEqual([
+          "/opt/npi nightly",
+          "--cwd",
+          "/workspace dir",
+          "--no-title",
+          "--model",
+          "fixture",
+          "--session",
+          sessionFile,
+        ]);
+      }),
+  );
+
+  effectIt.effect("refuses missing tmux or an explicit control opt-out before launch", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* Effect.flip(managedTmuxLaunchPlan({ ...source, executable: undefined })),
+      ).toMatchObject({ code: "tmux_unavailable" });
+      expect(
+        yield* Effect.flip(managedTmuxLaunchPlan({ ...source, extra: ["--no-control-socket"] })),
+      ).toMatchObject({ code: "tmux_control_unavailable" });
+    }),
+  );
+
+  effectIt.effect("rebinds a persisted owner by its complete identity without launching", () =>
+    Effect.gen(function* () {
+      const rebind = vi.fn(() => Effect.succeed(binding));
+      const launch = vi.fn(() => Effect.succeed(binding));
+      expect(yield* bindOrStartManagedTmux(binding, rebind, launch)).toEqual({
+        kind: "bound",
+        binding,
+      });
+      expect(rebind).toHaveBeenCalledExactlyOnceWith(binding);
+      expect(launch).not.toHaveBeenCalled();
+      rebind.mockReturnValue(Effect.succeed({ ...binding, owner: { ...owner, imageId: "other" } }));
+      expect(yield* Effect.flip(bindOrStartManagedTmux(binding, rebind, launch))).toMatchObject({
+        code: "tmux_owner_changed",
+      });
+      expect(launch).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect(
+    "discards a lease-losing startup and selects the original holder without typing into the pane",
+    () =>
+      Effect.gen(function* () {
+        exec.mockReset();
+        exec.mockImplementation(async (_file: string, args: string[]) => {
+          if (args.includes("new-session") || args.includes("#{session_id}"))
+            return { stdout: "$2\n" };
+          if (args.includes("list-panes")) return { stdout: "$2|@3|%4|321|0|off\n" };
+          if (args.includes("kill-session")) return { stdout: "" };
+          throw new Error("Unexpected tmux command");
+        });
+        const host = makeManagedTmuxHost(ownedState, executable);
+        const verifyLease = vi.fn(() => Effect.void);
+        const start = () =>
+          host.launch({
+            ...source,
+            env: {},
+            providerInstanceId: ProviderInstanceId.make("neopi"),
+            profile: null,
+            sessionFile,
+            registry: Effect.succeed('{"version":1,"sessions":[]}'),
+            canonicalize: Effect.succeed,
+            controlEnabled: Effect.succeed(true),
+            readHolderPid: Effect.succeed(999),
+            verifyLease,
+          });
+        const rebind = vi.fn(() =>
+          Effect.succeed({
+            ...binding,
+            providerInstanceId: ProviderInstanceId.make("neopi"),
+            profile: null,
+          }),
+        );
+        const findHolder = vi.fn(() => Effect.succeed("original-holder"));
+        expect(yield* bindOrStartManagedTmux(undefined, rebind, start, findHolder)).toEqual({
+          kind: "contended",
+          instanceId: "original-holder",
+        });
+        const commands = exec.mock.calls.map(([, args]) => args);
+        expect(commands.filter((args) => args.includes("new-session"))).toHaveLength(1);
+        expect(commands.filter((args) => args.includes("kill-session"))).toEqual([
+          ["-u", "-S", ownedSocket, "-N", "kill-session", "-t", "$2"],
+        ]);
+        expect(commands.some((args) => args.includes("send-keys"))).toBe(false);
+        expect(verifyLease).not.toHaveBeenCalled();
+        expect(rebind).not.toHaveBeenCalled();
+      }),
+  );
+
+  it("requires native evidence that the authenticated pane PID holds the lease", () => {
+    const catalog = {
+      id: owner.sessionId,
+      inUse: { pid: owner.pid },
+      control: { instanceId: owner.instanceId },
+    };
+    expect(() => verifyManagedTmuxLease(owner, catalog)).not.toThrow();
+    // The already authenticated pane and publication remain live when the gate is free.
+    // An advisory sidecar reporting the same PID is not a catalog inUse observation.
+    const advisoryOnly = { ...catalog, inUse: null, leaseRecordPid: owner.pid };
+    for (const reported of [
+      undefined,
+      advisoryOnly,
+      { ...catalog, inUse: { pid: 0 } },
+      { ...catalog, inUse: { pid: 999 } },
+      { ...catalog, control: { instanceId: "other" } },
+    ]) {
+      expect(() => verifyManagedTmuxLease(owner, reported)).toThrow(
+        expect.objectContaining({ code: "tmux_lease_unverified" }),
+      );
+    }
   });
 });

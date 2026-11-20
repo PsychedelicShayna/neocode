@@ -22,11 +22,14 @@ import {
   type RightPanelSurface,
 } from "~/rightPanelStore";
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
+import { closeNativeTerminal } from "./closeNativeTerminal";
 
 export interface NativeSessionTerminalHandle {
   newTerminal: () => void;
   splitTerminal: (direction?: "horizontal" | "vertical") => void;
   closeActiveTerminal: () => void;
+  /** Closes one terminal after the same confirmation `closeActiveTerminal` asks for. */
+  closeTerminal: (terminalId: string) => void;
 }
 
 export interface NativeSessionTerminalProps {
@@ -177,34 +180,33 @@ function NativeSessionTerminalBody({
   const removeTerminal = useCallback(
     (terminalId: string) => {
       void (async () => {
-        const result = await closeTerminal({
-          environmentId: target.environmentId,
-          input: { threadId, terminalId, deleteHistory: true },
+        const result = await closeNativeTerminal({
+          close: closeTerminal,
+          target,
+          threadId,
+          terminalId,
+          surfaceId: surface?.id ?? null,
         });
         if (result._tag === "Failure") return;
-        useTerminalUiStateStore.getState().closeTerminal(target, terminalId);
-        if (surface) useRightPanelStore.getState().closeTerminal(target, surface.id, terminalId);
         setLocalFocusRequestId((value) => value + 1);
       })();
     },
-    [closeTerminal, target, threadId, surface],
+    [closeTerminal, target, threadId, surface?.id],
   );
 
-  useImperativeHandle(
-    controllerRef,
-    () => ({
+  useImperativeHandle(controllerRef, () => {
+    const confirmAndClose = (terminalId: string) => {
+      void confirmTerminalClose([labels.get(terminalId) ?? terminalId]).then((confirmed) => {
+        if (confirmed) removeTerminal(terminalId);
+      });
+    };
+    return {
       newTerminal: () => createTerminal("new"),
       splitTerminal: (direction = "horizontal") => createTerminal(direction),
-      closeActiveTerminal: () => {
-        void confirmTerminalClose([labels.get(activeTerminalId) ?? activeTerminalId]).then(
-          (confirmed) => {
-            if (confirmed) removeTerminal(activeTerminalId);
-          },
-        );
-      },
-    }),
-    [activeTerminalId, createTerminal, removeTerminal, labels],
-  );
+      closeActiveTerminal: () => confirmAndClose(activeTerminalId),
+      closeTerminal: confirmAndClose,
+    };
+  }, [activeTerminalId, createTerminal, removeTerminal, labels]);
 
   if (!hasOpened && !visible) return null;
   return (

@@ -22,8 +22,10 @@ import {
   transcriptUserText,
   type CommandRow,
 } from "@t3tools/client-runtime/neopi-transcript";
+import type { KeybindingCommand } from "@t3tools/contracts";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCommandHandlers } from "../../commandTable";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { isElectron } from "../../env";
@@ -46,6 +48,7 @@ import { Textarea } from "../ui/textarea";
 import { Checkbox } from "../ui/checkbox";
 import { SidebarInset } from "../ui/sidebar";
 import { Dialog, DialogPopup, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
+import { ExLineAnchor } from "./ExLineAnchor";
 import { NativeSessionStatusBar } from "./NativeSessionStatusBar";
 import { NativeSessionTabBar } from "./NativeSessionTabBar";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
@@ -102,7 +105,6 @@ import {
   NATIVE_ROLE_CYCLE_UNSUPPORTED,
   nativeRoleCycleNotice,
   nativeThinkingCycleNotice,
-  type NativeSessionCommand,
 } from "./nativeSessionShortcuts";
 import {
   toggleNativeThinkingVisibility,
@@ -662,46 +664,59 @@ export function NativeSessionView({
   const hideThinking = useNativeTranscriptView((state) => state.hideThinking);
   const [toolOutputSerial, setToolOutputSerial] = useState(0);
   const canCycleRole = session?.capabilities.includes(NATIVE_CYCLE_ROLE_CAPABILITY) === true;
-  const runNativeCommand = useCallback(
-    (command: NativeSessionCommand) => {
-      const notify = (title: string) =>
-        toastManager.add({ id: `native-shortcut:${command}`, title, timeout: 1500 });
-      const fail = (cause: unknown) =>
-        setLocalError(cause instanceof Error ? cause.message : String(cause));
-      switch (command) {
-        case "composer.thinking.cycle":
-          void execute({ type: "cycle_thinking_level" })
-            .then((result) => notify(nativeThinkingCycleNotice(result)))
-            .catch(fail);
-          return;
-        case "composer.role.cycleForward":
-        case "composer.role.cycleBackward":
-          if (!canCycleRole) {
-            notify(NATIVE_ROLE_CYCLE_UNSUPPORTED);
-            return;
-          }
-          void execute({
-            type: "cycle_role",
-            direction: command === "composer.role.cycleForward" ? "forward" : "backward",
-          })
-            .then((result) => notify(nativeRoleCycleNotice(result)))
-            .catch(fail);
-          return;
-        case "transcript.thinking.toggle":
-          toggleNativeThinkingVisibility();
-          notify(
-            useNativeTranscriptView.getState().hideThinking
-              ? "Reasoning hidden"
-              : "Reasoning shown",
-          );
-          return;
-        case "transcript.tools.toggleExpand":
-          setToolOutputSerial((value) => value + 1);
-          return;
-      }
+  const nativeNotify = (command: KeybindingCommand, title: string) =>
+    toastManager.add({ id: `native-shortcut:${command}`, title, timeout: 1500 });
+  const nativeFail = (cause: unknown) =>
+    setLocalError(cause instanceof Error ? cause.message : String(cause));
+  const cycleRole = (command: KeybindingCommand, direction: "forward" | "backward") => {
+    if (!canCycleRole) {
+      nativeNotify(command, NATIVE_ROLE_CYCLE_UNSUPPORTED);
+      return;
+    }
+    void execute({ type: "cycle_role", direction })
+      .then((result) => nativeNotify(command, nativeRoleCycleNotice(result)))
+      .catch(nativeFail);
+  };
+  useCommandHandlers("workspace", {
+    "composer.thinking.cycle": {
+      label: "Cycle reasoning level",
+      available: () => true,
+      run: () =>
+        void execute({ type: "cycle_thinking_level" })
+          .then((result) =>
+            nativeNotify("composer.thinking.cycle", nativeThinkingCycleNotice(result)),
+          )
+          .catch(nativeFail),
     },
-    [execute, canCycleRole],
-  );
+    // A key explains in a toast why roles cannot cycle; the Ex line keeps its
+    // inline message instead, so there the command is unavailable.
+    "composer.role.cycleForward": {
+      label: "Next role",
+      available: (invocation) => invocation === undefined || canCycleRole,
+      run: () => cycleRole("composer.role.cycleForward", "forward"),
+    },
+    "composer.role.cycleBackward": {
+      label: "Previous role",
+      available: (invocation) => invocation === undefined || canCycleRole,
+      run: () => cycleRole("composer.role.cycleBackward", "backward"),
+    },
+    "transcript.thinking.toggle": {
+      label: "Show or hide reasoning",
+      available: () => true,
+      run: () => {
+        toggleNativeThinkingVisibility();
+        nativeNotify(
+          "transcript.thinking.toggle",
+          useNativeTranscriptView.getState().hideThinking ? "Reasoning hidden" : "Reasoning shown",
+        );
+      },
+    },
+    "transcript.tools.toggleExpand": {
+      label: "Expand or collapse tool output",
+      available: () => true,
+      run: () => setToolOutputSerial((value) => value + 1),
+    },
+  });
   // Streamed tokens re-render this view, and the composer is the costliest
   // subtree on it: everything it takes stays referentially stable until its own
   // inputs change, so only keystrokes and real composer state re-render it.
@@ -865,7 +880,6 @@ export function NativeSessionView({
         busy={feed.busy}
         onToggleDictation={dictationShown ? dictation.toggle : undefined}
         dictationActive={dictation.phase !== "idle"}
-        onNativeCommand={runNativeCommand}
       >
         {localError || (error && error !== dismissedError) ? (
           <p
@@ -995,7 +1009,9 @@ export function NativeSessionView({
             onReturnFocus={focusComposer}
           />
         </ComposerSurface.Shell>
-        <NativeSessionStatusBar target={target} />
+        <ExLineAnchor>
+          <NativeSessionStatusBar target={target} />
+        </ExLineAnchor>
       </NativeSessionWorkspacePanels>
       {expandedImage ? (
         <ExpandedImageDialog preview={expandedImage} onClose={() => setExpandedImage(null)} />

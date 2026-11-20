@@ -1,22 +1,5 @@
-import type { KeybindingCommand } from "@t3tools/contracts";
 import { nativeRecord } from "@t3tools/client-runtime/neopi-native-sessions";
 import { nativeEffortLabel } from "./nativeTraits";
-
-/** Keybinding commands only the native session workspace implements. */
-export const NATIVE_SESSION_COMMANDS = [
-  "composer.thinking.cycle",
-  "composer.role.cycleForward",
-  "composer.role.cycleBackward",
-  "transcript.thinking.toggle",
-  "transcript.tools.toggleExpand",
-] as const satisfies readonly KeybindingCommand[];
-export type NativeSessionCommand = (typeof NATIVE_SESSION_COMMANDS)[number];
-
-export function isNativeSessionCommand(
-  command: KeybindingCommand | null,
-): command is NativeSessionCommand {
-  return NATIVE_SESSION_COMMANDS.some((candidate) => candidate === command);
-}
 
 /** Advertised in NeoPi's `ready` frame once `cycle_role` exists. */
 export const NATIVE_CYCLE_ROLE_CAPABILITY = "cycle_role";

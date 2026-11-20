@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { registerCommand } from "../commandTable";
 import type { Project, Thread } from "../types";
 import {
   buildBrowseGroups,
   buildCommandPaletteProjectMetadata,
+  commandTableAction,
   buildProjectActionItems,
   buildThreadActionItems,
   buildLinkedThreadActionItems,
@@ -849,5 +851,35 @@ describe("filterCommandPaletteGroups", () => {
       "setting:default-model",
       "setting:keybinding-modelPicker.toggle",
     ]);
+  });
+});
+
+describe("command table actions", () => {
+  it("offers an action only while a mounted handler would run it, and runs that handler", async () => {
+    const item = {
+      value: "action:native-terminal",
+      title: "Toggle terminal",
+      searchTerms: ["terminal", "shell"],
+      icon: null,
+    };
+    expect(commandTableAction("terminal.toggle", item)).toBeNull();
+
+    let available = false;
+    const run = vi.fn();
+    const unregister = registerCommand("terminal.toggle", "workspace", {
+      label: "Toggle terminal",
+      available: () => available,
+      run,
+    });
+    try {
+      expect(commandTableAction("terminal.toggle", item)).toBeNull();
+      available = true;
+      const action = commandTableAction("terminal.toggle", item);
+      expect(action?.shortcutCommand).toBe("terminal.toggle");
+      await action?.run();
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      unregister();
+    }
   });
 });

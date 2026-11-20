@@ -108,6 +108,7 @@ import {
   resolveProjectPathForDispatch,
 } from "../lib/projectPaths";
 import { onOpenCommandPalette } from "../commandPaletteBus";
+import { useCommandHandlers } from "../commandTable";
 import { isPreviewFocused } from "../lib/previewFocus";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import {
@@ -137,6 +138,7 @@ import {
   browseInputEndPaddingClass,
   buildBrowseGroups,
   buildCommandPaletteProjectMetadata,
+  commandTableAction,
   buildProjectActionItems,
   buildRootGroups,
   buildThreadActionItems,
@@ -476,6 +478,27 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     open: false,
     mode: "command",
     openIntent: null,
+  });
+  // Mounted with the app shell on every page, so starting a session works from
+  // the palette and the Ex line wherever they are open.
+  const createNativeSession = useCreateNativeSession();
+  useCommandHandlers("app", {
+    "chat.new": {
+      label: "New thread",
+      available: () => true,
+      run: async () => {
+        await createNativeSession();
+      },
+      repeat: true,
+    },
+    "chat.newLocal": {
+      label: "New local thread",
+      available: () => true,
+      run: async () => {
+        await createNativeSession();
+      },
+      repeat: true,
+    },
   });
   const setOpen = useCallback((open: boolean) => dispatch({ _tag: "SetOpen", open }), []);
   const toggleMode = useCallback(
@@ -1771,16 +1794,18 @@ function OpenCommandPaletteDialog(props: {
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
   if (neopiSessionAction) actionItems.push(neopiSessionAction);
-  actionItems.push({
-    kind: "action",
+  const newThreadAction = commandTableAction("chat.new", {
     value: "action:new-native-session",
     title: "New thread",
     searchTerms: ["new thread", "chat", "create", "native"],
-    shortcutCommand: "chat.new",
     icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-    run: async () => {
-      await createNativeSession();
-    },
+  });
+  if (newThreadAction) actionItems.push(newThreadAction);
+  const toggleTerminalAction = commandTableAction("terminal.toggle", {
+    value: "action:native-terminal",
+    title: "Toggle terminal",
+    searchTerms: ["terminal", "shell", "workspace"],
+    icon: <TerminalSquare className={ITEM_ICON_CLASS} />,
   });
   if (nativeTarget) {
     const surfaces = [
@@ -1802,20 +1827,8 @@ function OpenCommandPaletteDialog(props: {
         },
       })),
     );
+    if (toggleTerminalAction) actionItems.push(toggleTerminalAction);
     actionItems.push(
-      {
-        kind: "action",
-        value: "action:native-terminal",
-        title: "Toggle terminal",
-        searchTerms: ["terminal", "shell", "workspace"],
-        shortcutCommand: "terminal.toggle",
-        icon: <TerminalSquare className={ITEM_ICON_CLASS} />,
-        run: async () => {
-          const store = useTerminalUiStateStore.getState();
-          const ui = selectThreadTerminalUiState(store.terminalUiStateByThreadKey, nativeTarget);
-          store.setTerminalOpen(nativeTarget, !ui.terminalOpen);
-        },
-      },
       {
         kind: "action",
         value: "action:native-model",

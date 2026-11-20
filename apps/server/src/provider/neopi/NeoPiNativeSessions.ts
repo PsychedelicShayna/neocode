@@ -91,6 +91,14 @@ import { readNeoPiNativeObservation, sameObservationDomain } from "./NeoPiNative
 import { observeNeoPiJournalEntry, observeNeoPiMessage } from "./NeoPiStopOutcome.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import {
+  managedTmuxClient,
+  managedTmuxConfig,
+  resolveManagedTmuxOwner,
+  sameManagedTmuxOwner,
+  verifyManagedTmuxStatus,
+  type ManagedTmuxOwner,
+} from "./NeoPiManagedTmux.ts";
+import {
   neoPiSessionCatalogSource,
   type NeoPiSessionCatalogSource,
 } from "./NeoPiSessionCatalogSource.ts";
@@ -125,6 +133,7 @@ const ControlIdentity = Schema.Struct({
   cwd: Schema.String,
   revisions: Schema.Struct({ generation: Schema.Number }),
 });
+const decodeControlIdentity = Schema.decodeUnknownEffect(ControlIdentity);
 /** Child roster history and background jobs, as the owner advertises them. */
 const SUBAGENT_HISTORY_CAPABILITY = "subagent_history";
 const JOBS_CAPABILITY = "background_jobs";
@@ -290,6 +299,7 @@ export interface NeoPiNativeConnection {
     "capabilities" | "request" | "respondUi" | "writeFrame" | "exit"
   >;
   readonly attachment: "owned" | "terminal";
+  readonly managedTmux?: ManagedTmuxOwner;
   readonly cwd: string;
   /** A startup dialog can block stdio commands; the native control reader remains available. */
   readonly readState?: Effect.Effect<unknown, NeoPiNativeSessionsError>;
@@ -327,6 +337,17 @@ export interface NeoPiNativeSessionsDependencies {
   readonly afterReadScan?: Effect.Effect<void>;
   /** Drops the shared listing so the next list rescans; absent in tests with a fresh catalog per call. */
   readonly invalidateCatalog?: Effect.Effect<void>;
+  readonly managedTmuxView?: (
+    profile: NeoPiNativeProfile,
+    ref: NeoPiNativeSessionRef,
+  ) => Effect.Effect<
+    {
+      owner: ManagedTmuxOwner;
+      executable: string;
+      args: string[];
+    },
+    NeoPiNativeSessionsError
+  >;
   readonly connect: (
     profile: NeoPiNativeProfile,
     input: NeoPiNativeSessionsOpenInput,
@@ -1399,6 +1420,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           ),
         );
         const identity = yield* Schema.decodeUnknownEffect(StateIdentity)(state);
+        if (native.managedTmux && identity.sessionId !== native.managedTmux.sessionId)
+          return yield* fail("The managed tmux owner changed native sessions.", "session_changed");
         const file = yield* dependencies.canonicalize(identity.sessionFile);
         if (
           connectInput.sessionFile &&
@@ -1483,8 +1506,10 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           return yield* abandon(current, error.message, error.code);
         const graceOver = clock.currentTimeMillisUnsafe() - started >= OWNER_REATTACH_GRACE_MS;
         if (graceOver) {
+          if (current.native.managedTmux && error.code === "tmux_no_owner")
+            return yield* abandon(current, error.message, error.code);
           if (error.code === "no_owner") {
-            if (!current.takeoverRequested)
+            if (current.native.managedTmux || !current.takeoverRequested)
               return yield* abandon(
                 current,
                 "No NeoPi is running this session now.",
@@ -1640,10 +1665,13 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     });
   const open = (
     input: NeoPiNativeSessionsOpenInput,
+    mode: "auto" | "attach" = "auto",
   ): Effect.Effect<NeoPiNativeSessionsOpenResult, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
       const profile = yield* dependencies.profile(input.providerInstanceId);
       if (!input.sessionFile) {
+        if (mode === "attach")
+          return yield* fail("An attach needs a native session file.", "invalid_path");
         const created = describe(yield* create(profile, input));
         yield* invalidateCatalog;
         return created;
@@ -1672,12 +1700,36 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             });
             return result;
           }
-          const created = describe(yield* create(profile, { ...input, sessionFile: file }));
+          const created = describe(yield* create(profile, { ...input, sessionFile: file }, mode));
           yield* invalidateCatalog;
           return created;
         }),
       );
     }).pipe(Effect.scoped, Effect.mapError(nativeError));
+  const managedTmuxView = (ref: NeoPiNativeSessionRef) =>
+    Effect.gen(function* () {
+      const file = yield* dependencies.canonicalize(ref.sessionFile);
+      if (file !== ref.sessionFile)
+        return yield* fail(
+          "Open the canonical native session before showing its TUI.",
+          "invalid_path",
+        );
+      const profile = yield* dependencies.profile(ref.providerInstanceId);
+      const resolve = dependencies.managedTmuxView;
+      if (!resolve)
+        return yield* fail("The managed tmux TUI view is not configured.", "tmux_not_configured");
+      // Check the pane before waiting on any existing connection's recovery.
+      const target = yield* resolve(profile, ref);
+      yield* open(ref, "attach");
+      const current = yield* requireSession(ref);
+      const connected = current.native.managedTmux;
+      if (!connected || !sameManagedTmuxOwner(connected, target.owner))
+        return yield* fail(
+          "The managed tmux owner changed. Reopen the native session.",
+          "tmux_owner_changed",
+        );
+      return { executable: target.executable, args: target.args, cwd: current.native.cwd };
+    }).pipe(Effect.mapError(nativeError));
   /**
    * What a session's owner is doing. NeoCode's own connection is authoritative
    * for sessions it owns; for a terminal-owned session the control snapshot
@@ -1967,9 +2019,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }
       let guardedCommand = nativeCommand;
       if (session.native.attachment === "terminal") {
-        const current = yield* Schema.decodeUnknownEffect(ControlIdentity)(
-          yield* client.request({ type: "get_status" }),
-        );
+        const current = yield* decodeControlIdentity(yield* client.request({ type: "get_status" }));
         yield* adoptIdentity(session, current.session.sessionId, current.session.sessionFile);
         session.cwd = current.cwd;
         session.cwdFile = session.ref.sessionFile;
@@ -2637,6 +2687,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     open,
     request,
     watch,
+    managedTmuxView,
     read,
     credit,
     setDemand,
@@ -2654,6 +2705,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const config = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
+  const managedConfig = yield* managedTmuxConfig(process.env.T3CODE_NEOPI_MANAGED_TMUX);
   const canonicalize = Effect.fnUntraced(function* (file: string) {
     if (!NodePath.isAbsolute(file))
       return yield* fail("A native session file must be an absolute path.", "invalid_path");
@@ -2667,6 +2719,9 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       }),
     );
   }, Effect.mapError(nativeError));
+  const managed = managedConfig
+    ? { ...managedConfig, sessionFile: yield* canonicalize(managedConfig.sessionFile) }
+    : undefined;
   const profile = Effect.fnUntraced(function* (id: ProviderInstanceId) {
     const instance = yield* instances.getInstance(id);
     const source = instance && neoPiSessionCatalogSource(instance);
@@ -2792,6 +2847,23 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     }
     return undefined;
   });
+  // The opt-in affects only this preconfigured native ref. Other sessions retain their
+  // ordinary owner path; the fixture's ref can never enter the stdio launch branch.
+  const isManaged = (providerInstanceId: ProviderInstanceId, file: string | undefined) =>
+    managed && managed.providerInstanceId === providerInstanceId && managed.sessionFile === file
+      ? managed
+      : undefined;
+  const probeManaged = (profile: NeoPiNativeProfile, target: NonNullable<typeof managed>) =>
+    resolveManagedTmuxOwner(
+      target,
+      { sessionFile: target.sessionFile, profile: profile.source.env.OMP_PROFILE ?? null },
+      runCatalog(profile, ["ctl", "list", "--json"]).pipe(
+        Effect.map((output) => (output.ok ? output.out : undefined)),
+        Effect.timeout("5 seconds"),
+        Effect.orElseSucceed(() => undefined),
+      ),
+      canonicalize,
+    );
   const connect: NeoPiNativeSessionsDependencies["connect"] = (
     profile,
     input,
@@ -2800,10 +2872,22 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   ) =>
     Effect.gen(function* () {
       const source = profile.source;
-      const row = input.sessionFile ? yield* catalogRow(profile, input.sessionFile) : undefined;
+      if (
+        managed &&
+        managed.sessionFile === input.sessionFile &&
+        managed.providerInstanceId !== profile.providerInstanceId
+      )
+        return yield* fail(
+          "The managed tmux owner belongs to a different NeoPi profile.",
+          "profile_conflict",
+        );
+      const target = isManaged(profile.providerInstanceId, input.sessionFile);
+      const managedOwner = target ? yield* probeManaged(profile, target) : undefined;
+      const row =
+        !target && input.sessionFile ? yield* catalogRow(profile, input.sessionFile) : undefined;
       const cwd = row?.cwd ?? input.cwd ?? config.cwd;
       const canonicalCwd = yield* fs.realPath(cwd);
-      const extra = yield* parseNeoPiLaunchArguments(source.launchArgs);
+      const extra = target ? [] : yield* parseNeoPiLaunchArguments(source.launchArgs);
       const startupUi = yield* Deferred.make<void>();
       let ownedPid: number | undefined;
       const spawn = Effect.fnUntraced(function* (args: string[], capturePid = false) {
@@ -2932,9 +3016,9 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         };
         return { client, hostTools };
       });
-      const attach = (owner: CatalogRow | undefined) =>
+      const attach = (instanceId: string | undefined) =>
         Effect.gen(function* () {
-          if (!owner?.control)
+          if (!instanceId)
             return yield* fail(
               "The native session is in use without an attachable control endpoint.",
               "session_in_use",
@@ -2942,7 +3026,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           const { client, hostTools } = yield* spawn([
             "ctl",
             "pipe",
-            owner.control.instanceId,
+            instanceId,
             "--label",
             "neocode-native",
           ]);
@@ -2958,19 +3042,43 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             !client.capabilities.has("session_journal_events")
           )
             return yield* fail(
-              olderOwnerMessage(
-                neoPiOwnerVersion(yield* readControlRegistry(profile), owner.control.instanceId),
-              ),
+              olderOwnerMessage(neoPiOwnerVersion(yield* readControlRegistry(profile), instanceId)),
               "owner_outdated",
             );
+          let attachedCwd = canonicalCwd;
+          if (target && managedOwner) {
+            const raw = yield* client
+              .request({ type: "get_status" })
+              .pipe(
+                Effect.mapError(() =>
+                  fail(
+                    "This managed tmux pane's NeoPi control is disabled or unavailable.",
+                    "tmux_control_unavailable",
+                  ),
+                ),
+              );
+            const status = yield* decodeControlIdentity(raw);
+            const file = yield* canonicalize(status.session.sessionFile);
+            const cwd = yield* Effect.try({
+              try: () =>
+                verifyManagedTmuxStatus(managedOwner, target.sessionFile, {
+                  ...(raw as object),
+                  session: { ...status.session, sessionFile: file },
+                }),
+              catch: nativeError,
+            });
+            attachedCwd = yield* fs.realPath(cwd);
+          }
           return {
             client,
             attachment: "terminal" as const,
-            cwd: canonicalCwd,
+            cwd: attachedCwd,
+            ...(managedOwner ? { managedTmux: managedOwner } : {}),
             ...(hostTools ? { hostTools } : {}),
           };
         });
-      if (row?.inUse) return yield* attach(row);
+      if (managedOwner) return yield* attach(managedOwner.instanceId);
+      if (row?.inUse) return yield* attach(row.control?.instanceId);
       if (mode === "attach") return yield* fail("No NeoPi owns this session yet.", "no_owner");
       const args = [
         "--mode",
@@ -3048,7 +3156,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         !input.sessionFile
       )
         return yield* Effect.fail(attempt.failure);
-      return yield* attach(yield* catalogRow(profile, input.sessionFile));
+      return yield* attach((yield* catalogRow(profile, input.sessionFile))?.control?.instanceId);
     }).pipe(Effect.mapError(nativeError));
   const profileChanges = yield* instances.subscribeChanges;
   return yield* makeNeoPiNativeSessionsWith({
@@ -3076,6 +3184,19 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     catalog,
     invalidateCatalog,
     connect,
+    managedTmuxView: (profile, ref) =>
+      Effect.gen(function* () {
+        const target = isManaged(ref.providerInstanceId, ref.sessionFile);
+        if (!target)
+          return yield* fail(
+            "No managed tmux owner is configured for this native session.",
+            "tmux_no_owner",
+          );
+        yield* profile.validate;
+        const owner = yield* probeManaged(profile, target);
+        yield* profile.validate;
+        return { ...managedTmuxClient(target, owner), owner };
+      }),
     settlement: {
       store: yield* makeNeoPiNativeSettledStore(
         NodePath.join(config.stateDir, "neopi-native-settled.json"),

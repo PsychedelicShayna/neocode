@@ -36,15 +36,21 @@ export function createTerminalEnvironmentAtoms<R, E>(
     readonly input: { readonly threadId: string; readonly terminalId?: string | undefined };
   }) => JSON.stringify([environmentId, input.threadId, input.terminalId ?? null]);
   const lifecycleConcurrency = { mode: "serial" as const, key: terminalThreadKey };
+  const subscribeOutput = (input: EnvironmentRpcInput<typeof WS_METHODS.terminalAttach>) =>
+    Stream.suspend(() =>
+      subscribe(WS_METHODS.terminalAttach, input).pipe(
+        Stream.scan(nextTerminalAttachSeedState(), applyTerminalAttachStreamEvent),
+      ),
+    );
   return {
     attach: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:attach",
-      subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.terminalAttach>) =>
-        Stream.suspend(() =>
-          subscribe(WS_METHODS.terminalAttach, input).pipe(
-            Stream.scan(nextTerminalAttachSeedState(), applyTerminalAttachStreamEvent),
-          ),
-        ),
+      subscribe: subscribeOutput,
+    }),
+    attachManagedTmux: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:terminal:managed-tmux",
+      subscribe: subscribeOutput,
+      idleTtlMs: 0,
     }),
     events: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:events",

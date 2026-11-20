@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NeoPiNativeSessionRef } from "./neopiNativeSessions.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /**
@@ -8,6 +9,7 @@ import { ProviderInstanceId } from "./providerInstance.ts";
  * that want "the primary shell" don't hardcode `"term-1"`.
  */
 export const DEFAULT_TERMINAL_ID = "term-1";
+export const MANAGED_TMUX_TERMINAL_ID = "managed-tmux";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const TerminalColsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
@@ -56,6 +58,7 @@ export const TerminalAttachInput = Schema.Struct({
   rows: Schema.optional(TerminalRowsSchema),
   env: Schema.optional(TerminalEnvSchema),
   providerInstanceId: Schema.optional(ProviderInstanceId),
+  managedTmux: Schema.optional(NeoPiNativeSessionRef),
   restartIfNotRunning: Schema.optional(Schema.Boolean),
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;
@@ -366,6 +369,11 @@ export class TerminalWriteError extends Schema.TaggedError<TerminalWriteError>()
   }
 }
 
+export class TerminalManagedTmuxError extends Schema.TaggedError<TerminalManagedTmuxError>()(
+  "TerminalManagedTmuxError",
+  { message: Schema.String },
+) {}
+
 export class TerminalResizeError extends Schema.TaggedError<TerminalResizeError>()(
   "TerminalResizeError",
   {
@@ -391,5 +399,6 @@ export const TerminalError = Schema.Union([
   TerminalNotRunningError,
   TerminalWriteError,
   TerminalResizeError,
+  TerminalManagedTmuxError,
 ]);
 export type TerminalError = typeof TerminalError.Type;

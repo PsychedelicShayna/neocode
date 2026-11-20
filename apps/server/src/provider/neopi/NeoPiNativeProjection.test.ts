@@ -61,6 +61,46 @@ const bodyText = (message: Record<string, unknown> | undefined) =>
   JSON.stringify((message?.content as unknown[] | undefined) ?? null);
 
 describe("NeoPiNativeProjection", () => {
+  it.each([true, undefined])(
+    "preserves the run and journal holds across a pause until terminal end (%s)",
+    (isTerminal) => {
+      const projection = published();
+      projection.fold({ type: "agent_start", runOwners: ["parent"] });
+      projection.fold({ type: "turn_start" });
+      projection.fold({ type: "message_end", messageId: "live", message: assistant("waiting") });
+      projection.fold({
+        type: "journal_entry",
+        sessionId,
+        entry: entry("durable", null, assistant("waiting")),
+      });
+      const heldEnd = projection.deliverableJournalEnd;
+      assert.isBelow(heldEnd, projection.journal.end);
+
+      projection.fold({
+        type: "agent_end",
+        isTerminal: false,
+        yielded: true,
+        awaitingAsyncWork: true,
+      });
+      const paused = projection.store.get("run")?.value;
+      assert.deepInclude(paused?.class === "run" ? paused.value : {}, {
+        active: false,
+        turnActive: true,
+        owners: ["parent"],
+      });
+      assert.equal(projection.deliverableJournalEnd, heldEnd);
+
+      projection.fold({ type: "agent_end", isTerminal });
+      const settled = projection.store.get("run")?.value;
+      assert.deepInclude(settled?.class === "run" ? settled.value : {}, {
+        active: false,
+        turnActive: false,
+        owners: [],
+      });
+      assert.equal(projection.deliverableJournalEnd, projection.journal.end);
+    },
+  );
+
   it("S3 after message_end no read serves an open or shorter body until the durable entry joins", () => {
     const projection = published();
     const messageId = "live-1";

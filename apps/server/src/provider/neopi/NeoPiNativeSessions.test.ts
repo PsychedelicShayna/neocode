@@ -2379,6 +2379,29 @@ describe("server wiring review round", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("reports an open run waiting for async work until its terminal end", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.pass();
+      yield* native.publish({ type: "agent_start" });
+      yield* lease.next("status", (status) => status.live.isStreaming);
+      yield* native.publish({
+        type: "agent_end",
+        isTerminal: false,
+        yielded: true,
+        awaitingAsyncWork: true,
+      });
+      const paused = yield* lease.next("status", (status) => !status.live.isStreaming);
+      assert.include(paused.live, { state: "busy", runPause: "async-work" });
+
+      yield* native.publish({ type: "agent_end", isTerminal: true });
+      const settled = yield* lease.next("status", (status) => status.live.state === "idle");
+      assert.isUndefined(settled.live.runPause);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("a profile invalidation fails the watch with profile_changed, not owner-stopped", () =>
     Effect.gen(function* () {
       const { native, service, profileChanges } = yield* fixture("terminal");

@@ -22,6 +22,7 @@ const noop = () => {};
 export function NativeTimelineView(props: {
   readonly rows: readonly TranscriptRow[];
   readonly busy: boolean;
+  readonly runPaused?: boolean;
   /** The author label on the assistant's messages: the session's own name and designation. */
   readonly assistantName?: string;
   readonly environmentId: EnvironmentId;
@@ -53,8 +54,8 @@ export function NativeTimelineView(props: {
     [props.rows, props.hideThinking],
   );
   const timeline = useMemo(
-    () => projectNativeTimeline(visibleRows, props.busy, props.toolLosses),
-    [visibleRows, props.busy, props.toolLosses],
+    () => projectNativeTimeline(visibleRows, props.busy, props.toolLosses, props.runPaused),
+    [visibleRows, props.busy, props.toolLosses, props.runPaused],
   );
   const [liveFollow, setLiveFollow] = useState(true);
   const onIsAtEndChange = useCallback((atEnd: boolean) => {

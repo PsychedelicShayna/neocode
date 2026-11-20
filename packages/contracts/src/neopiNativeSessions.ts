@@ -35,13 +35,15 @@ export const NeoPiNativeSessionCommand = Schema.StructWithRest(
 export type NeoPiNativeSessionCommand = typeof NeoPiNativeSessionCommand.Type;
 export const NeoPiNativeSessionAttachment = Schema.Literals(["owned", "terminal"]);
 /**
- * What a running owner is doing. `waiting` means a dialog (question or
- * approval) blocks the agent; `busy` means a turn is in flight.
+ * What a running owner is doing. `waiting` means a dialog blocks the agent;
+ * `busy` means a run is in flight, even if it is not currently streaming.
  */
 export const NeoPiNativeSessionLive = Schema.Struct({
   state: Schema.Literals(["busy", "waiting", "idle"]),
   isStreaming: Schema.Boolean,
   pendingDialogs: Schema.Number,
+  /** A non-terminal end stops streaming without ending the native run. */
+  runPause: Schema.optional(Schema.Literals(["continuation", "async-work"])),
   /** VCS branch of the owner's working directory, when NeoPi could read it. */
   branch: Schema.NullOr(Schema.String),
 });

@@ -10,6 +10,7 @@ import {
   type NeoPiNativeObservationDomain,
   type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
+  type NeoPiNativeSessionLive,
   type NeoPiNativeSessionsReadResult,
   type ServerProviderSlashCommand,
   type WS_METHODS,
@@ -345,6 +346,7 @@ export interface NativeSessionFeed {
   readonly conversation: NativeConversation;
   readonly connected: boolean;
   readonly busy: boolean;
+  readonly runPause: NonNullable<NeoPiNativeSessionLive["runPause"]> | null;
   readonly queue: NativePromptQueue;
   readonly dialogs: readonly Record<string, unknown>[];
   /**
@@ -402,11 +404,17 @@ export interface NativeSessionFeed {
     readonly message: string;
   } | null;
 }
+export const NATIVE_RUN_PAUSE_LABELS = {
+  continuation: "Waiting to continue",
+  "async-work": "Waiting for background work",
+} as const satisfies Record<NonNullable<NativeSessionFeed["runPause"]>, string>;
+
 export const emptyNativeSessionFeed = (): NativeSessionFeed => ({
   session: null,
   conversation: emptyNativeConversation(),
   connected: false,
   busy: false,
+  runPause: null,
   queue: EMPTY_NATIVE_QUEUE,
   dialogs: [],
   unconfirmedDialogs: null,
@@ -1400,6 +1408,7 @@ function endNativeOwner(
     agentsEpoch: feed.agentsEpoch + 1,
     activity: closeNativeActivity(feed.activity, nowMs()),
     busy: false,
+    runPause: null,
     // Only a stopped owner stops its agents.
     agents: disconnectNativeSubagents(
       feed.agents,
@@ -1470,6 +1479,7 @@ function reduceNativeEssential(
         connected: true,
         movedTo: null,
         busy,
+        runPause: sameSession && !busy ? feed.runPause : null,
         queue: nativePromptQueue(session.state.queuedMessages) ?? feed.queue,
         error: null,
         ownerLoss: null,
@@ -1552,15 +1562,20 @@ function reduceNativeEssential(
       }
     }
     case "status": {
-      const busy = envelope.live.state !== "idle";
-      if (busy === feed.busy) return feed;
+      const runPause = envelope.live.runPause ?? null;
+      const busy = envelope.live.isStreaming;
+      if (busy === feed.busy && runPause === feed.runPause) return feed;
       const at = nowMs();
       return {
         ...feed,
         busy,
-        activity: busy
-          ? openNativeActivity(feed.activity, at)
-          : closeNativeActivity(feed.activity, at),
+        runPause,
+        activity:
+          busy === feed.busy
+            ? feed.activity
+            : busy
+              ? openNativeActivity(feed.activity, at)
+              : closeNativeActivity(feed.activity, at),
       };
     }
     case "obligation-opened": {

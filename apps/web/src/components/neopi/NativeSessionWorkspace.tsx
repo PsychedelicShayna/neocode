@@ -2,6 +2,7 @@ import { BracesIcon, GitForkIcon, PlugIcon, UnplugIcon, XIcon } from "lucide-rea
 import type { LegendListRef } from "@legendapp/list/react";
 import {
   NATIVE_COMMAND_COMPLETIONS_CAPABILITY,
+  NATIVE_RUN_PAUSE_LABELS,
   deferNativeEditorText,
   executeNativeSessionCommand,
   nativeCommandCompletions,
@@ -943,9 +944,15 @@ export function NativeSessionView({
           </p>
         ) : null}
         <div className="relative flex min-h-0 flex-1 flex-col">
+          {feed.runPause ? (
+            <p role="status" className="shrink-0 px-5 py-1 text-xs text-muted-foreground">
+              {NATIVE_RUN_PAUSE_LABELS[feed.runPause]}
+            </p>
+          ) : null}
           <NativeTimelineView
             rows={rows}
             busy={feed.busy}
+            runPaused={feed.runPause !== null}
             assistantName={assistantName}
             environmentId={target.environmentId}
             timelineKey={nativeTimelineKey(target.environmentId, target.ref.sessionFile)}

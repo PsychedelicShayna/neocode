@@ -202,6 +202,33 @@ const session: NativeSession = {
 const initial = () =>
   reduceNativeSessionFeed(emptyNativeSessionFeed(), { type: "session", revision: 1, session });
 
+it("stops streaming but keeps an async pause through a non-streaming watch snapshot", () => {
+  let feed = reduceNativeSessionFeed(initial(), {
+    type: "status",
+    revision: 2,
+    live: {
+      state: "busy",
+      isStreaming: false,
+      pendingDialogs: 0,
+      branch: null,
+      runPause: "async-work",
+    },
+  });
+  expect(feed).toMatchObject({ busy: false, runPause: "async-work" });
+  feed = reduceNativeSessionFeed(feed, {
+    type: "session",
+    revision: 3,
+    session: { ...session, state: { isStreaming: false } },
+  });
+  expect(feed).toMatchObject({ busy: false, runPause: "async-work" });
+  feed = reduceNativeSessionFeed(feed, {
+    type: "status",
+    revision: 4,
+    live: { state: "idle", isStreaming: false, pendingDialogs: 0, branch: null },
+  });
+  expect(feed).toMatchObject({ busy: false, runPause: null });
+});
+
 describe("native slash commands", () => {
   it("offers NeoPi's own list with hints, aliases and terminal-only marks", () => {
     const commands = nativeSlashCommands({

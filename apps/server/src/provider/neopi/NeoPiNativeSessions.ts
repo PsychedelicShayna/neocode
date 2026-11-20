@@ -394,8 +394,10 @@ interface NativeSession {
   cwdFile: string;
   state: Record<string, unknown>;
   closed: boolean;
-  /** A turn is in flight, from `agent_start`/`agent_end` frames and `get_state`. */
+  /** The parent's loop is streaming, from its start/stop frames and `get_state`. */
   busy: boolean;
+  /** An observed non-terminal end; never inferred from a non-streaming snapshot. */
+  runPause: NeoPiNativeSessionLive["runPause"];
   /** Set while the terminal owner is gone and its successor is awaited; requests wait on it. */
   recovery: Deferred.Deferred<void, NeoPiNativeSessionsError> | null;
   /** A prompt is waiting: when the grace period ends, start an owner instead of closing. */
@@ -562,7 +564,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   const publishStatus = (session: NativeSession) => {
     const live = liveState(session, undefined);
     if (!live) return;
-    const key = `${live.state}\0${live.isStreaming}\0${live.pendingDialogs}`;
+    const key = `${live.state}\0${live.isStreaming}\0${live.pendingDialogs}\0${live.runPause ?? ""}`;
     if (key === session.statusKey) return;
     session.statusKey = key;
     broadcast(session, { type: "status", revision: session.projection.store.bump(), live });
@@ -640,6 +642,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     if (sessions.get(session.ref.sessionFile) === session) sessions.delete(session.ref.sessionFile);
     session.ref = { providerInstanceId: session.profile.providerInstanceId, sessionFile };
     session.state = { ...session.state, sessionId, sessionFile };
+    if (session.sessionId !== sessionId) session.runPause = undefined;
     session.sessionId = sessionId;
     sessions.set(sessionFile, session);
     if (session.hostToolsWanted) yield* session.native.hostTools?.bind(session.ref) ?? Effect.void;
@@ -1312,9 +1315,16 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         watchLeaf(current);
         if (frame.type === "agent_start") {
           current.busy = true;
+          current.runPause = undefined;
           current.busyEpoch++;
         } else if (frame.type === "agent_end") {
           current.busy = false;
+          current.runPause =
+            frame.isTerminal === false
+              ? frame.awaitingAsyncWork === true
+                ? "async-work"
+                : "continuation"
+              : undefined;
           current.busyEpoch++;
         }
         if (identityFrame && (unseenFile || identityFrame.sessionId !== current.sessionId))
@@ -1432,6 +1442,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             ? next.state
             : { ...next.state, sessionFile: next.file };
         current.busy = next.state.isStreaming === true;
+        current.runPause = undefined;
         return { native: next.native, accept: next.accept };
       }).pipe(Effect.onError(() => Scope.close(next.nativeScope, Exit.void)));
     });
@@ -1512,6 +1523,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       accepted.accept();
       yield* watchExit(current, successor);
       broadcast(current, sessionEnvelope(current));
+      publishStatus(current);
       ensureBuild(current);
       // The new connection starts at `off`: the aggregate demand is applied to it again (C4).
       applyDemand(current);
@@ -1572,6 +1584,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           cwdFile: file,
           closed: false,
           busy: state.isStreaming === true,
+          runPause: undefined,
           subagentLevel: null,
           demanding: false,
           refusal: null,
@@ -1668,19 +1681,21 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
   /**
    * What a session's owner is doing. NeoCode's own connection is authoritative
    * for sessions it owns; for a terminal-owned session the control snapshot
-   * NeoPi reported wins and NeoCode's feed fills in when none answered.
+   * NeoPi reported wins except when this connection observed a paused run.
    */
   const liveState = (
     connected: NativeSession | undefined,
     reported: CatalogRow["live"],
   ): NeoPiNativeSessionSummary["live"] => {
     if (!connected || connected.closed) return reported ?? undefined;
-    if (connected.native.attachment === "terminal" && reported) return reported;
+    const runPause = connected.busy ? undefined : connected.runPause;
+    if (connected.native.attachment === "terminal" && reported && !runPause) return reported;
     const pendingDialogs = connected.pendingUi.size;
     return {
-      state: pendingDialogs > 0 ? "waiting" : connected.busy ? "busy" : "idle",
+      state: pendingDialogs > 0 ? "waiting" : connected.busy || runPause ? "busy" : "idle",
       isStreaming: connected.busy,
       pendingDialogs,
+      ...(runPause === undefined ? {} : { runPause }),
       branch: reported?.branch ?? null,
     };
   };

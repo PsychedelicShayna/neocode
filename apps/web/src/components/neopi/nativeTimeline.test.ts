@@ -68,8 +68,8 @@ const divider = (id: string, second: number): Row<"divider"> => ({
   text: "Other model",
 });
 
-function foldLabels(rows: readonly TranscriptRow[]) {
-  const timeline = projectNativeTimeline(rows, false);
+function foldLabels(rows: readonly TranscriptRow[], runPaused = false) {
+  const timeline = projectNativeTimeline(rows, false, undefined, runPaused);
   const derived = deriveMessagesTimelineRows({
     timelineEntries: timeline.entries,
     latestTurn: timeline.latestTurn,
@@ -84,6 +84,11 @@ function foldLabels(rows: readonly TranscriptRow[]) {
 
 describe("native turn duration", () => {
   const settled = [user("u1", 0), tool("t1", 20), assistant("a1", 69)];
+
+  it("leaves a paused native run unfolded until the terminal end", () => {
+    expect(foldLabels(settled, true)).toEqual([]);
+    expect(foldLabels(settled)).toEqual(["Worked for 1m 9s"]);
+  });
 
   it("ends at the last assistant activity, not at settings changed afterwards", () => {
     expect(foldLabels(settled)).toEqual(["Worked for 1m 9s"]);

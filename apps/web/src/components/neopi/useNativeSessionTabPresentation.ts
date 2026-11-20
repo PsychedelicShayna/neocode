@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
+  NATIVE_RUN_PAUSE_LABELS,
   nativeRecord,
   type NativeSessionFeed,
   type NativeSessionTarget,
@@ -12,6 +13,8 @@ import { useEnvironmentQuery } from "../../state/query";
 export const TAB_STATUS = {
   attention: { label: "Waiting for your answer", dot: "bg-primary" },
   working: { label: "Working", dot: "bg-warning" },
+  continuation: { label: NATIVE_RUN_PAUSE_LABELS.continuation, dot: "bg-warning" },
+  "async-work": { label: NATIVE_RUN_PAUSE_LABELS["async-work"], dot: "bg-warning" },
   terminal: { label: "Following a terminal", dot: "bg-info" },
   ready: { label: "Ready", dot: "bg-success" },
   connecting: { label: "Connecting", dot: "bg-muted-foreground/50" },
@@ -34,6 +37,7 @@ const selectStatus = (result: FeedResult): TabStatus => {
   if (!feed.connected) return "offline";
   if (feed.dialogs.length > 0) return "attention";
   if (feed.busy) return "working";
+  if (feed.runPause) return feed.runPause;
   return feed.session?.attachment === "terminal" ? "terminal" : "ready";
 };
 const selectSessionName = (result: FeedResult): string => {
@@ -80,7 +84,11 @@ export function useNativeSessionTabPresentation(tab: NativeSessionTarget, watche
       : undefined);
   const status =
     TAB_STATUS[
-      observed ? watchedStatus : listed?.live ? LISTED_TAB_STATUS[listed.live.state] : "idle"
+      observed
+        ? watchedStatus
+        : listed?.live
+          ? (listed.live.runPause ?? LISTED_TAB_STATUS[listed.live.state])
+          : "idle"
     ];
   const title =
     listed?.title || sessionName || listed?.firstMessage.split("\n")[0]?.trim() || "New session";

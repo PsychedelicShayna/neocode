@@ -11,6 +11,7 @@ import {
   nativeCommandNeedsTerminal,
   nativeDisconnectLabel,
   nativeInboxLossWarnings,
+  NATIVE_RUN_PAUSE_LABELS,
   nativeObservationNotice,
   nativeOwnerNotice,
   nativeRecord,
@@ -460,9 +461,10 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             />
           ) : null}
         </View>
-      ) : observationNotice || feed.busy ? (
+      ) : observationNotice || feed.busy || feed.runPause ? (
         <Text accessibilityLiveRegion="polite" className="px-4 py-1 text-xs text-foreground-muted">
-          {observationNotice?.text ?? "Working"}
+          {observationNotice?.text ??
+            (feed.runPause ? NATIVE_RUN_PAUSE_LABELS[feed.runPause] : "Working")}
         </Text>
       ) : null}
       {losses.general.length > 0 ? (

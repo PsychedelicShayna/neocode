@@ -265,6 +265,7 @@ export function projectNativeTimeline(
   rows: readonly TranscriptRow[],
   busy: boolean,
   lossByToolCall?: ReadonlyMap<string, readonly { readonly text: string }[]>,
+  runPaused = false,
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
   // A call keeps one entry id from its live row through its durable one and any
@@ -321,14 +322,14 @@ export function projectNativeTimeline(
         break;
       case "assistant":
         entries.push(
-          memoized(row, turnId, null, () =>
+          memoized(row, turnId, row.live ? runPaused : null, () =>
             message(
               row.id,
               "assistant",
               row.text,
               turnId,
               row.timestamp,
-              row.live,
+              row.live && !runPaused,
               imageAttachments(row.id, row.images),
             ),
           ),
@@ -336,8 +337,8 @@ export function projectNativeTimeline(
         break;
       case "thinking":
         entries.push(
-          memoized(row, turnId, null, () =>
-            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live),
+          memoized(row, turnId, row.live ? runPaused : null, () =>
+            message(row.id, "reasoning", row.text, turnId, row.timestamp, row.live && !runPaused),
           ),
         );
         break;
@@ -430,15 +431,16 @@ export function projectNativeTimeline(
         break;
     }
   }
+  const runOpen = busy || runPaused;
   const latestTurn: TimelineLatestTurn | null = sawTurn
     ? {
         turnId,
-        state: busy ? "running" : "completed",
+        state: runOpen ? "running" : "completed",
         startedAt: turnStartedAt,
-        completedAt: busy ? null : workEndedAt,
+        completedAt: runOpen ? null : workEndedAt,
       }
     : null;
-  return { entries, latestTurn, runningTurnId: busy && sawTurn ? turnId : null };
+  return { entries, latestTurn, runningTurnId: runOpen && sawTurn ? turnId : null };
 }
 
 const NATIVE_SEND_SETTINGS: QueuedComposerMessage["sendSettings"] = {

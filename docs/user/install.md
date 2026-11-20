@@ -351,6 +351,10 @@ Recorded cost includes all journal branches, completed tasks and restored adviso
 spend, but excludes unfinished child runs. Missing counters stay unavailable,
 and disconnected observations are not shown as current.
 
+If NeoPi pauses a run to wait for background work, the native session shows
+**Waiting for background work** instead of **Ready**. Live output stops, but
+the transcript stays unfolded until the run ends.
+
 A slim status bar under the composer shows the project and branch, model and
 effort, context, cache hit rate, output speed, cost, how long the agent has
 worked, and the number of running subagents and background tasks. Narrow

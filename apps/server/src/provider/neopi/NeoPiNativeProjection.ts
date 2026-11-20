@@ -839,7 +839,7 @@ export class NeoPiNativeProjection {
       case "run_owners_joined":
       case "run_owners_skipped":
         this.#run(type, frame);
-        if (type === "agent_end") this.#runEnded();
+        if (type === "agent_end" && frame.isTerminal !== false) this.#runEnded();
         return "none";
       case "subagent_lifecycle":
       case "subagent_progress":
@@ -1400,7 +1400,7 @@ export class NeoPiNativeProjection {
    * candidate is associated elsewhere or retired; when this or a later entry
    * is associated or joined (NeoPi persists in order, so this entry's alias
    * would have come first); when persistence fails; when the entry leaves the
-   * ring; on navigation or identity change; or at `agent_end` /
+   * ring; on navigation or identity change; or at terminal `agent_end` /
    * `session_settled`, after which a late alias still retires the live row.
    */
   #holdIfUnassociated(entry: NeoPiNativeObservedJournalEntry): void {
@@ -1781,6 +1781,7 @@ export class NeoPiNativeProjection {
         break;
       case "agent_end":
         run.active = false;
+        if (frame.isTerminal === false) break;
         run.turnActive = false;
         owners.clear();
         break;

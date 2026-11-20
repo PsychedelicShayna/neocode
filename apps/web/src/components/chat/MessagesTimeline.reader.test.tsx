@@ -33,12 +33,16 @@ async function withTimeline(
   run: (fixture: {
     prepend: () => Promise<void>;
     measure: (id: string, height: number) => Promise<void>;
+    measureInPaint: (id: string, height: number) => Promise<void>;
+    distanceFromEnd: () => number;
+    scrollHeight: () => number;
     placeReader: (id: string, offset: number) => Promise<void>;
     composerPageUp: () => Promise<void>;
     attachToLiveEnd: () => Promise<void>;
     contentAtTop: () => { id: string; offset: number } | undefined;
   }) => Promise<void>,
   initiallyIncludesHistory = false,
+  initiallyFollowing = false,
 ) {
   const ref = createRef<LegendListRef>();
   const container = document.createElement("div");
@@ -58,7 +62,7 @@ async function withTimeline(
   };
   const props = {
     listRef: ref,
-    isWorking: true,
+    isWorking: !initiallyFollowing,
     activeTurnStartedAt: null,
     latestTurn: null,
     runningTurnId: null,
@@ -83,7 +87,7 @@ async function withTimeline(
   } satisfies Omit<ComponentProps<typeof MessagesTimeline>, "timelineEntries">;
   const flush = () => act(() => vi.advanceTimersByTimeAsync(50));
   function ReaderTimeline({ entries }: { entries: TimelineEntry[] }) {
-    const [following, setFollowing] = useState(false);
+    const [following, setFollowing] = useState(initiallyFollowing);
     const onLeave = useCallback(() => setFollowing(false), []);
     const onReturn = useCallback(() => setFollowing(true), []);
     useLeaveLiveEdgeOnScroll(ref, following, onLeave, onReturn);
@@ -132,7 +136,16 @@ async function withTimeline(
     return new DOMRect(0, top, 800, height);
   });
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
-  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(4000);
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    if (!initiallyFollowing) return 4000;
+    // jsdom does not lay out the actual size LegendList committed to its spacer.
+    const spacer = this.querySelector<HTMLElement>(
+      ".legend-list-content-container > [style*='position: relative']",
+    );
+    return Math.max(this.clientHeight, Number.parseFloat(spacer?.style.height || "0") + 32);
+  });
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
     setTimeout(() => callback(performance.now()), 16),
   );
@@ -159,7 +172,9 @@ async function withTimeline(
       const entries = initiallyIncludesHistory
         ? [earlier, prompt, answer, nextPrompt]
         : [prompt, answer, nextPrompt];
-      await act(() => root.render(<ReaderTimeline entries={entries} />));
+      await act(() =>
+        root.render(<ReaderTimeline entries={initiallyFollowing ? [prompt, answer] : entries} />),
+      );
       await flush();
       const list = ref.current!;
       const node = list.getScrollableNode() as HTMLElement;
@@ -167,16 +182,19 @@ async function withTimeline(
         list
           .getState()
           .data.findIndex((row: { message?: { id: string } }) => row.message?.id === id);
-      const measure = async (id: string, height: number) => {
+      const measureInPaint = async (id: string, height: number) => {
         heights[id] = height;
         const key: string = list.getState().data[idToIndex(id)].id;
         await act(() => list.setItemSize(key, { height, width: 800 }));
+      };
+      const measure = async (id: string, height: number) => {
+        await measureInPaint(id, height);
         await flush();
       };
       if (initiallyIncludesHistory) await measure("earlier", 120);
       await measure("prompt", 100);
       await measure("answer", 1000);
-      await measure("next-prompt", 500);
+      if (!initiallyFollowing) await measure("next-prompt", 500);
       const placeReader = async (id: string, offset: number) => {
         const readerTop = list.getState().positionAtIndex(idToIndex(id)) + offset;
         // LegendList applies a separate anchor reset to jumps longer than
@@ -190,7 +208,12 @@ async function withTimeline(
         await act(() => scroll(node, readerTop));
         await flush();
       };
-      await placeReader("answer", 800);
+      if (initiallyFollowing) {
+        await act(() => scroll(node, node.scrollHeight - node.clientHeight));
+        await flush();
+      } else {
+        await placeReader("answer", 800);
+      }
       const contentAtTop = () => {
         const state = list.getState();
         for (let index = 0; index < state.data.length; index++) {
@@ -201,6 +224,9 @@ async function withTimeline(
       };
       await run({
         measure,
+        measureInPaint,
+        distanceFromEnd: () => node.scrollHeight - node.clientHeight - node.scrollTop,
+        scrollHeight: () => node.scrollHeight,
         contentAtTop,
         placeReader,
         async attachToLiveEnd() {
@@ -313,5 +339,23 @@ it("holds the page the composer scrolled to while the reply keeps growing", asyn
       await measure("answer", 1455);
       expect(contentAtTop()).toEqual(before);
     },
+  );
+});
+
+it("pins a following reader before the frame that measures a growing reply is painted", async () => {
+  await withTimeline(
+    "following-growth-paint",
+    async ({ measureInPaint, distanceFromEnd, scrollHeight }) => {
+      expect(distanceFromEnd()).toBe(0);
+      const previousHeight = scrollHeight();
+      // Deliver a row measurement after this frame's animation callbacks,
+      // as ResizeObserver does. React may commit that extent before paint;
+      // do not advance to the next frame before checking the resulting viewport.
+      await measureInPaint("answer", 1114);
+      expect(scrollHeight() - previousHeight).toBe(114);
+      expect(distanceFromEnd()).toBe(0);
+    },
+    false,
+    true,
   );
 });

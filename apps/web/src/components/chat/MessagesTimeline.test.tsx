@@ -353,16 +353,12 @@ describe("MessagesTimeline", () => {
       });
       flushFrame();
 
-      grow(2633); // 957 px in a 710 px viewport, as in the fast-output trace.
-      flushFrame();
+      await act(() => grow(2633)); // 957 px in a 710 px viewport, as in the fast-output trace.
       expect(viewport.scrollTop).toBe(1923);
 
-      grow(3600);
-      await act(() => {
-        keyDownOnPage("PageUp");
-      });
-      viewport.scrollTop = 1310; // Reader scrolled up before the queued pin.
-      flushFrame();
+      await act(() => keyDownOnPage("PageUp"));
+      viewport.scrollTop = 1310;
+      await act(() => grow(3600));
       expect(viewport.scrollTop).toBe(1310);
 
       expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeGreaterThan(
@@ -371,23 +367,19 @@ describe("MessagesTimeline", () => {
       await act(() => keyDownOnPage("End"));
       viewport.scrollTop = 2842; // The browser lands 48 px short of the moving end.
       viewport.dispatchEvent(new Event("scroll"));
-      grow(4600); // The gap grows before the pin gets its frame.
-      expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBe(1048);
-      flushFrame();
+      await act(() => grow(4600));
       expect(viewport.scrollTop).toBe(3890);
 
       await act(() => {
         renderer?.update(<StreamingTimeline anchorMessageId={prompt.message.id} />);
       });
-      grow(5600);
-      flushFrame();
+      await act(() => grow(5600));
       expect(viewport.scrollTop).toBe(3890); // The send anchor owns the viewport.
 
       await act(() => {
         renderer?.update(<StreamingTimeline />);
       });
-      grow(6600);
-      flushFrame();
+      await act(() => grow(6600));
       expect(viewport.scrollTop).toBe(5890);
     } finally {
       await act(() => renderer?.unmount());

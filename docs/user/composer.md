@@ -10,6 +10,11 @@ On web and desktop, scroll inside the composer to reach the rest of a long draft
 or its attachments. Scrolling the conversation leaves the draft and its controls
 in place.
 
+At the end of the conversation, NeoCode keeps the latest text in view as the
+reply streams. Scroll up to read earlier text without being pulled back down.
+Scroll back to the end, or press `End` with focus outside the composer, to resume
+following the reply.
+
 To give a long draft more room, drag the composer's top edge, or focus **Resize
 prompt** with `Tab` and use `Up` or `Down`. The chosen height is remembered but
 stays within the window. Double-click the edge or press `Enter` while it has

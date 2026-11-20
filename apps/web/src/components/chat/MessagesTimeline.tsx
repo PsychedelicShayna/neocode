@@ -72,6 +72,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
@@ -1041,41 +1042,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     !anchoredEndSpace &&
     !prependedAwayFromEnd &&
     !disclosureToggleSettling;
-  useLayoutEffect(() => {
-    if (!followContentGrowth || !hasTimelineList) return;
-    const list = listRef.current;
-    const viewport = list?.getScrollableNode();
-    if (!list || !viewport) return;
-
-    let frame: number | null = null;
-    const schedulePin = () => {
-      if (frame !== null) return;
-      // Wait for the virtualizer to commit its new extent. One instant pin
-      // per layout frame, only when the row sizes or viewport height change.
-      frame = requestAnimationFrame(() => {
-        frame = null;
-        if (listIdentityRef.current !== listIdentityKey) return;
-        const bottom = viewport.scrollHeight - viewport.clientHeight;
-        if (bottom - viewport.scrollTop > 1) viewport.scrollTop = bottom;
-      });
-    };
-    // LegendList's maintain-at-end band can be crossed by a single output
-    // update. Observe the row extent instead; footer-only changes do not pin.
-    const unsubscribe = list.getState().listen("totalSize", schedulePin);
-    let viewportHeight = viewport.clientHeight;
-    const resize = new ResizeObserver(() => {
-      const height = viewport.clientHeight;
-      if (height === viewportHeight) return;
-      viewportHeight = height;
-      schedulePin();
-    });
-    resize.observe(viewport);
-    return () => {
-      unsubscribe();
-      resize.disconnect();
-      if (frame !== null) cancelAnimationFrame(frame);
-    };
-  }, [followContentGrowth, hasTimelineList, listIdentityKey, listRef]);
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -1390,6 +1356,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             }
             ListFooterComponent={timelineListFooter}
           />
+          {followContentGrowth && hasTimelineList ? (
+            <FollowTimelineEnd key={listIdentityKey} listRef={listRef} />
+          ) : null}
           <TimelineMinimap
             items={minimapItems}
             hasPersistentGutter={minimapHasPersistentGutter}
@@ -1410,6 +1379,53 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     </TimelineRowCtx>
   );
 });
+
+function FollowTimelineEnd({ listRef }: { listRef: RefObject<LegendListRef | null> }) {
+  // Subscribe to the same extent signal as LegendList's spacer. The snapshot
+  // is a revision, not scrollHeight: the DOM still has the old height when
+  // LegendList publishes the signal.
+  const extentRevision = useRef(0);
+  const subscribe = useCallback(
+    (notify: () => void) =>
+      listRef.current?.getState().listen("totalSize", () => {
+        ++extentRevision.current;
+        notify();
+      }) ?? (() => {}),
+    [listRef],
+  );
+  const revision = useSyncExternalStore(
+    subscribe,
+    () => extentRevision.current,
+    () => 0,
+  );
+  const pin = useCallback((viewport: HTMLElement) => {
+    const bottom = viewport.scrollHeight - viewport.clientHeight;
+    if (bottom - viewport.scrollTop > 1) viewport.scrollTop = bottom;
+  }, []);
+
+  useLayoutEffect(() => {
+    // DOM mutations (including the spacer's new height) are complete before
+    // layout effects. rAF from a row ResizeObserver would miss this paint.
+    const viewport = listRef.current?.getScrollableNode();
+    if (revision > 0 && viewport) pin(viewport);
+  }, [listRef, pin, revision]);
+
+  useLayoutEffect(() => {
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    let viewportHeight = viewport.clientHeight;
+    const resize = new ResizeObserver(() => {
+      const height = viewport.clientHeight;
+      if (height === viewportHeight) return;
+      viewportHeight = height;
+      pin(viewport);
+    });
+    resize.observe(viewport);
+    return () => resize.disconnect();
+  }, [listRef, pin]);
+
+  return null;
+}
 
 function keyExtractor(item: MessagesTimelineRow) {
   return item.id;

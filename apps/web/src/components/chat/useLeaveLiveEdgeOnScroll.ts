@@ -5,6 +5,7 @@ import {
   scrollMovedAwayFromEnd,
   settleUpwardGesture,
 } from "./MessagesTimeline.logic";
+import type { PageScrollKey } from "./pageScrollController";
 import { isTimelineScrollTarget } from "./timelineScrollTarget";
 
 const SCROLL_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
@@ -13,6 +14,12 @@ const SCROLL_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
 const TOUCH_SLOP_PX = 8;
 /** Without `scrollend` (Safari has lacked it), this pause in scrolling settles a gesture. */
 const SCROLL_SETTLE_MS = 150;
+const TIMELINE_PAGE_SCROLL_START = "timeline-page-scroll-start";
+
+/** A composer page key that the page scroll controller routed to this list. */
+export function notifyTimelinePageScroll(node: HTMLElement, key: PageScrollKey): void {
+  node.dispatchEvent(new CustomEvent(TIMELINE_PAGE_SCROLL_START, { detail: key }));
+}
 
 /**
  * A gesture on `target` that scrolls the timeline itself in the direction of
@@ -66,7 +73,14 @@ export function useLeaveLiveEdgeOnScroll(
           return;
         }
         const view = node.ownerDocument.defaultView ?? window;
-        const atEnd = () => resolveTimelineIsAtEnd(listRef.current?.getState()) === true;
+        // The native scroll event can run before LegendList updates its own
+        // offset. A final End/wheel event might be the only event at the edge.
+        const atEnd = () =>
+          resolveTimelineIsAtEnd({
+            contentLength: node.scrollHeight,
+            scroll: node.scrollTop,
+            scrollLength: node.clientHeight,
+          }) === true;
         let previousTop = node.scrollTop;
         let pointerHeld = false;
         let scrollbarHeld = false;
@@ -99,6 +113,7 @@ export function useLeaveLiveEdgeOnScroll(
         let settleTimer: ReturnType<typeof setTimeout> | undefined;
         const onScroll = () => {
           const top = node.scrollTop;
+          const movedDown = top > previousTop;
           if (upward) upward.highestTop = Math.min(upward.highestTop, top);
           if (
             scrollMovedAwayFromEnd({
@@ -114,7 +129,7 @@ export function useLeaveLiveEdgeOnScroll(
             clearTimeout(settleTimer);
             settleTimer = setTimeout(onScrollEnd, SCROLL_SETTLE_MS);
           }
-          if (returning && atEnd()) {
+          if (returning && movedDown && atEnd()) {
             returning = false;
             onReturn();
           }
@@ -165,10 +180,28 @@ export function useLeaveLiveEdgeOnScroll(
           if (deltaY < 0) up();
           else down();
         };
-        // Page keys scroll the timeline when it or the page has focus; the
-        // composer claims (prevents) a page key it forwards to the timeline.
+        const onPageScrollStart = (event: Event) => {
+          if ((event as CustomEvent<PageScrollKey>).detail === "PageUp") {
+            // Each frame writes scrollTop and may emit its own scrollend.
+            // This is a deliberate page navigation, not a small wheel nudge.
+            returning = false;
+            upward = null;
+            onLeave();
+          } else {
+            down();
+          }
+        };
+        // Page keys scroll the timeline when it or the page has focus.
         const onKeyDown = (event: KeyboardEvent) => {
-          if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+          if (
+            event.defaultPrevented ||
+            event.isComposing ||
+            event.altKey ||
+            event.ctrlKey ||
+            event.metaKey ||
+            event.shiftKey
+          )
+            return;
           const target = event.target;
           const editable =
             target instanceof Element &&
@@ -176,12 +209,10 @@ export function useLeaveLiveEdgeOnScroll(
           const onPage =
             target === node.ownerDocument.body || target === node.ownerDocument.documentElement;
           const isUp = SCROLL_UP_KEYS.has(event.key);
-          const scrolls = editable
-            ? (event.key === "PageUp" || event.key === "PageDown") && event.defaultPrevented
-            : isUp || SCROLL_DOWN_KEYS.has(event.key);
           if (
-            !scrolls ||
-            !gestureMovesTimeline(editable || onPage ? node : target, node, isUp ? -1 : 1)
+            editable ||
+            (!isUp && !SCROLL_DOWN_KEYS.has(event.key)) ||
+            !gestureMovesTimeline(onPage ? node : target, node, isUp ? -1 : 1)
           )
             return;
           if (isUp) up();
@@ -198,6 +229,7 @@ export function useLeaveLiveEdgeOnScroll(
         node.addEventListener("pointerdown", onPointerDown, { passive: true });
         node.addEventListener("touchstart", onTouchStart, { passive: true });
         node.addEventListener("touchmove", onTouchMove, { passive: true });
+        node.addEventListener(TIMELINE_PAGE_SCROLL_START, onPageScrollStart);
         view.addEventListener("pointerup", onPointerUp);
         view.addEventListener("pointercancel", onPointerUp);
         view.addEventListener("keydown", onKeyDown);
@@ -210,6 +242,7 @@ export function useLeaveLiveEdgeOnScroll(
           node.removeEventListener("pointerdown", onPointerDown);
           node.removeEventListener("touchstart", onTouchStart);
           node.removeEventListener("touchmove", onTouchMove);
+          node.removeEventListener(TIMELINE_PAGE_SCROLL_START, onPageScrollStart);
           view.removeEventListener("pointerup", onPointerUp);
           view.removeEventListener("pointercancel", onPointerUp);
           view.removeEventListener("keydown", onKeyDown);

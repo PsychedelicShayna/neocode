@@ -98,6 +98,7 @@ import {
 import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import { createPageScrollController } from "../chat/pageScrollController";
+import { notifyTimelinePageScroll } from "../chat/useLeaveLiveEdgeOnScroll";
 import type { NativeModelChoice } from "../chat/neopiModelSwitcher";
 import { NativeSessionModelPicker } from "./NativeSessionModelPicker";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -278,6 +279,10 @@ export function NativeSessionView({
       createPageScrollController({
         getContainer: () => timelineRef.current?.getScrollableNode() ?? null,
         getScrollPaddingBottomPx: () => 0,
+        onScrollStart: (key) => {
+          const node = timelineRef.current?.getScrollableNode();
+          if (node) notifyTimelinePageScroll(node, key);
+        },
       }),
     [],
   );

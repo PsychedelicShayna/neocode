@@ -3,7 +3,11 @@ import { act, createElement, createRef } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { gestureMovesTimeline, useLeaveLiveEdgeOnScroll } from "./useLeaveLiveEdgeOnScroll";
+import {
+  gestureMovesTimeline,
+  notifyTimelinePageScroll,
+  useLeaveLiveEdgeOnScroll,
+} from "./useLeaveLiveEdgeOnScroll";
 
 class ScrollElement extends EventTarget {
   scrollTop = 0;
@@ -82,8 +86,8 @@ describe("gestureMovesTimeline", () => {
   });
 });
 
-describe("useLeaveLiveEdgeOnScroll without scrollend", () => {
-  // A browser window lacking `onscrollend`, as Safari has.
+describe("useLeaveLiveEdgeOnScroll", () => {
+  // No `onscrollend` property: this also exercises the Safari fallback.
   const view = new EventTarget();
   const node = Object.assign(new ScrollElement(), {
     overflowY: "auto",
@@ -92,11 +96,12 @@ describe("useLeaveLiveEdgeOnScroll without scrollend", () => {
     scrollTop: 4300,
     ownerDocument: { defaultView: view, body: {}, documentElement: {} },
   });
+  let reportedScrollTop: number | undefined;
   const list = {
     getScrollableNode: () => node,
     getState: () => ({
       contentLength: node.scrollHeight,
-      scroll: node.scrollTop,
+      scroll: reportedScrollTop ?? node.scrollTop,
       scrollLength: node.clientHeight,
     }),
   };
@@ -125,6 +130,7 @@ describe("useLeaveLiveEdgeOnScroll without scrollend", () => {
     });
     vi.stubGlobal("cancelAnimationFrame", () => {});
     node.scrollTop = 4300;
+    reportedScrollTop = undefined;
     onLeave.mockClear();
     onReturn.mockClear();
     act(() => {
@@ -161,5 +167,35 @@ describe("useLeaveLiveEdgeOnScroll without scrollend", () => {
     vi.advanceTimersByTime(500);
     expect(onReturn).not.toHaveBeenCalled();
     expect(node.scrollTop).toBe(3800);
+  });
+
+  it("stops following on a forwarded composer PageUp before the first scroll frame", () => {
+    notifyTimelinePageScroll(node as unknown as HTMLElement, "PageUp");
+    const editor = Object.assign(new ScrollElement(), { closest: () => ({}) });
+    const event = new Event("keydown", { cancelable: true });
+    Object.defineProperty(event, "target", { value: editor });
+    event.preventDefault();
+    view.dispatchEvent(Object.assign(event, { key: "PageUp" }));
+    expect(onLeave).toHaveBeenCalledTimes(1);
+
+    // The controller writes scrollTop frame by frame. A scrollend mentioning
+    // just the first, short step must not be taken for a touchpad nudge.
+    scrollTo(4295);
+    node.dispatchEvent(new Event("scrollend"));
+    scrollTo(3650);
+    vi.advanceTimersByTime(500);
+    expect(onReturn).not.toHaveBeenCalled();
+    expect(node.scrollTop).toBe(3650);
+  });
+
+  it("resumes after a page-focused End even if the list has not processed the final scroll", () => {
+    scrollTo(2000);
+    reportedScrollTop = 2000;
+    const event = new Event("keydown");
+    Object.defineProperty(event, "target", { value: node.ownerDocument.body });
+    view.dispatchEvent(Object.assign(event, { key: "End" }));
+    expect(onReturn).not.toHaveBeenCalled();
+    scrollTo(4300);
+    expect(onReturn).toHaveBeenCalledTimes(1);
   });
 });

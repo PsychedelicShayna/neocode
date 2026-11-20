@@ -173,12 +173,15 @@ function stubDomGlobals() {
     cancelAnimationFrame: () => {},
     desktopBridge: undefined,
   });
-  vi.stubGlobal("document", {
-    documentElement: {
-      classList,
-      offsetHeight: 0,
-    },
-  });
+  vi.stubGlobal(
+    "document",
+    Object.assign(new EventTarget(), {
+      documentElement: {
+        classList,
+        offsetHeight: 0,
+      },
+    }),
+  );
 }
 
 beforeAll(async () => {

@@ -2,9 +2,9 @@
 import { act } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import { workspaceKey } from "@t3tools/client-runtime/environment";
 import {
   emptyNativeSessionFeed,
-  nativeSessionKey,
   type NativeSessionFeed,
 } from "@t3tools/client-runtime/neopi-native-sessions";
 import { afterEach, expect, it, vi } from "vite-plus/test";
@@ -73,15 +73,17 @@ afterEach(() => {
   demand.released = 0;
 });
 
-it("raises detail for an opened child known only from the inventory, then names its run", () => {
-  act(() => {
-    useAgentViewStore.getState().dispatch(nativeSessionKey(target), { type: "open", id: "child" });
-  });
+it("holds child demand when the workspace panel opens the view and releases it on close", () => {
+  const dispatch = useAgentViewStore.getState().dispatch;
+  const key = workspaceKey(target);
   act(() => {
     renderer = create(<Source feed={withChild()} />);
   });
+  act(() => dispatch(key, { type: "open", id: "child" }));
   expect(demand.held).toEqual([[{ kind: "child", childId: "child" }]]);
   act(() => renderer!.update(<Source feed={withChild("run")} />));
   expect(demand.released).toBe(1);
   expect(demand.held.at(-1)).toEqual([{ kind: "child", childId: "child", runToken: "run" }]);
+  act(() => dispatch(key, { type: "back" }));
+  expect(demand.released).toBe(2);
 });

@@ -1,3 +1,4 @@
+import { workspaceKey } from "@t3tools/client-runtime/environment";
 import { nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import {
   nativeAgentHubAgents,
@@ -46,6 +47,7 @@ export function useNativeAgentHubSource({
   request: Request;
 }): AgentHubSource {
   const key = nativeSessionKey(target);
+  const viewKey = workspaceKey(target);
   const sessionId = feed.session?.sessionId;
   const sessionFile = target.ref.sessionFile;
   const agents = useMemo(
@@ -112,7 +114,7 @@ export function useNativeAgentHubSource({
   // raises NeoPi's subscription for it. A child known only from the inventory
   // has no run token yet; it is held by id and re-held once its run is named.
   const openChild = useAgentViewStore((store) => {
-    const view = selectAgentView(key)(store);
+    const view = selectAgentView(viewKey)(store);
     return view.mode === "agent" ? view.selectedId : null;
   });
   const rosterEntry = openChild

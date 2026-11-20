@@ -369,6 +369,10 @@ and the panel says so. While the inventory loads, the panel does not report it
 as empty. If a refresh fails, existing jobs stay visible; use **Retry** after
 reconnecting to refresh the list.
 
+Open a child's conversation from **Agents** to follow its live updates. Closing
+the child view returns to tracking the roster's progress rather than individual
+child steps.
+
 Open **NeoPi session configuration** in the header to inspect native ownership,
 current permissions and role configuration. **Next owned turn** changes the
 permission preference sent before your next turn, not the current native policy.

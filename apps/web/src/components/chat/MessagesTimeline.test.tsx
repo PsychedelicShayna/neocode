@@ -6,11 +6,12 @@ import {
   TurnId,
   type ComposerContextRecord,
 } from "@t3tools/contracts";
-import { act, createRef, type ReactNode, type Ref } from "react";
+import { act, createRef, useCallback, useState, type ReactNode, type Ref } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { LegendListRef } from "@legendapp/list/react";
+import { useLeaveLiveEdgeOnScroll } from "./useLeaveLiveEdgeOnScroll";
 
 vi.mock("@legendapp/list/react", async () => {
   const legendListTestId = "legend-list";
@@ -259,15 +260,32 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
-  it("keeps the live edge when streaming content grows by more than a viewport in one frame", async () => {
+  it("pins fast streaming growth while following and after a page-focused End", async () => {
     const props = buildProps();
-    const viewport = { clientHeight: 710, scrollHeight: 1676, scrollTop: 966 };
+    const view = new EventTarget();
+    const body = {};
+    const viewport = Object.assign(
+      new (class extends EventTarget {
+        contains(target: EventTarget) {
+          return target === this;
+        }
+      })(),
+      {
+        clientHeight: 710,
+        scrollHeight: 1676,
+        scrollTop: 966,
+        ownerDocument: { defaultView: view, body },
+      },
+    );
     const sizeListeners = new Set<() => void>();
     const frames = new Map<number, FrameRequestCallback>();
     let nextFrame = 0;
     props.listRef.current = {
       getScrollableNode: () => viewport,
       getState: () => ({
+        contentLength: viewport.scrollHeight,
+        scroll: viewport.scrollTop,
+        scrollLength: viewport.clientHeight,
         listen: (key: string, listener: () => void) => {
           if (key !== "totalSize") return () => {};
           sizeListeners.add(listener);
@@ -275,6 +293,7 @@ describe("MessagesTimeline", () => {
         },
       }),
     } as unknown as LegendListRef;
+    vi.stubGlobal("Element", viewport.constructor);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
       frames.set(++nextFrame, callback);
@@ -307,10 +326,30 @@ describe("MessagesTimeline", () => {
         message: { ...answer.message, id: MessageId.make("message-2"), streaming: true },
       },
     ];
+    function StreamingTimeline({ anchorMessageId = null }: { anchorMessageId?: MessageId | null }) {
+      const [following, setFollowing] = useState(true);
+      const onLeave = useCallback(() => setFollowing(false), []);
+      const onReturn = useCallback(() => setFollowing(true), []);
+      useLeaveLiveEdgeOnScroll(props.listRef, following, onLeave, onReturn);
+      return (
+        <MessagesTimeline
+          {...props}
+          timelineEntries={timelineEntries}
+          liveFollowEnabled={following}
+          onManualNavigation={onLeave}
+          anchorMessageId={anchorMessageId}
+        />
+      );
+    }
+    const keyDownOnPage = (key: string) => {
+      const event = Object.assign(new Event("keydown"), { key });
+      Object.defineProperty(event, "target", { value: body });
+      view.dispatchEvent(event);
+    };
     let renderer: ReactTestRenderer | undefined;
     try {
       await act(() => {
-        renderer = create(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
+        renderer = create(<StreamingTimeline />);
       });
       flushFrame();
 
@@ -320,41 +359,32 @@ describe("MessagesTimeline", () => {
 
       grow(3600);
       await act(() => {
-        renderer?.update(
-          <MessagesTimeline
-            {...props}
-            timelineEntries={timelineEntries}
-            liveFollowEnabled={false}
-          />,
-        );
+        keyDownOnPage("PageUp");
       });
       viewport.scrollTop = 1310; // Reader scrolled up before the queued pin.
       flushFrame();
       expect(viewport.scrollTop).toBe(1310);
 
-      viewport.scrollTop = 2890; // Reader returned to the end.
-      await act(() => {
-        renderer?.update(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
-      });
-      grow(4600);
+      expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeGreaterThan(
+        viewport.clientHeight,
+      );
+      await act(() => keyDownOnPage("End"));
+      viewport.scrollTop = 2842; // The browser lands 48 px short of the moving end.
+      viewport.dispatchEvent(new Event("scroll"));
+      grow(4600); // The gap grows before the pin gets its frame.
+      expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBe(1048);
       flushFrame();
       expect(viewport.scrollTop).toBe(3890);
 
       await act(() => {
-        renderer?.update(
-          <MessagesTimeline
-            {...props}
-            timelineEntries={timelineEntries}
-            anchorMessageId={prompt.message.id}
-          />,
-        );
+        renderer?.update(<StreamingTimeline anchorMessageId={prompt.message.id} />);
       });
       grow(5600);
       flushFrame();
       expect(viewport.scrollTop).toBe(3890); // The send anchor owns the viewport.
 
       await act(() => {
-        renderer?.update(<MessagesTimeline {...props} timelineEntries={timelineEntries} />);
+        renderer?.update(<StreamingTimeline />);
       });
       grow(6600);
       flushFrame();

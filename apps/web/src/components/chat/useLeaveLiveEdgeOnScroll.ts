@@ -48,7 +48,8 @@ export function gestureMovesTimeline(
  * pins, corrects a row estimate or the window resizes. An upward gesture stops
  * follow at once; when its scrolling settles, a nudge that stayed in the follow
  * band resumes it (`settleUpwardGesture`). A downward gesture that brings the
- * view into the band resumes it too. A pin or a layout change never does.
+ * view into the band resumes it too; a page-focused End requests it directly.
+ * A pin or a layout change never does.
  */
 export function useLeaveLiveEdgeOnScroll(
   listRef: RefObject<LegendListRef | null>,
@@ -74,7 +75,7 @@ export function useLeaveLiveEdgeOnScroll(
         }
         const view = node.ownerDocument.defaultView ?? window;
         // The native scroll event can run before LegendList updates its own
-        // offset. A final End/wheel event might be the only event at the edge.
+        // offset. A final wheel event might be the only event at the edge.
         const atEnd = () =>
           resolveTimelineIsAtEnd({
             contentLength: node.scrollHeight,
@@ -205,12 +206,21 @@ export function useLeaveLiveEdgeOnScroll(
           const target = event.target;
           const editable =
             target instanceof Element &&
-            target.closest("input, textarea, [contenteditable=true]") !== null;
+            (target.closest("input, textarea, [contenteditable=true]") !== null ||
+              (target instanceof HTMLElement && target.isContentEditable));
           const onPage =
             target === node.ownerDocument.body || target === node.ownerDocument.documentElement;
+          if (editable) return;
+          if (event.key === "End" && (onPage || target === node)) {
+            // The browser can scroll to a bottom that moves before we observe it.
+            // End itself is sufficient intent; the growth pin will catch up.
+            upward = null;
+            returning = false;
+            onReturn();
+            return;
+          }
           const isUp = SCROLL_UP_KEYS.has(event.key);
           if (
-            editable ||
             (!isUp && !SCROLL_DOWN_KEYS.has(event.key)) ||
             !gestureMovesTimeline(onPage ? node : target, node, isUp ? -1 : 1)
           )

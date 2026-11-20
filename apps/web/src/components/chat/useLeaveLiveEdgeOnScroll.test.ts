@@ -15,6 +15,7 @@ class ScrollElement extends EventTarget {
   clientHeight = 100;
   overflowY = "visible";
   overscrollBehaviorY = "auto";
+  isContentEditable = false;
 
   constructor(readonly parentElement: ScrollElement | null = null) {
     super();
@@ -24,6 +25,10 @@ class ScrollElement extends EventTarget {
     return (
       target === this || (target.parentElement !== null && this.contains(target.parentElement))
     );
+  }
+
+  closest(): object | null {
+    return null;
   }
 }
 
@@ -50,6 +55,7 @@ function setup() {
 
 beforeEach(() => {
   vi.stubGlobal("Element", ScrollElement);
+  vi.stubGlobal("HTMLElement", ScrollElement);
   vi.stubGlobal("getComputedStyle", (element: ScrollElement) => element);
 });
 afterEach(() => vi.unstubAllGlobals());
@@ -120,6 +126,12 @@ describe("useLeaveLiveEdgeOnScroll", () => {
     node.scrollTop = top;
     node.dispatchEvent(new Event("scroll"));
   };
+  const keyDown = (target: object, key: string, modifiers: KeyboardEventInit = {}) => {
+    const event = Object.assign(new Event("keydown", { cancelable: true }), { key, ...modifiers });
+    Object.defineProperty(event, "target", { value: target });
+    view.dispatchEvent(event);
+    return event;
+  };
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -188,14 +200,58 @@ describe("useLeaveLiveEdgeOnScroll", () => {
     expect(node.scrollTop).toBe(3650);
   });
 
-  it("resumes after a page-focused End even if the list has not processed the final scroll", () => {
+  it("resumes after a wheel-down only once the DOM reaches the follow band", () => {
     scrollTo(2000);
     reportedScrollTop = 2000;
-    const event = new Event("keydown");
-    Object.defineProperty(event, "target", { value: node.ownerDocument.body });
-    view.dispatchEvent(Object.assign(event, { key: "End" }));
+    node.dispatchEvent(Object.assign(new Event("wheel"), { deltaY: 100, ctrlKey: false }));
+    scrollTo(4252);
     expect(onReturn).not.toHaveBeenCalled();
     scrollTo(4300);
     expect(onReturn).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves End in the composer to move the caret without resuming follow", () => {
+    scrollTo(2000);
+    const editor = Object.assign(new ScrollElement(node), { closest: () => ({}) });
+    expect(keyDown(editor, "End").defaultPrevented).toBe(false);
+    scrollTo(4300);
+    expect(onReturn).not.toHaveBeenCalled();
+  });
+
+  it("does not resume on End in an editable timeline", () => {
+    scrollTo(2000);
+    node.isContentEditable = true;
+    try {
+      keyDown(node, "End");
+      scrollTo(4300);
+      expect(onReturn).not.toHaveBeenCalled();
+    } finally {
+      node.isContentEditable = false;
+    }
+  });
+
+  it.each(["ctrlKey", "metaKey", "altKey", "shiftKey"])(
+    "does not change the behavior of End with %s",
+    (modifier) => {
+      scrollTo(2000);
+      expect(keyDown(node.ownerDocument.body, "End", { [modifier]: true }).defaultPrevented).toBe(
+        false,
+      );
+      scrollTo(4300);
+      expect(onReturn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["wheel up", wheelUp],
+    ["PageUp", () => keyDown(node, "PageUp")],
+    ["Home", () => keyDown(node, "Home")],
+    ["scrollbar drag", () => node.dispatchEvent(new Event("pointerdown"))],
+  ])("leaves immediately on %s after a timeline-focused End", (_label, leave) => {
+    scrollTo(2000);
+    keyDown(node, "End");
+    expect(onReturn).toHaveBeenCalledTimes(1);
+    leave();
+    expect(onLeave).toHaveBeenCalledTimes(1);
   });
 });

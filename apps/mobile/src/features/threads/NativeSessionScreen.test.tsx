@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, useCallback, useSyncExternalStore, type ReactNode } from "react";
+import { act, useCallback, useSyncExternalStore, type ComponentProps, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { it } from "@effect/vitest";
 import { describe, expect, vi } from "vite-plus/test";
@@ -36,6 +36,7 @@ import { EnvironmentRegistry } from "../../../../../packages/client-runtime/src/
 import { EnvironmentSupervisor } from "../../../../../packages/client-runtime/src/connection/supervisor";
 import type { WsRpcProtocolClient } from "../../../../../packages/client-runtime/src/rpc/protocol";
 import type { RpcSession } from "../../../../../packages/client-runtime/src/rpc/session";
+import type { NativeSessionComposer } from "./NativeSessionComposer";
 import { NativeMobileModels, NativeSessionScreen } from "./NativeSessionScreen";
 
 type Router = ReturnType<typeof StackRouter>;
@@ -43,6 +44,7 @@ type Action = Parameters<Router["getStateForAction"]>[1];
 const fixture = vi.hoisted(() => ({
   current: undefined as Effect.Success<ReturnType<typeof makeHarness>> | undefined,
   draftText: "",
+  resizeTranscript: undefined as ((height: number) => void) | undefined,
   navigation: undefined as
     | {
         navigate: (name: string, params?: object) => void;
@@ -115,8 +117,23 @@ vi.mock("../../state/use-atom-command", () => ({
 
 // Native visuals and unrelated composer persistence are outside this regression.
 // In particular, both exit handlers below are supplied by the real screen.
+vi.mock("../../state/native-queued-draft", () => ({
+  restoreNativeMobileQueuedDraft: vi.fn(),
+}));
+vi.mock("../settings/appearance/AppearancePreferencesProvider", () => ({
+  useAppearancePreferences: () => ({ themeAppearance: "light" }),
+}));
+vi.mock("./floating-working-control", () => ({
+  FloatingWorkingControl: ({
+    showScrollToEnd,
+    onScrollToEnd,
+  }: {
+    showScrollToEnd: boolean;
+    onScrollToEnd: () => void;
+  }) => (showScrollToEnd ? <button onClick={onScrollToEnd}>Scroll to end</button> : null),
+}));
 vi.mock("react-native", async () => {
-  const { forwardRef, useImperativeHandle } = await import("react");
+  const { forwardRef, useEffect, useImperativeHandle, useRef } = await import("react");
   const Box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
   return {
     Platform: { OS: "android" },
@@ -130,11 +147,56 @@ vi.mock("react-native", async () => {
         renderItem: (info: { item: NativeTranscriptRow }) => ReactNode;
         keyExtractor: (item: NativeTranscriptRow) => string;
         ListHeaderComponent?: ReactNode;
+        onScroll?: (event: {
+          nativeEvent: {
+            contentSize: { height: number };
+            layoutMeasurement: { height: number };
+            contentOffset: { y: number };
+          };
+        }) => void;
+        onContentSizeChange?: (width: number, height: number) => void;
       }
-    >(function FlatList({ data, renderItem, keyExtractor, ListHeaderComponent }, ref) {
-      useImperativeHandle(ref, () => ({ scrollToEnd: () => {} }), []);
+    >(function FlatList(
+      { data, renderItem, keyExtractor, ListHeaderComponent, onScroll, onContentSizeChange },
+      ref,
+    ) {
+      const node = useRef<HTMLDivElement>(null);
+      const height = useRef(1000);
+      const viewport = 400;
+      useEffect(() => {
+        fixture.resizeTranscript = (next) => {
+          height.current = next;
+          onContentSizeChange?.(800, next);
+        };
+        return () => {
+          fixture.resizeTranscript = undefined;
+        };
+      }, [onContentSizeChange]);
+      useImperativeHandle(
+        ref,
+        () => ({
+          scrollToEnd() {
+            const element = node.current!;
+            element.scrollTop = height.current - viewport;
+            element.dispatchEvent(new Event("scroll"));
+          },
+        }),
+        [],
+      );
       return (
-        <div>
+        <div
+          ref={node}
+          data-native-test-transcript
+          onScroll={(event) =>
+            onScroll?.({
+              nativeEvent: {
+                contentSize: { height: height.current },
+                layoutMeasurement: { height: viewport },
+                contentOffset: { y: event.currentTarget.scrollTop },
+              },
+            })
+          }
+        >
           {ListHeaderComponent}
           {data.map((item) => (
             <div key={keyExtractor(item)}>{renderItem({ item })}</div>
@@ -185,7 +247,12 @@ vi.mock("../../state/use-composer-drafts", () => ({
   setComposerDraftText: vi.fn(),
   waitForComposerDraftsLoaded: vi.fn(),
 }));
-vi.mock("./NativeSessionComposer", () => ({ NativeSessionComposer: () => null }));
+vi.mock("./NativeSessionComposer", () => ({
+  NativeSessionComposer: ({
+    argumentSuggestions,
+  }: Pick<ComponentProps<typeof NativeSessionComposer>, "argumentSuggestions">) =>
+    argumentSuggestions.map(({ label, value }) => <span key={value}>{label}</span>),
+}));
 vi.mock("./NativeSessionWorkspaceControls", () => ({
   NativeSessionWorkspaceControls: () => null,
   NativeSessionAgents: () => null,
@@ -504,6 +571,42 @@ const mountScreen = (h: Effect.Success<ReturnType<typeof makeHarness>>) => {
   };
   return { render, focused, click, selectCanonicalSession, cleanup };
 };
+
+it.effect("returns to the native live end and follows further output", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness();
+    yield* Effect.promise(async () => {
+      const screen = mountScreen(h);
+      try {
+        await act(async () => {
+          screen.render();
+          await screen.selectCanonicalSession();
+          h.flush();
+        });
+        const transcript = screen
+          .focused()
+          .querySelector<HTMLElement>("[data-native-test-transcript]")!;
+        const scroll = (top: number) =>
+          act(() => {
+            transcript.scrollTop = top;
+            transcript.dispatchEvent(new Event("scroll"));
+          });
+        await scroll(600);
+        expect(screen.focused().textContent).not.toContain("Scroll to end");
+        await scroll(200);
+        expect(screen.focused().textContent).toContain("Scroll to end");
+        await act(() => screen.click("Scroll to end"));
+        expect(transcript.scrollTop).toBe(600);
+        expect(screen.focused().textContent).not.toContain("Scroll to end");
+        await act(() => fixture.resizeTranscript!(1300));
+        expect(transcript.scrollTop).toBe(900);
+        expect(screen.focused().textContent).not.toContain("Scroll to end");
+      } finally {
+        await screen.cleanup();
+      }
+    });
+  }),
+);
 
 describe("NativeSessionScreen exit and canonical reselection", () => {
   it.effect("Back releases the closed watch boundary before reopening the same session", () =>

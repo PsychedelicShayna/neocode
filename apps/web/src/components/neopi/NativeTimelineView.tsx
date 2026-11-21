@@ -6,9 +6,13 @@ import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useTheme } from "../../hooks/useTheme";
 import type { QueuedComposerMessage } from "../../queuedMessageStore";
 import { MessagesTimeline } from "../chat/MessagesTimeline";
+import { ScrollToEndButton } from "../chat/ScrollToEndButton";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import type { CitationHistoryPage } from "../chat/useAssistantCitationTarget";
-import { useLeaveLiveEdgeOnScroll } from "../chat/useLeaveLiveEdgeOnScroll";
+import {
+  notifyTimelinePageScroll,
+  useLeaveLiveEdgeOnScroll,
+} from "../chat/useLeaveLiveEdgeOnScroll";
 import { projectNativeTimeline } from "./nativeTimeline";
 
 const NO_TURN_DIFFS: [] = [];
@@ -58,6 +62,7 @@ export function NativeTimelineView(props: {
     [visibleRows, props.busy, props.toolLosses, props.runPaused],
   );
   const [liveFollow, setLiveFollow] = useState(true);
+  const [isAtEnd, setIsAtEnd] = useState(true);
   const onLeave = useCallback(() => setLiveFollow(false), []);
   const onReturn = useCallback(() => setLiveFollow(true), []);
   // Leaving and coming back are both read from the reader's input. Arriving at
@@ -70,47 +75,60 @@ export function NativeTimelineView(props: {
     setLiveFollow(true);
     void listRef.current?.scrollToEnd({ animated: false });
   }, [followSignal, listRef]);
+  const composerInset = props.composerInset ?? 0;
+  const jumpToEnd = () => {
+    const list = listRef.current;
+    const node = list?.getScrollableNode();
+    if (!list || !node) return;
+    notifyTimelinePageScroll(node, "End");
+    void list.scrollToEnd({ animated: false });
+  };
   return (
-    // The header and docked composer sit outside the list, so its edges fade instead of cutting text.
-    <div className="relative flex min-h-0 flex-1 flex-col [mask-image:linear-gradient(to_bottom,transparent,black_1.25rem,black_calc(100%-0.75rem),transparent)]">
-      <MessagesTimeline
-        isWorking={props.busy}
-        activeTurnStartedAt={props.busy ? (timeline.latestTurn?.startedAt ?? null) : null}
-        listRef={listRef}
-        timelineEntries={timeline.entries}
-        latestTurn={timeline.latestTurn}
-        runningTurnId={timeline.runningTurnId}
-        turnDiffSummaries={NO_TURN_DIFFS}
-        routeThreadKey={props.timelineKey}
-        onOpenTurnDiff={noop}
-        supportsConversationRollback={false}
-        onRevertToTurnCount={noop}
-        isRevertingCheckpoint={false}
-        onImageExpand={props.onImageExpand}
-        activeThreadEnvironmentId={props.environmentId}
-        markdownCwd={props.cwd}
-        resolvedTheme={resolvedTheme}
-        timestampFormat={settings.timestampFormat}
-        workspaceRoot={props.cwd}
-        anchorMessageId={null}
-        onAnchorReady={noop}
-        contentInsetEndAdjustment={props.composerInset ?? 0}
-        liveFollowEnabled={liveFollow}
-        onIsAtEndChange={noop}
-        onManualNavigation={onLeave}
-        loadEarlier={props.loadEarlier}
-        {...(props.assistantName ? { assistantName: props.assistantName } : {})}
-        {...(props.queuedMessages ? { queuedMessages: props.queuedMessages } : {})}
-        {...(props.onSteerQueuedMessage
-          ? { onSteerQueuedMessage: props.onSteerQueuedMessage }
-          : {})}
-        {...(props.onRemoveQueuedMessage
-          ? { onRemoveQueuedMessage: props.onRemoveQueuedMessage }
-          : {})}
-        {...(props.toggleToolOutputSerial === undefined
-          ? {}
-          : { toggleToolOutputSerial: props.toggleToolOutputSerial })}
-      />
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      {/* The header and docked composer sit outside the list, so its edges fade instead of cutting text. */}
+      <div className="relative flex min-h-0 flex-1 flex-col [mask-image:linear-gradient(to_bottom,transparent,black_1.25rem,black_calc(100%-0.75rem),transparent)]">
+        <MessagesTimeline
+          isWorking={props.busy}
+          activeTurnStartedAt={props.busy ? (timeline.latestTurn?.startedAt ?? null) : null}
+          listRef={listRef}
+          timelineEntries={timeline.entries}
+          latestTurn={timeline.latestTurn}
+          runningTurnId={timeline.runningTurnId}
+          turnDiffSummaries={NO_TURN_DIFFS}
+          routeThreadKey={props.timelineKey}
+          onOpenTurnDiff={noop}
+          supportsConversationRollback={false}
+          onRevertToTurnCount={noop}
+          isRevertingCheckpoint={false}
+          onImageExpand={props.onImageExpand}
+          activeThreadEnvironmentId={props.environmentId}
+          markdownCwd={props.cwd}
+          resolvedTheme={resolvedTheme}
+          timestampFormat={settings.timestampFormat}
+          workspaceRoot={props.cwd}
+          anchorMessageId={null}
+          onAnchorReady={noop}
+          contentInsetEndAdjustment={composerInset}
+          liveFollowEnabled={liveFollow}
+          onIsAtEndChange={setIsAtEnd}
+          onManualNavigation={onLeave}
+          loadEarlier={props.loadEarlier}
+          {...(props.assistantName ? { assistantName: props.assistantName } : {})}
+          {...(props.queuedMessages ? { queuedMessages: props.queuedMessages } : {})}
+          {...(props.onSteerQueuedMessage
+            ? { onSteerQueuedMessage: props.onSteerQueuedMessage }
+            : {})}
+          {...(props.onRemoveQueuedMessage
+            ? { onRemoveQueuedMessage: props.onRemoveQueuedMessage }
+            : {})}
+          {...(props.toggleToolOutputSerial === undefined
+            ? {}
+            : { toggleToolOutputSerial: props.toggleToolOutputSerial })}
+        />
+      </div>
+      {!liveFollow && !isAtEnd && (
+        <ScrollToEndButton bottom={composerInset + 4} onClick={jumpToEnd} />
+      )}
     </div>
   );
 }

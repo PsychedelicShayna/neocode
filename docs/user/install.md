@@ -355,6 +355,9 @@ If NeoPi pauses a run to wait for background work, the native session shows
 **Waiting for background work** instead of **Ready**. Live output stops, but
 the transcript stays unfolded until the run ends.
 
+When you scroll back to read older output, **Scroll to end** returns to the
+newest text and resumes following the live reply. The control hides at the end.
+
 A slim status bar under the composer shows the project and branch, model and
 effort, context, cache hit rate, output speed, cost, how long the agent has
 worked, and the number of running subagents and background tasks. Narrow

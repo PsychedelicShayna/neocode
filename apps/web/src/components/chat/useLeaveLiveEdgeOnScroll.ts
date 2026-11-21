@@ -16,8 +16,8 @@ const TOUCH_SLOP_PX = 8;
 const SCROLL_SETTLE_MS = 150;
 const TIMELINE_PAGE_SCROLL_START = "timeline-page-scroll-start";
 
-/** A composer page key that the page scroll controller routed to this list. */
-export function notifyTimelinePageScroll(node: HTMLElement, key: PageScrollKey): void {
+/** Reader navigation routed to the list by the composer or the jump control. */
+export function notifyTimelinePageScroll(node: HTMLElement, key: PageScrollKey | "End"): void {
   node.dispatchEvent(new CustomEvent(TIMELINE_PAGE_SCROLL_START, { detail: key }));
 }
 
@@ -181,8 +181,16 @@ export function useLeaveLiveEdgeOnScroll(
           if (deltaY < 0) up();
           else down();
         };
+        const returnToEnd = () => {
+          upward = null;
+          returning = false;
+          onReturn();
+        };
         const onPageScrollStart = (event: Event) => {
-          if ((event as CustomEvent<PageScrollKey>).detail === "PageUp") {
+          const { detail } = event as CustomEvent<PageScrollKey | "End">;
+          if (detail === "End") {
+            returnToEnd();
+          } else if (detail === "PageUp") {
             // Each frame writes scrollTop and may emit its own scrollend.
             // This is a deliberate page navigation, not a small wheel nudge.
             returning = false;
@@ -214,9 +222,7 @@ export function useLeaveLiveEdgeOnScroll(
           if (event.key === "End" && (onPage || target === node)) {
             // The browser can scroll to a bottom that moves before we observe it.
             // End itself is sufficient intent; the growth pin will catch up.
-            upward = null;
-            returning = false;
-            onReturn();
+            returnToEnd();
             return;
           }
           const isUp = SCROLL_UP_KEYS.has(event.key);

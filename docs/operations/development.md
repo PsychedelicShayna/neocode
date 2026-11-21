@@ -35,6 +35,29 @@ Read ports from the `[dev-runner]` output. Worktrees derive stable preferences f
 but occupied ports can shift them. `T3CODE_PORT_OFFSET` or `T3CODE_DEV_INSTANCE` can select a
 different preference when needed.
 
+### Host existing native sessions in tmux
+
+Set `T3CODE_NEOPI_TMUX=1` in the **NeoCode server's** environment and restart
+NeoCode. This is off by default and requires Linux or macOS, `tmux` on the
+server's `PATH`, and NeoPi control enabled for the configured profile.
+
+When you open a populated native session that has no live owner, NeoCode starts
+its NeoPi TUI on a private tmux socket in the NeoCode state directory. Open
+**TUI** to see the same owner. Closing the view or restarting NeoCode does not
+stop the owner; reopening the session reconnects to it without starting another.
+Turning the opt-in off leaves existing tmux owners running and ignores their
+saved managed bindings. NeoCode uses ordinary native session discovery: it
+attaches to a live owner through its control endpoint, or refuses the open if
+the session is in use but cannot be attached. It does not start a replacement
+while the session is in use. The managed **TUI** view is not available for
+these owners while the opt-in is off.
+
+NeoPi v19's catalog omits untouched, untitled sessions and cannot report their
+file lease. NeoCode refuses to drive these sessions in tmux, including a
+brand-new session. Use the default (direct) mode to start a new session. A
+missing tmux or disabled control is an error, not a reason to start a direct
+owner while the setting is on.
+
 ### Attach a prestarted NeoPi TUI
 
 On a Unix host with `tmux` on the NeoCode server's `PATH`, opt in by setting the server's

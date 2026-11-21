@@ -1,7 +1,13 @@
+// @effect-diagnostics nodeBuiltinImport:off -- managed state filenames use the canonical session hash.
+import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
 import { assert, describe, it } from "@effect/vitest";
 import { NodeFileSystem } from "@effect/platform-node";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { vi } from "vite-plus/test";
 import {
   NeoPiNativeSessionsError,
+  ProviderDriverKind,
   ProviderInstanceId,
   type NeoPiJournalEntry,
   type NeoPiNativeSessionRef,
@@ -18,11 +24,24 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as Queue from "effect/Queue";
 import * as TestClock from "effect/testing/TestClock";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { deriveServerPaths, layerTest as configLayer } from "../../config.ts";
+import { layerTest as settingsLayer } from "../../serverSettings.ts";
+import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
+import * as HostToolBridge from "./NeoPiHostToolBridge.ts";
+import * as ManagedTmux from "./NeoPiManagedTmux.ts";
+import { registerNeoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import {
+  makeNeoPiNativeSessions,
   makeNeoPiNativeSessionsWith,
   type NeoPiNativeConnection,
   type NeoPiNativeProfile,
@@ -637,9 +656,12 @@ describe("canonical native session lifecycle", () => {
         managedTmuxView: () => Effect.succeed({ owner, executable, args }),
         connect: (profile, input, observer, mode) => {
           modes.push(mode);
-          return dependencies
-            .connect(profile, input, observer, mode)
-            .pipe(Effect.map((connection) => ({ ...connection, managedTmux: owner })));
+          return dependencies.connect(profile, input, observer, mode).pipe(
+            Effect.map((connection) => ({
+              ...connection,
+              managedTmux: { ...owner, sessionFile: originalRef.sessionFile },
+            })),
+          );
         },
       });
       assert.deepEqual(yield* service.managedTmuxView(originalRef), {
@@ -3609,4 +3631,225 @@ describe("join replay through the client reducer (paired)", () => {
         assert.isNull(feed.unconfirmedDialogs);
       }).pipe(Effect.scoped),
   );
+});
+
+const encodeOptOutFixture = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeOptOutRequest = Schema.decodeSync(
+  Schema.fromJsonString(Schema.Struct({ id: Schema.String, type: Schema.String })),
+);
+
+describe("opening native sessions with managed tmux disabled", () => {
+  for (const scenario of [
+    "malformed",
+    "stale",
+    "unsafe directory",
+    "live owner",
+    "invalid launch arguments with a live owner",
+  ] as const) {
+    const invalidArgs = scenario === "invalid launch arguments with a live owner";
+    const name = invalidArgs
+      ? `rejects ${scenario} before attaching`
+      : `uses the ordinary open path with ${scenario} managed state`;
+    it.live(name, () =>
+      Effect.gen(function* () {
+        vi.stubEnv("T3CODE_NEOPI_TMUX", undefined);
+        vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", undefined);
+        const makeHost = vi.spyOn(ManagedTmux, "makeManagedTmuxHost");
+        const hostTools = vi
+          .spyOn(HostToolBridge, "makeNeoPiNativeHostToolPump")
+          .mockReturnValue(Effect.succeed({ bind: () => Effect.succeed([]), revoke: Effect.void }));
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            makeHost.mockRestore();
+            hostTools.mockRestore();
+            vi.unstubAllEnvs();
+          }),
+        );
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.realPath(yield* fs.makeTempDirectoryScoped());
+        const sessionFile = NodePath.join(cwd, "session.jsonl");
+        const { stateDir } = yield* deriveServerPaths(cwd, undefined);
+        const directory = NodePath.join(stateDir, "nt");
+        yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+        if (scenario === "unsafe directory") yield* fs.chmod(directory, 0o755);
+        yield* fs.writeFileString(sessionFile, "");
+        const live = scenario === "live owner" || invalidArgs;
+        const owner = {
+          executable: "/fixture/tmux",
+          session: "$0",
+          window: "@0",
+          pane: "%0",
+          pid: 321,
+          instanceId: "existing-control",
+          imageId: "existing-image",
+          sessionId: "existing-session",
+        };
+        const key = NodeCrypto.createHash("sha256").update(sessionFile).digest("hex");
+        const binding = {
+          socket: NodePath.join(directory, "s"),
+          session: "managed",
+          sessionFile,
+          providerInstanceId: instanceId,
+          profile: null,
+          owner,
+        } satisfies ManagedTmux.ManagedTmuxBinding;
+        const bindingPath = NodePath.join(directory, `${key}.json`);
+        yield* fs.writeFileString(
+          bindingPath,
+          scenario === "malformed" ? "not JSON" : encodeOptOutFixture(binding),
+        );
+        yield* fs.chmod(bindingPath, 0o600);
+
+        const instance = registerNeoPiSessionCatalogSource(
+          {
+            enabled: true,
+            instanceId,
+            driverKind: ProviderDriverKind.make("neopi"),
+            get adapter(): never {
+              throw new Error("Unexpected provider adapter access");
+            },
+            get snapshot(): never {
+              throw new Error("Unexpected provider snapshot access");
+            },
+            get textGeneration(): never {
+              throw new Error("Unexpected provider text generation access");
+            },
+            displayName: undefined,
+            continuationIdentity: {
+              driverKind: ProviderDriverKind.make("neopi"),
+              continuationKey: instanceId,
+            },
+          },
+          {
+            binary: "/fixture/npi",
+            env: {},
+            profile: "default",
+            ...(invalidArgs ? { launchArgs: "--fork" } : {}),
+            capabilities: new Set(["exit_with_parent"]),
+            probe: { status: "compatible", version: "fixture" },
+          },
+        );
+        const changes = yield* PubSub.unbounded<void>();
+        const spawned: ReadonlyArray<string>[] = [];
+        const encode = (value: unknown) =>
+          new TextEncoder().encode(`${encodeOptOutFixture(value)}\n`);
+        const service = yield* makeNeoPiNativeSessions().pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              configLayer(cwd, cwd),
+              settingsLayer(),
+              Layer.mock(ProviderInstanceRegistry)({
+                getInstance: () => Effect.succeed(instance),
+                subscribeChanges: PubSub.subscribe(changes),
+              }),
+              Layer.mock(ChildProcessSpawner.ChildProcessSpawner)({
+                spawn: (command) =>
+                  Effect.gen(function* () {
+                    if (!ChildProcess.isStandardCommand(command))
+                      return yield* Effect.die("Unexpected piped child command");
+                    spawned.push(command.args);
+                    const catalog = command.args[0] === "sessions";
+                    const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+                    const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+                    const finish = Queue.end(stdout).pipe(
+                      Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
+                      Effect.asVoid,
+                    );
+                    if (!catalog)
+                      yield* Queue.offer(
+                        stdout,
+                        encode({
+                          type: "ready",
+                          protocolVersion: 1,
+                          capabilities: ["control_v1", "session_journal", "session_journal_events"],
+                        }),
+                      );
+                    return ChildProcessSpawner.makeHandle({
+                      pid: ChildProcessSpawner.ProcessId(123),
+                      exitCode: catalog
+                        ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
+                        : Deferred.await(exited),
+                      isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
+                      kill: () => finish,
+                      stdin: Sink.forEach((chunk: Uint8Array) => {
+                        const request = decodeOptOutRequest(new TextDecoder().decode(chunk));
+                        return Queue.offer(
+                          stdout,
+                          encode({
+                            type: "response",
+                            id: request.id,
+                            command: request.type,
+                            success: true,
+                            data:
+                              request.type === "get_state"
+                                ? { sessionId: owner.sessionId, sessionFile, messageCount: 0 }
+                                : {},
+                          }),
+                        );
+                      }).pipe(Sink.ensuring(finish)),
+                      stdout: catalog
+                        ? Stream.make(
+                            encode({
+                              version: 1,
+                              sessions: [
+                                {
+                                  path: sessionFile,
+                                  id: owner.sessionId,
+                                  cwd,
+                                  title: "Existing session",
+                                  firstMessage: "Hello",
+                                  modified: "2026-11-20T00:00:00Z",
+                                  inUse: live ? { pid: owner.pid } : null,
+                                  control: live
+                                    ? { pid: owner.pid, instanceId: owner.instanceId }
+                                    : null,
+                                },
+                              ],
+                            }),
+                          )
+                        : Stream.fromQueue(stdout),
+                      stderr: Stream.empty,
+                      all: Stream.empty,
+                      getInputFd: () => Sink.drain,
+                      getOutputFd: () => Stream.empty,
+                      unref: Effect.succeed(Effect.void),
+                    });
+                  }),
+              }),
+            ),
+          ),
+        );
+        const ref = { providerInstanceId: instanceId, sessionFile };
+        if (invalidArgs) {
+          const result = yield* service.open(ref).pipe(Effect.result);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.equal(result.failure.message, "NeoPi launch arguments may not override --fork");
+          }
+          assert.deepEqual(spawned, [["sessions", "list", "--json", "--session-dir", cwd]]);
+          assert.equal(makeHost.mock.calls.length, 0);
+          return;
+        }
+        const opened = yield* service.open(ref);
+        assert.equal(opened.attachment, live ? "terminal" : "owned");
+        assert.deepEqual(spawned, [
+          ["sessions", "list", "--json", "--session-dir", cwd],
+          live
+            ? ["ctl", "pipe", owner.instanceId, "--label", "neocode-native"]
+            : [
+                "--mode",
+                "rpc-ui",
+                "--cwd",
+                cwd,
+                "--no-title",
+                "--exit-with-parent",
+                "--session",
+                sessionFile,
+              ],
+        ]);
+        assert.equal(makeHost.mock.calls.length, 0);
+        yield* service.close({ ref });
+      }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+    );
+  }
 });

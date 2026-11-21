@@ -47,6 +47,113 @@ const fresh = (
   options: Parameters<typeof projectTranscript>[1] = { debug: false },
 ) => projectTranscript(input, options);
 
+describe("structured NeoPi messages", () => {
+  const adviser = {
+    role: "custom",
+    customType: "advisor",
+    content: "<advisory>model-facing text</advisory>",
+    details: {
+      notes: [
+        { note: "Urgent", severity: "blocker", advisor: "Logic", extra: true },
+        { note: "Check this", severity: "concern", advisor: "Scope" },
+        { note: "Polish", severity: "nit", advisor: "Review" },
+        { note: "Optional" },
+        { note: "Unknown severity", severity: "bogus" },
+      ],
+    },
+  };
+  const irc = {
+    role: "custom",
+    customType: "irc:incoming",
+    content: "<irc>model-facing text</irc>",
+    details: { id: "wire-id", from: "peer", message: "First line\nSecond line", replyTo: "other" },
+  };
+  const steer = {
+    role: "user",
+    content: "<parent-irc>model-facing text</parent-irc>",
+    parentIrc: { from: "main", body: "Change direction" },
+    steering: true,
+  };
+
+  it("keeps each valid advisory note and its identity from live to the journal", () => {
+    const project = createTranscriptProjector();
+    const before = project(source([], [{ messageId: "a", message: adviser }]), { debug: false });
+    expect(before).toMatchObject([
+      {
+        id: "live:a:advisor:0",
+        kind: "advisor",
+        text: "Urgent",
+        severity: "blocker",
+        advisor: "Logic",
+      },
+      {
+        id: "live:a:advisor:1",
+        kind: "advisor",
+        text: "Check this",
+        severity: "concern",
+        advisor: "Scope",
+      },
+      {
+        id: "live:a:advisor:2",
+        kind: "advisor",
+        text: "Polish",
+        severity: "nit",
+        advisor: "Review",
+      },
+      { id: "live:a:advisor:3", kind: "advisor", text: "Optional", severity: "nit", advisor: null },
+    ]);
+    const after = project(source([entry("a-record", "custom_message", adviser)]), {
+      debug: false,
+      rowKeys: new Map([["a-record", "live:a"]]),
+    });
+    expect(after.map(({ id }) => id)).toEqual(before.map(({ id }) => id));
+    expect(after.every((row) => row.kind === "advisor" && !row.live)).toBe(true);
+  });
+
+  it("shows live-only IRC and keeps one row across overlapping sideband, live and journal copies", () => {
+    const project = createTranscriptProjector();
+    const pending = [
+      { messageId: "irc:wire-id", message: irc },
+      { messageId: "message-5", message: irc },
+      {
+        messageId: "message-6",
+        message: { ...irc, details: { ...irc.details, id: "different-id" } },
+      },
+    ];
+    const first = project(source([], pending.slice(0, 1)), { debug: false });
+    expect(first).toMatchObject([{ kind: "irc", from: "peer", text: "First line\nSecond line" }]);
+    const second = project(source([], pending), { debug: false });
+    expect(second).toHaveLength(2); // Equal sender/body but a different IRC id is another delivery.
+    expect(second[0]?.id).toBe(first[0]?.id);
+    const journal = entry("irc-record", "custom_message", irc);
+    const third = project(source([journal], pending), { debug: false });
+    expect(third).toHaveLength(2);
+    expect(third[0]).toMatchObject({ id: first[0]?.id, kind: "irc", entry: journal, live: false });
+  });
+
+  it("keeps a parent steer as one IRC message even with its hidden observation in debug mode", () => {
+    const observation = {
+      ...irc,
+      display: false,
+      details: { ...irc.details, from: "main", message: "Change direction", fromParent: true },
+    };
+    const pending = [{ messageId: "observation", message: observation }];
+    for (const debug of [false, true]) {
+      const first = fresh(source([], [...pending, { messageId: "steer", message: steer }]), {
+        debug,
+      });
+      expect(first).toMatchObject([{ kind: "irc", from: "main", text: "Change direction" }]);
+      const durable = fresh(source([message("steer-record", steer)], pending), {
+        debug,
+        rowKeys: new Map([["steer-record", "live:steer"]]),
+      });
+      expect(durable).toMatchObject([
+        { id: first[0]?.id, kind: "irc", from: "main", text: "Change direction" },
+      ]);
+    }
+  });
+});
+
 describe("createTranscriptProjector", () => {
   const history = [
     user("u1"),

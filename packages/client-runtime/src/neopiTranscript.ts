@@ -22,12 +22,15 @@ export interface TranscriptFile {
   readonly record: Record<string, unknown>;
 }
 
-interface RowBase {
-  readonly id: string;
+interface RowBaseWithoutId {
   readonly entry: NeoPiJournalEntry;
   readonly timestamp: string;
   /** A live (not yet persisted) message from the current turn. */
   readonly live: boolean;
+}
+
+interface RowBase extends RowBaseWithoutId {
+  readonly id: string;
 }
 
 export interface UserRow extends RowBase {
@@ -96,6 +99,23 @@ export interface NoteRow extends RowBase {
   readonly tone: "system" | "notice" | "error";
 }
 
+interface AdvisorRow extends RowBase {
+  readonly kind: "advisor";
+  readonly text: string;
+  readonly severity: "nit" | "concern" | "blocker";
+  readonly label: string;
+  readonly advisor: string | null;
+}
+
+interface IrcRow extends RowBase {
+  readonly kind: "irc";
+  readonly text: string;
+  readonly label: string;
+  readonly from: string;
+}
+
+export type AttributedMessageRow = AdvisorRow | IrcRow;
+
 export interface DividerRow extends RowBase {
   readonly kind: "divider";
   readonly text: string;
@@ -120,6 +140,7 @@ export type TranscriptRow =
   | ThinkingRow
   | ToolRow
   | NoteRow
+  | AttributedMessageRow
   | DividerRow
   | RecordRow
   | CommandRow;
@@ -397,6 +418,73 @@ const VISIBLE_DIVIDERS = new Set([
 ]);
 
 /**
+ * Projects structured speech without using its model-facing content.
+ * An attributed record is handled even when hidden or malformed.
+ */
+export function visitAttributedMessage(
+  base: RowBaseWithoutId,
+  message: Readonly<Record<string, unknown>>,
+  key: string,
+  push: (row: AttributedMessageRow) => void,
+): boolean {
+  if (base.entry.type === "message" && message.role === "user" && "parentIrc" in message) {
+    const { from, body } = journalRecord(message.parentIrc);
+    if (typeof from === "string" && from && typeof body === "string")
+      push({ ...base, kind: "irc", id: `${key}:irc`, from, label: `IRC · ${from}`, text: body });
+    return true;
+  }
+  if (base.entry.type !== "custom_message" && message.role !== "custom") return false;
+  const type = message.customType;
+  if (
+    type !== "advisor" &&
+    type !== "irc:incoming" &&
+    type !== "irc:relay" &&
+    type !== "irc:workpool"
+  )
+    return false;
+  // Parent steering gets a hidden observation and a separate typed user-role message.
+  if (message.display === false) return true;
+  const details = journalRecord(message.details);
+  if (type === "advisor") {
+    if (Array.isArray(details.notes)) {
+      details.notes.forEach((value, index) => {
+        const { note, advisor, severity = "nit" } = journalRecord(value);
+        if (
+          typeof note !== "string" ||
+          (severity !== "nit" && severity !== "concern" && severity !== "blocker")
+        )
+          return;
+        const name = str(advisor);
+        push({
+          ...base,
+          kind: "advisor",
+          id: `${key}:advisor:${index}`,
+          text: note,
+          severity,
+          advisor: name,
+          label: name ? `Advisor · ${name}` : "Advisor",
+        });
+      });
+    }
+  } else {
+    const from = str(details.from);
+    const text = str(type === "irc:incoming" ? details.message : details.body);
+    const deliveryId = type === "irc:incoming" ? str(details.id) : null;
+    if (from && text !== null) {
+      push({
+        ...base,
+        kind: "irc",
+        id: deliveryId ? `irc:${deliveryId}` : `${key}:irc`,
+        from,
+        label: `IRC · ${from}`,
+        text,
+      });
+    }
+  }
+  return true;
+}
+
+/**
  * One projection pass over `rows`. `pendingTools` maps a call id to the index of
  * its tool row while no result has joined it yet.
  */
@@ -404,6 +492,8 @@ function createPass(
   options: TranscriptOptions,
   rows: TranscriptRow[],
   pendingTools: Map<string, number>,
+  bubbleIds: Set<string>,
+  durableBubbleIds?: ReadonlySet<string>,
 ) {
   const appendOutputs = (anchor: string | null) => {
     for (const output of options.commandOutputs?.get(anchor) ?? []) rows.push(output);
@@ -414,6 +504,12 @@ function createPass(
   };
   /** A message's rows are keyed by the key it was first shown under (`rowKeys`). */
   const rowKey = (entry: NeoPiJournalEntry) => options.rowKeys?.get(entry.id) ?? entry.id;
+
+  const pushBubble = (row: AttributedMessageRow) => {
+    if (durableBubbleIds?.has(row.id) || bubbleIds.has(row.id)) return;
+    bubbleIds.add(row.id);
+    push(row);
+  };
 
   const errorNote = (
     base: { entry: NeoPiJournalEntry; timestamp: string; live: boolean },
@@ -436,6 +532,11 @@ function createPass(
     const message = journalRecord(entry.message);
     const base = { entry, timestamp: entry.timestamp, live };
     const role = str(message.role);
+    if (
+      (role === "user" || role === "custom") &&
+      visitAttributedMessage(base, message, rowKey(entry), pushBubble)
+    )
+      return;
     const before = rows.length;
     if (role === "user") {
       push({
@@ -634,7 +735,10 @@ function createPass(
       const base = { entry, timestamp: entry.timestamp, live: false };
       if (entry.type === "message") visitMessage(entry, false);
       else if (entry.type === "custom_message") {
-        if (entry.display !== false || options.debug) {
+        if (
+          !visitAttributedMessage(base, entry, rowKey(entry), pushBubble) &&
+          (entry.display !== false || options.debug)
+        ) {
           const customType = str(entry.customType);
           push({
             ...base,
@@ -787,6 +891,7 @@ interface PersistedProjection {
   readonly rows: TranscriptRow[];
   /** Unjoined tool calls after the last entry, for live results that join them. */
   readonly pendingTools: Map<string, number>;
+  readonly bubbleIds: ReadonlySet<string>;
   /** Per iteration of the entry loop: its first entry index and the rows before it. */
   readonly iterationEntry: number[];
   readonly iterationRows: number[];
@@ -801,6 +906,7 @@ function projectPersisted(
     readonly rowCount: number;
     readonly iterations: number;
     readonly pendingTools: Map<string, number>;
+    readonly bubbleIds: Set<string>;
     /** Tool rows the last iteration joined a result onto; they resume as open calls. */
     readonly unjoined: ReadonlyArray<number>;
   } | null,
@@ -810,9 +916,10 @@ function projectPersisted(
   for (const index of resume?.unjoined ?? [])
     rows[index] = { ...(rows[index] as ToolRow), result: null };
   const pendingTools = resume ? resume.pendingTools : new Map<string, number>();
+  const bubbleIds = resume ? resume.bubbleIds : new Set<string>();
   const iterationEntry = resume ? resume.base.iterationEntry.slice(0, resume.iterations) : [];
   const iterationRows = resume ? resume.base.iterationRows.slice(0, resume.iterations) : [];
-  createPass(options, rows, pendingTools).visitEntries(
+  createPass(options, rows, pendingTools, bubbleIds).visitEntries(
     entries,
     resume?.from ?? 0,
     (entryIndex, rowCount) => {
@@ -833,6 +940,7 @@ function projectPersisted(
     rowKeys: options.rowKeys,
     rows,
     pendingTools,
+    bubbleIds,
     iterationEntry,
     iterationRows,
   };
@@ -854,10 +962,12 @@ function resumeAfterAppend(cached: PersistedProjection, entries: ReadonlyArray<N
   const from = cached.iterationEntry[iterations]!;
   const lastEntry = cached.entries[from];
   const pendingTools = new Map<string, number>();
+  const bubbleIds = new Set<string>();
   const unjoined: number[] = [];
   const seen = new Set<string>();
   for (let index = 0; index < rowCount; index++) {
     const row = cached.rows[index]!;
+    if (row.kind === "advisor" || row.kind === "irc") bubbleIds.add(row.id);
     if (row.kind !== "tool" || row.call.id === "") continue;
     if (seen.has(row.call.id)) return null;
     seen.add(row.call.id);
@@ -865,7 +975,7 @@ function resumeAfterAppend(cached: PersistedProjection, entries: ReadonlyArray<N
     if (row.result !== null && row.result.entry === lastEntry) unjoined.push(index);
     if (row.result === null || row.result.entry === lastEntry) pendingTools.set(row.call.id, index);
   }
-  return { base: cached, from, rowCount, iterations, pendingTools, unjoined };
+  return { base: cached, from, rowCount, iterations, pendingTools, bubbleIds, unjoined };
 }
 
 const rowsById = (rows: ReadonlyArray<TranscriptRow>, from = 0) => {
@@ -909,10 +1019,13 @@ export function createTranscriptProjector() {
     const tail = new Map<string, TranscriptRow>();
     if (source.pending.length > 0) {
       const next = persisted.rows.slice();
-      createPass(options, next, new Map(persisted.pendingTools)).visitPending(
-        source.pending,
-        source.leafId,
-      );
+      createPass(
+        options,
+        next,
+        new Map(persisted.pendingTools),
+        new Set(),
+        persisted.bubbleIds,
+      ).visitPending(source.pending, source.leafId);
       for (let index = 0; index < next.length; index++) {
         if (next[index] === persisted.rows[index]) continue;
         const row = next[index]!;
@@ -939,7 +1052,7 @@ export function projectTranscript(
 export function transcriptUserText(entries: ReadonlyArray<NeoPiJournalEntry>) {
   return entries.flatMap((entry) => {
     const message = journalRecord(entry.message);
-    if (entry.type !== "message" || message.role !== "user") return [];
+    if (entry.type !== "message" || message.role !== "user" || "parentIrc" in message) return [];
     return [{ id: entry.id, role: "user" as const, text: blockText(message.content) }];
   });
 }

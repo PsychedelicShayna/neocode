@@ -42,6 +42,11 @@ import {
   openNativeActivity,
   type NativeActivity,
 } from "./neopiNativeStatus.ts";
+import {
+  visitAttributedMessage,
+  type AttributedMessageRow,
+  type TranscriptSource,
+} from "./neopiTranscript.ts";
 
 const nowMs = () => DateTime.toEpochMillis(DateTime.nowUnsafe());
 
@@ -254,6 +259,8 @@ export interface NativeObservation {
   readonly cursor: NeoPiNativeCursor | null;
   /** By opaque key. Messages also feed the conversation; other classes are read by key. */
   readonly entities: ReadonlyMap<string, NativeObservedEntity>;
+  /** Display-only IRC messages, kept separately from the persistence join. */
+  readonly ircMessages: TranscriptSource["pending"];
   /** The pass whose returned keys are being accumulated, until it completes. */
   readonly passId: string | null;
   readonly returned: ReadonlySet<string>;
@@ -310,6 +317,7 @@ const emptyNativeObservation = (): NativeObservation => ({
   domain: null,
   cursor: null,
   entities: new Map(),
+  ircMessages: [],
   passId: null,
   returned: new Set(),
   staged: null,
@@ -479,6 +487,7 @@ const invalidateNativeReads = (feed: NativeSessionFeed): NativeSessionFeed =>
     : { ...feed, observation: { ...feed.observation, outstanding: null } };
 
 const decodeSegmentedEntity = Schema.decodeUnknownOption(Schema.fromJsonString(NeoPiNativeEntity));
+const IRC_OBSERVATION_PREFIX = "presentation:irc:";
 /**
  * Applies one cursor-read reply in place; a rebase is a full pass in a new
  * domain or after falling behind, never a reset. Only the reply to the one
@@ -610,6 +619,7 @@ function applyNativeRead(
       unproven = new Set([...unproven, ...waiting]);
     else carried = new Set([...carried, ...waiting]);
   }
+  let ircMessages: Array<TranscriptSource["pending"][number]> | undefined;
   const accept = (entity: NeoPiNativeEntity) => {
     returned.add(entity.key);
     const previous = entities.get(entity.key);
@@ -618,6 +628,17 @@ function applyNativeRead(
     entities.set(entity.key, entity);
     removed.delete(entity.key);
     const value = entity.value;
+    if (value.class === "presentation" && entity.key.startsWith(IRC_OBSERVATION_PREFIX)) {
+      const message = nativeRecord(value.value.message);
+      const current = ircMessages ?? held.ircMessages;
+      const index = current.findIndex((row) => row.messageId === entity.key);
+      if (index < 0) {
+        (ircMessages ??= [...current]).push({ messageId: entity.key, message, ended: true });
+      } else if (current[index]?.message !== message) {
+        (ircMessages ??= [...current])[index] = { messageId: entity.key, message, ended: true };
+      }
+      return;
+    }
     if (value.class !== "message") return;
     conversation = reduceNativeConversation(conversation, {
       type: "message",
@@ -645,6 +666,12 @@ function applyNativeRead(
     if (!previous) return;
     entities.delete(key);
     const value = previous.value;
+    if (value.class === "presentation" && key.startsWith(IRC_OBSERVATION_PREFIX)) {
+      const current = ircMessages ?? held.ircMessages;
+      const index = current.findIndex((row) => row.messageId === key);
+      if (index >= 0) (ircMessages ??= [...current]).splice(index, 1);
+      return;
+    }
     if (value.class !== "message") return;
     // Retired by its durable entry: the row stays until that entry is held.
     if (joinEntryId !== undefined && conversation.identity) {
@@ -811,6 +838,7 @@ function applyNativeRead(
       domain,
       cursor: result.continuation,
       entities,
+      ircMessages: ircMessages ?? held.ircMessages,
       passId: completed ? null : result.passId,
       returned: completed ? new Set() : returned,
       // Membership staging is decided by `stageNativeMembership` after this reply.
@@ -1779,19 +1807,22 @@ export function reduceNativeSessionFeed(
   };
 }
 
+/** Add ephemeral IRC observations without making them pending journal records. */
+export function nativeTranscriptPending(
+  pending: TranscriptSource["pending"],
+  ircMessages: NativeObservation["ircMessages"] | undefined,
+): TranscriptSource["pending"] {
+  if (!ircMessages?.length) return pending;
+  return pending.length ? [...pending, ...ircMessages] : ircMessages;
+}
+
 function nativeTranscriptEntries(
   conversation: NativeConversation,
-  debug: boolean,
+  ircMessages: NativeObservation["ircMessages"] | undefined,
 ): readonly NeoPiJournalEntry[] {
-  const entries = debug
-    ? conversation.entries
-    : conversation.entries.filter(
-        (entry) =>
-          entry.type === "message" || (entry.type === "custom_message" && entry.display !== false),
-      );
   return [
-    ...entries,
-    ...conversation.pending.map(({ messageId, message }) => ({
+    ...conversation.entries,
+    ...nativeTranscriptPending(conversation.pending, ircMessages).map(({ messageId, message }) => ({
       id: `live:${messageId}`,
       parentId: conversation.identity?.leafId ?? null,
       type: "message",
@@ -1803,7 +1834,8 @@ function nativeTranscriptEntries(
 
 export type NativeTranscriptRow =
   | { readonly kind: "entry"; readonly id: string; readonly entry: NeoPiJournalEntry }
-  | { readonly kind: "command"; readonly id: string; readonly text: string };
+  | { readonly kind: "command"; readonly id: string; readonly text: string }
+  | (AttributedMessageRow & { readonly entryKey: string });
 
 /** The first tool call id in a journal entry's message, if any. */
 function firstToolCallId(entry: NeoPiJournalEntry): string | null {
@@ -1826,7 +1858,9 @@ function firstToolCallId(entry: NeoPiJournalEntry): string | null {
  * reader is looking at removed and a new one inserted.
  */
 export function nativeTranscriptRows(
-  feed: Pick<NativeSessionFeed, "conversation" | "commandOutputs">,
+  feed: Pick<NativeSessionFeed, "conversation" | "commandOutputs"> & {
+    readonly observation?: Pick<NativeObservation, "ircMessages">;
+  },
   debug: boolean,
   previous: readonly NativeTranscriptRow[] = [],
 ): readonly NativeTranscriptRow[] {
@@ -1834,6 +1868,10 @@ export function nativeTranscriptRows(
   const keys = new Set<string>();
   const shownAs = new Map<string, string>();
   for (const row of previous) {
+    if (row.kind === "advisor" || row.kind === "irc") {
+      shownAs.set(row.entry.id, row.entryKey);
+      continue;
+    }
     if (row.kind !== "entry") continue;
     shownAs.set(row.entry.id, row.id);
     const callId = firstToolCallId(row.entry);
@@ -1863,7 +1901,31 @@ export function nativeTranscriptRows(
       rows.push({ kind: "command", id: output.id, text: output.text });
   };
   appendOutputs(null);
-  for (const entry of nativeTranscriptEntries(feed.conversation, true)) {
+  for (const entry of nativeTranscriptEntries(feed.conversation, feed.observation?.ircMessages)) {
+    const liveKey = persistedFrom.get(entry.id);
+    const message = entry.type === "custom_message" ? entry : nativeRecord(entry.message);
+    if (
+      entry.type === "custom_message" ||
+      message.role === "custom" ||
+      (message.role === "user" && "parentIrc" in message)
+    ) {
+      const entryKey = shownAs.get(entry.id) ?? (liveKey && shownAs.get(liveKey)) ?? entry.id;
+      if (
+        visitAttributedMessage(
+          { entry, timestamp: entry.timestamp, live: entry.id.startsWith("live:") },
+          message,
+          entryKey,
+          (row) => {
+            if (keys.has(row.id)) return;
+            keys.add(row.id);
+            rows.push({ ...row, entryKey });
+          },
+        )
+      ) {
+        appendOutputs(entry.id);
+        continue;
+      }
+    }
     if (
       debug ||
       entry.type === "message" ||
@@ -1871,7 +1933,6 @@ export function nativeTranscriptRows(
     ) {
       const callId = firstToolCallId(entry);
       const tool = callId ? `tool:${callId}` : null;
-      const liveKey = persistedFrom.get(entry.id);
       const id =
         [
           shownAs.get(entry.id),

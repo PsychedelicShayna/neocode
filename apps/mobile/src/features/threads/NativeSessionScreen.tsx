@@ -71,6 +71,42 @@ type Params = { environmentId: string; providerInstanceId: string; sessionFile: 
 type Request = ReturnType<typeof useNativeSession>["request"];
 const answered = new Map<string, Set<string>>();
 const editors = new Map<string, string>();
+
+const ATTRIBUTED_BUBBLE = {
+  nit: {
+    surface: "bg-adaptive-emerald-500-a12-a16",
+    text: "text-adaptive-emerald-700-300",
+    severity: "Nit",
+  },
+  concern: { surface: "bg-warning", text: "text-warning-foreground", severity: "Concern" },
+  blocker: { surface: "bg-danger", text: "text-danger-foreground", severity: "Blocker" },
+  irc: {
+    surface: "bg-adaptive-sky-500-a12-a16",
+    text: "text-adaptive-sky-700-300",
+    severity: null,
+  },
+} as const;
+
+function AttributedNativeBubble({
+  row,
+}: {
+  row: Extract<NativeTranscriptRow, { kind: "advisor" | "irc" }>;
+}) {
+  const tone = ATTRIBUTED_BUBBLE[row.kind === "irc" ? "irc" : row.severity];
+  return (
+    <View
+      className={`max-w-[90%] self-start gap-1 rounded-2xl rounded-bl-sm px-3 py-2 ${tone.surface}`}
+    >
+      <Text accessibilityRole="header" className={`text-xs font-t3-medium ${tone.text}`}>
+        {tone.severity ? `${row.label} ${tone.severity}` : row.label}
+      </Text>
+      <Text selectable className="text-sm text-foreground">
+        {row.text}
+      </Text>
+    </View>
+  );
+}
+
 export function NativeSessionScreen({ route }: StaticScreenProps<Params>) {
   const target = useMemo(
     () => ({
@@ -93,25 +129,36 @@ export function NativeSessionScreen({ route }: StaticScreenProps<Params>) {
 function useTranscriptRows(
   conversation: NativeSessionFeed["conversation"],
   commandOutputs: NativeSessionFeed["commandOutputs"],
+  ircMessages: NativeSessionFeed["observation"]["ircMessages"],
   debug: boolean,
 ): readonly NativeTranscriptRow[] {
   const [shown, setShown] = useState(() => ({
     conversation,
     commandOutputs,
+    ircMessages,
     debug,
-    rows: nativeTranscriptRows({ conversation, commandOutputs }, debug),
+    rows: nativeTranscriptRows(
+      { conversation, commandOutputs, observation: { ircMessages } },
+      debug,
+    ),
   }));
   if (
     shown.conversation === conversation &&
     shown.commandOutputs === commandOutputs &&
+    shown.ircMessages === ircMessages &&
     shown.debug === debug
   )
     return shown.rows;
   const next = {
     conversation,
     commandOutputs,
+    ircMessages,
     debug,
-    rows: nativeTranscriptRows({ conversation, commandOutputs }, debug, shown.rows),
+    rows: nativeTranscriptRows(
+      { conversation, commandOutputs, observation: { ircMessages } },
+      debug,
+      shown.rows,
+    ),
   };
   setShown(next);
   return next.rows;
@@ -396,7 +443,12 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       })
       .catch((cause) => setLocalError(String(cause)));
   }, [request, target, feed.session?.capabilities]);
-  const rows = useTranscriptRows(feed.conversation, feed.commandOutputs, debug);
+  const rows = useTranscriptRows(
+    feed.conversation,
+    feed.commandOutputs,
+    feed.observation.ircMessages,
+    debug,
+  );
   const callIdsByRow = useMemo(
     () =>
       new Map(
@@ -538,45 +590,41 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             />
           ) : null
         }
-        renderItem={({ item }) =>
-          item.kind === "command" ? (
-            <View
-              className="px-4 py-3"
-              accessibilityLabel="Command output"
-              onLayout={({ nativeEvent }) => {
-                measuredRowsRef.current.set(item.id, nativeEvent.layout.height);
-                submissionFollow.changed();
-              }}
-            >
+        renderItem={({ item }) => (
+          <View
+            className={item.kind === "entry" ? "gap-2 px-4 py-3" : "px-4 py-3"}
+            accessibilityLabel={item.kind === "command" ? "Command output" : undefined}
+            onLayout={({ nativeEvent }) => {
+              measuredRowsRef.current.set(item.id, nativeEvent.layout.height);
+              submissionFollow.changed();
+            }}
+          >
+            {item.kind === "command" ? (
               <NativeCommandOutput text={item.text} />
-            </View>
-          ) : (
-            <View
-              className="gap-2 px-4 py-3"
-              onLayout={({ nativeEvent }) => {
-                measuredRowsRef.current.set(item.id, nativeEvent.layout.height);
-                submissionFollow.changed();
-              }}
-            >
-              <Text className="text-xs font-t3-medium text-foreground-muted">
-                {journalEntryLabel(item.entry)}
-              </Text>
-              <NeoPiJournalContent
-                entry={item.entry}
-                environmentId={target.environmentId}
-                nativeRef={feed.session?.ref ?? target.ref}
-                cwd={feed.session?.cwd ?? null}
-              />
-              {(callIdsByRow.get(item.id) ?? []).flatMap((callId) =>
-                (losses.byToolCall.get(callId) ?? []).map((warning) => (
-                  <Text key={warning.key} className="text-xs text-warning-foreground">
-                    {warning.text}
-                  </Text>
-                )),
-              )}
-            </View>
-          )
-        }
+            ) : item.kind !== "entry" ? (
+              <AttributedNativeBubble row={item} />
+            ) : (
+              <>
+                <Text className="text-xs font-t3-medium text-foreground-muted">
+                  {journalEntryLabel(item.entry)}
+                </Text>
+                <NeoPiJournalContent
+                  entry={item.entry}
+                  environmentId={target.environmentId}
+                  nativeRef={feed.session?.ref ?? target.ref}
+                  cwd={feed.session?.cwd ?? null}
+                />
+                {(callIdsByRow.get(item.id) ?? []).flatMap((callId) =>
+                  (losses.byToolCall.get(callId) ?? []).map((warning) => (
+                    <Text key={warning.key} className="text-xs text-warning-foreground">
+                      {warning.text}
+                    </Text>
+                  )),
+                )}
+              </>
+            )}
+          </View>
+        )}
       />
       <View className="gap-2 border-t border-border px-4 py-3">
         <FloatingWorkingControl

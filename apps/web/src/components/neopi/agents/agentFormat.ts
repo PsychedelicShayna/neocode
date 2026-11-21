@@ -60,6 +60,15 @@ export function previewLines(rows: readonly TranscriptRow[], limit: number): Pre
           error: row.result?.isError === true,
         });
         break;
+      case "advisor":
+      case "irc":
+        lines.push({
+          id: row.id,
+          kind: "note",
+          text: clamp(`${row.label}: ${row.text}`),
+          error: row.kind === "advisor" && row.severity === "blocker",
+        });
+        break;
       case "note":
         lines.push({
           id: row.id,

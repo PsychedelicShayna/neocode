@@ -19,6 +19,7 @@ import {
   nativeRecord,
   nativeSlashArgument,
   nativeSlashCommands,
+  nativeTranscriptPending,
   nativeTranscriptRows,
   reduceNativeSessionFeed,
   type NativeSessionFeed,
@@ -496,6 +497,66 @@ describe("observation rebase", () => {
         ...(next ? { nextCursor: next } : {}),
       },
     });
+
+  it("renders relay-only IRC on both clients and retires it without a persistence loss", () => {
+    const epoch = domain();
+    const baseline = step(observing(), {
+      epoch,
+      passId: "irc-base",
+      watermark: 1,
+      journal: horizon([journalEntry("base", null, "Existing message")]),
+    });
+    const key = "presentation:irc:relay:1";
+    const relay = step(baseline, {
+      epoch,
+      passId: "irc-live",
+      kind: "incremental",
+      watermark: 2,
+      entities: [
+        {
+          key,
+          ordinal: 2,
+          revision: 2,
+          value: {
+            class: "presentation",
+            value: {
+              message: {
+                role: "custom",
+                customType: "irc:relay",
+                display: true,
+                details: { from: "peer", to: "sibling", body: "Relay only" },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const project = (feed: NativeSessionFeed) =>
+      projectTranscript(
+        {
+          entries: feed.conversation.entries,
+          pending: nativeTranscriptPending(feed.conversation.pending, feed.observation.ircMessages),
+          leafId: feed.conversation.identity?.leafId ?? null,
+        },
+        { debug: false },
+      );
+    expect(project(relay).at(-1)).toMatchObject({ kind: "irc", from: "peer", text: "Relay only" });
+    expect(nativeTranscriptRows(relay, false).at(-1)).toMatchObject({
+      kind: "irc",
+      label: "IRC · peer",
+      text: "Relay only",
+    });
+    const retired = step(relay, {
+      epoch,
+      passId: "irc-retired",
+      kind: "incremental",
+      watermark: 3,
+      tombstones: [{ key, revision: 3, ordinal: 2 }],
+    });
+    expect(project(retired)).toEqual(project(baseline));
+    expect(nativeTranscriptRows(retired, false)).toEqual(nativeTranscriptRows(baseline, false));
+    expect(retired.conversation.losses).toEqual(baseline.conversation.losses);
+  });
 
   it("keeps the history being read and leaves a placeholder for a gap larger than one page", () => {
     const epoch = domain();

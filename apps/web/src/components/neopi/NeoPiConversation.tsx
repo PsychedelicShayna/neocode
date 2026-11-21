@@ -28,6 +28,7 @@ export function NeoPiConversation({
 }) {
   const {
     conversation,
+    transcriptPending,
     connection,
     loading,
     error,
@@ -60,12 +61,12 @@ export function NeoPiConversation({
       projectTranscript(
         {
           entries: conversation.entries,
-          pending: conversation.pending,
+          pending: transcriptPending,
           leafId: conversation.identity?.leafId ?? null,
         },
         { debug, rowKeys },
       ),
-    [conversation.entries, conversation.pending, conversation.identity?.leafId, debug, rowKeys],
+    [conversation.entries, transcriptPending, conversation.identity?.leafId, debug, rowKeys],
   );
   const identity = conversation.identity;
   const assistantName = identity

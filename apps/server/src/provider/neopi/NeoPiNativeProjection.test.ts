@@ -61,6 +61,79 @@ const bodyText = (message: Record<string, unknown> | undefined) =>
   JSON.stringify((message?.content as unknown[] | undefined) ?? null);
 
 describe("NeoPiNativeProjection", () => {
+  it("serves visible sideband IRC without waiting for a message lifecycle, and ignores hidden steers", () => {
+    const projection = published();
+    const relay = {
+      role: "custom",
+      customType: "irc:relay",
+      display: true,
+      timestamp: 1794950400000,
+      details: { from: "peer", to: "sibling", body: "Relay only" },
+    };
+    const incoming = {
+      ...relay,
+      customType: "irc:incoming",
+      details: { id: "delivery", from: "peer", message: "Incoming" },
+    };
+    projection.fold({ type: "irc_message", message: relay });
+    projection.fold({ type: "irc_message", message: incoming });
+    projection.fold({ type: "irc_message", message: incoming });
+    projection.fold({
+      type: "irc_message",
+      message: { ...incoming, display: false, details: { ...incoming.details, id: "hidden" } },
+    });
+    const reply = readNeoPiNativeObservation(projection, null, WIDE, "reader");
+    assert.equal(reply.type, "pass");
+    if (reply.type !== "pass") return;
+    assert.deepEqual(
+      reply.entities.flatMap(({ value }) =>
+        value.class === "presentation" ? [value.value.message] : [],
+      ),
+      [relay, incoming],
+    );
+    projection.fold({
+      type: "journal_entry",
+      sessionId,
+      entry: { ...incoming, ...entry("durable-irc", null), type: "custom_message" },
+    });
+    const durable = readNeoPiNativeObservation(projection, null, WIDE, "reader");
+    assert.equal(durable.type, "pass");
+    if (durable.type !== "pass") return;
+    assert.deepEqual(
+      durable.entities.flatMap(({ value }) =>
+        value.class === "presentation" ? [value.value.message] : [],
+      ),
+      [relay],
+    );
+    assert.include(durable.journal?.entries.map(({ id }) => id) ?? [], "durable-irc");
+  });
+
+  it("holds a flat journal advisory until its live message is associated", () => {
+    const projection = published();
+    const advisor = {
+      role: "custom",
+      customType: "advisor",
+      details: { notes: [{ note: "Advice" }] },
+      display: true,
+    };
+    projection.fold({ type: "message_end", messageId: "live-advisor", message: advisor });
+    projection.fold({
+      type: "journal_entry",
+      sessionId,
+      entry: { ...entry("durable-advisor", null), ...advisor, type: "custom_message" },
+    });
+    assert.isBelow(projection.deliverableJournalEnd, projection.journal.end);
+
+    projection.fold({
+      type: "message_persisted",
+      sessionId,
+      messageId: "live-advisor",
+      entryId: "durable-advisor",
+    });
+    assert.equal(projection.deliverableJournalEnd, projection.journal.end);
+    assert.isUndefined(servedMessage(projection, "live-advisor"));
+  });
+
   it.each([true, undefined])(
     "preserves the run and journal holds across a pause until terminal end (%s)",
     (isTerminal) => {

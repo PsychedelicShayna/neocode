@@ -357,6 +357,19 @@ function projectNativeTimeline(
       );
       continue;
     }
+    if (row.kind === "advisor" || row.kind === "irc") {
+      entries.push(
+        memoized(row, null, null, () => ({
+          id: row.id,
+          kind: "message-bubble",
+          createdAt: row.timestamp,
+          label: row.label,
+          text: row.text,
+          tone: row.kind === "irc" ? "irc" : row.severity,
+        })),
+      );
+      continue;
+    }
     lastAt = row.timestamp;
     // Journal bookkeeping (model, reasoning and tier changes, compaction,
     // unrecognised records) lands after the reply when settings change later.

@@ -3503,6 +3503,30 @@ describe("attach-only discovery (r12 C5)", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("does not report a terminal attachment's initial xd:// mount notice as missed", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture("terminal");
+      native.bindNotices.push(xdevMountNotice);
+      const { ref, attachment } = yield* service.open(originalRef);
+      assert.equal(attachment, "terminal");
+      assert.equal(native.binds, 1);
+      assert.equal(native.snapshots, 0);
+
+      const first = yield* follow(service, ref);
+      assert.deepEqual((yield* first.pass()).inbox, []);
+      yield* Fiber.interrupt(first.fiber);
+
+      yield* native.publish(xdevMountNotice);
+      const returning = yield* follow(service, ref);
+      assert.deepEqual(
+        (yield* returning.pass()).inbox.map((record) =>
+          record.type === "gap" ? [record.reason, record.notices] : record.type,
+        ),
+        [["not-observed", 1]],
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("does not report a fresh owned session's initial xd:// mount notice as missed", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();
@@ -3539,28 +3563,34 @@ describe("attach-only discovery (r12 C5)", () => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("still reports other notices missed during a fresh owned session's startup", () =>
-    Effect.gen(function* () {
-      const { native, service } = yield* fixture();
-      native.bindNotices.push(
-        xdevMountNotice,
-        { ...xdevMountNotice, level: "warning" },
-        { ...xdevMountNotice, message: "xd://: extension unavailable" },
-      );
-      const { ref } = yield* service.open({ providerInstanceId: instanceId });
-      yield* native.publish(xdevMountNotice);
+  for (const attachment of ["owned", "terminal"] as const) {
+    it.effect(`still reports other notices missed during ${attachment} startup`, () =>
+      Effect.gen(function* () {
+        const { native, service } = yield* fixture(attachment);
+        native.bindNotices.push(
+          xdevMountNotice,
+          { ...xdevMountNotice, level: "warning" },
+          { ...xdevMountNotice, level: "error" },
+          { ...xdevMountNotice, message: "xd://: extension unavailable" },
+          { ...xdevMountNotice, source: "other-extension" },
+        );
+        const { ref } = yield* service.open(
+          attachment === "owned" ? { providerInstanceId: instanceId } : originalRef,
+        );
+        yield* native.publish(xdevMountNotice);
 
-      const first = yield* follow(service, ref);
-      assert.deepEqual(
-        (yield* first.pass()).inbox.map((record) =>
-          record.type === "gap"
-            ? [record.reason, record.fromSeq, record.toSeq, record.notices]
-            : record.type,
-        ),
-        [["not-observed", 1, 3, 3]],
-      );
-    }).pipe(Effect.scoped),
-  );
+        const first = yield* follow(service, ref);
+        assert.deepEqual(
+          (yield* first.pass()).inbox.map((record) =>
+            record.type === "gap"
+              ? [record.reason, record.fromSeq, record.toSeq, record.notices]
+              : record.type,
+          ),
+          [["not-observed", 1, 5, 5]],
+        );
+      }).pipe(Effect.scoped),
+    );
+  }
 
   it.effect(
     "with no owner anywhere, discovery reports owner-stopped, ends the stream and starts nothing",

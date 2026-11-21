@@ -492,7 +492,7 @@ interface NativeSession {
    * tools are registered with the owner only once something wants them.
    */
   hostToolsWanted: boolean;
-  /** Only an owned open is pending; the first lease or bind completion ends it. */
+  /** An initial open bind is pending; the first lease or bind completion ends it. */
   startupHostToolsBind: "pending" | "binding" | null;
 }
 interface NativeMarkers {
@@ -1705,10 +1705,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           recovery: null,
           takeoverRequested: false,
           hostToolsWanted: mode === "auto",
-          startupHostToolsBind:
-            mode === "auto" && native.attachment === "owned" && native.hostTools !== undefined
-              ? "pending"
-              : null,
+          startupHostToolsBind: mode === "auto" && native.hostTools ? "pending" : null,
         };
         const current = session;
         sessions.set(file, current);

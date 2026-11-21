@@ -117,6 +117,8 @@ export const NeoPiNativeSessionsOpenResult = Schema.Struct({
   sessionId: Schema.String,
   cwd: Schema.String,
   attachment: NeoPiNativeSessionAttachment,
+  /** A verified dedicated tmux owner can open auxiliary monitor windows. */
+  managedTmux: Schema.optional(Schema.Literal(true)),
   capabilities: Schema.Array(Schema.String),
   state: NeoPiNativeSessionRecord,
 });

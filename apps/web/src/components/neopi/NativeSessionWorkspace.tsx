@@ -926,6 +926,7 @@ export function NativeSessionView({
       <NativeSessionWorkspacePanels
         target={target}
         cwd={session?.cwd ?? null}
+        managedTmux={session?.managedTmux === true}
         agents={feed.agents}
         keybindings={keybindings}
         composerRef={composerRef}

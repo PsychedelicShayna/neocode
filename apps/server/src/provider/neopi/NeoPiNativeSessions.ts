@@ -100,8 +100,10 @@ import {
   bindOrStartManagedTmux,
   makeManagedTmuxHost,
   managedControlPublication,
+  decodeManagedMonitorGrant,
   managedTmuxClient,
   managedTmuxConfig,
+  openManagedTmuxMonitor,
   rebindManagedTmux,
   resolveManagedTmuxOwner,
   resolveTmuxExecutable,
@@ -372,6 +374,7 @@ export interface NeoPiNativeSessionsDependencies {
   ) => Effect.Effect<
     {
       owner: ManagedTmuxOwner;
+      socket: string;
       executable: string;
       args: string[];
     },
@@ -705,6 +708,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     sessionId: session.sessionId,
     cwd: session.cwd,
     attachment: session.native.attachment,
+    ...(session.native.managedTmux ? { managedTmux: true as const } : {}),
     capabilities: Array.from(session.native.client.capabilities),
     state: session.state,
   });
@@ -1739,7 +1743,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         }),
       );
     }).pipe(Effect.scoped, Effect.mapError(nativeError));
-  const managedTmuxView = (ref: NeoPiNativeSessionRef) =>
+  const resolveManagedTmuxView = (ref: NeoPiNativeSessionRef) =>
     Effect.gen(function* () {
       const file = yield* dependencies.canonicalize(ref.sessionFile);
       if (file !== ref.sessionFile)
@@ -1761,7 +1765,41 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           "The managed tmux owner changed. Reopen the native session.",
           "tmux_owner_changed",
         );
-      return { executable: target.executable, args: target.args, cwd: current.native.cwd };
+      return { current, profile, target };
+    }).pipe(Effect.mapError(nativeError));
+  const managedTmuxView = (ref: NeoPiNativeSessionRef) =>
+    resolveManagedTmuxView(ref).pipe(
+      Effect.map(({ current, target }) => ({
+        executable: target.executable,
+        args: target.args,
+        cwd: current.native.cwd,
+      })),
+    );
+  const managedTmuxMonitor = (ref: NeoPiNativeSessionRef, agentId: string) =>
+    Effect.gen(function* () {
+      const { current, profile, target } = yield* resolveManagedTmuxView(ref);
+      const native = current.native;
+      const reply = yield* requestNative({ ref, command: { type: "monitor_grant", agentId } });
+      const capability = yield* Effect.try({
+        try: () => decodeManagedMonitorGrant(agentId, reply),
+        // Decoder issues may include response data. Never expose the capability.
+        catch: () => fail("NeoPi returned an invalid monitor grant.", "tmux_monitor_grant"),
+      });
+      if (current.native !== native)
+        return yield* fail(
+          "The managed tmux owner changed. Reopen the native session.",
+          "tmux_owner_changed",
+        );
+      yield* profile.validate;
+      const client = yield* openManagedTmuxMonitor({
+        socket: target.socket,
+        owner: target.owner,
+        cwd: native.cwd,
+        binary: profile.source.binary,
+        env: profile.source.env,
+        capability,
+      });
+      return { ...client, cwd: native.cwd };
     }).pipe(Effect.mapError(nativeError));
   /**
    * What a session's owner is doing. NeoCode's own connection is authoritative
@@ -2722,6 +2760,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     request,
     watch,
     managedTmuxView,
+    managedTmuxMonitor,
     read,
     credit,
     setDemand,
@@ -3546,7 +3585,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
               rebind(managedHost.target(saved.session), profile, saved),
             );
             yield* profile.validate;
-            return { ...managedTmuxClient(binding, binding.owner), owner: binding.owner };
+            return {
+              ...managedTmuxClient(binding, binding.owner),
+              owner: binding.owner,
+              socket: binding.socket,
+            };
           }
         }
         const target = isManaged(ref.providerInstanceId, ref.sessionFile);
@@ -3558,7 +3601,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         yield* profile.validate;
         const owner = yield* probeManaged(profile, target);
         yield* profile.validate;
-        return { ...managedTmuxClient(target, owner), owner };
+        return { ...managedTmuxClient(target, owner), owner, socket: target.socket };
       }),
     settlement: {
       store: yield* makeNeoPiNativeSettledStore(

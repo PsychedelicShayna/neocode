@@ -11,6 +11,12 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 export const DEFAULT_TERMINAL_ID = "term-1";
 export const MANAGED_TMUX_TERMINAL_ID = "managed-tmux";
 
+export function managedTmuxTerminalThreadId(resourceId: string, monitorViewId?: string) {
+  return monitorViewId
+    ? `${MANAGED_TMUX_TERMINAL_ID}-monitor:${monitorViewId}:${resourceId}`
+    : `${MANAGED_TMUX_TERMINAL_ID}:${resourceId}`;
+}
+
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const TerminalColsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
   Schema.isLessThanOrEqualTo(1000),
@@ -58,7 +64,17 @@ export const TerminalAttachInput = Schema.Struct({
   rows: Schema.optional(TerminalRowsSchema),
   env: Schema.optional(TerminalEnvSchema),
   providerInstanceId: Schema.optional(ProviderInstanceId),
-  managedTmux: Schema.optional(NeoPiNativeSessionRef),
+  managedTmux: Schema.optional(
+    Schema.Struct({
+      ...NeoPiNativeSessionRef.fields,
+      monitor: Schema.optional(
+        Schema.Struct({
+          agentId: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256)),
+          viewId: Schema.String.check(Schema.isPattern(/^[0-9a-f]{32}$/)),
+        }),
+      ),
+    }),
+  ),
   restartIfNotRunning: Schema.optional(Schema.Boolean),
 });
 export type TerminalAttachInput = typeof TerminalAttachInput.Type;

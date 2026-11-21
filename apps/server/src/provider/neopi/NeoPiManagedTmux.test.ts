@@ -14,11 +14,16 @@ import {
   managedTmuxClient,
   managedTmuxConfig,
   resolveManagedTmuxOwner,
+  openManagedTmuxMonitor,
+  decodeManagedMonitorGrant,
   type ManagedTmuxBinding,
   type ManagedTmuxConfig,
 } from "./NeoPiManagedTmux.ts";
 
-const { exec } = vi.hoisted(() => ({ exec: vi.fn() }));
+const { exec, writeFile } = vi.hoisted(() => ({
+  exec: vi.fn(),
+  writeFile: vi.fn(async (_path: string, _data: string, _options: unknown) => {}),
+}));
 vi.mock("node:child_process", () => ({
   execFile: Object.assign(vi.fn(), { [Symbol.for("nodejs.util.promisify.custom")]: exec }),
 }));
@@ -36,7 +41,7 @@ vi.mock("node:fs/promises", () => ({
     mode: 0o700,
   })),
   mkdir: vi.fn(async () => {}),
-  writeFile: vi.fn(async () => {}),
+  writeFile,
   rename: vi.fn(async () => {}),
   rm: vi.fn(async () => {}),
 }));
@@ -175,6 +180,88 @@ describe("managed tmux pane lookup", () => {
     resolveExecutable.mockReturnValue(undefined);
     await expect(lookup(await prepare())).rejects.toMatchObject({ code: "tmux_unavailable" });
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("managed tmux monitor", () => {
+  const owner = { ...pane, ...publication };
+  const open = (capability = "a".repeat(64)) =>
+    openManagedTmuxMonitor({
+      socket,
+      owner,
+      cwd: "/project",
+      binary: "/private/npi nightly",
+      env: { PI_CONTROL_DIR: "/private/control" },
+      capability,
+    });
+
+  effectIt.effect(
+    "isolates the monitor in its own window, preserves native refusals, and closes on hide",
+    () =>
+      Effect.gen(function* () {
+        writeFile.mockClear();
+        exec.mockReset();
+        exec.mockImplementation(async (_file: string, args: string[]) => ({
+          stdout: args.includes("new-session") ? "$9\n" : "",
+        }));
+        const observed = yield* Effect.gen(function* () {
+          const client = yield* open();
+          expect(exec.mock.calls.some(([, args]) => args.includes("kill-session"))).toBe(false);
+          return client;
+        }).pipe(Effect.scoped);
+        const [tmux, launch] = exec.mock.calls[0]!;
+        expect(tmux).toBe(executable);
+        expect(launch.slice(0, 5)).toEqual(["-N", "-S", socket, "new-session", "-dEP"]);
+        expect(launch).toContain("remain-on-exit");
+        expect(launch).toContain("failed"); // NeoPi's authoritative connection-limit refusal stays visible.
+        expect(launch).not.toContain(owner.session);
+        expect(launch.join(" ")).not.toContain("a".repeat(64));
+        const [grantWrite, scriptWrite] = writeFile.mock.calls;
+        expect(grantWrite).toEqual([
+          expect.stringMatching(/\/monitor-.*\.cap$/),
+          "a".repeat(64),
+          { mode: 0o600, flag: "wx" },
+        ]);
+        expect(scriptWrite?.[1]).toContain(
+          `exec '/private/npi nightly' 'monitor' 'attach' '${owner.instanceId}' '--capability-file' '${grantWrite?.[0]}'`,
+        );
+        expect(scriptWrite?.[1]).not.toMatch(/--(?:session|new-session|mode|exit-with-parent)\b/);
+        expect(scriptWrite?.[1]).not.toContain("a".repeat(64));
+        expect(observed.args.slice(0, 8)).toEqual([
+          "-N",
+          "-S",
+          socket,
+          "attach-session",
+          "-E",
+          "-t",
+          "$9",
+          ";",
+        ]);
+        expect(exec.mock.calls.at(-1)?.[1]).toEqual([
+          "-N",
+          "-S",
+          socket,
+          "kill-session",
+          "-t",
+          "$9",
+        ]);
+      }),
+  );
+
+  it("pins a grant to the requested agent and refuses writable advisor grants", () => {
+    const capability = "a".repeat(64);
+    const grant = { capability, agentId: "advisor-a", kind: "advisor", canChat: false };
+    expect(decodeManagedMonitorGrant("advisor-a", grant)).toBe(capability);
+    expect(() => decodeManagedMonitorGrant("advisor-a", { ...grant, canChat: true })).toThrow();
+    expect(() => decodeManagedMonitorGrant("advisor-b", grant)).toThrow();
+    expect(
+      decodeManagedMonitorGrant("worker", {
+        capability,
+        agentId: "worker",
+        kind: "sub",
+        canChat: true,
+      }),
+    ).toBe(capability);
   });
 });
 

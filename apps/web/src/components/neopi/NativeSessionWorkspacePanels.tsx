@@ -99,6 +99,7 @@ const DevicePanel = lazy(() =>
 export function NativeSessionWorkspacePanels({
   target,
   cwd,
+  managedTmux,
   agents,
   keybindings,
   composerRef,
@@ -119,6 +120,7 @@ export function NativeSessionWorkspacePanels({
 }: {
   target: NativeSessionTarget;
   cwd: string | null;
+  managedTmux?: boolean;
   agents: readonly RuntimeSubagent[];
   keybindings: ResolvedKeybindingsConfig;
   composerRef: RefObject<ChatComposerHandle | null>;
@@ -591,7 +593,17 @@ export function NativeSessionWorkspacePanels({
             workspaceMutationId={workspaceMutationId}
           />
         ) : null}
-        {activeSurface?.kind === "agents" ? <NativeAgentsPanel viewKey={key} /> : null}
+        {activeSurface?.kind === "agents" ? (
+          <NativeAgentsPanel
+            key={managedTmux && panel.isOpen && !agentViewActive ? `${key}:monitor` : key}
+            viewKey={key}
+            monitor={
+              managedTmux && panel.isOpen && !agentViewActive && cwd
+                ? { target, cwd, request }
+                : undefined
+            }
+          />
+        ) : null}
         {activeSurface?.kind === "background-tasks" ? (
           <NativeBackgroundTasksPanel target={target} visible={panel.isOpen} />
         ) : null}

@@ -20,6 +20,7 @@ import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   MANAGED_TMUX_TERMINAL_ID,
+  managedTmuxTerminalThreadId,
   TerminalManagedTmuxError,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
@@ -3534,22 +3535,27 @@ const makeWsRpcLayer = (
             input.managedTmux
               ? Stream.unwrap(
                   Effect.gen(function* () {
-                    const ref = input.managedTmux!;
-                    const threadId = `${MANAGED_TMUX_TERMINAL_ID}:${nativeWorkspaceResourceId(ref)}`;
+                    const { monitor, ...ref } = input.managedTmux!;
+                    const threadId = managedTmuxTerminalThreadId(
+                      nativeWorkspaceResourceId(ref),
+                      monitor?.viewId,
+                    );
                     const terminalId = MANAGED_TMUX_TERMINAL_ID;
                     if (input.threadId !== threadId || input.terminalId !== terminalId)
                       return yield* new TerminalManagedTmuxError({
-                        message: "Invalid managed TUI view identity.",
+                        message: "Invalid managed terminal view identity.",
                       });
-                    const target = yield* neopiNativeSessions
-                      .managedTmuxView(ref)
-                      .pipe(
-                        Effect.mapError(
-                          (error) => new TerminalManagedTmuxError({ message: error.message }),
-                        ),
-                      );
+                    const target = (
+                      monitor
+                        ? neopiNativeSessions.managedTmuxMonitor(ref, monitor.agentId)
+                        : neopiNativeSessions.managedTmuxView(ref)
+                    ).pipe(
+                      Effect.mapError(
+                        (error) => new TerminalManagedTmuxError({ message: error.message }),
+                      ),
+                    );
                     const identity = { threadId, terminalId };
-                    yield* terminalManager.openTmuxView({ ...identity, cwd: target.cwd }, target);
+                    yield* terminalManager.openTmuxView(identity, target);
                     return terminalAttachStream(terminalManager, identity);
                   }),
                 )

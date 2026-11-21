@@ -422,18 +422,32 @@ it.layer(
       const { manager, ptyAdapter } = yield* createManager();
       const input = openInput({ terminalId: MANAGED_TMUX_TERMINAL_ID });
       const args = ["-N", "-S", "/private/tmux.sock", "attach-session", "-E", "-t", "$2"];
+      let acquisitions = 0;
+      let releases = 0;
+      const target = Effect.acquireRelease(
+        Effect.sync(() => {
+          acquisitions++;
+          return { executable: "/usr/bin/tmux", args, cwd: input.cwd };
+        }),
+        () =>
+          Effect.sync(() => {
+            releases++;
+          }),
+      );
       yield* Effect.gen(function* () {
-        yield* manager.openTmuxView(input, { executable: "/usr/bin/tmux", args });
-        yield* manager
-          .openTmuxView(input, { executable: "/usr/bin/tmux", args })
-          .pipe(Effect.scoped);
+        yield* manager.openTmuxView(input, target);
+        yield* manager.openTmuxView(input, target).pipe(Effect.scoped);
+        expect(acquisitions).toBe(1);
+        expect(releases).toBe(0);
         expect(ptyAdapter.spawnInputs).toHaveLength(1);
         expect(ptyAdapter.spawnInputs[0]).toMatchObject({ shell: "/usr/bin/tmux", args });
         expect(ptyAdapter.processes[0]?.killed).toBe(false);
       }).pipe(Effect.scoped);
       expect(ptyAdapter.processes[0]?.killed).toBe(true);
       expect(yield* manager.getSnapshot(input)).toBeNull();
-      yield* manager.openTmuxView(input, { executable: "/usr/bin/tmux", args }).pipe(Effect.scoped);
+      expect(releases).toBe(1);
+      yield* manager.openTmuxView(input, target).pipe(Effect.scoped);
+      expect(releases).toBe(2);
       expect(ptyAdapter.spawnInputs).toHaveLength(2);
     }),
   );

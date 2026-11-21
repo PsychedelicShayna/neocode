@@ -63,24 +63,32 @@ export function NativeSessionTerminal(props: NativeSessionTerminalProps) {
 export function NativeManagedTuiView({
   target,
   cwd,
+  monitor,
+  onSessionExited,
 }: {
   target: NativeSessionTarget;
   cwd: string;
+  monitor?: { readonly agentId: string; readonly viewId: string };
+  onSessionExited?: () => void;
 }) {
   return (
     <section
-      aria-label="Managed NeoPi TUI"
+      aria-label={monitor ? "Managed NeoPi agent monitor" : "Managed NeoPi TUI"}
       data-thread-terminal-drawer
-      className="relative h-[min(40dvh,24rem)] shrink-0 overflow-hidden border-t border-border"
+      className={
+        monitor
+          ? "relative min-h-0 flex-1 overflow-hidden"
+          : "relative h-[min(40dvh,24rem)] shrink-0 overflow-hidden border-t border-border"
+      }
     >
       <TerminalViewport
         advancedTypography={false}
         threadRef={target}
         terminalId={MANAGED_TMUX_TERMINAL_ID}
-        terminalLabel="NeoPi TUI"
-        managedTmux={target.ref}
+        terminalLabel={monitor ? "NeoPi Monitor" : "NeoPi TUI"}
+        managedTmux={monitor ? { ...target.ref, monitor } : target.ref}
         cwd={cwd}
-        onSessionExited={() => {}}
+        onSessionExited={onSessionExited ?? (() => {})}
         focusRequestId={0}
         autoFocus
         visible

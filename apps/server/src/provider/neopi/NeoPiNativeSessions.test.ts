@@ -653,7 +653,8 @@ describe("canonical native session lifecycle", () => {
       const modes: Array<string | undefined> = [];
       const service = yield* makeNeoPiNativeSessionsWith({
         ...dependencies,
-        managedTmuxView: () => Effect.succeed({ owner, executable, args }),
+        managedTmuxView: () =>
+          Effect.succeed({ owner, executable, args, socket: "/private/owner.sock" }),
         connect: (profile, input, observer, mode) => {
           modes.push(mode);
           return dependencies.connect(profile, input, observer, mode).pipe(

@@ -45,6 +45,16 @@ When you open a populated native session that has no live owner, NeoCode starts
 its NeoPi TUI on a private tmux socket in the NeoCode state directory. Open
 **TUI** to see the same owner. Closing the view or restarting NeoCode does not
 stop the owner; reopening the session reconnects to it without starting another.
+In the **Agents** panel, select a subagent and choose **Monitor**, or choose
+**Monitor** beside an advisor. This opens a separate tmux window in the
+embedded terminal, without starting or replacing the session's NeoPi writer.
+Subagents can receive chat through their owner; advisor monitors are view-only.
+**Hide monitor** or leave the Agents panel to close the window and release its
+connection. NeoPi admits up to 32 simultaneous monitor connections per owner,
+including monitors opened outside NeoCode. At capacity the monitor reports
+the refusal; close an existing monitor before opening another. The limit does
+not restrict the number of agents that can run.
+
 Turning the opt-in off leaves existing tmux owners running and ignores their
 saved managed bindings. NeoCode uses ordinary native session discovery: it
 attaches to a live owner through its control endpoint, or refuses the open if

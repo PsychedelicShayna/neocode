@@ -16,7 +16,6 @@ import {
   type ProviderInstanceConfig,
   type ProviderInstanceId,
   resolveEnvironmentMachineKind,
-  resolveProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import {
@@ -44,7 +43,6 @@ import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { NeoPiBinarySelectionNote } from "../neopi/NeoPiBinarySelectionNote";
 import { NeoPiInstallHelp } from "../neopi/NeoPiInstallHelp";
 import { cn } from "../../lib/utils";
-import { resolveAppModelSelectionState } from "../../modelSelection";
 import { getOnboardingProviderState } from "../../onboarding/providerReadiness.logic";
 import {
   useEnvironments,
@@ -600,8 +598,6 @@ export function EnvironmentProviderSettings({
   );
   const refreshingRef = useRef(false);
   const visibleProviderSettings = PROVIDER_SETTINGS;
-  const textGenerationModelSelection = resolveAppModelSelectionState(settings, serverProviders);
-  const textGenInstanceId = textGenerationModelSelection.instanceId;
   const resolvedBackgroundActivity = resolveServerBackgroundActivitySettings(settings);
   const providerHealthPreset = getBackgroundActivityPresetSettings(
     resolvedBackgroundActivity.profile,
@@ -724,15 +720,7 @@ export function EnvironmentProviderSettings({
     rows.find((row) => row.instanceId === selectedInstanceId) ??
     (targetInstanceMissing ? null : (rows[0] ?? null));
 
-  const updateProviderInstance = (
-    row: InstanceRow,
-    next: ProviderInstanceConfig,
-    options?: {
-      readonly textGenerationModelSelection?: Parameters<
-        typeof buildProviderInstanceUpdatePatch
-      >[0]["textGenerationModelSelection"];
-    },
-  ) => {
+  const updateProviderInstance = (row: InstanceRow, next: ProviderInstanceConfig) => {
     updateSettings(
       buildProviderInstanceUpdatePatch({
         settings,
@@ -740,7 +728,6 @@ export function EnvironmentProviderSettings({
         instance: next,
         driver: row.driver,
         isDefault: row.isDefault,
-        textGenerationModelSelection: options?.textGenerationModelSelection,
       }),
     );
   };
@@ -870,21 +857,7 @@ export function EnvironmentProviderSettings({
             )
           ) : null
         }
-        onUpdate={(next) => {
-          const wasEnabled = resolveProviderInstanceEnabled(row.instance);
-          const isDisabling = next.enabled === false && wasEnabled;
-          const shouldClearTextGen = isDisabling && textGenInstanceId === row.instanceId;
-          updateProviderInstance(
-            row,
-            next,
-            shouldClearTextGen
-              ? {
-                  textGenerationModelSelection:
-                    DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
-                }
-              : undefined,
-          );
-        }}
+        onUpdate={(next) => updateProviderInstance(row, next)}
         onDelete={
           mode === "editor" && !row.isDefault
             ? () => deleteProviderInstance(row.instanceId)

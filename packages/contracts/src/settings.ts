@@ -14,11 +14,7 @@ import {
 import { UsageLimitSourceId } from "./usageLimitSourceId.ts";
 import { EnvironmentMachineKind, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
 import { KeybindingShortcut } from "./keybindings.ts";
-import {
-  CustomModelSetting,
-  DEFAULT_TEXT_GENERATION_MODEL,
-  ProviderOptionSelections,
-} from "./model.ts";
+import { CustomModelSetting } from "./model.ts";
 import {
   DEFAULT_RUNTIME_MODE,
   ModelSelection,
@@ -1057,8 +1053,6 @@ export const PROJECT_SCOPED_SERVER_SETTING_KEYS = [
   "actions",
   "enableAgentBrowserAccess",
   "enableAgentDeviceAccess",
-  "textGenerationModelSelection",
-  "sourceControlWriterModelSelection",
   "sourceControlWritingStyle",
   "pullRequestMergeMethod",
   "sidebarAutoSettleOnMerge",
@@ -1071,7 +1065,7 @@ export type ProjectScopedServerSettingKey = (typeof PROJECT_SCOPED_SERVER_SETTIN
 /**
  * One project's overrides. An absent key inherits the environment value;
  * `null` is a real value where the environment type is nullable (no default
- * model, no dedicated writer model, never auto-settle).
+ * model, never auto-settle).
  */
 export const ProjectSettingsOverrides = Schema.Struct({
   worktreeCleanup: Schema.optionalKey(WorktreeCleanup),
@@ -1085,8 +1079,6 @@ export const ProjectSettingsOverrides = Schema.Struct({
   actions: Schema.optionalKey(ScopedActions),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   enableAgentDeviceAccess: Schema.optionalKey(Schema.Boolean),
-  textGenerationModelSelection: Schema.optionalKey(ModelSelection),
-  sourceControlWriterModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStyleSettings),
   pullRequestMergeMethod: Schema.optionalKey(Schema.NullOr(PullRequestMergeMethod)),
   sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
@@ -1109,12 +1101,7 @@ const NULLABLE_PROJECT_SETTINGS_OVERRIDES: ReadonlySet<ProjectScopedServerSettin
   {
     [K in ProjectScopedServerSettingKey]: null extends ProjectSettingsOverrides[K] ? K : never;
   }[ProjectScopedServerSettingKey]
->([
-  "defaultModelSelection",
-  "sourceControlWriterModelSelection",
-  "pullRequestMergeMethod",
-  "sidebarAutoSettleAfterDays",
-]);
+>(["defaultModelSelection", "pullRequestMergeMethod", "sidebarAutoSettleAfterDays"]);
 
 export const StorageCleanupSettings = Schema.Struct({
   worktreeAfterDays: StorageRetentionDays.pipe(Schema.withDecodingDefault(Effect.succeed(null))),
@@ -1270,19 +1257,8 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   addProjectBaseDirectory: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
-  textGenerationModelSelection: ModelSelection.pipe(
-    Schema.withDecodingDefault(
-      Effect.succeed({
-        instanceId: ProviderInstanceId.make("neopi"),
-        model: DEFAULT_TEXT_GENERATION_MODEL,
-      }),
-    ),
-  ),
   sourceControlWritingStyle: SourceControlWritingStyleSettings.pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
-  ),
-  sourceControlWriterModelSelection: Schema.NullOr(ModelSelection).pipe(
-    Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   /**
    * The merge method pull requests start with; `null` reuses the method
@@ -1425,12 +1401,6 @@ export const DEFAULT_UNIFIED_SETTINGS: UnifiedSettings = {
 
 // ── Server Settings Patch (replace with a Schema.deepPartial if available) ──────────────────────────────────────────
 
-const ModelSelectionPatch = Schema.Struct({
-  instanceId: Schema.optionalKey(ProviderInstanceId),
-  model: Schema.optionalKey(TrimmedNonEmptyString),
-  options: Schema.optionalKey(ProviderOptionSelections),
-});
-
 const CodexSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
@@ -1520,7 +1490,6 @@ export const ProjectSettingsOverridesPatch = Schema.Struct({
     Schema.Struct({
       ...ProjectSettingsOverrides.fields,
       worktreeCleanup: Schema.optionalKey(WorktreeCleanupPatch),
-      textGenerationModelSelection: Schema.optionalKey(ModelSelectionPatch),
       sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStylePatch),
     }),
   ),
@@ -1596,9 +1565,7 @@ export const ServerSettingsPatch = Schema.Struct({
   newWorktreesStartFromOrigin: Schema.optionalKey(Schema.Boolean),
   worktreeSubmodules: Schema.optionalKey(Schema.NullOr(WorktreeSubmodules)),
   addProjectBaseDirectory: Schema.optionalKey(TrimmedString),
-  textGenerationModelSelection: Schema.optionalKey(ModelSelectionPatch),
   sourceControlWritingStyle: Schema.optionalKey(SourceControlWritingStylePatch),
-  sourceControlWriterModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   pullRequestMergeMethod: Schema.optionalKey(Schema.NullOr(PullRequestMergeMethod)),
   observability: Schema.optionalKey(
     Schema.Struct({

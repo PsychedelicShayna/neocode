@@ -1,20 +1,15 @@
 import {
-  DEFAULT_TEXT_GENERATION_MODEL,
-  DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
-  type ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import {
   type CustomModelDefinition,
-  createModelSelection,
   normalizeCustomModelSlug,
   readCustomModelEntries,
   resolveSelectableModel,
 } from "@t3tools/shared/model";
-import { getComposerProviderState } from "./components/chat/composerProviderState";
 import { UnifiedSettings } from "@t3tools/contracts/settings";
 import * as Arr from "effect/Array";
 import * as Result from "effect/Result";
@@ -24,17 +19,11 @@ import {
   resolveSelectableProvider,
 } from "./providerModels";
 import { ModelEsque } from "./components/chat/providerIconUtils";
-import {
-  type ProviderInstanceEntry,
-  deriveProviderInstanceEntries,
-  NO_PROVIDER_MODEL_SELECTION,
-  resolveSelectableProviderInstanceEntry,
-} from "./providerInstances";
+import { type ProviderInstanceEntry, deriveProviderInstanceEntries } from "./providerInstances";
 import { sortModelsForProviderInstance } from "./modelOrdering";
 
 const MAX_CUSTOM_MODEL_COUNT = 32;
 export const MAX_CUSTOM_MODEL_LENGTH = 256;
-const DEFAULT_TEXT_GENERATION_INSTANCE_ID = ProviderInstanceId.make("neopi");
 
 /**
  * Resolve the custom-model list for a given instance, preferring the
@@ -349,50 +338,4 @@ export function getCustomModelOptionsByInstance(
     );
   }
   return out;
-}
-
-export function resolveAppModelSelectionState(
-  settings: UnifiedSettings,
-  providers: ReadonlyArray<ServerProvider>,
-): ModelSelection {
-  const selection = settings.textGenerationModelSelection ?? {
-    instanceId: DEFAULT_TEXT_GENERATION_INSTANCE_ID,
-    model: DEFAULT_TEXT_GENERATION_MODEL,
-  };
-  const supportedProviders = providers.filter(
-    (provider) => provider.driver === "neopi" && provider.supportsTextGeneration !== false,
-  );
-  const entries = deriveProviderInstanceEntries(supportedProviders);
-  const selectedEntry = entries.find(
-    (entry) => entry.instanceId === selection.instanceId && entry.enabled && entry.isAvailable,
-  );
-  const entry = selectedEntry ?? resolveSelectableProviderInstanceEntry(entries, undefined);
-  if (entry) {
-    // When the instance changed due to fallback (e.g. selected instance was disabled),
-    // don't carry over the old instance's model — use the fallback instance's default.
-    const selectedModel = selectedEntry ? selection.model : null;
-    const model =
-      resolveAppModelSelectionForInstance(
-        entry.instanceId,
-        settings,
-        supportedProviders,
-        selectedModel,
-      ) ??
-      entry.models[0]?.slug ??
-      DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[entry.driverKind];
-    if (!model) {
-      return createModelSelection(entry.instanceId, "", []);
-    }
-    const provider = entry.driverKind;
-    const { modelOptionsForDispatch } = getComposerProviderState({
-      provider,
-      model,
-      models: entry.models,
-      modelOptions: selectedEntry ? selection.options : undefined,
-    });
-
-    return createModelSelection(entry.instanceId, model, modelOptionsForDispatch);
-  }
-
-  return NO_PROVIDER_MODEL_SELECTION;
 }

@@ -178,8 +178,7 @@ function resolveProjectOverrides(
     // A model on a disabled provider falls back to the environment, like the
     // environment-level guards do for these keys.
     if (
-      (key === "textGenerationModelSelection" || key === "defaultModelSelection") &&
-      value !== undefined &&
+      key === "defaultModelSelection" &&
       value !== null &&
       !isModelSelectionProviderEnabled(settings, value as ModelSelection)
     ) {

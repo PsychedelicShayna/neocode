@@ -2,8 +2,7 @@
  * ServerSettings - Server-authoritative settings service.
  *
  * Owns persistence, validation, and change notification of settings that affect
- * server-side behavior (binary paths, streaming mode, env mode, custom models,
- * text generation model selection).
+ * server-side behavior (binary paths, streaming mode, env mode, custom models).
  *
  * Follows the same pattern as `keybindings.ts`: JSON file + Cache + PubSub +
  * Semaphore + FileSystem.watch for concurrency and external edit detection.
@@ -11,7 +10,6 @@
  * @module ServerSettings
  */
 import {
-  DEFAULT_TEXT_GENERATION_MODEL,
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectScript,
@@ -51,11 +49,8 @@ import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJso
 import {
   applyServerSettingsPatch,
   deriveLegacyProjectOverrides,
-  isModelSelectionProviderEnabled,
 } from "@t3tools/shared/serverSettings";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
-
-export { resolveSourceControlWriterModelSelection } from "@t3tools/shared/serverSettings";
 
 const encodeServerSettings = Schema.encodeEffect(ServerSettings);
 const encodeServerSettingsJson = Schema.encodeUnknownEffect(fromJsonStringPretty(ServerSettings));
@@ -242,16 +237,16 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
     return {
       start: Effect.void,
       ready: Effect.void,
-      getSettings: Ref.get(currentSettingsRef).pipe(Effect.map(resolveTextGenerationProvider)),
+      getSettings: Ref.get(currentSettingsRef),
       updateSettings: (update) =>
         writeSemaphore.withPermits(1)(
           Effect.gen(function* () {
             const current = yield* Ref.get(currentSettingsRef);
             const patch = typeof update === "function" ? update(current) : update;
-            if (patch === null) return resolveTextGenerationProvider(current);
+            if (patch === null) return current;
             const next = yield* normalizeServerSettings(applyServerSettingsPatch(current, patch));
             yield* Ref.set(currentSettingsRef, next);
-            return resolveTextGenerationProvider(next);
+            return next;
           }),
         ),
       streamChanges: Stream.empty,
@@ -345,39 +340,11 @@ function restoreUsedProviders(
   };
 }
 
-function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {
-  return isModelSelectionProviderEnabled(settings, settings.textGenerationModelSelection)
-    ? settings
-    : fallbackTextGenerationProvider(settings);
-}
-
-function fallbackTextGenerationProvider(settings: ServerSettings): ServerSettings {
-  const explicit = Object.entries(settings.providerInstances).find(
-    ([, instance]) => instance.driver === "neopi" && resolveProviderInstanceEnabled(instance),
-  );
-  const defaultInstance = settings.providerInstances[ProviderInstanceId.make("neopi")];
-  const defaultEnabled = defaultInstance === undefined
-    ? settings.providers.neopi.enabled
-    : defaultInstance.driver === "neopi" && resolveProviderInstanceEnabled(defaultInstance);
-  const instanceId = explicit?.[0] ?? (defaultEnabled ? "neopi" : undefined);
-  if (instanceId === undefined) return settings;
-
-  return {
-    ...settings,
-    textGenerationModelSelection: {
-      instanceId: ProviderInstanceId.make(instanceId),
-      model: DEFAULT_TEXT_GENERATION_MODEL,
-    } satisfies ModelSelection,
-  };
-}
-
 // Values under these keys are compared as a whole — never stripped field-by-field.
 const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "backgroundActivity",
   "automaticGitFetchInterval",
   "providerHealthRefreshInterval",
-  "sourceControlWriterModelSelection",
-  "textGenerationModelSelection",
   "pullRequestMergeMethod",
 ]);
 
@@ -769,7 +736,6 @@ const make = Effect.gen(function* () {
           ),
         ),
       ),
-      Stream.map(resolveTextGenerationProvider),
     );
 
   type SecretChange = {
@@ -990,7 +956,7 @@ const make = Effect.gen(function* () {
             ? yield* materializeProviderEnvironmentSecrets(current)
             : current;
         const patch = typeof update === "function" ? update(currentForUpdate) : update;
-        if (patch === null) return resolveTextGenerationProvider(currentForUpdate);
+        if (patch === null) return currentForUpdate;
         const updated = applyServerSettingsPatch(current, patch);
         const persisted = yield* persistProviderEnvironmentSecrets(current, updated);
         const next = yield* normalizeServerSettings(persisted.settings);
@@ -1016,7 +982,7 @@ const make = Effect.gen(function* () {
         );
         yield* Cache.set(settingsCache, cacheKey, next);
         yield* emitChange(next);
-        return resolveTextGenerationProvider(materialized);
+        return materialized;
       }),
     );
 
@@ -1091,10 +1057,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     ready: Deferred.await(startedDeferred),
-    getSettings: getSettingsFromCache.pipe(
-      Effect.flatMap(materializeProviderEnvironmentSecrets),
-      Effect.map(resolveTextGenerationProvider),
-    ),
+    getSettings: getSettingsFromCache.pipe(Effect.flatMap(materializeProviderEnvironmentSecrets)),
     updateSettings,
     get streamChanges() {
       return materializeChanges(Stream.fromPubSub(changesPubSub));

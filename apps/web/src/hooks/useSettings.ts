@@ -432,9 +432,6 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
           }
         }
         if (Object.keys(sharedPatch).length > 0) {
-          const sourceSettings = environments.find(
-            (target) => target.environmentId === environmentId,
-          )?.serverConfig?.settings;
           const targets = new Set(
             environments.filter(supportsSharedSettingsSync).map((target) => target.environmentId),
           );
@@ -447,9 +444,6 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
             const targetPatch = filterSharedServerPatch(
               sharedPatch,
               target?.serverConfig?.environment.capabilities,
-              target?.serverConfig?.settings,
-              sourceSettings,
-              targetId === environmentId,
             );
             if (Object.keys(targetPatch).length === 0) continue;
             wroteToTarget = true;

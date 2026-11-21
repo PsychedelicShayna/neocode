@@ -250,16 +250,39 @@ vi.mock("../../state/use-composer-drafts", () => ({
 vi.mock("./NativeSessionComposer", () => ({
   NativeSessionComposer: ({
     argumentSuggestions,
-  }: Pick<ComponentProps<typeof NativeSessionComposer>, "argumentSuggestions">) =>
-    argumentSuggestions.map(({ label, value }) => <span key={value}>{label}</span>),
+  }: Pick<ComponentProps<typeof NativeSessionComposer>, "argumentSuggestions">) => (
+    <div aria-label="Composer">
+      {argumentSuggestions.map(({ label, value }) => (
+        <span key={value}>{label}</span>
+      ))}
+    </div>
+  ),
 }));
 vi.mock("./NativeSessionWorkspaceControls", () => ({
   NativeSessionWorkspaceControls: () => null,
   NativeSessionAgents: () => null,
 }));
 vi.mock("./NativeNeoPiControls", () => ({
-  NativeField: () => null,
-  NativeModal: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  NativeField: ({
+    label,
+    value,
+    onChange,
+  }: {
+    label: string;
+    value: string;
+    onChange: (value: string) => void;
+  }) => (
+    <input
+      aria-label={label}
+      value={value}
+      onInput={(event) => onChange(event.currentTarget.value)}
+    />
+  ),
+  NativeModal: ({ children, title }: { children: ReactNode; title: string }) => (
+    <div role="dialog" aria-label={title}>
+      {children}
+    </div>
+  ),
   NativeError: ({ message }: { message: string | null }) =>
     message ? <p role="alert">{message}</p> : null,
 }));
@@ -483,6 +506,15 @@ const makeHarness = Effect.fnUntraced(function* (
     registry,
     flush,
     publishEntity,
+    openDialog: (request: { type: string; id: string } & Record<string, unknown>) =>
+      publishEnvelope({ type: "obligation-opened", revision: ++revision, id: request.id, request }),
+    cancelDialog: (id: string) =>
+      publishEnvelope({
+        type: "obligation-settled",
+        revision: ++revision,
+        id,
+        outcome: "cancelled",
+      }),
     closeOwner,
     target: { environmentId, ref },
     counts: () => ({ watches, closes, active: active.size }),
@@ -607,6 +639,133 @@ it.effect("returns to the native live end and follows further output", () =>
     });
   }),
 );
+
+describe("NativeSessionScreen Ask", () => {
+  const ask = {
+    type: "extension_ui_request",
+    method: "ask",
+    id: "mobile-ask",
+    questions: [
+      { id: "one", question: "Pick a language", options: [{ label: "Spanish" }] },
+      {
+        id: "many",
+        question: "Pick any cities",
+        multi: true,
+        options: [{ label: "Lima" }, { label: "Quito" }],
+      },
+      { id: "empty", question: "Pick any extras", multi: true, options: [] },
+    ],
+  };
+
+  it.effect("answers a typed Ask above the composer using the native wire format", () =>
+    Effect.gen(function* () {
+      const sent = vi.fn();
+      const h = yield* makeHarness({
+        session: { ...session, attachment: "owned" },
+        request: (command) =>
+          Effect.sync(() => {
+            if (command.type === "extension_ui_response") sent(command);
+            return {};
+          }),
+      });
+      yield* Effect.promise(async () => {
+        const screen = mountScreen(h);
+        try {
+          await act(async () => {
+            screen.render();
+            await screen.selectCanonicalSession();
+            h.flush();
+          });
+          await act(() => h.openDialog(ask));
+          const focused = screen.focused();
+          expect(focused.querySelector('[role="dialog"]')).toBeNull();
+          const option = Array.from(focused.querySelectorAll("button")).find(
+            (button) => button.textContent === "Spanish",
+          )!;
+          const composer = focused.querySelector('[aria-label="Composer"]')!;
+          expect(
+            option.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING,
+          ).toBeTruthy();
+          expect(focused.textContent).not.toContain("Pick any cities");
+          await act(() => screen.click("Spanish"));
+          await act(() => screen.click("Next"));
+          await act(() => screen.click("Quito"));
+          await act(() => screen.click("Lima"));
+          await act(() => {
+            const field = focused.querySelector<HTMLInputElement>('[aria-label="Other answer"]')!;
+            field.value = "  and Cusco  ";
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+          await act(() => screen.click("Next"));
+          await act(() => screen.click("Submit answers"));
+          expect(sent).toHaveBeenCalledExactlyOnceWith({
+            type: "extension_ui_response",
+            id: ask.id,
+            answers: [
+              { id: "one", selectedOptions: ["Spanish"] },
+              { id: "many", selectedOptions: ["Quito", "Lima"], customInput: "and Cusco" },
+              { id: "empty", selectedOptions: [] },
+            ],
+          });
+          expect(focused.textContent).not.toContain("Pick any extras");
+        } finally {
+          await screen.cleanup();
+        }
+      });
+    }),
+  );
+
+  it.effect("dismisses Ask, removes an owner-cancelled Ask, and keeps generic select modal", () =>
+    Effect.gen(function* () {
+      const sent = vi.fn();
+      const h = yield* makeHarness({
+        request: (command) =>
+          Effect.sync(() => {
+            if (command.type === "extension_ui_response") sent(command);
+            return {};
+          }),
+      });
+      yield* Effect.promise(async () => {
+        const screen = mountScreen(h);
+        try {
+          await act(async () => {
+            screen.render();
+            await screen.selectCanonicalSession();
+            h.flush();
+          });
+          const focused = screen.focused();
+          await act(() => h.openDialog({ ...ask, id: "owner-cancel-ask" }));
+          expect(focused.textContent).toContain("Pick a language");
+          await act(() => h.cancelDialog("owner-cancel-ask"));
+          expect(focused.textContent).not.toContain("Pick a language");
+          expect(sent).not.toHaveBeenCalled();
+          await act(() => h.openDialog({ ...ask, id: "dismiss-ask" }));
+          await act(() => screen.click("Dismiss"));
+          expect(focused.textContent).not.toContain("Pick a language");
+          expect(sent).toHaveBeenCalledExactlyOnceWith({
+            type: "extension_ui_response",
+            id: "dismiss-ask",
+            cancelled: true,
+          });
+          await act(() =>
+            h.openDialog({
+              type: "extension_ui_request",
+              method: "select",
+              title: "Ask",
+              id: "generic-select",
+              options: ["Some option"],
+            }),
+          );
+          expect(focused.querySelector('[role="dialog"][aria-label="Ask"]')?.textContent).toContain(
+            "Some option",
+          );
+        } finally {
+          await screen.cleanup();
+        }
+      });
+    }),
+  );
+});
 
 describe("NativeSessionScreen exit and canonical reselection", () => {
   it.effect("Back releases the closed watch boundary before reopening the same session", () =>

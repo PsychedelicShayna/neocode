@@ -49,7 +49,6 @@ import {
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
-import { Checkbox } from "../ui/checkbox";
 import { SidebarInset } from "../ui/sidebar";
 import { Dialog, DialogPopup, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { ExLineAnchor } from "./ExLineAnchor";
@@ -121,6 +120,13 @@ import {
   consumeNativeDraft,
   prepareNativePrompt,
 } from "./neopiNativeComposer";
+import {
+  nativeAskProgress,
+  selectNativeSessionDialog,
+  stepNativeAsk,
+  type NativeAskAction,
+  type NativeAskDraft,
+} from "@t3tools/client-runtime/neopi-native-ask";
 import { restoreNativeEditor } from "./neopiNativeDraft";
 import { restoreNativeQueuedDraft } from "./neopiNativeQueueDraft";
 import type { ComposerSubmissionIntent } from "../../composer-logic";
@@ -852,8 +858,37 @@ export function NativeSessionView({
     (attachment) => useRightPanelStore.getState().openAttachment(target, attachment),
     [target],
   );
-  const dialog = feed.dialogs.find(
-    (item) => typeof item.id === "string" && !dismissed.has(item.id),
+  const obligation = useMemo(
+    () => selectNativeSessionDialog(feed.dialogs, dismissed),
+    [feed.dialogs, dismissed],
+  );
+  const ask = obligation?.kind === "ask" ? obligation : null;
+  const dialog = obligation?.kind === "modal" ? obligation : null;
+  const askDraftRef = useRef<NativeAskDraft | undefined>(undefined);
+  const [askDraft, setAskDraft] = useState<NativeAskDraft>();
+  const responsesInFlight = useRef(new Set<string>());
+  const [respondingToAsk, setRespondingToAsk] = useState<string | null>(null);
+  const dispatchAsk = useCallback(
+    (action: NativeAskAction) => {
+      if (!ask || responsesInFlight.current.has(ask.id)) return;
+      // The live feed can close an obligation before React runs the card's timer cleanup.
+      const current = nativeSessionAtoms.cached(target);
+      if (!current?.dialogs.some((frame) => frame.id === ask.id)) return;
+      const { draft, response } = stepNativeAsk(ask, askDraftRef.current, action);
+      askDraftRef.current = draft;
+      setAskDraft(draft);
+      if (!response) return;
+      responsesInFlight.current.add(ask.id);
+      setRespondingToAsk(ask.id);
+      setLocalError(null);
+      void request(response)
+        .catch((cause) => setLocalError(String(cause)))
+        .finally(() => {
+          responsesInFlight.current.delete(ask.id);
+          setRespondingToAsk((id) => (id === ask.id ? null : id));
+        });
+    },
+    [ask, request, target],
   );
   return (
     <AgentHubSourceProvider source={agentHub}>
@@ -1070,6 +1105,17 @@ export function NativeSessionView({
               onExpandImage={setExpandedImage}
               onFileOpen={openComposerFile}
               nativeSession={nativeSessionComposer}
+              nativeAsk={
+                ask
+                  ? {
+                      ...nativeAskProgress(ask, askDraft),
+                      id: ask.id,
+                      questionCount: ask.questions.length,
+                      isResponding: respondingToAsk === ask.id,
+                      dispatch: dispatchAsk,
+                    }
+                  : null
+              }
             />
           </ComposerSurface.Host>
           <NativeBranchToolbar
@@ -1101,11 +1147,11 @@ export function NativeSessionView({
       ) : null}
       {dialog ? (
         <NativeSessionDialog
-          key={String(dialog.id)}
-          dialog={dialog}
+          key={dialog.id}
+          dialog={dialog.dialog}
           request={request}
           onAnswered={() => {
-            const next = new Set(dismissed).add(String(dialog.id));
+            const next = new Set(dismissed).add(dialog.id);
             answeredDialogs.set(key, next);
             setDismissed(next);
           }}
@@ -1125,9 +1171,6 @@ export function NativeSessionDialog({
   onAnswered: () => void;
 }) {
   const [value, setValue] = useState(typeof dialog.prefill === "string" ? dialog.prefill : "");
-  const [answers, setAnswers] = useState<
-    Record<string, { selectedOptions: string[]; customInput: string }>
-  >({});
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const toolApproval = dialog.type === "tool_approval_request";
@@ -1155,7 +1198,6 @@ export function NativeSessionDialog({
         ? { decision: "refine", feedback: value || "Plan review cancelled." }
         : { cancelled: true },
     );
-  const questions = Array.isArray(dialog.questions) ? dialog.questions.map(nativeRecord) : [];
   return (
     <Dialog
       open
@@ -1244,48 +1286,6 @@ export function NativeSessionDialog({
               onChange={(event) => setValue(event.target.value)}
             />
           ) : null}
-          {questions.map((question) => {
-            const id = String(question.id);
-            const answer = answers[id] ?? { selectedOptions: [], customInput: "" };
-            return (
-              <fieldset key={id} className="space-y-2">
-                <legend className="text-sm font-medium">{String(question.question)}</legend>
-                {(Array.isArray(question.options) ? question.options : []).map((item, index) => {
-                  const option = nativeRecord(item);
-                  const label = String(option.label);
-                  return (
-                    <label key={index} className="flex items-center gap-2 text-sm">
-                      <Checkbox
-                        checked={answer.selectedOptions.includes(label)}
-                        onCheckedChange={() =>
-                          setAnswers({
-                            ...answers,
-                            [id]: {
-                              ...answer,
-                              selectedOptions: question.multi
-                                ? answer.selectedOptions.includes(label)
-                                  ? answer.selectedOptions.filter((value) => value !== label)
-                                  : [...answer.selectedOptions, label]
-                                : [label],
-                            },
-                          })
-                        }
-                      />
-                      {label}
-                      {typeof option.description === "string" ? ` · ${option.description}` : ""}
-                    </label>
-                  );
-                })}
-                <Input
-                  aria-label={`Other answer: ${String(question.question)}`}
-                  value={answer.customInput}
-                  onChange={(event) =>
-                    setAnswers({ ...answers, [id]: { ...answer, customInput: event.target.value } })
-                  }
-                />
-              </fieldset>
-            );
-          })}
         </div>
         <DialogFooter>
           <Button variant="ghost" disabled={pending} onClick={() => void cancel()}>
@@ -1345,21 +1345,6 @@ export function NativeSessionDialog({
           {dialog.method === "input" || dialog.method === "editor" ? (
             <Button disabled={pending} onClick={() => void respond({ value })}>
               Submit
-            </Button>
-          ) : null}
-          {dialog.method === "ask" ? (
-            <Button
-              disabled={pending}
-              onClick={() =>
-                void respond({
-                  answers: questions.map((question) => ({
-                    id: question.id,
-                    ...(answers[String(question.id)] ?? { selectedOptions: [], customInput: "" }),
-                  })),
-                })
-              }
-            >
-              Submit answers
             </Button>
           ) : null}
         </DialogFooter>

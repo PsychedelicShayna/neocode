@@ -41,6 +41,13 @@ a message or choose **Continue in NeoCode** and NeoCode runs it from then on, bu
 never while a terminal still owns it. **Detach from terminal session** lets go
 without ending the terminal's session; the tab stays put with a **Reconnect** button.
 
+When NeoPi asks a question in a session NeoCode runs, it appears above the
+composer without taking focus. Choose an option or type your own answer (in the
+composer on web and desktop, or in the question card on mobile). For a
+multi-choice question you can do both, or continue without selecting anything.
+Your message draft is preserved.
+Terminal-attached sessions still use NeoPi's existing prompts.
+
 When NeoPi fails to start a turn in a saved conversation, web and desktop return
 the unsent prompt and its attachments to an empty composer. If you've already
 started another draft there, it stays unchanged: send or clear it before using

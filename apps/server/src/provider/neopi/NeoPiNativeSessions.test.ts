@@ -104,6 +104,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       profileValid: true,
       blockSnapshot: false,
       startupDialog: false,
+      uiResponses: [] as unknown[],
       jobs: [] as Record<string, unknown>[],
       agents: [] as Record<string, unknown>[],
       /** `get_subagent_history` rows, served when `capabilities` lists `subagent_history`. */
@@ -329,6 +330,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
               }),
             respondUi: (response) =>
               Effect.gen(function* () {
+                native.uiResponses.push(response);
                 yield* publish({
                   type: "extension_ui_request",
                   id: "cancel-dialog",
@@ -906,6 +908,53 @@ describe("canonical native session lifecycle", () => {
       assert.deepEqual(entries, []);
       assert.equal(native.running, true);
       assert.equal(native.disposals, 0);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("sends a rich Ask answer once and ignores a response to an owner-cancelled Ask", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      const ask = (id: string) =>
+        native.publish({
+          type: "extension_ui_request",
+          id,
+          method: "ask",
+          questions: [
+            { id: "first", question: "Pick one", options: [{ label: "A" }] },
+            { id: "second", question: "Pick any", multi: true, options: [{ label: "B" }] },
+          ],
+        });
+      yield* ask("ask-1");
+      yield* lease.next("obligation-opened", (env) => env.id === "ask-1");
+      const answers = [
+        { id: "first", selectedOptions: ["A"] },
+        { id: "second", selectedOptions: ["B"], customInput: "and another thing" },
+      ];
+      const reply = (id: string) =>
+        service.request({
+          ref: originalRef,
+          command: { type: "extension_ui_response", id, answers },
+        });
+      yield* reply("ask-1");
+      yield* lease.next("obligation-settled", (env) => env.id === "ask-1");
+      yield* reply("ask-1");
+
+      yield* ask("ask-2");
+      yield* lease.next("obligation-opened", (env) => env.id === "ask-2");
+      yield* native.publish({
+        type: "extension_ui_request",
+        id: "cancel-ask-2",
+        method: "cancel",
+        targetId: "ask-2",
+      });
+      yield* lease.next("obligation-settled", (env) => env.id === "ask-2");
+      yield* reply("ask-2");
+      assert.deepEqual(native.uiResponses, [
+        { type: "extension_ui_response", id: "ask-1", answers },
+      ]);
     }).pipe(Effect.scoped),
   );
 
@@ -3675,7 +3724,13 @@ describe("join replay through the client reducer (paired)", () => {
 
 const encodeOptOutFixture = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeOptOutRequest = Schema.decodeSync(
-  Schema.fromJsonString(Schema.Struct({ id: Schema.String, type: Schema.String })),
+  Schema.fromJsonString(
+    Schema.Struct({
+      id: Schema.String,
+      type: Schema.String,
+      enabled: Schema.optional(Schema.Boolean),
+    }),
+  ),
 );
 
 describe("opening native sessions with optional managed tmux", () => {
@@ -3804,6 +3859,7 @@ describe("opening native sessions with optional managed tmux", () => {
         );
         const force = vi.fn((_binding: ManagedTmux.ManagedTmuxBinding) => Effect.void);
         const requests: string[] = [];
+        const askNegotiations: Array<boolean | undefined> = [];
         const gracefulExit = yield* Deferred.make<void>();
         const observeProcess = unconfirmedStop
           ? vi
@@ -3914,6 +3970,8 @@ describe("opening native sessions with optional managed tmux", () => {
                       stdin: Sink.forEach((chunk: Uint8Array) => {
                         const request = decodeOptOutRequest(new TextDecoder().decode(chunk));
                         requests.push(request.type);
+                        if (request.type === "set_ask_dialog")
+                          askNegotiations.push(request.enabled);
                         return Queue.offer(
                           stdout,
                           encode({
@@ -4131,6 +4189,7 @@ describe("opening native sessions with optional managed tmux", () => {
         }
         const opened = yield* service.open(ref);
         assert.equal(opened.attachment, live ? "terminal" : "owned");
+        assert.deepEqual(askNegotiations, live ? [] : [true]);
         assert.deepEqual(spawned, [
           ["sessions", "list", "--json", "--session-dir", cwd],
           live

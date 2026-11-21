@@ -348,19 +348,68 @@ describe("managed lifetime pane evidence", () => {
     ).toEqual({ kind: "changed" });
   });
 
+  for (const [lookup, code] of [
+    ["$2|@3|%9|321|0|off\n", "tmux_owner_changed"],
+    ["", "tmux_no_owner"],
+  ] as const) {
+    effectIt.effect(`Force Stop refuses a late ${code} with recovery guidance`, () =>
+      Effect.gen(function* () {
+        const host = makeManagedTmuxHost(ownedState, executable, "linux");
+        exec.mockReset();
+        exec.mockResolvedValueOnce({ stdout: lookup });
+        expect(yield* Effect.flip(host.force(binding))).toMatchObject({
+          code,
+          message: expect.stringContaining(
+            "Exit with /exit in the old TUI, then reopen the session.",
+          ),
+        });
+        expect(exec).toHaveBeenCalledExactlyOnceWith(
+          executable,
+          expect.arrayContaining(["list-panes"]),
+          expect.anything(),
+        );
+      }),
+    );
+  }
+
+  effectIt.effect(
+    "Force Stop gives recovery guidance when the pidfd recheck refuses a reused PID",
+    () =>
+      Effect.gen(function* () {
+        const host = makeManagedTmuxHost(ownedState, executable, "linux");
+        const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+        try {
+          exec.mockReset();
+          exec.mockResolvedValueOnce({ stdout: "$2|@3|%4|321|0|off\n" });
+          // Exit 42 means the helper refused to send a signal after rechecking the PID.
+          exec.mockRejectedValueOnce(
+            Object.assign(new Error("Process identity changed"), { code: 42 }),
+          );
+          expect(yield* Effect.flip(host.force(binding))).toMatchObject({
+            code: "tmux_force_unconfirmed",
+            message: expect.stringContaining(
+              "Exit with /exit in the old TUI, then reopen the session.",
+            ),
+          });
+          expect(exec.mock.calls.map(([command]) => command)).toEqual([
+            executable,
+            "/usr/bin/python3",
+          ]);
+          expect(kill).not.toHaveBeenCalled();
+        } finally {
+          kill.mockRestore();
+        }
+      }),
+  );
+
   effectIt.effect("Force Stop validates the pane before signaling the exact process", () =>
     Effect.gen(function* () {
       const host = makeManagedTmuxHost(ownedState, executable, "linux");
       exec.mockReset();
-      exec.mockResolvedValueOnce({ stdout: "$2|@3|%9|321|0|off\n" });
-      expect(yield* Effect.flip(host.force(binding))).toMatchObject({
-        code: "tmux_owner_changed",
-      });
-      expect(exec).toHaveBeenCalledTimes(1);
       exec.mockResolvedValueOnce({ stdout: "$2|@3|%4|321|0|off\n" });
       exec.mockResolvedValueOnce({ stdout: "" });
       yield* host.force(binding);
-      expect(exec.mock.calls[1]?.[1].slice(0, 6)).toEqual([
+      expect(exec.mock.calls[0]?.[1].slice(0, 6)).toEqual([
         "-N",
         "-S",
         ownedSocket,
@@ -368,8 +417,8 @@ describe("managed lifetime pane evidence", () => {
         "-s",
         "-t",
       ]);
-      expect(exec.mock.calls[2]?.[0]).toBe("/usr/bin/python3");
-      expect(exec.mock.calls[2]?.[1].slice(-3)).toEqual(["321", "1001", "1:2002"]);
+      expect(exec.mock.calls[1]?.[0]).toBe("/usr/bin/python3");
+      expect(exec.mock.calls[1]?.[1].slice(-3)).toEqual(["321", "1001", "1:2002"]);
     }),
   );
 });

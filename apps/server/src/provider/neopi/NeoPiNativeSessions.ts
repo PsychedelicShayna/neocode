@@ -102,6 +102,7 @@ import {
   makeManagedTmuxHost,
   managedControlPublication,
   decodeManagedMonitorGrant,
+  managedForceStopRecovery,
   managedTmuxClient,
   managedTmuxConfig,
   openManagedTmuxMonitor,
@@ -3257,7 +3258,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             }
             if (!allowed || forcing.has(input.imageId))
               return yield* fail(
-                "This owner is not eligible for Force Stop. Exit with /exit in the old TUI, then reopen the session.",
+                `This owner is not eligible for Force Stop. ${managedForceStopRecovery}`,
                 "tmux_force_not_available",
               );
             yield* profile.validate;

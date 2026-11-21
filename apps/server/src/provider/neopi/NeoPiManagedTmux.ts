@@ -106,9 +106,11 @@ const wrongSession = () =>
     message: "This managed tmux pane belongs to a different native session or profile.",
     code: "session_changed",
   });
-const changedOwner = () =>
+export const managedForceStopRecovery = "Exit with /exit in the old TUI, then reopen the session.";
+
+const changedOwner = (recovery = "Reopen the view.") =>
   new NeoPiNativeSessionsError({
-    message: "The managed tmux pane's NeoPi control identity changed. Reopen the view.",
+    message: `The managed tmux pane's NeoPi control identity changed. ${recovery}`,
     code: "tmux_owner_changed",
   });
 const noOwner = () =>
@@ -964,21 +966,27 @@ export const makeManagedTmuxHost = (
           "tmux_force_unsupported",
           "Force Stop requires a verified Linux process image.",
         );
-      const owner = yield* readPane(target(binding.session));
+      const owner = yield* readPane(target(binding.session)).pipe(
+        Effect.mapError((error) =>
+          error.code === "tmux_no_owner"
+            ? tmuxError(error.code, `${error.message} ${managedForceStopRecovery}`)
+            : error,
+        ),
+      );
       if (
         owner.session !== binding.owner.session ||
         owner.window !== binding.owner.window ||
         owner.pane !== binding.owner.pane ||
         owner.pid !== binding.owner.pid
       )
-        return yield* changedOwner();
+        return yield* changedOwner(managedForceStopRecovery);
       const identity = binding.process;
       yield* Effect.tryPromise({
         try: (signal) => killManagedProcess(owner.pid, identity, signal),
         catch: () =>
           tmuxError(
             "tmux_force_unconfirmed",
-            "Could not signal the exact managed owner with a pidfd.",
+            `Could not signal the exact managed owner with a pidfd. ${managedForceStopRecovery}`,
           ),
       });
     });

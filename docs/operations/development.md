@@ -82,9 +82,10 @@ choose **Force Stop** from the session's NeoCode menu if it is available.
 Force Stop ends the process without a graceful exit. It requires the exact
 live pane and the Linux process identity recorded in its binding, which is
 checked again before signaling via pidfd. This also applies when graceful
-Stop is unconfirmed. After both the old pane and process have exited, reopen
-the session. NeoCode verifies the new owner's lease and records the current
-executable for that owner.
+Stop is unconfirmed. If Force Stop refuses because the pane or process
+changed during the final checks, NeoCode directs you to exit with `/exit`
+in the old TUI and reopen after both the old pane and process have exited.
+On reopen, NeoCode verifies the new owner's lease and records its executable.
 
 ### Attach a prestarted NeoPi TUI
 

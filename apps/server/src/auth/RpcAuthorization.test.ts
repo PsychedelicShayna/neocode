@@ -56,6 +56,7 @@ describe("RPC authorization scopes", () => {
       WS_METHODS.neopiNativeSessionsRequest,
       WS_METHODS.neopiNativeSessionsClose,
       WS_METHODS.neopiNativeSessionsSetSettled,
+      WS_METHODS.neopiManagedSessionStop,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }

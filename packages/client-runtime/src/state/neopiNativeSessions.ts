@@ -454,6 +454,14 @@ export function createNativeSessionAtoms<R, E>(
           registry.refresh(list({ environmentId: target.environmentId, input: {} })),
         ),
     }),
+    stopManaged: createEnvironmentRpcCommand(runtime, {
+      label: "native-sessions:stop-managed",
+      tag: WS_METHODS.neopiManagedSessionStop,
+      onSuccess: (target, registry) =>
+        Effect.sync(() =>
+          registry.refresh(list({ environmentId: target.environmentId, input: {} })),
+        ),
+    }),
     watch: observation,
     cached: (target: NativeSessionTarget) => cache.get(nativeSessionKey(target)),
     /**

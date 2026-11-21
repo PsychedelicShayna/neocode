@@ -2,6 +2,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import { NeoPiNativeSessionRef, NeoPiNativeSessionsError } from "@t3tools/contracts";
@@ -9,6 +10,8 @@ import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hos
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type { ManagedOwnerLiveness } from "./NeoPiManagedLifecycle.ts";
+import { isMissing, killManagedProcess, observeManagedProcess } from "./NeoPiManagedProcess.ts";
 
 const exec = NodeUtil.promisify(NodeChildProcess.execFile);
 const isNativeSessionsError = Schema.is(NeoPiNativeSessionsError);
@@ -66,6 +69,7 @@ const Publication = Schema.Struct({
   pid: Schema.Int,
   role: Schema.String,
   tmuxPane: Schema.NullOr(Schema.String),
+  procStartTicks: Schema.optional(Schema.NullOr(Schema.Int)),
 });
 const Registry = Schema.fromJsonString(
   Schema.Struct({
@@ -175,7 +179,7 @@ function bindPublication(
     sessionId: meta.sessionId,
   };
   verifyManagedTmuxStatus(owner, meta.sessionFile, snapshot);
-  return { owner, sessionFile: meta.sessionFile };
+  return { owner, sessionFile: meta.sessionFile, procStartTicks: meta.procStartTicks };
 }
 
 const tmuxMissing = () =>
@@ -192,27 +196,30 @@ const tmuxMissing = () =>
  * window) and `attach-session -f ignore-size`. Same-UID explicit socket access is
  * not a security boundary. This probe never starts or changes a tmux server.
  */
+async function checkPrivateSocket(socketPath: string) {
+  const [path, socket, directory] = await Promise.all([
+    NodeFSP.realpath(socketPath),
+    NodeFSP.lstat(socketPath),
+    NodeFSP.lstat(NodePath.dirname(socketPath)),
+  ]);
+  if (
+    path !== socketPath ||
+    !socket.isSocket() ||
+    socket.uid !== process.getuid?.() ||
+    !directory.isDirectory() ||
+    directory.uid !== socket.uid ||
+    (directory.mode & 0o077) !== 0
+  )
+    throw noOwner();
+}
+
 const readPane = Effect.fnUntraced(function* (config: TmuxTarget) {
   const { executable } = config;
   if (executable === undefined) return yield* tmuxMissing();
   return yield* Effect.tryPromise({
     try: async (signal) => {
       if (!NodePath.isAbsolute(config.socket)) throw noOwner();
-      const [path, socket, directory] = await Promise.all([
-        NodeFSP.realpath(config.socket),
-        NodeFSP.lstat(config.socket),
-        NodeFSP.lstat(NodePath.dirname(config.socket)),
-      ]);
-      if (
-        path !== config.socket ||
-        !socket.isSocket() ||
-        socket.uid !== process.getuid?.() ||
-        !directory.isDirectory() ||
-        directory.uid !== socket.uid ||
-        (directory.mode & 0o077) !== 0
-      ) {
-        throw noOwner();
-      }
+      await checkPrivateSocket(config.socket);
       const { stdout } = await exec(
         executable,
         [
@@ -315,6 +322,7 @@ const Binding = Schema.Struct({
   session: Schema.String,
   ...NeoPiNativeSessionRef.fields,
   profile: Schema.NullOr(Schema.String),
+  process: Schema.optional(Schema.Struct({ start: Schema.String, image: Schema.String })),
   owner: Schema.Struct({
     executable: Schema.String,
     session: Schema.String,
@@ -326,6 +334,49 @@ const Binding = Schema.Struct({
     sessionId: Schema.String,
   }),
 });
+
+export function managedControlPublication(
+  binding: ManagedTmuxBinding,
+  registry: string | undefined,
+) {
+  const decoded = decodeRegistry(registry);
+  if (decoded._tag === "None") return undefined;
+  const { owner } = binding;
+  for (const entry of decoded.value.sessions) {
+    const pub = decodePublication(entry.meta);
+    if (pub._tag === "None") continue;
+    const meta = pub.value;
+    if (
+      meta.instanceId !== owner.instanceId &&
+      (meta.pid !== owner.pid || meta.tmuxPane !== owner.pane)
+    )
+      continue;
+    if (
+      meta.instanceId !== owner.instanceId ||
+      meta.imageId !== owner.imageId ||
+      meta.pid !== owner.pid ||
+      meta.tmuxPane !== owner.pane ||
+      meta.role !== "tui" ||
+      meta.profile !== binding.profile ||
+      meta.sessionFile !== binding.sessionFile ||
+      meta.sessionId !== owner.sessionId
+    ) {
+      return { kind: "changed" as const };
+    }
+    let snapshot: unknown;
+    if (entry.snapshot !== null) {
+      try {
+        verifyManagedTmuxStatus(owner, binding.sessionFile, entry.snapshot);
+        snapshot = entry.snapshot;
+      } catch (cause) {
+        if (isNativeSessionsError(cause) && cause.code !== "tmux_control_unavailable")
+          return { kind: "changed" as const };
+      }
+    }
+    return { kind: "same" as const, snapshot, start: meta.procStartTicks ?? undefined };
+  }
+  return undefined;
+}
 export type ManagedTmuxBinding = typeof Binding.Type;
 type TmuxBindingIdentity = Pick<ManagedTmuxBinding, "socket" | "session" | "sessionFile" | "owner">;
 const bindingJson = Schema.fromJsonString(Binding);
@@ -425,8 +476,7 @@ const managedConfigText = [
   "set -g default-shell /bin/sh",
   "",
 ].join("\n");
-const isMissingFile = (error: unknown) =>
-  error instanceof Error && "code" in error && error.code === "ENOENT";
+
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 const paneEnvironment = {
   TMUX: true,
@@ -439,7 +489,11 @@ const paneEnvironment = {
   _: true,
 };
 
-export const makeManagedTmuxHost = (stateDir: string, executable: string | undefined) => {
+export const makeManagedTmuxHost = (
+  stateDir: string,
+  executable: string | undefined,
+  platform: NodeJS.Platform,
+) => {
   const directory = NodePath.join(stateDir, "nt");
   const socket = NodePath.join(directory, "s");
   const configFile = NodePath.join(directory, "tmux.conf");
@@ -455,6 +509,34 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
   };
   const fileKey = (file: string) => NodeCrypto.createHash("sha256").update(file).digest("hex");
   const bindingFile = (file: string) => NodePath.join(directory, `${fileKey(file)}.json`);
+  const stopFile = (binding: ManagedTmuxBinding) =>
+    NodePath.join(directory, `stop-${fileKey(`${binding.sessionFile}\0${binding.owner.imageId}`)}`);
+  const stopTime = (binding: ManagedTmuxBinding) =>
+    Effect.tryPromise({
+      try: async () => {
+        try {
+          return (await NodeFSP.lstat(stopFile(binding))).mtimeMs;
+        } catch (cause) {
+          if (isMissing(cause)) return undefined;
+          throw cause;
+        }
+      },
+      catch: storageError,
+    });
+  const markStop = (binding: ManagedTmuxBinding) =>
+    Effect.tryPromise({
+      try: async () => {
+        await checkDirectory();
+        try {
+          await NodeFSP.writeFile(stopFile(binding), "", { mode: 0o600, flag: "wx" });
+          return true;
+        } catch (cause) {
+          if (cause instanceof Error && "code" in cause && cause.code === "EEXIST") return false;
+          throw cause;
+        }
+      },
+      catch: storageError,
+    });
   const storageError = () =>
     tmuxError(
       "tmux_storage_unavailable",
@@ -472,7 +554,7 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
             throw new Error("Not a private binding");
           raw = await NodeFSP.readFile(path, "utf8");
         } catch (cause) {
-          if (isMissingFile(cause)) return undefined;
+          if (isMissing(cause)) return undefined;
           throw cause;
         }
         const binding = decodeBinding(raw);
@@ -482,6 +564,41 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
       },
       catch: storageError,
     });
+  const list = Effect.tryPromise({
+    try: async () => {
+      try {
+        await checkDirectory();
+        return await NodeFSP.readdir(directory);
+      } catch (cause) {
+        if (isMissing(cause)) return [];
+        throw cause;
+      }
+    },
+    catch: storageError,
+  }).pipe(
+    Effect.flatMap((names) =>
+      Effect.forEach(
+        names.filter((name) => /^[0-9a-f]{64}\.json$/.test(name)),
+        (name) =>
+          Effect.tryPromise({
+            try: async () => {
+              const path = NodePath.join(directory, name);
+              const stat = await NodeFSP.lstat(path);
+              if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+                return undefined;
+              const binding = decodeBinding(await NodeFSP.readFile(path, "utf8"));
+              return binding.socket === socket &&
+                NodePath.basename(bindingFile(binding.sessionFile)) === name
+                ? binding
+                : undefined;
+            },
+            catch: storageError,
+          }).pipe(Effect.orElseSucceed(() => undefined)),
+        { concurrency: 8 },
+      ),
+    ),
+    Effect.map((entries) => entries.filter((entry) => entry !== undefined)),
+  );
   const save = (binding: ManagedTmuxBinding) =>
     Effect.tryPromise({
       try: async () => {
@@ -497,6 +614,108 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
       catch: storageError,
     });
   const target = (session: string): TmuxTarget => ({ socket, session, executable });
+  // One tmux query for the sidebar, not one subprocess for each historical session.
+  const panes = Effect.tryPromise({
+    try: async (signal) => {
+      if (!executable) throw tmuxMissing();
+      try {
+        await checkPrivateSocket(socket);
+      } catch (cause) {
+        if (isMissing(cause)) return [];
+        throw cause;
+      }
+      try {
+        const { stdout } = await exec(
+          executable,
+          [
+            "-N",
+            "-S",
+            socket,
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}|#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}",
+          ],
+          { signal, timeout: 3000, maxBuffer: 65536 },
+        );
+        const rows = stdout.trimEnd().split("\n").filter(Boolean);
+        if (!rows.every((row) => /^[^|]+\|\$\d+\|@\d+\|%\d+\|[1-9]\d*\|[01]$/.test(row)))
+          throw new Error("Unrecognized tmux pane inventory");
+        return rows;
+      } catch (cause) {
+        // tmux can leave a socket inode when its last session exits. A failed
+        // tmux command is not enough: verify that the private socket has no listener.
+        const { promise, resolve } = Promise.withResolvers<boolean>();
+        const probe = NodeNet.createConnection({ path: socket, signal });
+        probe.once("connect", () => {
+          probe.destroy();
+          resolve(false);
+        });
+        probe.once("error", (error) =>
+          resolve(isMissing(error) || ("code" in error && error.code === "ECONNREFUSED")),
+        );
+        probe.setTimeout(1000, () => {
+          probe.destroy();
+          resolve(false);
+        });
+        if (await promise) return [];
+        throw cause;
+      }
+    },
+    catch: () => tmuxError("tmux_unavailable", "The managed tmux server did not report its panes."),
+  });
+  const evidence = async (binding: ManagedTmuxBinding, rows: readonly string[] | undefined) => {
+    const { owner } = binding;
+    const prefix = `${binding.session}|${owner.session}|${owner.window}|${owner.pane}|`;
+    const exact = `${prefix}${owner.pid}|`;
+    const live = rows?.includes(`${exact}0`) ?? false;
+    const deadOrMissing =
+      rows !== undefined &&
+      (rows.includes(`${exact}1`) || !rows.some((row) => row.startsWith(prefix)));
+    const observed = await observeManagedProcess(platform, owner.pid);
+    const expected = binding.process;
+    const sameProcess =
+      observed.state === "alive" &&
+      (!expected ||
+        (observed.identity.start === expected.start && observed.identity.image === expected.image));
+    const oldProcessGone =
+      observed.state === "gone" ||
+      (expected && observed.state === "alive" && observed.identity.start !== expected.start);
+    const liveness: ManagedOwnerLiveness =
+      deadOrMissing && oldProcessGone
+        ? "exited"
+        : live && (sameProcess || (platform !== "linux" && observed.state === "unknown"))
+          ? "alive"
+          : "unknown";
+    return { liveness, process: observed.state === "alive" ? observed.identity : undefined };
+  };
+  const observe = (binding: ManagedTmuxBinding, rows: readonly string[] | undefined) =>
+    Effect.promise(() => evidence(binding, rows));
+  const force = (binding: ManagedTmuxBinding) =>
+    Effect.gen(function* () {
+      if (platform !== "linux" || !binding.process)
+        return yield* tmuxError(
+          "tmux_force_unsupported",
+          "Force Stop requires a verified Linux process image.",
+        );
+      const owner = yield* readPane(target(binding.session));
+      if (
+        owner.session !== binding.owner.session ||
+        owner.window !== binding.owner.window ||
+        owner.pane !== binding.owner.pane ||
+        owner.pid !== binding.owner.pid
+      )
+        return yield* changedOwner();
+      const identity = binding.process;
+      yield* Effect.tryPromise({
+        try: (signal) => killManagedProcess(owner.pid, identity, signal),
+        catch: () =>
+          tmuxError(
+            "tmux_force_unconfirmed",
+            "Could not signal the exact managed owner with a pidfd.",
+          ),
+      });
+    });
   const launch = Effect.fnUntraced(function* (input: {
     readonly providerInstanceId: ManagedTmuxBinding["providerInstanceId"];
     readonly profile: string | null;
@@ -534,7 +753,7 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
         });
         await checkDirectory();
         const socketStat = await NodeFSP.lstat(socket).catch((cause) => {
-          if (isMissingFile(cause)) return undefined;
+          if (isMissing(cause)) return undefined;
           throw cause;
         });
         if (socketStat && (!socketStat.isSocket() || socketStat.uid !== process.getuid?.()))
@@ -607,16 +826,25 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
                 input.canonicalize,
               ).pipe(Effect.result);
               if (found._tag === "Success") {
-                const binding = {
-                  ...found.success,
+                const binding: ManagedTmuxBinding = {
+                  owner: found.success.owner,
+                  sessionFile: found.success.sessionFile,
                   socket,
                   session,
                   providerInstanceId: input.providerInstanceId,
                   profile: input.profile,
                 };
                 if (binding.owner.session !== id) return yield* changedOwner();
+                const observed = yield* Effect.promise(() =>
+                  observeManagedProcess(platform, binding.owner.pid),
+                );
+                const lockedBinding =
+                  observed.state === "alive" &&
+                  found.success.procStartTicks === Number(observed.identity.start)
+                    ? { ...binding, process: observed.identity }
+                    : binding;
                 yield* input.verifyLease(binding);
-                yield* save(binding).pipe(
+                yield* save(lockedBinding).pipe(
                   Effect.tap(() =>
                     Effect.sync(() => {
                       persisted = true;
@@ -624,7 +852,7 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
                   ),
                   Effect.uninterruptible,
                 );
-                return binding;
+                return lockedBinding;
               }
               if (
                 input.sessionFile &&
@@ -661,5 +889,5 @@ export const makeManagedTmuxHost = (stateDir: string, executable: string | undef
             }).pipe(Effect.ignore),
     );
   });
-  return { read, launch, target };
+  return { read, list, launch, target, panes, observe, force, stopTime, markStop };
 };

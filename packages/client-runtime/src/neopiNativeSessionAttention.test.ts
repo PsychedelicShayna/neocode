@@ -2,6 +2,7 @@ import { ProviderInstanceId, type NeoPiNativeSessionSummary } from "@t3tools/con
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  managedSessionSidebarLabel,
   nativeSessionProjectLabel,
   partitionNativeSessions,
   resolveNativeSessionStatus,
@@ -27,6 +28,17 @@ const visits: NativeSessionVisitState = {
   baseline: "2026-11-01T00:00:00.000Z",
   visited: { "/seen.jsonl": "2026-11-03T00:00:00.000Z" },
 };
+
+it("maps managed liveness and Stop progress onto sidebar attention labels", () => {
+  expect(managedSessionSidebarLabel("alive", "idle", "idle")).toBe("Alive");
+  expect(managedSessionSidebarLabel("alive", "idle", "working")).toBe("Working");
+  expect(managedSessionSidebarLabel("alive", "idle", "waiting")).toBe("Needs input");
+  expect(managedSessionSidebarLabel("alive", "requested", "idle")).toBe("Stop requested");
+  expect(managedSessionSidebarLabel("alive", "awaiting-input", "waiting")).toBe("Stop needs input");
+  expect(managedSessionSidebarLabel("alive", "unconfirmed", "idle")).toBe("Stop unconfirmed");
+  expect(managedSessionSidebarLabel("exited", "exited", "idle")).toBe("Exited");
+  expect(managedSessionSidebarLabel("unknown", "idle", "idle")).toBe("Liveness unknown");
+});
 
 describe("resolveNativeSessionStatus", () => {
   it("ranks a blocked owner above a working one regardless of visits", () => {

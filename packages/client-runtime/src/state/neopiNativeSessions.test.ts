@@ -357,24 +357,24 @@ describe("native observation controller", () => {
           live: { state: "idle", isStreaming: false, pendingDialogs: 0, branch: null },
         });
         yield* waitFor("idle");
-        yield* lease.push({
-          type: "status",
-          revision: h.nextRevision(),
-          live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
-        });
-        yield* waitFor("working");
 
         expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 1 });
         unmount();
-        yield* waitFor(undefined);
+        expect(h.registry.get(activity).get(key)).toBe("idle");
         yield* Deferred.await(lease.released);
         expect(h.counts().active).toBe(0);
       }),
     ),
   );
 
-  for (const freshState of ["idle", "busy"] as const) {
-    it.effect(`holds observed idle until a post-close catalog read confirms ${freshState}`, () =>
+  it.effect.each([
+    ["idle", "busy", "idle"],
+    ["idle", "busy", "busy"],
+    ["working", "idle", "idle"],
+    ["working", "idle", "busy"],
+  ] as const)(
+    "holds observed %s over cached and late %s until a post-close read returns %s",
+    ([observedStatus, staleState, freshState]) =>
       Effect.scoped(
         Effect.gen(function* () {
           const h = yield* makeHarness();
@@ -406,22 +406,38 @@ describe("native observation controller", () => {
               ),
             );
           const other = { ...ref, sessionFile: "/sessions/other.jsonl" };
+          const otherStatus = staleState === "idle" ? "idle" : "working";
           yield* AtomRegistry.mount(h.registry, activity);
           yield* AtomRegistry.mount(h.registry, catalog);
+          const cached = {
+            sessions: [summary(staleState), summary(staleState, other)],
+            diagnostics: [],
+          };
+          yield* Deferred.succeed(yield* Queue.take(h.catalogs), cached);
+          yield* waitForCatalog(cached);
+          h.registry.refresh(catalog);
           const oldRead = yield* Queue.take(h.catalogs);
           const unmount = h.registry.mount(h.watch);
           const lease = yield* Queue.take(h.leases);
+          if (observedStatus === "working") {
+            yield* lease.push({
+              type: "status",
+              revision: h.nextRevision(),
+              live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
+            });
+          }
           yield* AtomRegistry.toStream(h.registry, activity).pipe(
-            Stream.filter((current) => current.get(nativeSessionKey(h.target)) === "idle"),
+            Stream.filter((current) => current.get(nativeSessionKey(h.target)) === observedStatus),
             Stream.runHead,
           );
 
           unmount();
           yield* Deferred.await(lease.released);
-          const stale = { sessions: [summary("busy"), summary("busy", other)], diagnostics: [] };
+          expect(statuses(cached)).toEqual([observedStatus, otherStatus]);
+          const stale = { ...cached };
           yield* Deferred.succeed(oldRead, stale);
           yield* waitForCatalog(stale);
-          expect(statuses(stale)).toEqual(["idle", "working"]);
+          expect(statuses(stale)).toEqual([observedStatus, otherStatus]);
 
           h.registry.refresh(catalog);
           const failedRead = yield* Queue.take(h.catalogs);
@@ -433,22 +449,24 @@ describe("native observation controller", () => {
             Stream.filter(AsyncResult.isFailure),
             Stream.runHead,
           );
-          expect(statuses(stale)).toEqual(["idle", "working"]);
+          expect(statuses(stale)).toEqual([observedStatus, otherStatus]);
 
           h.registry.refresh(catalog);
           const freshRead = yield* Queue.take(h.catalogs);
           const fresh = {
-            sessions: [summary(freshState), summary("busy", other)],
+            sessions: [summary(freshState), summary(staleState, other)],
             diagnostics: [],
           };
           yield* Deferred.succeed(freshRead, fresh);
           yield* waitForCatalog(fresh);
-          expect(statuses(fresh)).toEqual([freshState === "idle" ? "idle" : "working", "working"]);
+          expect(statuses(fresh)).toEqual([
+            freshState === "idle" ? "idle" : "working",
+            otherStatus,
+          ]);
           expect(h.registry.get(activity).has(nativeSessionKey(h.target))).toBe(false);
         }),
       ),
-    );
-  }
+  );
 
   it.effect("does not create orphan feeds for commands without an observation", () =>
     Effect.scoped(

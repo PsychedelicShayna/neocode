@@ -91,14 +91,13 @@ export function createNativeSessionAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   const cache = new Map<string, NativeSessionFeed>();
+  type ActivityRef = SubscriptionRef.SubscriptionRef<ReadonlyMap<string, NativeSessionActivity>>;
   // A passive projection of the live session views. Reading it never acquires a lease.
-  const activityRef = Atom.family<
-    EnvironmentId,
-    SubscriptionRef.SubscriptionRef<ReadonlyMap<string, NativeSessionActivity>>
-  >(() =>
+  const activityRef = Atom.family<EnvironmentId, ActivityRef>(() =>
     Effect.runSync(SubscriptionRef.make<ReadonlyMap<string, NativeSessionActivity>>(new Map())),
   );
-  const closedActivity = Atom.family((_environmentId: EnvironmentId) => new Map<string, number>());
+  // Handoff revisions must live as long as their activity, not in a weak atom family of their own.
+  const closedActivity = new WeakMap<ActivityRef, Map<string, number>>();
   const catalogReadRevision = new WeakMap<NeoPiNativeSessionsListResult, number>();
   let lastCatalogReadStarted = 0;
   const activity = Atom.family(
@@ -188,9 +187,9 @@ export function createNativeSessionAtoms<R, E>(
           const revision = catalogReadRevision.get(result.value);
           if (revision === undefined) return;
 
-          const held = closedActivity(environmentId);
-          if (held.size === 0) return;
           const observed = activityRef(environmentId);
+          const held = closedActivity.get(observed);
+          if (!held?.size) return;
           const previous = SubscriptionRef.getUnsafe(observed);
           let updated: Map<string, NativeSessionActivity> | undefined;
           for (const [key, closedAfterRevision] of held) {
@@ -238,7 +237,7 @@ export function createNativeSessionAtoms<R, E>(
             if (observed === null || activity === next) return Effect.void;
             return SubscriptionRef.update(observed, (previous) => {
               activity = next;
-              closedActivity(environmentId).delete(key);
+              closedActivity.get(observed)?.delete(key);
               const updated = new Map(previous);
               if (next === undefined) updated.delete(key);
               else updated.set(key, next);
@@ -246,10 +245,15 @@ export function createNativeSessionAtoms<R, E>(
             });
           };
           yield* Effect.addFinalizer(() => {
-            if (activity === undefined || activity === "working") return publishActivity(undefined);
-            // Reads already in flight may still describe an earlier state of the owner.
+            if (observed === null || activity === undefined) return Effect.void;
+            // Keep the last observed status until a read started after the view closed.
             return Effect.sync(() => {
-              closedActivity(environmentId).set(key, lastCatalogReadStarted);
+              let held = closedActivity.get(observed);
+              if (!held) {
+                held = new Map();
+                closedActivity.set(observed, held);
+              }
+              held.set(key, lastCatalogReadStarted);
             });
           });
           const external = yield* Queue.unbounded<NativeSessionUpdate>();

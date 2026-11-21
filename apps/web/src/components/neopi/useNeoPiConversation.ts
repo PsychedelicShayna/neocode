@@ -10,6 +10,7 @@ import {
   reduceNativeConversation,
   type NativeConversation,
 } from "@t3tools/client-runtime/neopi-conversation";
+import { nativeTranscriptPending } from "@t3tools/client-runtime/neopi-native-sessions";
 import {
   findOlderNativePage,
   mergeThreadConversation,
@@ -67,6 +68,11 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
       return mergeThreadConversation(paged, readOnlyThreadConversation(readOnlyPage));
     return emptyNativeConversation();
   }, [history, feed, paged, readOnlyPage]);
+  const ircMessages = history === "live" ? feed?.observation.ircMessages : undefined;
+  const transcriptPending = useMemo(
+    () => nativeTranscriptPending(conversation.pending, ircMessages),
+    [conversation.pending, ircMessages],
+  );
   // A stop is re-read from the binding: whether NeoCode's own runtime still runs decides
   // between "stopped" and "control plane off".
   useEffect(() => {
@@ -144,6 +150,7 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
 
   return {
     conversation,
+    transcriptPending,
     connection,
     refresh,
     loadOlder,

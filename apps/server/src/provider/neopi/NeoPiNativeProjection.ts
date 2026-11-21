@@ -505,6 +505,9 @@ const NEOPI_NATIVE_INBOX_LIMITS: NeoPiNativeInboxLimits = {
 /** Per-call detail a gap keeps; beyond it the gap says the detail is truncated. */
 const GAP_TOOL_CALLS = 16;
 
+/** IRC observations may never enter the journal; keep a bounded window of them. */
+const LIVE_IRC_MESSAGES = 64;
+
 /** The essential envelopes a projection produces; lease, lifecycle and status belong to the connection. */
 export type NeoPiNativeProjectionEnvelope = Extract<
   NeoPiNativeEssentialEnvelope,
@@ -569,6 +572,18 @@ const toolKey = (toolCallId: string) => `tool:${toolCallId}`;
 const editPreviewKey = (toolCallId: string) => `editPreview:${toolCallId}`;
 const RUN_KEY = "run";
 
+/** The persistence join also covers NeoPi's flat custom_message entries. */
+function messagePersistenceKind(role: unknown, customType: unknown): string | undefined {
+  if (role === "custom" && typeof customType === "string") return `custom:${customType}`;
+  return text(role);
+}
+
+function journalMessageKind(entry: NeoPiNativeObservedJournalEntry): string | undefined {
+  return entry.type === "custom_message"
+    ? messagePersistenceKind("custom", entry.customType)
+    : messagePersistenceKind(entry.message?.role, entry.message?.customType);
+}
+
 type MessageValue = Extract<NeoPiNativeEntityValue, { class: "message" }>;
 type ToolValue = Extract<NeoPiNativeEntityValue, { class: "tool" }>;
 type EditPreviewValue = Extract<NeoPiNativeEntityValue, { class: "editPreview" }>;
@@ -606,6 +621,8 @@ export class NeoPiNativeProjection {
   #commandOutputs = 0;
   /** The newest live message, the anchor of a command output. */
   #lastMessageId: string | null = null;
+  readonly #ircMessages = new Set<string>();
+  #ircSequence = 0;
   /** Settled job keys, oldest first. */
   #settledJobs: string[] = [];
   #horizonCursor: { readonly firstEntryId: string; readonly cursor: string } | null = null;
@@ -818,6 +835,9 @@ export class NeoPiNativeProjection {
       case "message_update":
       case "message_end":
         this.#message(type, frame);
+        return "none";
+      case "irc_message":
+        this.#ircMessage(frame);
         return "none";
       case "tool_execution_start":
       case "tool_execution_update":
@@ -1263,15 +1283,18 @@ export class NeoPiNativeProjection {
       snapshot?.incarnation === this.#domain.projectionIncarnation &&
       snapshot.attempt === this.#domain.buildAttempt
     ) {
-      const unassociatedRoles = new Set(
-        gapEntries
-          .filter((entry) => !this.store.retiredBy(entry.id))
-          .map((entry) => entry.message?.role),
+      const unassociatedKinds = new Set(
+        gapEntries.filter((entry) => !this.store.retiredBy(entry.id)).map(journalMessageKind),
       );
       for (const messageId of this.#endedBeforeGap) {
         const value = this.store.get(messageKey(messageId))?.value;
         if (value?.class !== "message" || value.phase !== "ended") continue;
-        if (!unassociatedRoles.has(value.message.role)) continue;
+        if (
+          !unassociatedKinds.has(
+            messagePersistenceKind(value.message.role, value.message.customType),
+          )
+        )
+          continue;
         this.store.remove(messageKey(messageId));
         this.#resolveCandidate(messageId);
       }
@@ -1311,6 +1334,7 @@ export class NeoPiNativeProjection {
       this.#inboxMeta = [];
       this.#inboxBytes = 0;
       this.#pendingJoins.clear();
+      this.#ircMessages.clear();
       this.#rosterLive.clear();
       this.#heldEntries.clear();
       this.#settledJobs = [];
@@ -1405,12 +1429,16 @@ export class NeoPiNativeProjection {
    * `session_settled`, after which a late alias still retires the live row.
    */
   #holdIfUnassociated(entry: NeoPiNativeObservedJournalEntry): void {
-    const role = entry.message?.role;
-    if (role === undefined || this.store.retiredBy(entry.id)) return;
+    const kind = journalMessageKind(entry);
+    if (kind === undefined || this.store.retiredBy(entry.id)) return;
     const candidates = new Set<string>();
     for (const record of this.store.values()) {
       const value = record.value;
-      if (value?.class === "message" && value.phase === "ended" && value.message.role === role)
+      if (
+        value?.class === "message" &&
+        value.phase === "ended" &&
+        messagePersistenceKind(value.message.role, value.message.customType) === kind
+      )
         candidates.add(value.messageId);
     }
     if (candidates.size > 0) this.#heldEntries.set(entry.id, candidates);
@@ -1441,6 +1469,8 @@ export class NeoPiNativeProjection {
 
   /** C3.5: navigation restarts the build, so reads say `building` until its page publishes. */
   #navigate(identity: NeoPiNativeIdentity): void {
+    for (const key of this.#ircMessages) this.store.remove(key);
+    this.#ircMessages.clear();
     this.#domain = { ...this.#domain, branchGeneration: this.#domain.branchGeneration + 1 };
     this.#horizonCursor = null;
     this.#pageApplied = false;
@@ -1472,6 +1502,14 @@ export class NeoPiNativeProjection {
     if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
       this.store.remove(toolKey(message.toolCallId), entry.id);
       this.store.remove(editPreviewKey(message.toolCallId), entry.id);
+    }
+    const custom = entry.type === "custom_message" ? entry : message;
+    if (custom?.customType === "irc:incoming") {
+      const deliveryId = text(asRecord(custom.details)?.id);
+      if (deliveryId) {
+        const key = `presentation:irc:incoming:${deliveryId}`;
+        if (this.#ircMessages.delete(key)) this.store.remove(key, entry.id);
+      }
     }
   }
 
@@ -1552,6 +1590,37 @@ export class NeoPiNativeProjection {
       ...(stopOutcome === undefined ? {} : { stopOutcome }),
     };
     this.store.put(key, value);
+  }
+
+  #ircMessage(frame: NativeRecord): void {
+    if (!this.#sameSession(frame)) return;
+    const native = asRecord(frame.message);
+    if (native?.role !== "custom" || native.display === false) return;
+    const type = native.customType;
+    if (type !== "irc:incoming" && type !== "irc:relay" && type !== "irc:workpool") return;
+    const details = asRecord(native.details);
+    if (
+      !details ||
+      typeof details.from !== "string" ||
+      typeof (type === "irc:incoming" ? details.message : details.body) !== "string"
+    )
+      return;
+    const deliveryId = text(details.id);
+    if (type === "irc:incoming" && !deliveryId) return;
+    const key =
+      type === "irc:incoming"
+        ? `presentation:irc:incoming:${deliveryId}`
+        : `presentation:irc:relay:${++this.#ircSequence}`;
+    if (this.store.get(key) || this.store.wasRetired(key)) return;
+    this.#ircMessages.add(key);
+    const { message } = observeNeoPiMessage(native);
+    // This is presentation only, not a pending message that can fail to persist.
+    this.store.put(key, { class: "presentation", value: { message } });
+    if (this.#ircMessages.size > LIVE_IRC_MESSAGES) {
+      const oldest = this.#ircMessages.values().next().value!;
+      this.#ircMessages.delete(oldest);
+      this.store.remove(oldest);
+    }
   }
 
   /**

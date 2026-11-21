@@ -146,6 +146,14 @@ export type TimelineEntry =
     }
   | {
       id: string;
+      kind: "message-bubble";
+      createdAt: string;
+      label: string;
+      text: string;
+      tone: "nit" | "concern" | "blocker" | "irc";
+    }
+  | {
+      id: string;
       kind: "proposed-plan";
       createdAt: string;
       proposedPlan: ProposedPlan;
@@ -1469,6 +1477,7 @@ function compareTimelineEntriesByCreatedAt(left: TimelineEntry, right: TimelineE
 function timelineEntrySourceOrder(entry: TimelineEntry): number {
   switch (entry.kind) {
     case "message":
+    case "message-bubble":
       return 0;
     case "proposed-plan":
       return 1;

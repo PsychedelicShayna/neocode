@@ -1610,6 +1610,35 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
     transform: scaleX(-1);
   }
 
+  .chat-bubble[data-bubble="attributed"] {
+    border-bottom-left-radius: 0;
+  }
+
+  .chat-bubble[data-bubble="attributed"]::after {
+    right: calc(100% - 1px);
+    transform: scaleX(-1);
+  }
+
+  .chat-bubble[data-tone="nit"] {
+    --chat-bubble-fill: color-mix(in srgb, var(--success) 13%, var(--background));
+    --chat-bubble-foreground: var(--success-foreground);
+  }
+
+  .chat-bubble[data-tone="concern"] {
+    --chat-bubble-fill: color-mix(in srgb, var(--warning-surface), var(--background) 20%);
+    --chat-bubble-foreground: var(--warning-foreground);
+  }
+
+  .chat-bubble[data-tone="blocker"] {
+    --chat-bubble-fill: color-mix(in srgb, var(--error-surface), var(--background) 20%);
+    --chat-bubble-foreground: var(--error-foreground);
+  }
+
+  .chat-bubble[data-tone="irc"] {
+    --chat-bubble-fill: color-mix(in srgb, var(--info) 13%, var(--background));
+    --chat-bubble-foreground: var(--info-foreground);
+  }
+
   /* Harness rows (tool calls, thoughts, folds, notices) are scenery between
      the bubbles: their muted label and icon tones drop toward the canvas. */
   .chat-harness {

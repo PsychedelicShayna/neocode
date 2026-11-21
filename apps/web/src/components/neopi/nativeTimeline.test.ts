@@ -84,6 +84,101 @@ function foldLabels(rows: readonly TranscriptRow[], runPaused = false) {
 }
 
 describe("native turn output", () => {
+  it("shows advisor and IRC bubbles in a collapsed turn without exposing or replacing its tool result", () => {
+    const record = (id: string, second: number, type: string, fields: object): NeoPiJournalEntry =>
+      ({ id, type, parentId: null, timestamp: at(second), ...fields }) as NeoPiJournalEntry;
+    const transcript = createTranscriptProjector()(
+      {
+        leafId: "answer",
+        pending: [],
+        entries: [
+          record("prompt", 0, "message", { message: { role: "user", content: "go" } }),
+          record("call", 1, "message", {
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "toolCall",
+                  id: "send",
+                  name: "irc",
+                  intent: "Sending an IRC message",
+                  arguments: { op: "send" },
+                },
+              ],
+              stopReason: "toolUse",
+            },
+          }),
+          record("advice", 2, "custom_message", {
+            customType: "advisor",
+            details: {
+              notes: [
+                { advisor: "Logic", severity: "blocker", note: "Stop here." },
+                { advisor: "Scope", severity: "concern", note: "Check the branch." },
+                { note: "Optional polish." },
+              ],
+            },
+          }),
+          record("result", 3, "message", {
+            message: { role: "toolResult", toolCallId: "send", toolName: "irc", content: "Sent" },
+          }),
+          record("incoming", 4, "custom_message", {
+            customType: "irc:incoming",
+            details: { id: "1", from: "peer", message: "Received" },
+          }),
+          record("steer", 5, "message", {
+            message: {
+              role: "user",
+              content: "<parent-irc>wire envelope</parent-irc>",
+              parentIrc: { from: "main", body: "Proceed" },
+              steering: true,
+            },
+          }),
+          record("answer", 10, "message", {
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Done." }],
+              stopReason: "stop",
+            },
+          }),
+        ],
+      },
+      { debug: false },
+    );
+    const timeline = projectNativeTimeline(transcript, false);
+    const derive = (expandedTurnIds?: ReadonlySet<TurnId>) =>
+      deriveMessagesTimelineRows({
+        timelineEntries: timeline.entries,
+        latestTurn: timeline.latestTurn,
+        runningTurnId: timeline.runningTurnId,
+        ...(expandedTurnIds ? { expandedTurnIds } : {}),
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+    const rows = derive();
+    expect(rows).toMatchObject([
+      { kind: "message", message: { role: "user", text: "go" } },
+      { kind: "turn-fold", label: "Worked for 10s", expanded: false },
+      { kind: "message-bubble", tone: "blocker", label: "Advisor · Logic", text: "Stop here." },
+      {
+        kind: "message-bubble",
+        tone: "concern",
+        label: "Advisor · Scope",
+        text: "Check the branch.",
+      },
+      { kind: "message-bubble", tone: "nit", label: "Advisor", text: "Optional polish." },
+      { kind: "message-bubble", tone: "irc", label: "IRC · peer", text: "Received" },
+      { kind: "message-bubble", tone: "irc", label: "IRC · main", text: "Proceed" },
+      { kind: "message", message: { role: "assistant", text: "Done." } },
+    ]);
+    const expanded = derive(new Set([TurnId.make("native:prompt")]));
+    expect(expanded.find((row) => row.id === "tool:send")).toMatchObject({
+      kind: "work",
+      groupedEntries: [{ toolCallId: "send", toolLifecycleStatus: "completed", detail: "Sent" }],
+    });
+  });
+
   it("keeps every assistant message visible when the turn settles", () => {
     const finishedTool: Row<"tool"> = {
       ...tool("t1", 2),

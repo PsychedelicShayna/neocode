@@ -445,6 +445,7 @@ function isActivityEntry(entry: TimelineEntry): entry is ActivityEntry {
 }
 
 export type MessagesTimelineRow =
+  | Extract<TimelineEntry, { kind: "message-bubble" }>
   | {
       kind: "activity-group";
       id: string;
@@ -1292,6 +1293,11 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    if (timelineEntry.kind === "message-bubble") {
+      nextRows.push(timelineEntry);
+      continue;
+    }
+
     const activityTurnId = timelineEntryTurnId(timelineEntry);
     if (index > scannedActivityThrough && activityTurnId && isActivityEntry(timelineEntry)) {
       const entries = [timelineEntry];
@@ -1780,6 +1786,16 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     case "context-compaction": {
       const bc = b as typeof a;
       return a.createdAt === bc.createdAt && a.label === bc.label && a.detail === bc.detail;
+    }
+
+    case "message-bubble": {
+      const bubble = b as typeof a;
+      return (
+        a.createdAt === bubble.createdAt &&
+        a.label === bubble.label &&
+        a.text === bubble.text &&
+        a.tone === bubble.tone
+      );
     }
 
     case "proposed-plan":

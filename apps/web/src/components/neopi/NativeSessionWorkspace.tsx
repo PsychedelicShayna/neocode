@@ -14,6 +14,7 @@ import {
   nativeOwnerNotice,
   nativeRowKeys,
   nativeSlashCommands,
+  nativeTranscriptPending,
   type NativeSessionTarget,
   type NativeSlashCommand,
 } from "@t3tools/client-runtime/neopi-native-sessions";
@@ -512,7 +513,7 @@ export function NativeSessionView({
       projectRows(
         {
           entries: conversation.entries,
-          pending: conversation.pending,
+          pending: nativeTranscriptPending(conversation.pending, feed.observation.ircMessages),
           leafId: conversation.identity?.leafId ?? null,
         },
         { debug, commandOutputs, rowKeys },
@@ -521,6 +522,7 @@ export function NativeSessionView({
       projectRows,
       conversation.entries,
       conversation.pending,
+      feed.observation.ircMessages,
       conversation.identity?.leafId,
       debug,
       commandOutputs,

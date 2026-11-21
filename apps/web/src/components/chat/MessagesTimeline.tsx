@@ -1838,6 +1838,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "message" && row.message.role === "assistant" ? (
         <AssistantTimelineRow row={row} />
       ) : null}
+      {row.kind === "message-bubble" ? <AttributedTimelineBubble row={row} /> : null}
       {row.kind === "message" && row.message.role === "reasoning" ? (
         <ReasoningTimelineRow row={row} />
       ) : null}
@@ -2080,6 +2081,26 @@ const MESSAGE_HEADING_LEVEL = 3;
 
 function MessageAuthorHeading({ children }: { children: string }) {
   return <h3 className="sr-only select-none">{children}</h3>;
+}
+
+function AttributedTimelineBubble({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "message-bubble" }>;
+}) {
+  return (
+    <div
+      data-bubble="attributed"
+      data-tone={row.tone}
+      className="chat-bubble ms-3 w-fit min-w-0 max-w-[85%] px-3.5 py-2.5"
+    >
+      <h3 className="mb-1 flex flex-wrap items-baseline gap-x-2 text-xs font-medium">
+        <span className="wrap-anywhere">{row.label}</span>
+        {row.tone !== "irc" ? <span className="capitalize">{row.tone}</span> : null}
+      </h3>
+      <div className="whitespace-pre-wrap wrap-anywhere text-sm text-foreground">{row.text}</div>
+    </div>
+  );
 }
 
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {

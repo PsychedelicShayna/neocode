@@ -207,7 +207,13 @@ vi.mock("react-native", async () => {
   };
 });
 vi.mock("../../components/AppText", () => ({
-  AppText: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
+  AppText: ({
+    children,
+    accessibilityRole,
+  }: {
+    children?: ReactNode;
+    accessibilityRole?: string;
+  }) => (accessibilityRole === "header" ? <h3>{children}</h3> : <span>{children}</span>),
 }));
 vi.mock("../../components/MaterialButton", () => ({
   MaterialButton: ({
@@ -603,6 +609,65 @@ const mountScreen = (h: Effect.Success<ReturnType<typeof makeHarness>>) => {
   };
   return { render, focused, click, selectCanonicalSession, cleanup };
 };
+
+it.effect("renders attributed advisory and IRC bubbles in the mobile transcript", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness();
+    yield* Effect.promise(async () => {
+      const screen = mountScreen(h);
+      try {
+        await act(async () => {
+          screen.render();
+          await screen.selectCanonicalSession();
+          h.flush();
+        });
+        const incoming = {
+          role: "custom",
+          customType: "irc:incoming",
+          display: true,
+          content: "<irc>Model envelope</irc>",
+          details: { id: "one", from: "peer", message: "Peer update" },
+        };
+        await act(async () => {
+          h.publishEntity("message:advice", {
+            class: "message",
+            messageId: "advice",
+            phase: "ended",
+            entryId: null,
+            message: {
+              role: "custom",
+              customType: "advisor",
+              content: "<advisory>Model envelope</advisory>",
+              details: { notes: [{ note: "Read this", advisor: "Logic", severity: "concern" }] },
+            },
+          });
+          h.publishEntity("presentation:irc:incoming:one", {
+            class: "presentation",
+            value: { message: incoming },
+          });
+          h.publishEntity("message:irc", {
+            class: "message",
+            messageId: "irc",
+            phase: "ended",
+            entryId: null,
+            message: incoming,
+          });
+          h.flush();
+        });
+        const transcript = screen.focused().querySelector("[data-native-test-transcript]")!;
+        expect(Array.from(transcript.querySelectorAll("h3"), (head) => head.textContent)).toEqual([
+          "Advisor · Logic Concern",
+          "IRC · peer",
+        ]);
+        expect(transcript.textContent).toContain("Read this");
+        expect(transcript.textContent).toContain("Peer update");
+        expect(transcript.textContent).not.toContain("Model envelope");
+      } finally {
+        await screen.cleanup();
+      }
+    });
+  }),
+);
 
 it.effect("returns to the native live end and follows further output", () =>
   Effect.gen(function* () {

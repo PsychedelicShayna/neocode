@@ -103,6 +103,10 @@ Older NeoPi versions keep their original abort behavior and do not withdraw the
 queue. If an attachment is no longer available on its server, the composer names
 it so you can attach it again.
 
+NeoPi advisor messages show their severity and, when supplied, the advisor's
+name. Incoming IRC messages show their sender. On web and desktop, both stay
+readable when a turn's work is collapsed; IRC tool calls still appear under work.
+
 ## Queue messages offline on mobile
 
 Mobile keeps local copies of draft attachments, so you can preview them and queue

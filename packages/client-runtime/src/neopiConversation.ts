@@ -8,6 +8,8 @@ export interface NativeIdentity {
 export interface NativeLiveMessage {
   readonly messageId: string;
   readonly message: Readonly<Record<string, unknown>>;
+  /** The observation ended before its durable journal entry joined. */
+  readonly ended?: true;
   /** The typed outcome an observation read built from whitelisted fields; never raw `stopDetails`. */
   readonly stopOutcome?: NeoPiStopOutcome;
 }
@@ -80,6 +82,7 @@ export type NativeConversationAction =
       type: "message";
       messageId: string;
       message: Readonly<Record<string, unknown>>;
+      ended?: true;
       stopOutcome?: NeoPiStopOutcome;
     }
   /** These live rows cannot be identified with any durable entry: they become continuity losses. */
@@ -357,6 +360,7 @@ export function reduceNativeConversation(
       const message: NativeLiveMessage = {
         messageId: action.messageId,
         message: action.message,
+        ...(action.ended ? { ended: true } : {}),
         ...(action.stopOutcome ? { stopOutcome: action.stopOutcome } : {}),
       };
       return {

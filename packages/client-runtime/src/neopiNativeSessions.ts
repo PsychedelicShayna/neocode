@@ -623,6 +623,7 @@ function applyNativeRead(
       type: "message",
       messageId: value.messageId,
       message: value.message,
+      ...(value.phase !== "open" ? { ended: true } : {}),
       ...(value.stopOutcome ? { stopOutcome: value.stopOutcome } : {}),
     });
     if (value.entryId !== null && conversation.identity)

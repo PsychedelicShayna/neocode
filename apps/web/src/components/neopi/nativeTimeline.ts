@@ -3,6 +3,7 @@ import {
   MessageId,
   ProviderInstanceId,
   TurnId,
+  type ResponseStreamingMode,
   type ToolLifecycleItemType,
 } from "@t3tools/contracts";
 import {
@@ -16,6 +17,7 @@ import type { QueuedComposerMessage } from "../../queuedMessageStore";
 import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
 import type { ChatAttachment, ChatMessage } from "../../types";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
+import { splitBufferedAssistantText } from "@t3tools/shared/responseStreaming";
 import {
   asKnownContextRecord,
   previewAnnotationFromRecord,
@@ -266,6 +268,7 @@ export function projectNativeTimeline(
   busy: boolean,
   lossByToolCall?: ReadonlyMap<string, readonly { readonly text: string }[]>,
   runPaused = false,
+  responseStreamingMode: ResponseStreamingMode = "token",
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
   // A call keeps one entry id from its live row through its durable one and any
@@ -320,21 +323,35 @@ export function projectNativeTimeline(
           ),
         );
         break;
-      case "assistant":
-        entries.push(
-          memoized(row, turnId, row.live ? runPaused : null, () =>
-            message(
-              row.id,
-              "assistant",
-              row.text,
-              turnId,
-              row.timestamp,
-              row.live && !runPaused,
-              imageAttachments(row.id, row.images),
-            ),
-          ),
-        );
+      case "assistant": {
+        const mode = row.live && !row.ended ? responseStreamingMode : "token";
+        const streaming =
+          row.live && !runPaused && (responseStreamingMode === "token" || !row.ended);
+        const entry = memoized(row, turnId, streaming ? mode : `${mode}:settled`, () => {
+          const text =
+            mode === "paragraph"
+              ? splitBufferedAssistantText(row.text).ready
+              : mode === "turn"
+                ? ""
+                : row.text;
+          return message(
+            row.id,
+            "assistant",
+            text,
+            turnId,
+            row.timestamp,
+            streaming,
+            imageAttachments(row.id, row.images),
+          );
+        });
+        // Keep the working indicator without an empty bubble before the first finished block.
+        if (
+          entry.kind === "message" &&
+          (mode === "token" || row.images.length || entry.message.text.trim())
+        )
+          entries.push(entry);
         break;
+      }
       case "thinking":
         entries.push(
           memoized(row, turnId, row.live ? runPaused : null, () =>

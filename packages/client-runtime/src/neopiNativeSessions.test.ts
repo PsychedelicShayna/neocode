@@ -24,6 +24,7 @@ import {
   type NativeSessionFeed,
   type NativeSession,
 } from "./neopiNativeSessions.ts";
+import { projectTranscript } from "./neopiTranscript.ts";
 
 describe("deferred native editor text", () => {
   function fixture(initialDraft: string) {
@@ -445,6 +446,7 @@ describe("observation rebase", () => {
     revision: number,
     entryId: string | null,
     content: unknown = "live text",
+    phase: "open" | "ended" | "durable" = entryId === null ? "open" : "durable",
   ): NeoPiNativeEntity => ({
     key: `message:${messageId}`,
     ordinal: (ordinal += 1),
@@ -452,7 +454,7 @@ describe("observation rebase", () => {
     value: {
       class: "message",
       messageId,
-      phase: entryId === null ? "open" : "durable",
+      phase,
       entryId,
       message: { role: "assistant", content },
     },
@@ -1047,6 +1049,33 @@ describe("observation rebase", () => {
       tombstones: [{ key: "message:m", ordinal: 1, revision: 5, joinEntryId: "r" }],
     });
     expect(transcript(feed)).toEqual(["u", "reply"]);
+  });
+
+  it("marks a finished assistant reply even while its journal entry is pending", () => {
+    const epoch = domain();
+    let feed = step(observing(), {
+      epoch,
+      passId: "p1",
+      watermark: 3,
+      entities: [message("m", 3, null, [{ type: "text", text: "Open" }])],
+    });
+    const rows = () => projectTranscript({ ...feed.conversation, leafId: null }, { debug: false });
+    expect(rows()[0]).toMatchObject({ kind: "assistant", text: "Open", live: true });
+    expect(rows()[0]).not.toHaveProperty("ended");
+
+    feed = step(feed, {
+      epoch,
+      passId: "p2",
+      kind: "incremental",
+      watermark: 4,
+      entities: [message("m", 4, null, [{ type: "text", text: "Complete" }], "ended")],
+    });
+    expect(rows()[0]).toMatchObject({
+      kind: "assistant",
+      text: "Complete",
+      live: true,
+      ended: true,
+    });
   });
 
   it("drops segment data of a transfer its pass did not finish", () => {

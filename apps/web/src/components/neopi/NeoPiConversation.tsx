@@ -1,4 +1,4 @@
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { ProjectId, ScopedThreadRef } from "@t3tools/contracts";
 import { nativeRowKeys } from "@t3tools/client-runtime/neopi-native-sessions";
 import { projectTranscript } from "@t3tools/client-runtime/neopi-transcript";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
@@ -13,12 +13,14 @@ import { nativeTreeSessionKey, useNativeTreeField } from "./neopiTreeState";
 
 export function NeoPiConversation({
   threadRef,
+  projectId,
   cwd,
   composerInset,
   onOpenTree,
   ownerStatus,
 }: {
   threadRef: ScopedThreadRef;
+  projectId: ProjectId;
   cwd?: string | undefined;
   composerInset: number;
   onOpenTree: () => void;
@@ -141,6 +143,7 @@ export function NeoPiConversation({
           busy={busy === true}
           {...(assistantName ? { assistantName } : {})}
           environmentId={threadRef.environmentId}
+          projectId={projectId}
           timelineKey={nativeTimelineKey(threadRef.environmentId, threadRef.threadId)}
           cwd={cwd}
           loadEarlier={loadEarlier}

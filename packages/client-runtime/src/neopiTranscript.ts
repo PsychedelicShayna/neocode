@@ -42,6 +42,8 @@ export interface AssistantRow extends RowBase {
   readonly kind: "assistant";
   readonly text: string;
   readonly images: ReadonlyArray<TranscriptImage>;
+  /** A finished message can still be live while it awaits its journal entry. */
+  readonly ended?: true;
   /** Last prose row of a finished assistant message: meta is shown below it. */
   readonly meta: AssistantMeta | null;
 }
@@ -126,6 +128,7 @@ export interface TranscriptSource {
   readonly pending: ReadonlyArray<{
     readonly messageId: string;
     readonly message: Readonly<Record<string, unknown>>;
+    readonly ended?: true;
   }>;
   readonly leafId: string | null;
 }
@@ -422,7 +425,7 @@ function createPass(
     tone: meta.stopReason === "aborted" ? "system" : "error",
   });
 
-  const visitMessage = (entry: NeoPiJournalEntry, live: boolean) => {
+  const visitMessage = (entry: NeoPiJournalEntry, live: boolean, ended?: true) => {
     const message = journalRecord(entry.message);
     const base = { entry, timestamp: entry.timestamp, live };
     const role = str(message.role);
@@ -449,7 +452,15 @@ function createPass(
         const id = `${rowKey(entry)}:${index}`;
         if (block.type === "text" && typeof block.text === "string") {
           if (block.text.trim().length === 0) return;
-          push({ ...base, kind: "assistant", id, text: block.text, images: [], meta: null });
+          push({
+            ...base,
+            kind: "assistant",
+            id,
+            text: block.text,
+            images: [],
+            meta: null,
+            ...(ended ? { ended } : {}),
+          });
           lastProse = rows.length - 1;
           return;
         }
@@ -670,8 +681,8 @@ function createPass(
   };
 
   const visitPending = (pending: TranscriptSource["pending"], leafId: string | null) => {
-    for (const { messageId, message } of pending) {
-      visitMessage(liveEntry(messageId, leafId, message), true);
+    for (const { messageId, message, ended } of pending) {
+      visitMessage(liveEntry(messageId, leafId, message), true, ended);
       appendOutputs(`live:${messageId}`);
     }
   };

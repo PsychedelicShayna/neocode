@@ -394,6 +394,11 @@ durable journal identities. A reconnect reads a fresh branch and never resends a
 prompt. Unknown entry types and extension content remain available as canonical
 JSON alongside native text, images, reasoning and tool records.
 
+Under **Settings → General → Response streaming**, choose **Show finished paragraphs**
+to reveal each completed paragraph or code block while NeoPi works. Any remaining
+text appears when the message ends. Native sessions without a saved project use
+their environment's setting.
+
 In a thread's right panel, choose **Session tree** to inspect alternate branches.
 Filter tools and system events, search loaded entries, and
 load older pages until the point you want is available. Selecting a row only

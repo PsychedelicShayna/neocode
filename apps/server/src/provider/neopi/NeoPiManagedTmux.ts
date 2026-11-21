@@ -22,7 +22,7 @@ const Config = Schema.fromJsonString(
   }),
 );
 const decodeConfig = Schema.decodeUnknownSync(Config);
-type TmuxTarget = {
+export type TmuxTarget = {
   readonly executable: string | undefined;
   readonly socket: string;
   readonly session: string;
@@ -357,7 +357,7 @@ export const bindOrStartManagedTmux = Effect.fnUntraced(function* <B extends Tmu
   rebind: (saved: B) => Effect.Effect<B, NeoPiNativeSessionsError>,
   start: () => Effect.Effect<B, NeoPiNativeSessionsError>,
   findHolder: () => Effect.Effect<string | undefined, NeoPiNativeSessionsError> = () =>
-    Effect.succeed(undefined),
+    Effect.undefined,
 ) {
   if (saved) return { kind: "bound" as const, binding: yield* rebindManagedTmux(saved, rebind) };
   const started = yield* Effect.suspend(start).pipe(Effect.result);

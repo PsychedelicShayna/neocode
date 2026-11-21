@@ -103,6 +103,7 @@ import {
   verifyManagedTmuxStatus,
   type ManagedTmuxBinding,
   type ManagedTmuxOwner,
+  type TmuxTarget,
 } from "./NeoPiManagedTmux.ts";
 import {
   neoPiSessionCatalogSource,
@@ -2724,11 +2725,10 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   const config = yield* ServerConfig;
   const serverSettings = yield* ServerSettingsService;
   const managedConfig = yield* managedTmuxConfig(process.env.T3CODE_NEOPI_MANAGED_TMUX);
-  const createInTmux = process.env.T3CODE_NEOPI_TMUX === "1";
-  const managedHost = makeManagedTmuxHost(
-    yield* fs.realPath(config.stateDir),
-    yield* resolveTmuxExecutable,
-  );
+  const managedHost =
+    process.env.T3CODE_NEOPI_TMUX === "1"
+      ? makeManagedTmuxHost(yield* fs.realPath(config.stateDir), yield* resolveTmuxExecutable)
+      : undefined;
   const canonicalize = Effect.fnUntraced(function* (file: string) {
     if (!NodePath.isAbsolute(file))
       return yield* fail("A native session file must be an absolute path.", "invalid_path");
@@ -2884,12 +2884,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     );
   const probeManaged = (
     profile: NeoPiNativeProfile,
-    target: {
-      readonly socket: string;
-      readonly session: string;
-      readonly executable: string | undefined;
-      readonly sessionFile: string;
-    },
+    target: TmuxTarget & { readonly sessionFile: string },
   ) =>
     resolveManagedTmuxOwner(
       target,
@@ -2914,11 +2909,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       : Effect.fail(
           fail("The managed tmux owner belongs to a different NeoPi profile.", "profile_conflict"),
         );
-  const rebind = (profile: NeoPiNativeProfile, binding: ManagedTmuxBinding) =>
+  const rebind = (target: TmuxTarget, profile: NeoPiNativeProfile, binding: ManagedTmuxBinding) =>
     Effect.gen(function* () {
       yield* assertManagedProfile(profile, binding);
       const owner = yield* probeManaged(profile, {
-        ...managedHost.target(binding.session),
+        ...target,
         sessionFile: binding.sessionFile,
       });
       yield* verifyLease(profile, { ...binding, owner });
@@ -2942,7 +2937,9 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           "The managed tmux owner belongs to a different NeoPi profile.",
           "profile_conflict",
         );
-      const saved = input.sessionFile ? yield* managedHost.read(input.sessionFile) : undefined;
+      // With hosted creation off, the catalog remains authoritative for existing owners.
+      const saved =
+        managedHost && input.sessionFile ? yield* managedHost.read(input.sessionFile) : undefined;
       const fixture = saved ? undefined : isManaged(profile.providerInstanceId, input.sessionFile);
       const row =
         !saved && !fixture && input.sessionFile
@@ -2953,12 +2950,12 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       let managedOwner = fixture ? yield* probeManaged(profile, fixture) : undefined;
       let managedFile = fixture?.sessionFile;
       let contendedInstance: string | undefined;
-      if (saved || (createInTmux && mode !== "attach" && !fixture && !row?.inUse)) {
+      if (managedHost && (saved || (mode !== "attach" && !fixture && !row?.inUse))) {
         const file = input.sessionFile;
-        const findHolder = () => (file ? catalogRow(profile, file) : Effect.succeed(undefined));
+        const findHolder = () => (file ? catalogRow(profile, file) : Effect.undefined);
         const selected = yield* bindOrStartManagedTmux(
           saved,
-          (binding) => rebind(profile, binding),
+          (binding) => rebind(managedHost.target(binding.session), profile, binding),
           () =>
             Effect.gen(function* () {
               const extra = yield* parseNeoPiLaunchArguments(source.launchArgs).pipe(
@@ -3318,11 +3315,15 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     managedTmuxView: (profile, ref) =>
       Effect.gen(function* () {
         yield* profile.validate;
-        const saved = yield* managedHost.read(ref.sessionFile);
-        if (saved) {
-          const binding = yield* rebindManagedTmux(saved, (saved) => rebind(profile, saved));
-          yield* profile.validate;
-          return { ...managedTmuxClient(binding, binding.owner), owner: binding.owner };
+        if (managedHost) {
+          const saved = yield* managedHost.read(ref.sessionFile);
+          if (saved) {
+            const binding = yield* rebindManagedTmux(saved, (saved) =>
+              rebind(managedHost.target(saved.session), profile, saved),
+            );
+            yield* profile.validate;
+            return { ...managedTmuxClient(binding, binding.owner), owner: binding.owner };
+          }
         }
         const target = isManaged(ref.providerInstanceId, ref.sessionFile);
         if (!target)

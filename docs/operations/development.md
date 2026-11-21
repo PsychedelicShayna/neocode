@@ -45,9 +45,12 @@ When you open a populated native session that has no live owner, NeoCode starts
 its NeoPi TUI on a private tmux socket in the NeoCode state directory. Open
 **TUI** to see the same owner. Closing the view or restarting NeoCode does not
 stop the owner; reopening the session reconnects to it without starting another.
-Sessions that already have a live owner stay with that owner. Turning the opt-in
-off changes how unowned sessions are opened, not how existing managed owners
-are reconnected.
+Turning the opt-in off leaves existing tmux owners running and ignores their
+saved managed bindings. NeoCode uses ordinary native session discovery: it
+attaches to a live owner through its control endpoint, or refuses the open if
+the session is in use but cannot be attached. It does not start a replacement
+while the session is in use. The managed **TUI** view is not available for
+these owners while the opt-in is off.
 
 NeoPi v19's catalog omits untouched, untitled sessions and cannot report their
 file lease. NeoCode refuses to drive these sessions in tmux, including a

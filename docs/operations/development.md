@@ -69,6 +69,13 @@ NeoCode refuses the managed open. Update older NeoPi builds before enabling
 this mode. Missing tmux or disabled control is also an error; NeoCode does not
 fall back to a direct owner while the setting is on.
 
+Managed launch arguments accept only supported settings options, such as
+`--model` or `--no-skills`; send prompts from NeoCode after opening the
+session. NeoCode does not retry a rejected lease in the background. It pins
+the launch executable's path and SHA-256 for a saved owner: if the executable
+changed, restore it to reconnect. Owners saved before executable pinning
+cannot be reopened in managed mode.
+
 ### Attach a prestarted NeoPi TUI
 
 On a Unix host with `tmux` on the NeoCode server's `PATH`, opt in by setting the server's
@@ -90,6 +97,9 @@ only pane in the only window of the configured tmux session; do not leave a
 wrapper process as the pane's PID. Leave control enabled. Set `exit-unattached
 off`, `destroy-unattached off`, `allow-passthrough off`, `window-size latest`,
 and `aggressive-resize off` in the dedicated tmux configuration.
+
+Use a NeoPi release with exact-file lease queries. A registry match is not
+enough: the exact-file lease must attest that pane before NeoCode attaches.
 
 Open the existing native session and select **TUI** at the far right of its
 status bar. Closing the view detaches its tmux client, not the NeoPi owner.

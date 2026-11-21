@@ -329,6 +329,8 @@ const Binding = Schema.Struct({
   session: Schema.String,
   ...NeoPiNativeSessionRef.fields,
   profile: Schema.NullOr(Schema.String),
+  // Keep legacy records readable so they are refused explicitly, not treated as absent.
+  neoPiBinary: Schema.optional(Schema.Struct({ path: Schema.String, sha256: Schema.String })),
   process: Schema.optional(Schema.Struct({ start: Schema.String, image: Schema.String })),
   owner: Schema.Struct({
     executable: Schema.String,
@@ -467,7 +469,7 @@ function leaseHolder(sessionFile: string, output: LeaseCommandOutput) {
 }
 
 export const verifyManagedTmuxLease = Effect.fnUntraced(function* (
-  binding: TmuxBindingIdentity,
+  binding: Pick<TmuxBindingIdentity, "sessionFile" | "owner">,
   query: Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>,
 ) {
   const output = yield* query;
@@ -509,6 +511,33 @@ const requireUnheldLease = Effect.fnUntraced(function* (
   });
 });
 
+// Only options with known arity and no startup action may precede attestation.
+const managedOptions: Readonly<Record<string, "switch" | "value">> = {
+  "--hide-thinking": "switch",
+  "--no-context-files": "switch",
+  "--no-extensions": "switch",
+  "--no-lsp": "switch",
+  "--no-mcp": "switch",
+  "--no-pty": "switch",
+  "--no-rules": "switch",
+  "--no-skills": "switch",
+  "--no-title": "switch",
+  "--no-tools": "switch",
+  "--append-system-prompt": "value",
+  "--max-fps": "value",
+  "--model": "value",
+  "--models": "value",
+  "--motion": "value",
+  "--provider": "value",
+  "--service-tier": "value",
+  "--smol": "value",
+  "--slow": "value",
+  "--spinner-interval": "value",
+  "--system-prompt": "value",
+  "--thinking": "value",
+  "--tools": "value",
+};
+
 export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   readonly executable: string | undefined;
   readonly binary: string;
@@ -519,13 +548,21 @@ export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   if (!input.executable) return yield* tmuxMissing();
   if (input.extra.some((arg) => arg.split("=", 1)[0] === "--no-control-socket"))
     return yield* unavailable();
-  // Managed owners need an interactive TUI with durable native identity, not a startup prompt
-  // supplied through positional arguments or a different mode after the option terminator.
-  if (input.extra.some((arg) => arg === "--" || arg === "--print"))
+  for (let i = 0; i < input.extra.length; i++) {
+    const arg = input.extra[i]!;
+    const equals = arg.indexOf("=");
+    const option = managedOptions[equals < 0 ? arg : arg.slice(0, equals)];
+    if (option === "switch" && equals < 0) continue;
+    if (option === "value") {
+      // A separate option value must not be mistaken for another flag or attachment.
+      const value = equals < 0 ? input.extra[++i] : arg.slice(equals + 1);
+      if (value && !value.startsWith("-") && !value.startsWith("@")) continue;
+    }
     return yield* tmuxError(
       "tmux_launch_failed",
-      "NeoPi launch arguments must keep managed sessions interactive.",
+      "Only supported settings options are allowed for managed tmux launches; send prompts after opening the session.",
     );
+  }
   return [
     input.binary,
     "--cwd",
@@ -932,7 +969,7 @@ export const makeManagedTmuxHost = (
   const launch = Effect.fnUntraced(function* (input: {
     readonly providerInstanceId: ManagedTmuxBinding["providerInstanceId"];
     readonly profile: string | null;
-    readonly binary: string;
+    readonly neoPiBinary: NonNullable<ManagedTmuxBinding["neoPiBinary"]>;
     readonly env: Record<string, string>;
     readonly cwd: string;
     readonly sessionFile?: string;
@@ -950,7 +987,11 @@ export const makeManagedTmuxHost = (
         "tmux_lease_unsupported",
         "NeoPi tmux sessions require Linux file lease queries.",
       );
-    const argv = yield* managedTmuxLaunchPlan({ ...input, executable });
+    const argv = yield* managedTmuxLaunchPlan({
+      ...input,
+      executable,
+      binary: input.neoPiBinary.path,
+    });
     if (!(yield* input.controlEnabled)) return yield* unavailable();
     if (input.sessionFile)
       yield* requireUnheldLease(input.sessionFile, input.queryLease(input.sessionFile));
@@ -1043,6 +1084,7 @@ export const makeManagedTmuxHost = (
                   session,
                   providerInstanceId: input.providerInstanceId,
                   profile: input.profile,
+                  neoPiBinary: input.neoPiBinary,
                 };
                 if (binding.owner.session !== id) return yield* changedOwner();
                 const observed = yield* Effect.promise(() =>

@@ -2632,6 +2632,42 @@ describe("server wiring review round", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("ends recovery and passive discovery on the first rejected tmux attestation", () =>
+    Effect.gen(function* () {
+      const { dependencies, native } = yield* fixture("terminal");
+      let attempts = 0;
+      const service = yield* makeNeoPiNativeSessionsWith({
+        ...dependencies,
+        connect: (...args) => {
+          attempts++;
+          return dependencies.connect(...args);
+        },
+      });
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      native.attachError = new NeoPiNativeSessionsError({
+        code: "tmux_lease_unverified",
+        message: "Different writer holds the lease",
+      });
+      yield* Deferred.succeed(native.exit!, ownerExited);
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(attempts, 2);
+      assert.equal(
+        (yield* lease.next("lifecycle", (envelope) => envelope.state === "incompatible")).reason,
+        "Different writer holds the lease",
+      );
+      yield* Fiber.join(lease.fiber);
+
+      const passive = yield* follow(service, originalRef);
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(attempts, 3);
+      yield* passive.next("lifecycle", (envelope) => envelope.state === "incompatible");
+      yield* Fiber.join(passive.fiber);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("a discovery cancelled while its candidate connects closes that candidate", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture("terminal");
@@ -3639,22 +3675,36 @@ const decodeOptOutRequest = Schema.decodeSync(
   Schema.fromJsonString(Schema.Struct({ id: Schema.String, type: Schema.String })),
 );
 
-describe("opening native sessions with managed tmux disabled", () => {
+describe("opening native sessions with optional managed tmux", () => {
   for (const scenario of [
     "malformed",
     "stale",
     "unsafe directory",
     "live owner",
     "invalid launch arguments with a live owner",
+    "prestarted owner without a matching lease",
+    "saved owner after a binary change",
+    "saved owner after a same-path binary replacement",
+    "saved owner without a binary pin",
+    "graceful stop without a matching lease",
   ] as const) {
     const invalidArgs = scenario === "invalid launch arguments with a live owner";
-    const name = invalidArgs
-      ? `rejects ${scenario} before attaching`
-      : `uses the ordinary open path with ${scenario} managed state`;
+    const fixtureOwner = scenario === "prestarted owner without a matching lease";
+    const changedPath = scenario === "saved owner after a binary change";
+    const changedBytes = scenario === "saved owner after a same-path binary replacement";
+    const missingPin = scenario === "saved owner without a binary pin";
+    const changedBinary = changedPath || changedBytes || missingPin;
+    const stopOwner = scenario === "graceful stop without a matching lease";
+    const savedOwner = changedBinary || stopOwner;
+    const name =
+      invalidArgs || fixtureOwner || savedOwner
+        ? `rejects ${scenario} before opening a control pipe`
+        : `uses the ordinary open path with ${scenario} managed state`;
     it.live(name, () =>
       Effect.gen(function* () {
         vi.stubEnv("T3CODE_NEOPI_TMUX", undefined);
         vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", undefined);
+        const createHost = ManagedTmux.makeManagedTmuxHost;
         const makeHost = vi.spyOn(ManagedTmux, "makeManagedTmuxHost");
         const hostTools = vi
           .spyOn(HostToolBridge, "makeNeoPiNativeHostToolPump")
@@ -3674,6 +3724,9 @@ describe("opening native sessions with managed tmux disabled", () => {
         yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
         if (scenario === "unsafe directory") yield* fs.chmod(directory, 0o755);
         yield* fs.writeFileString(sessionFile, "");
+        const binary = NodePath.join(cwd, "npi");
+        const binaryData = "mock NeoPi executable";
+        yield* fs.writeFileString(binary, binaryData, { mode: 0o700 });
         const live = scenario === "live owner" || invalidArgs;
         const owner = {
           executable: "/fixture/tmux",
@@ -3692,6 +3745,16 @@ describe("opening native sessions with managed tmux disabled", () => {
           sessionFile,
           providerInstanceId: instanceId,
           profile: null,
+          ...(savedOwner && !missingPin
+            ? {
+                neoPiBinary: {
+                  path: changedPath ? `${binary}-previous` : binary,
+                  sha256: NodeCrypto.createHash("sha256")
+                    .update(changedBytes ? "previous executable" : binaryData)
+                    .digest("hex"),
+                },
+              }
+            : {}),
           owner,
         } satisfies ManagedTmux.ManagedTmuxBinding;
         const bindingPath = NodePath.join(directory, `${key}.json`);
@@ -3700,6 +3763,22 @@ describe("opening native sessions with managed tmux disabled", () => {
           scenario === "malformed" ? "not JSON" : encodeOptOutFixture(binding),
         );
         yield* fs.chmod(bindingPath, 0o600);
+        const probeOwner = vi.spyOn(ManagedTmux, "resolveManagedTmuxOwner");
+        yield* Effect.addFinalizer(() => Effect.sync(() => probeOwner.mockRestore()));
+        if (fixtureOwner) {
+          vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", encodeOptOutFixture(binding));
+          probeOwner.mockReturnValue(Effect.succeed(owner));
+        }
+        if (savedOwner) {
+          vi.stubEnv("T3CODE_NEOPI_TMUX", "1");
+          const host = createHost(stateDir, owner.executable, "linux");
+          makeHost.mockReturnValue({
+            ...host,
+            panes: Effect.succeed([]),
+            observe: () => Effect.succeed({ liveness: "alive", process: undefined }),
+          });
+          probeOwner.mockReturnValue(Effect.succeed(owner));
+        }
 
         const instance = registerNeoPiSessionCatalogSource(
           {
@@ -3722,7 +3801,7 @@ describe("opening native sessions with managed tmux disabled", () => {
             },
           },
           {
-            binary: "/fixture/npi",
+            binary,
             env: {},
             profile: "default",
             ...(invalidArgs ? { launchArgs: "--fork" } : {}),
@@ -3750,13 +3829,14 @@ describe("opening native sessions with managed tmux disabled", () => {
                       return yield* Effect.die("Unexpected piped child command");
                     spawned.push(command.args);
                     const catalog = command.args[0] === "sessions";
+                    const lease = command.args[0] === "session" && command.args[1] === "lease";
                     const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
                     const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
                     const finish = Queue.end(stdout).pipe(
                       Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
                       Effect.asVoid,
                     );
-                    if (!catalog)
+                    if (!catalog && !lease)
                       yield* Queue.offer(
                         stdout,
                         encode({
@@ -3767,9 +3847,10 @@ describe("opening native sessions with managed tmux disabled", () => {
                       );
                     return ChildProcessSpawner.makeHandle({
                       pid: ChildProcessSpawner.ProcessId(123),
-                      exitCode: catalog
-                        ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
-                        : Deferred.await(exited),
+                      exitCode:
+                        catalog || lease
+                          ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
+                          : Deferred.await(exited),
                       isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
                       kill: () => finish,
                       stdin: Sink.forEach((chunk: Uint8Array) => {
@@ -3808,7 +3889,9 @@ describe("opening native sessions with managed tmux disabled", () => {
                               ],
                             }),
                           )
-                        : Stream.fromQueue(stdout),
+                        : lease
+                          ? Stream.make(encode({ status: "not_held", sessionFile }))
+                          : Stream.fromQueue(stdout),
                       stderr: Stream.empty,
                       all: Stream.empty,
                       getInputFd: () => Sink.drain,
@@ -3821,6 +3904,44 @@ describe("opening native sessions with managed tmux disabled", () => {
           ),
         );
         const ref = { providerInstanceId: instanceId, sessionFile };
+        if (fixtureOwner) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, "tmux_lease_unverified");
+          assert.deepEqual(spawned, [["session", "lease", "--file", sessionFile, "--json"]]);
+          assert.equal(makeHost.mock.calls.length, 0);
+          const view = yield* service.managedTmuxView(ref).pipe(Effect.flip);
+          assert.equal(view.code, "tmux_lease_unverified");
+          assert.deepEqual(spawned, [
+            ["session", "lease", "--file", sessionFile, "--json"],
+            ["session", "lease", "--file", sessionFile, "--json"],
+          ]);
+          const passive = yield* follow(service, ref);
+          yield* passive.next("lifecycle", (envelope) => envelope.state === "incompatible");
+          yield* Fiber.join(passive.fiber);
+          assert.equal(spawned.length, 2, "passive discovery must reuse this owner's refusal");
+
+          probeOwner.mockReturnValue(Effect.succeed({ ...owner, instanceId: "successor-control" }));
+          const successor = yield* follow(service, ref);
+          yield* successor.next("lifecycle", (envelope) => envelope.state === "incompatible");
+          yield* Fiber.join(successor.fiber);
+          assert.equal(spawned.length, 3, "a different owner instance gets one attestation");
+          return;
+        }
+        if (changedBinary) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, "tmux_binary_changed");
+          assert.equal(probeOwner.mock.calls.length, 0);
+          assert.deepEqual(spawned, []);
+          return;
+        }
+        if (stopOwner) {
+          const result = yield* service
+            .stopManaged({ ref, imageId: owner.imageId, action: "stop" })
+            .pipe(Effect.result);
+          assert.deepEqual(spawned, [["session", "lease", "--file", sessionFile, "--json"]]);
+          assert.equal(result._tag === "Failure" && result.failure.code, "tmux_lease_unverified");
+          return;
+        }
         if (invalidArgs) {
           const result = yield* service.open(ref).pipe(Effect.result);
           assert.equal(result._tag, "Failure");

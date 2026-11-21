@@ -381,6 +381,7 @@ describe("managed tmux owner startup", () => {
     extra: ["--model", "fixture"],
     executable,
   };
+  const neoPiBinary = { path: source.binary, sha256: "a".repeat(64) };
   const owner = {
     ...pane,
     instanceId: publication.instanceId,
@@ -423,6 +424,22 @@ describe("managed tmux owner startup", () => {
       expect(
         yield* Effect.flip(managedTmuxLaunchPlan({ ...source, extra: ["--no-control-socket"] })),
       ).toMatchObject({ code: "tmux_control_unavailable" });
+    }),
+  );
+
+  effectIt.effect("refuses positional startup work hidden among managed options", () =>
+    Effect.gen(function* () {
+      for (const extra of [
+        ["do work"],
+        ["--model", "fixture", "do work"],
+        ["--no-skills", "do work"],
+        ["--unknown", "do work"],
+        ["@attachment.txt"],
+        ["-p", "do work"],
+      ]) {
+        const result = yield* managedTmuxLaunchPlan({ ...source, extra }).pipe(Effect.result);
+        expect(result._tag, extra.join(" ")).toBe("Failure");
+      }
     }),
   );
 
@@ -471,6 +488,7 @@ describe("managed tmux owner startup", () => {
           yield* Effect.flip(
             host.launch({
               ...source,
+              neoPiBinary,
               env: {},
               providerInstanceId: ProviderInstanceId.make("neopi"),
               profile: null,
@@ -575,6 +593,7 @@ describe("managed tmux owner startup", () => {
           const result = yield* host
             .launch({
               ...source,
+              neoPiBinary,
               env: {},
               providerInstanceId: ProviderInstanceId.make("neopi"),
               profile: "work",
@@ -588,7 +607,8 @@ describe("managed tmux owner startup", () => {
             })
             .pipe(Effect.result);
           expect(result._tag).toBe(accepted ? "Success" : "Failure");
-          if (result._tag === "Success") expect(result.success.sessionFile).toBe(sessionFile);
+          if (result._tag === "Success")
+            expect(result.success).toMatchObject({ sessionFile, neoPiBinary });
           const commands = exec.mock.calls.map(([, args]) => args);
           expect(commands.some((args) => args.includes("kill-session"))).toBe(!accepted);
           expect(commands.some((args) => args.includes("send-keys"))).toBe(false);

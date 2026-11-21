@@ -8,6 +8,7 @@ export interface NativeIdentity {
 export interface NativeLiveMessage {
   readonly messageId: string;
   readonly message: Readonly<Record<string, unknown>>;
+  readonly textAppendGeneration?: string;
   /** The observation ended before its durable journal entry joined. */
   readonly ended?: true;
   /** The typed outcome an observation read built from whitelisted fields; never raw `stopDetails`. */
@@ -82,6 +83,7 @@ export type NativeConversationAction =
       type: "message";
       messageId: string;
       message: Readonly<Record<string, unknown>>;
+      textAppendGeneration?: string;
       ended?: true;
       stopOutcome?: NeoPiStopOutcome;
     }
@@ -360,6 +362,9 @@ export function reduceNativeConversation(
       const message: NativeLiveMessage = {
         messageId: action.messageId,
         message: action.message,
+        ...(action.textAppendGeneration === undefined
+          ? {}
+          : { textAppendGeneration: action.textAppendGeneration }),
         ...(action.ended ? { ended: true } : {}),
         ...(action.stopOutcome ? { stopOutcome: action.stopOutcome } : {}),
       };

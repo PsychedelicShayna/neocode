@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import {
   modelDisplayName,
+  type AssistantRow,
   type TranscriptRow,
   type ToolRow,
 } from "@t3tools/client-runtime/neopi-transcript";
@@ -17,7 +18,11 @@ import type { QueuedComposerMessage } from "../../queuedMessageStore";
 import type { TimelineEntry, WorkLogEntry } from "../../session-logic";
 import type { ChatAttachment, ChatMessage } from "../../types";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
-import { splitBufferedAssistantText } from "@t3tools/shared/responseStreaming";
+import {
+  createAssistantParagraphScanner,
+  splitBufferedAssistantText,
+  type AssistantParagraphScanner,
+} from "@t3tools/shared/responseStreaming";
 import {
   asKnownContextRecord,
   previewAnnotationFromRecord,
@@ -172,7 +177,7 @@ function message(
   createdAt: string,
   streaming: boolean,
   attachments?: ChatAttachment[],
-): TimelineEntry {
+): Extract<TimelineEntry, { kind: "message" }> {
   return {
     id,
     kind: "message",
@@ -252,6 +257,58 @@ function memoized(
   return entry;
 }
 
+interface ParagraphProjection {
+  row: AssistantRow;
+  scan: AssistantParagraphScanner;
+  boundary: number;
+  turnId: TurnId;
+  streaming: boolean;
+  entry: Extract<TimelineEntry, { kind: "message" }> | null;
+}
+
+function projectParagraph(
+  previous: ParagraphProjection | undefined,
+  row: AssistantRow,
+  turnId: TurnId,
+  streaming: boolean,
+): ParagraphProjection {
+  const appended =
+    previous !== undefined &&
+    (previous.row === row ||
+      (row.textAppendGeneration !== undefined &&
+        previous.row.textAppendGeneration === row.textAppendGeneration &&
+        row.text.length >= previous.row.text.length));
+  const scan = appended ? previous.scan : createAssistantParagraphScanner();
+  const boundary = appended && previous.row === row ? previous.boundary : scan(row.text);
+  const sameText = appended && boundary === previous.boundary;
+  const text = sameText ? (previous.entry?.message.text ?? "") : row.text.slice(0, boundary);
+  const entry =
+    previous !== undefined &&
+    turnId === previous.turnId &&
+    streaming === previous.streaming &&
+    row.timestamp === previous.row.timestamp &&
+    (sameText || text === previous.entry?.message.text)
+      ? previous.entry
+      : text.trim()
+        ? message(row.id, "assistant", text, turnId, row.timestamp, streaming)
+        : null;
+  if (previous !== undefined) {
+    previous.row = row;
+    previous.scan = scan;
+    previous.boundary = boundary;
+    previous.turnId = turnId;
+    previous.streaming = streaming;
+    previous.entry = entry;
+    return previous;
+  }
+  return { row, scan, boundary, turnId, streaming, entry };
+}
+
+/** One memoized projection per mounted native timeline. */
+export function createNativeTimelineProjector() {
+  return projectNativeTimeline.bind(null, new Map<string, ParagraphProjection>());
+}
+
 const LOSS_MARKER_LABEL = "Some live output of this call was not kept.";
 /** The merged entry for a settings change, kept while the previous entry and label hold. */
 const mergedSettingMemo = new WeakMap<
@@ -263,7 +320,8 @@ const mergedSettingMemo = new WeakMap<
  * `lossByToolCall` holds live output missing from a call's inbox stream
  * (`nativeInboxLossWarnings`); each such call shows it in its own body.
  */
-export function projectNativeTimeline(
+function projectNativeTimeline(
+  paragraphs: Map<string, ParagraphProjection>,
   rows: readonly TranscriptRow[],
   busy: boolean,
   lossByToolCall?: ReadonlyMap<string, readonly { readonly text: string }[]>,
@@ -271,6 +329,8 @@ export function projectNativeTimeline(
   responseStreamingMode: ResponseStreamingMode = "token",
 ): NativeTimeline {
   const entries: TimelineEntry[] = [];
+  const runOpen = busy || runPaused;
+  let paragraphCount = 0;
   // A call keeps one entry id from its live row through its durable one and any
   // rebase, so an expanded call stays expanded; a repeated call id falls back to its row.
   const toolIds = new Set<string>();
@@ -324,9 +384,18 @@ export function projectNativeTimeline(
         );
         break;
       case "assistant": {
-        const mode = row.live && !row.ended ? responseStreamingMode : "token";
-        const streaming =
-          row.live && !runPaused && (responseStreamingMode === "token" || !row.ended);
+        const open = row.live && !row.ended && runOpen;
+        const mode = open ? responseStreamingMode : "token";
+        const streaming = row.live && !runPaused && (responseStreamingMode === "token" || open);
+        if (mode === "paragraph" && row.images.length === 0) {
+          const previous = paragraphs.get(row.id);
+          const paragraph = projectParagraph(previous, row, turnId, streaming);
+          if (!previous) paragraphs.set(row.id, paragraph);
+          paragraphCount++;
+          if (paragraph.entry) entries.push(paragraph.entry);
+          break;
+        }
+        paragraphs.delete(row.id);
         const entry = memoized(row, turnId, streaming ? mode : `${mode}:settled`, () => {
           const text =
             mode === "paragraph"
@@ -448,7 +517,12 @@ export function projectNativeTimeline(
         break;
     }
   }
-  const runOpen = busy || runPaused;
+  if (paragraphCount === 0) paragraphs.clear();
+  else if (paragraphCount !== paragraphs.size) {
+    for (const id of paragraphs.keys()) {
+      if (!rows.some((row) => row.id === id)) paragraphs.delete(id);
+    }
+  }
   const latestTurn: TimelineLatestTurn | null = sawTurn
     ? {
         turnId,

@@ -14,7 +14,7 @@ import {
   notifyTimelinePageScroll,
   useLeaveLiveEdgeOnScroll,
 } from "../chat/useLeaveLiveEdgeOnScroll";
-import { projectNativeTimeline } from "./nativeTimeline";
+import { createNativeTimelineProjector } from "./nativeTimeline";
 
 const NO_TURN_DIFFS: [] = [];
 const noop = () => {};
@@ -63,16 +63,11 @@ export function NativeTimelineView(props: {
     () => (props.hideThinking ? props.rows.filter((row) => row.kind !== "thinking") : props.rows),
     [props.rows, props.hideThinking],
   );
+  const [project] = useState(createNativeTimelineProjector);
   const timeline = useMemo(
     () =>
-      projectNativeTimeline(
-        visibleRows,
-        props.busy,
-        props.toolLosses,
-        props.runPaused,
-        responseStreamingMode,
-      ),
-    [visibleRows, props.busy, props.toolLosses, props.runPaused, responseStreamingMode],
+      project(visibleRows, props.busy, props.toolLosses, props.runPaused, responseStreamingMode),
+    [project, visibleRows, props.busy, props.toolLosses, props.runPaused, responseStreamingMode],
   );
   const [liveFollow, setLiveFollow] = useState(true);
   const [isAtEnd, setIsAtEnd] = useState(true);

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import type {
   NeoPiEditFilePreview,
   NeoPiNativeEntityValue,
@@ -1519,12 +1520,29 @@ export class NeoPiNativeProjection {
       return;
     const { message, stopOutcome } = observeNeoPiMessage(native);
     this.#lastMessageId = messageId;
+    const assistantEvent = asRecord(frame.assistantMessageEvent);
+    // Only the native text-delta event guarantees the snapshot extends its
+    // previous open text. Starts, replacements, and rebuilds get a new key.
+    const textAppendGeneration =
+      type === "message_end" || message.role !== "assistant"
+        ? undefined
+        : (type === "message_update" &&
+            frame.snapshot !== true &&
+            assistantEvent?.type === "text_delta" &&
+            typeof assistantEvent.delta === "string" &&
+            held?.class === "message" &&
+            held.textAppendGeneration) ||
+          NodeCrypto.randomUUID();
     const value: MessageValue = {
       class: "message",
       messageId,
       phase: type === "message_end" ? "ended" : "open",
       entryId: null,
       message,
+      ...(textAppendGeneration === undefined ? {} : { textAppendGeneration }),
+      ...(type === "message_update" && held?.class === "message" && held.runSettled
+        ? { runSettled: true as const }
+        : {}),
       ...(stopOutcome === undefined ? {} : { stopOutcome }),
     };
     this.store.put(key, value);
@@ -1759,12 +1777,23 @@ export class NeoPiNativeProjection {
   #runEnded(): void {
     this.#heldEntries.clear();
     const orphans: string[] = [];
-    for (const record of this.store.values())
+    for (const record of this.store.values()) {
+      const value = record.value;
       if (
-        record.value?.class === "editPreview" &&
-        this.store.get(toolKey(record.value.toolCallId))?.value?.class !== "tool"
-      )
+        value?.class === "message" &&
+        value.phase === "open" &&
+        value.message.role === "assistant"
+      ) {
+        // A terminal run may omit message_end. Keep its last observed body and
+        // mark it settled so that a later run doesn't buffer it again.
+        if (!value.runSettled) this.store.put(record.key, { ...value, runSettled: true });
+      } else if (
+        value?.class === "editPreview" &&
+        this.store.get(toolKey(value.toolCallId))?.value?.class !== "tool"
+      ) {
         orphans.push(record.key);
+      }
+    }
     for (const key of orphans) this.store.remove(key);
   }
 

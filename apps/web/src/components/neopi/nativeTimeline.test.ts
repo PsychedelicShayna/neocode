@@ -21,8 +21,9 @@ import {
   reduceNativeSessionFeed,
   type NativeSessionFeed,
 } from "@t3tools/client-runtime/neopi-native-sessions";
-import { projectNativeTimeline } from "./nativeTimeline";
+import { createNativeTimelineProjector } from "./nativeTimeline";
 
+const projectNativeTimeline = createNativeTimelineProjector();
 const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
 const entry = (id: string, type: string) => ({ id, type }) as unknown as NeoPiJournalEntry;
 type Row<Kind extends TranscriptRow["kind"]> = Extract<TranscriptRow, { kind: Kind }>;
@@ -431,5 +432,82 @@ describe("projection reads through the incremental timeline window", () => {
       else expect(next.result).toHaveLength(count);
       stable = next;
     }
+  });
+});
+
+describe("native paragraph streaming", () => {
+  const ready = "One finished paragraph.\n\n";
+  const body = `${ready}Unfinished tail`;
+
+  function openParagraphStream() {
+    const empty = emptyNativeSessionFeed();
+    const live: NativeSessionFeed = {
+      ...empty,
+      busy: true,
+      conversation: {
+        ...empty.conversation,
+        pending: [
+          {
+            messageId: "stream",
+            message: { role: "assistant", content: [{ type: "text", text: body }] },
+            textAppendGeneration: "original",
+          },
+        ],
+      },
+    };
+    const projectRows = createTranscriptProjector();
+    const project = createNativeTimelineProjector();
+    return {
+      live,
+      render(feed: NativeSessionFeed, paused = false) {
+        return project(
+          projectRows({ ...feed.conversation, leafId: null }, { debug: false }),
+          feed.busy,
+          undefined,
+          paused,
+          "paragraph",
+        ).entries.at(-1);
+      },
+    };
+  }
+
+  it("reveals retained text on terminal owner loss without message_end, but not on pause", () => {
+    const { live, render } = openParagraphStream();
+    expect(render(live)).toMatchObject({ message: { text: ready, streaming: true } });
+    const stopped = reduceNativeSessionFeed(live, {
+      type: "lifecycle",
+      revision: 99,
+      state: "owner-stopped",
+    });
+    expect(stopped.busy).toBe(false);
+    expect(render(stopped, true)).toMatchObject({ message: { text: ready, streaming: false } });
+    expect(render(stopped)).toMatchObject({ message: { text: body, streaming: false } });
+  });
+
+  it("keeps the visible assistant entry and message when only hidden tokens grow", () => {
+    const { live, render } = openParagraphStream();
+    const first = render(live);
+    expect(first).toMatchObject({ message: { text: ready } });
+    const update = (text: string, textAppendGeneration = "original") =>
+      render({
+        ...live,
+        conversation: {
+          ...live.conversation,
+          pending: [
+            {
+              messageId: "stream",
+              message: { role: "assistant", content: [{ type: "text", text }] },
+              textAppendGeneration,
+            },
+          ],
+        },
+      });
+    expect(update(`${body} grows`)).toBe(first);
+    expect(update(`${body} grows\n\n`)).toMatchObject({ message: { text: `${body} grows\n\n` } });
+    expect(
+      update("Corrected paragraph long enough to replace the held prefix.\n\nTail", "new"),
+    ).toMatchObject({
+      message: { text: "Corrected paragraph long enough to replace the held prefix.\n\n" },
+    });
   });
 });

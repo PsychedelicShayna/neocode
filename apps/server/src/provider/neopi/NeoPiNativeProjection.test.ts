@@ -101,6 +101,49 @@ describe("NeoPiNativeProjection", () => {
     },
   );
 
+  it("preserves append provenance across text deltas, but not replacement snapshots or end", () => {
+    const projection = published();
+    const messageId = "live";
+    projection.fold({ type: "message_start", messageId, message: assistant("First") });
+    const initial = servedMessage(projection, messageId)?.textAppendGeneration;
+    assert.isString(initial);
+    projection.fold({
+      type: "message_update",
+      messageId,
+      message: assistant("First paragraph"),
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " paragraph" },
+    });
+    assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial);
+    projection.fold({
+      type: "message_start",
+      messageId,
+      snapshot: true,
+      message: assistant("Replacement"),
+    });
+    const replacement = servedMessage(projection, messageId)?.textAppendGeneration;
+    assert.isString(replacement);
+    assert.notEqual(replacement, initial);
+    projection.fold({ type: "message_end", messageId, message: assistant("Replacement final") });
+    assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
+  });
+
+  it("settles an open assistant body without a message_end, but not during a resumable pause", () => {
+    const projection = published();
+    const messageId = "unfinished";
+    const message = assistant("First.\n\nUnfinished tail");
+    projection.fold({ type: "agent_start" });
+    projection.fold({ type: "message_start", messageId, message });
+    projection.fold({ type: "agent_end", isTerminal: false, yielded: true });
+    assert.isUndefined(servedMessage(projection, messageId)?.runSettled);
+    projection.fold({ type: "session_settled" });
+    assert.deepInclude(servedMessage(projection, messageId), { runSettled: true, message });
+    projection.fold({ type: "agent_start" });
+    assert.isTrue(servedMessage(projection, messageId)?.runSettled);
+    const final = assistant("First.\n\nUnfinished tail received before the late end.");
+    projection.fold({ type: "message_end", messageId, message: final });
+    assert.deepInclude(servedMessage(projection, messageId), { phase: "ended", message: final });
+  });
+
   it("S3 after message_end no read serves an open or shorter body until the durable entry joins", () => {
     const projection = published();
     const messageId = "live-1";

@@ -41,6 +41,7 @@ export interface UserRow extends RowBase {
 export interface AssistantRow extends RowBase {
   readonly kind: "assistant";
   readonly text: string;
+  readonly textAppendGeneration?: string;
   readonly images: ReadonlyArray<TranscriptImage>;
   /** A finished message can still be live while it awaits its journal entry. */
   readonly ended?: true;
@@ -129,6 +130,7 @@ export interface TranscriptSource {
     readonly messageId: string;
     readonly message: Readonly<Record<string, unknown>>;
     readonly ended?: true;
+    readonly textAppendGeneration?: string;
   }>;
   readonly leafId: string | null;
 }
@@ -425,7 +427,12 @@ function createPass(
     tone: meta.stopReason === "aborted" ? "system" : "error",
   });
 
-  const visitMessage = (entry: NeoPiJournalEntry, live: boolean, ended?: true) => {
+  const visitMessage = (
+    entry: NeoPiJournalEntry,
+    live: boolean,
+    ended?: true,
+    textAppendGeneration?: string,
+  ) => {
     const message = journalRecord(entry.message);
     const base = { entry, timestamp: entry.timestamp, live };
     const role = str(message.role);
@@ -457,6 +464,7 @@ function createPass(
             kind: "assistant",
             id,
             text: block.text,
+            ...(textAppendGeneration === undefined ? {} : { textAppendGeneration }),
             images: [],
             meta: null,
             ...(ended ? { ended } : {}),
@@ -681,8 +689,8 @@ function createPass(
   };
 
   const visitPending = (pending: TranscriptSource["pending"], leafId: string | null) => {
-    for (const { messageId, message, ended } of pending) {
-      visitMessage(liveEntry(messageId, leafId, message), true, ended);
+    for (const { messageId, message, ended, textAppendGeneration } of pending) {
+      visitMessage(liveEntry(messageId, leafId, message), true, ended, textAppendGeneration);
       appendOutputs(`live:${messageId}`);
     }
   };

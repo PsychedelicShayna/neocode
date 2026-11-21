@@ -82,6 +82,108 @@ function foldLabels(rows: readonly TranscriptRow[], runPaused = false) {
   return derived.flatMap((row) => (row.kind === "turn-fold" ? [row.label] : []));
 }
 
+describe("native turn output", () => {
+  it("keeps every assistant message visible when the turn settles", () => {
+    const finishedTool: Row<"tool"> = {
+      ...tool("t1", 2),
+      call: { id: "t1", name: "bash", intent: null, arguments: { command: "pwd" } },
+      result: {
+        entry: { ...entry("r1", "message"), timestamp: at(3) },
+        text: "Command result",
+        images: [],
+        isError: false,
+        details: null,
+      },
+    };
+    const thought: Row<"thinking"> = {
+      kind: "thinking",
+      id: "thinking",
+      entry: entry("thinking", "message"),
+      timestamp: at(5),
+      live: false,
+      text: "Private reasoning",
+      summary: false,
+    };
+    const transcript = [
+      user("u1", 0),
+      { ...assistant("a1", 1), text: "Starting the check." },
+      finishedTool,
+      { ...assistant("a2", 4), text: "The command passed." },
+      thought,
+      { ...assistant("a3", 6), text: "Verification complete." },
+    ];
+    const derive = (busy: boolean, expandedTurnIds = new Set<TurnId>()) => {
+      const timeline = projectNativeTimeline(transcript, busy);
+      return deriveMessagesTimelineRows({
+        timelineEntries: timeline.entries,
+        latestTurn: timeline.latestTurn,
+        runningTurnId: timeline.runningTurnId,
+        expandedTurnIds,
+        expandedWorkGroupIds: new Set(["activity-group:thinking"]),
+        isWorking: busy,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+    };
+    const messages = (rows: readonly MessagesTimelineRow[]) =>
+      rows.flatMap((row) =>
+        row.kind === "message" && row.message.role === "assistant"
+          ? [[row.message.text, row.showAssistantMeta]]
+          : [],
+      );
+
+    expect(messages(derive(true))).toEqual([
+      ["Starting the check.", false],
+      ["The command passed.", false],
+      ["Verification complete.", false],
+    ]);
+    const settled = derive(false);
+    expect(messages(settled)).toEqual([
+      ["Starting the check.", false],
+      ["The command passed.", false],
+      ["Verification complete.", true],
+    ]);
+    expect(settled.map((row) => row.id)).toEqual(["u1", "a1", "turn-fold:native:u1", "a2", "a3"]);
+
+    const expanded = derive(false, new Set([TurnId.make("native:u1")]));
+    expect(messages(expanded)).toEqual(messages(settled));
+    expect(expanded.find((row) => row.id === "tool:t1")).toMatchObject({
+      kind: "work",
+      groupedEntries: [
+        { toolCallId: "t1", toolLifecycleStatus: "completed", detail: "Command result" },
+      ],
+    });
+    expect(expanded.find((row) => row.id === "activity-group:thinking")).toMatchObject({
+      kind: "activity-group",
+      expanded: true,
+      entries: [{ id: "thinking", message: { text: "Private reasoning" } }],
+    });
+  });
+
+  it.each([
+    { label: "without tools", tools: [], rowIds: ["u1", "a1"] },
+    {
+      label: "after tool calls",
+      tools: [tool("t1", 10), tool("t2", 20)],
+      rowIds: ["u1", "turn-fold:native:u1", "a1"],
+    },
+  ])("keeps the single terminal message $label unchanged", ({ tools, rowIds }) => {
+    const timeline = projectNativeTimeline([user("u1", 0), ...tools, assistant("a1", 30)], false);
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: timeline.entries,
+      latestTurn: timeline.latestTurn,
+      runningTurnId: timeline.runningTurnId,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+    expect(rows.map((row) => row.id)).toEqual(rowIds);
+    expect(rows.at(-1)).toMatchObject({ kind: "message", showAssistantMeta: true });
+  });
+});
+
 describe("native turn duration", () => {
   const settled = [user("u1", 0), tool("t1", 20), assistant("a1", 69)];
 

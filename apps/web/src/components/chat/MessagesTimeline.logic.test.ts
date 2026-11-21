@@ -1449,7 +1449,7 @@ describe("deriveMessagesTimelineRows", () => {
         liveAgentTaskIds,
         ...(expandedTurnIds ? { expandedTurnIds } : {}),
       }).map((row) => row.id);
-    const unfolded = ["turn-fold:turn-1", "spawn-entry", "assistant-final-entry"];
+    const unfolded = ["assistant-first-entry", "spawn-entry", "assistant-final-entry"];
 
     const activeRows = (
       timelineEntries: typeof direct,
@@ -1509,6 +1509,15 @@ describe("deriveMessagesTimelineRows", () => {
         ]);
         expect(rows.some((row) => row.kind === "work" || row.kind === "thinking")).toBe(false);
       }
+      const withFoldableWork = [...direct.slice(0, 2), laterTool, ...direct.slice(2)];
+      expect(derive(withFoldableWork, new Set())).toEqual([
+        "assistant-first-entry",
+        "spawn-entry",
+        "turn-fold:turn-1",
+        "assistant-final-entry",
+      ]);
+      const expanded = derive(withFoldableWork, new Set(), new Set([TurnId.make("turn-1")]));
+      expect(expanded.filter((id) => id === "spawn-entry")).toEqual(["spawn-entry"]);
     }
 
     expect(derive(direct, new Set())).toEqual(unfolded);
@@ -1518,13 +1527,6 @@ describe("deriveMessagesTimelineRows", () => {
     expect(derive(workflow, new Set())).toEqual(unfolded);
     // No live set is known.
     expect(derive(direct, undefined)).toEqual(unfolded);
-    // Expanding the turn reveals the other work without duplicating the batch.
-    expect(derive(direct, new Set(), new Set(["turn-1" as TurnId]))).toEqual([
-      "turn-fold:turn-1",
-      "assistant-first-entry",
-      "spawn-entry",
-      "assistant-final-entry",
-    ]);
   });
 
   it("only enables assistant copy for the terminal assistant message in a turn", () => {
@@ -1704,7 +1706,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(assistantRow?.assistantTurnDiffSummary).toBe(assistantTurnDiffSummary);
   });
 
-  it("folds the first assistant message and settled work before the terminal response", () => {
+  it("folds settled work without hiding the first assistant message", () => {
     const timelineEntries = [
       {
         id: "user-entry",
@@ -1780,6 +1782,7 @@ describe("deriveMessagesTimelineRows", () => {
     expect(foldRow?.label).toBe("Worked for 22s");
     expect(collapsedRows.map((row) => row.id)).toEqual([
       "user-entry",
+      "assistant-first-entry",
       "turn-fold:turn-1",
       "assistant-final-entry",
     ]);
@@ -1795,8 +1798,8 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(expandedRows.map((row) => row.id)).toEqual([
       "user-entry",
-      "turn-fold:turn-1",
       "assistant-first-entry",
+      "turn-fold:turn-1",
       "work-entry-1",
       "assistant-final-entry",
     ]);
@@ -1892,7 +1895,7 @@ describe("deriveMessagesTimelineRows", () => {
     ).toEqual(["turn-fold:turn-1", "assistant-final-entry"]);
   });
 
-  it("folds all assistant messages before the terminal message", () => {
+  it("keeps every message visible in a completed turn with no work to fold", () => {
     const timelineEntries = [
       {
         id: "assistant-first-entry",
@@ -1946,7 +1949,11 @@ describe("deriveMessagesTimelineRows", () => {
       supportsConversationRollback: false,
     });
 
-    expect(rows.map((row) => row.id)).toEqual(["turn-fold:turn-1", "assistant-final-entry"]);
+    expect(rows.map((row) => row.id)).toEqual([
+      "assistant-first-entry",
+      "assistant-middle-entry",
+      "assistant-final-entry",
+    ]);
   });
 
   const reasoningEntry = (id: string, at: string, turnId: string | null) => ({

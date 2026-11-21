@@ -64,6 +64,12 @@ const instanceId = ProviderInstanceId.make("native-profile");
 const testClient = "client-a";
 const otherId = ProviderInstanceId.make("other-profile");
 const originalRef = { providerInstanceId: instanceId, sessionFile: "/native/session.jsonl" };
+const xdevMountNotice = {
+  type: "notice",
+  level: "info",
+  source: "xdev",
+  message: "xd://: mounted preview_status, preview_open",
+} as const;
 const entry = (id: string, parentId: string | null = null): NeoPiJournalEntry => ({
   id,
   parentId,
@@ -121,6 +127,7 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
       pages: 0,
       /** Host-tool registrations (`set_host_tools`) sent to the owner. */
       binds: 0,
+      bindNotices: [] as SessionEventFrame[],
       /** Runs inside `connect` once the connection exists (and its finalizer is registered). */
       connectHook: Effect.void as Effect.Effect<void>,
       /** Makes every connect fail with this error. */
@@ -357,8 +364,9 @@ const fixture = (attachment: "owned" | "terminal" = "owned") =>
             ),
             hostTools: {
               bind: () =>
-                Effect.sync(() => {
+                Effect.gen(function* () {
                   native.binds++;
+                  for (const notice of native.bindNotices) yield* publish(notice);
                 }),
               revoke: Effect.void,
             },
@@ -3448,6 +3456,65 @@ describe("attach-only discovery (r12 C5)", () => {
       const { native, service } = yield* fixture("terminal");
       yield* service.open(originalRef);
       assert.equal(native.binds, 1);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not report a fresh owned session's initial xd:// mount notice as missed", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      native.bindNotices.push(xdevMountNotice);
+      const { ref } = yield* service.open({ providerInstanceId: instanceId });
+      assert.equal(native.binds, 1);
+
+      const first = yield* follow(service, ref);
+      assert.deepEqual((yield* first.pass()).inbox, []);
+      yield* Fiber.interrupt(first.fiber);
+
+      yield* native.publish(xdevMountNotice);
+      const returning = yield* follow(service, ref);
+      assert.deepEqual(
+        (yield* returning.pass()).inbox.map((record) =>
+          record.type === "gap" ? [record.reason, record.notices] : record.type,
+        ),
+        [["not-observed", 1]],
+      );
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("does not report a reopened owned session's initial xd:// mount notice as missed", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      native.bindNotices.push(xdevMountNotice);
+      const { ref, attachment } = yield* service.open(originalRef);
+      assert.equal(attachment, "owned");
+      assert.deepEqual(ref, originalRef);
+      assert.equal(native.binds, 1);
+
+      const first = yield* follow(service, ref);
+      assert.deepEqual((yield* first.pass()).inbox, []);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("still reports other notices missed during a fresh owned session's startup", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      native.bindNotices.push(
+        xdevMountNotice,
+        { ...xdevMountNotice, level: "warning" },
+        { ...xdevMountNotice, message: "xd://: extension unavailable" },
+      );
+      const { ref } = yield* service.open({ providerInstanceId: instanceId });
+      yield* native.publish(xdevMountNotice);
+
+      const first = yield* follow(service, ref);
+      assert.deepEqual(
+        (yield* first.pass()).inbox.map((record) =>
+          record.type === "gap"
+            ? [record.reason, record.fromSeq, record.toSeq, record.notices]
+            : record.type,
+        ),
+        [["not-observed", 1, 3, 3]],
+      );
     }).pipe(Effect.scoped),
   );
 

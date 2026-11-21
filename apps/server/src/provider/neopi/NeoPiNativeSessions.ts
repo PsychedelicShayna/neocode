@@ -469,6 +469,8 @@ interface NativeSession {
    * tools are registered with the owner only once something wants them.
    */
   hostToolsWanted: boolean;
+  /** Only an owned open is pending; the first lease or bind completion ends it. */
+  startupHostToolsBind: "pending" | "binding" | null;
 }
 interface NativeMarkers {
   count: number;
@@ -1312,11 +1314,22 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         );
       });
     /**
-     * The synchronous sink (C1): every native frame folds into the projection here,
-     * in parser order. Nothing in this path waits; reads it makes owed run elsewhere.
+     * The synchronous sink (C1): native frames fold into the projection here in
+     * parser order. Nothing in this path waits; reads it makes owed run elsewhere.
      */
     const observer: NeoPiNativeFrameObserver = {
       frame: (frame) => {
+        // Initial host-tool registration can announce its mount before the first view
+        // attaches. That informational notice is not missed work.
+        if (
+          frame.type === "notice" &&
+          session?.startupHostToolsBind === "binding" &&
+          frame.level === "info" &&
+          frame.source === "xdev" &&
+          typeof frame.message === "string" &&
+          frame.message.startsWith("xd://: mounted ")
+        )
+          return;
         if (frame.type === "extension_ui_request" && typeof frame.id === "string") {
           if (frame.method === "cancel" && typeof frame.targetId === "string")
             pendingUi.delete(frame.targetId);
@@ -1668,13 +1681,30 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           recovery: null,
           takeoverRequested: false,
           hostToolsWanted: mode === "auto",
+          startupHostToolsBind:
+            mode === "auto" && native.attachment === "owned" && native.hostTools !== undefined
+              ? "pending"
+              : null,
         };
         const current = session;
         sessions.set(file, current);
         yield* Effect.addFinalizer(() => finish(current, "The native connection was closed.")).pipe(
           Effect.provideService(Scope.Scope, scope),
         );
-        if (current.hostToolsWanted) yield* native.hostTools?.bind(current.ref) ?? Effect.void;
+        if (current.hostToolsWanted && native.hostTools) {
+          if (current.startupHostToolsBind === "pending") {
+            current.startupHostToolsBind = "binding";
+            yield* native.hostTools.bind(current.ref).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  current.startupHostToolsBind = null;
+                }),
+              ),
+            );
+          } else {
+            yield* native.hostTools.bind(current.ref);
+          }
+        }
         yield* watchExit(current, native);
         // An observed terminal owner's telemetry changes elsewhere without frames here.
         yield* Effect.sleep(TERMINAL_POLL_INTERVAL).pipe(
@@ -2273,6 +2303,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           observation.session = session;
           session.observations.add(observation);
           if (session.observations.size === 1) {
+            session.startupHostToolsBind = null;
             projection.setInboxObserved(true);
             // Bulk frames were not folded while no lease was held, so what the projection
             // holds is stale: the first lease starts a new incarnation and builds again.

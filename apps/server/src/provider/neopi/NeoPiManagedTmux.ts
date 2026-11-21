@@ -392,9 +392,6 @@ const encodeBinding = Schema.encodeSync(bindingJson);
 const tmuxError = (code: string, message: string) =>
   new NeoPiNativeSessionsError({ code, message });
 
-const sessionInUse = () =>
-  tmuxError("session_in_use", "The native session is already open elsewhere.");
-
 export const rebindManagedTmux = Effect.fnUntraced(function* <B extends TmuxBindingIdentity>(
   saved: B,
   rebind: (saved: B) => Effect.Effect<B, NeoPiNativeSessionsError>,
@@ -410,42 +407,107 @@ export const rebindManagedTmux = Effect.fnUntraced(function* <B extends TmuxBind
   return binding;
 });
 
-export const bindOrStartManagedTmux = Effect.fnUntraced(function* <B extends TmuxBindingIdentity>(
-  saved: B | undefined,
-  rebind: (saved: B) => Effect.Effect<B, NeoPiNativeSessionsError>,
-  start: () => Effect.Effect<B, NeoPiNativeSessionsError>,
-  findHolder: () => Effect.Effect<string | undefined, NeoPiNativeSessionsError> = () =>
-    Effect.undefined,
+const LeaseHolder = Schema.Struct({
+  pid: Schema.Int,
+  instanceId: Schema.NonEmptyString,
+  imageId: Schema.NonEmptyString,
+});
+const LeaseReport = Schema.fromJsonString(
+  Schema.Union([
+    Schema.Struct({
+      status: Schema.Literal("held"),
+      sessionFile: Schema.String,
+      holder: LeaseHolder,
+    }),
+    Schema.Struct({ status: Schema.Literal("held_unknown"), sessionFile: Schema.String }),
+    Schema.Struct({ status: Schema.Literal("not_held"), sessionFile: Schema.String }),
+    Schema.Struct({
+      status: Schema.Literal("inspection_failed"),
+      sessionFile: Schema.String,
+      reason: Schema.String,
+    }),
+  ]),
+);
+const decodeLeaseReport = Schema.decodeUnknownOption(LeaseReport);
+
+interface LeaseCommandOutput {
+  readonly ok: boolean;
+  readonly out: string;
+  readonly err: string;
+}
+
+const unverifiedLease = (reason: string) =>
+  tmuxError("tmux_lease_unverified", `Could not verify the NeoPi session lease: ${reason}`);
+
+function leaseHolder(sessionFile: string, output: LeaseCommandOutput) {
+  if (!output.ok) {
+    const diagnostic = output.err || output.out;
+    if (/(?:unknown|unrecognized|unsupported|unexpected) (?:option|flag).*--file/i.test(diagnostic))
+      throw tmuxError(
+        "tmux_lease_unsupported",
+        "NeoPi too old for tmux sessions. Update NeoPi to a release with exact-file lease queries.",
+      );
+    throw unverifiedLease(diagnostic.trim().split("\n", 1)[0] || "the lease command failed.");
+  }
+  const decoded = decodeLeaseReport(output.out);
+  if (decoded._tag === "None") throw unverifiedLease("NeoPi returned an invalid lease report.");
+  const report = decoded.value;
+  if (report.sessionFile !== sessionFile)
+    throw unverifiedLease("NeoPi reported a different session file.");
+  switch (report.status) {
+    case "held":
+      return report.holder;
+    case "not_held":
+      return undefined;
+    case "held_unknown":
+      throw unverifiedLease("the lease is held, but NeoPi could not attest its holder.");
+    case "inspection_failed":
+      throw unverifiedLease(report.reason || "NeoPi could not inspect the lease.");
+  }
+}
+
+export const verifyManagedTmuxLease = Effect.fnUntraced(function* (
+  binding: TmuxBindingIdentity,
+  query: Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>,
 ) {
-  if (saved) return { kind: "bound" as const, binding: yield* rebindManagedTmux(saved, rebind) };
-  const started = yield* Effect.suspend(start).pipe(Effect.result);
-  if (started._tag === "Success") return { kind: "bound" as const, binding: started.success };
-  if (started.failure.code !== "session_in_use") return yield* started.failure;
-  const instanceId = yield* findHolder();
-  if (!instanceId) return yield* started.failure;
-  return { kind: "contended" as const, instanceId };
+  const output = yield* query;
+  return yield* Effect.try({
+    try: () => {
+      const holder = leaseHolder(binding.sessionFile, output);
+      if (!holder) throw unverifiedLease("the lease is not held.");
+      if (holder.pid !== binding.owner.pid)
+        throw unverifiedLease(
+          `the lease is held by PID ${holder.pid}, not managed pane PID ${binding.owner.pid}.`,
+        );
+      if (
+        holder.instanceId !== binding.owner.instanceId ||
+        holder.imageId !== binding.owner.imageId
+      )
+        throw unverifiedLease(
+          "the lease holder's control identity does not match the managed pane.",
+        );
+    },
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : unverifiedLease(String(cause))),
+  });
 });
 
-export function verifyManagedTmuxLease(
-  owner: ManagedTmuxOwner,
-  catalog:
-    | {
-        readonly id: string;
-        readonly inUse: { readonly pid: number } | null;
-        readonly control: { readonly instanceId: string } | null;
-      }
-    | undefined,
+const requireUnheldLease = Effect.fnUntraced(function* (
+  file: string,
+  query: Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>,
 ) {
-  if (
-    catalog?.inUse?.pid !== owner.pid ||
-    catalog.id !== owner.sessionId ||
-    catalog.control?.instanceId !== owner.instanceId
-  )
-    throw tmuxError(
-      "tmux_lease_unverified",
-      "NeoPi did not verify the managed tmux owner's session lease. NeoPi v19 cannot verify untitled sessions that are absent from its catalog.",
-    );
-}
+  const output = yield* query;
+  return yield* Effect.try({
+    try: () => {
+      const holder = leaseHolder(file, output);
+      if (holder)
+        throw tmuxError(
+          "session_in_use",
+          `The native session is already open elsewhere (PID ${holder.pid}).`,
+        );
+    },
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : unverifiedLease(String(cause))),
+  });
+});
 
 export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   readonly executable: string | undefined;
@@ -878,14 +940,20 @@ export const makeManagedTmuxHost = (
     readonly controlEnabled: Effect.Effect<boolean, NeoPiNativeSessionsError>;
     readonly registry: Effect.Effect<string | undefined>;
     readonly canonicalize: (file: string) => Effect.Effect<string, NeoPiNativeSessionsError>;
-    readonly readHolderPid: Effect.Effect<number | undefined, NeoPiNativeSessionsError>;
-    readonly verifyLease: (
-      binding: ManagedTmuxBinding,
-    ) => Effect.Effect<void, NeoPiNativeSessionsError>;
+    readonly queryLease: (
+      file: string,
+    ) => Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>;
   }) {
     if (executable === undefined) return yield* tmuxMissing();
+    if (platform !== "linux")
+      return yield* tmuxError(
+        "tmux_lease_unsupported",
+        "NeoPi tmux sessions require Linux file lease queries.",
+      );
     const argv = yield* managedTmuxLaunchPlan({ ...input, executable });
     if (!(yield* input.controlEnabled)) return yield* unavailable();
+    if (input.sessionFile)
+      yield* requireUnheldLease(input.sessionFile, input.queryLease(input.sessionFile));
     const session = `native-${NodeCrypto.randomUUID()}`;
     const launchFile = NodePath.join(directory, `${session}.sh`);
     const paneTarget = target(session);
@@ -985,7 +1053,7 @@ export const makeManagedTmuxHost = (
                   found.success.procStartTicks === Number(observed.identity.start)
                     ? { ...binding, process: observed.identity }
                     : binding;
-                yield* input.verifyLease(binding);
+                yield* verifyManagedTmuxLease(binding, input.queryLease(binding.sessionFile));
                 yield* save(lockedBinding).pipe(
                   Effect.tap(() =>
                     Effect.sync(() => {
@@ -996,22 +1064,21 @@ export const makeManagedTmuxHost = (
                 );
                 return lockedBinding;
               }
-              if (
-                input.sessionFile &&
-                (found.failure.code === "tmux_control_unavailable" ||
-                  found.failure.code === "tmux_no_owner")
-              ) {
-                const pane = yield* readPane(paneTarget).pipe(Effect.option);
-                const holder = yield* input.readHolderPid;
-                if (holder && (pane._tag === "None" || pane.value.pid !== holder))
-                  return yield* sessionInUse();
-              }
               if (found.failure.code !== "tmux_control_unavailable") return yield* found.failure;
               yield* Effect.sleep("250 millis");
             }
-          }).pipe(Effect.timeoutOption("15 seconds"));
-          if (result._tag === "None") return yield* unavailable();
-          return result.value;
+          }).pipe(Effect.timeout("15 seconds"), Effect.result);
+          if (result._tag === "Failure") {
+            // A competing writer can win after the initial check. The losing pane can stop
+            // or stay unready in NeoPi's conflict chooser; never respond to that chooser.
+            if (
+              input.sessionFile &&
+              (!isNativeSessionsError(result.failure) || result.failure.code === "tmux_no_owner")
+            )
+              yield* requireUnheldLease(input.sessionFile, input.queryLease(input.sessionFile));
+            return yield* isNativeSessionsError(result.failure) ? result.failure : unavailable();
+          }
+          return result.success;
         }),
       (id) =>
         persisted

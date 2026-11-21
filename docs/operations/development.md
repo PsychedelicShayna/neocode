@@ -35,16 +35,18 @@ Read ports from the `[dev-runner]` output. Worktrees derive stable preferences f
 but occupied ports can shift them. `T3CODE_PORT_OFFSET` or `T3CODE_DEV_INSTANCE` can select a
 different preference when needed.
 
-### Host existing native sessions in tmux
+### Host native sessions in tmux
 
 Set `T3CODE_NEOPI_TMUX=1` in the **NeoCode server's** environment and restart
-NeoCode. This is off by default and requires Linux or macOS, `tmux` on the
-server's `PATH`, and NeoPi control enabled for the configured profile.
+NeoCode. This is off by default and requires Linux, `tmux` on the server's
+`PATH`, and NeoPi with control enabled and exact-file lease queries.
 
-When you open a populated native session that has no live owner, NeoCode starts
-its NeoPi TUI on a private tmux socket in the NeoCode state directory. Open
-**TUI** to see the same owner. Closing the view or restarting NeoCode does not
-stop the owner; reopening the session reconnects to it without starting another.
+When you start a new native session or open an existing one without a live
+owner, NeoCode starts its NeoPi TUI on a private tmux socket in the NeoCode
+state directory. NeoCode proceeds only if NeoPi attests that the exact pane
+process owns the session file lease, including before the first turn is written.
+Open **TUI** to see the same owner. Closing the view or restarting NeoCode
+does not stop the owner; reopening the session reconnects without starting another.
 In the **Agents** panel, select a subagent and choose **Monitor**, or choose
 **Monitor** beside an advisor. This opens a separate tmux window in the
 embedded terminal, without starting or replacing the session's NeoPi writer.
@@ -62,11 +64,10 @@ the session is in use but cannot be attached. It does not start a replacement
 while the session is in use. The managed **TUI** view is not available for
 these owners while the opt-in is off.
 
-NeoPi v19's catalog omits untouched, untitled sessions and cannot report their
-file lease. NeoCode refuses to drive these sessions in tmux, including a
-brand-new session. Use the default (direct) mode to start a new session. A
-missing tmux or disabled control is an error, not a reason to start a direct
-owner while the setting is on.
+If another writer holds the lease or NeoPi cannot attest the pane's lease,
+NeoCode refuses the managed open. Update older NeoPi builds before enabling
+this mode. Missing tmux or disabled control is also an error; NeoCode does not
+fall back to a direct owner while the setting is on.
 
 ### Attach a prestarted NeoPi TUI
 

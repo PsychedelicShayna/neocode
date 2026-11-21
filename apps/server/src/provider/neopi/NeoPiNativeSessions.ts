@@ -97,7 +97,6 @@ import { observeNeoPiJournalEntry, observeNeoPiMessage } from "./NeoPiStopOutcom
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
 import { managedStopStatus, submitManagedStopOnce } from "./NeoPiManagedLifecycle.ts";
 import {
-  bindOrStartManagedTmux,
   makeManagedTmuxHost,
   managedControlPublication,
   decodeManagedMonitorGrant,
@@ -2961,16 +2960,18 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       registryJson(profile),
       canonicalize,
     );
-  const verifyLease = (profile: NeoPiNativeProfile, binding: ManagedTmuxBinding) =>
-    Effect.gen(function* () {
-      const row = yield* catalogRow(profile, binding.sessionFile);
-      // `inUse` incorporates NeoPi's OS-gate observation. A matching PID record alone
-      // is advisory; v19 does not report `inUse` for an untitled, untouched session.
-      yield* Effect.try({
-        try: () => verifyManagedTmuxLease(binding.owner, row),
-        catch: nativeError,
-      });
-    });
+  // There is no control attachment yet: verify the exact file before binding or attaching
+  // through the same NeoPi executable and profile used by the pane.
+  const queryManagedLease = (profile: NeoPiNativeProfile, file: string, cwd: string) =>
+    runCatalog(profile, ["session", "lease", "--file", file, "--json"], cwd).pipe(
+      Effect.timeout("5 seconds"),
+      Effect.mapError((cause) =>
+        fail(
+          `Could not query the NeoPi session lease: ${nativeError(cause).message}`,
+          "tmux_lease_unverified",
+        ),
+      ),
+    );
   const assertManagedProfile = (profile: NeoPiNativeProfile, binding: ManagedTmuxBinding) =>
     binding.providerInstanceId === profile.providerInstanceId &&
     binding.profile === (profile.source.env.OMP_PROFILE ?? null)
@@ -2985,7 +2986,10 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         ...target,
         sessionFile: binding.sessionFile,
       });
-      yield* verifyLease(profile, { ...binding, owner });
+      yield* verifyManagedTmuxLease(
+        { ...binding, owner },
+        queryManagedLease(profile, binding.sessionFile, config.cwd),
+      );
       return { ...binding, owner };
     });
   const lifecycleScope = yield* Effect.scope;
@@ -3191,7 +3195,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           "The managed tmux owner belongs to a different NeoPi profile.",
           "profile_conflict",
         );
-      // With hosted creation off, the catalog remains authoritative for existing owners.
+      // The catalog supplies cwd and ordinary attachment discovery, not managed lease proof.
       const saved =
         managedHost && input.sessionFile ? yield* managedHost.read(input.sessionFile) : undefined;
       const fixture = saved ? undefined : isManaged(profile.providerInstanceId, input.sessionFile);
@@ -3206,58 +3210,42 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       const ordinaryArgs =
         managedHost || fixture ? undefined : yield* parseNeoPiLaunchArguments(source.launchArgs);
       let managedFile = fixture?.sessionFile;
-      let contendedInstance: string | undefined;
-      if (managedHost && (saved || (mode !== "attach" && !fixture && !row?.inUse))) {
-        const file = input.sessionFile;
-        const findHolder = () => (file ? catalogRow(profile, file) : Effect.undefined);
-        const selected = yield* bindOrStartManagedTmux(
-          saved,
-          (binding) => rebind(managedHost.target(binding.session), profile, binding),
-          () =>
-            Effect.gen(function* () {
-              const extra = yield* parseNeoPiLaunchArguments(source.launchArgs).pipe(
+      if (managedHost && (saved || (mode !== "attach" && !fixture))) {
+        const binding = saved
+          ? yield* rebindManagedTmux(saved, (binding) =>
+              rebind(managedHost.target(binding.session), profile, binding),
+            )
+          : yield* managedHost.launch({
+              providerInstanceId: profile.providerInstanceId,
+              profile: source.env.OMP_PROFILE ?? null,
+              binary: source.binary,
+              env: source.env,
+              cwd: canonicalCwd,
+              ...(input.sessionFile ? { sessionFile: input.sessionFile } : {}),
+              extra: yield* parseNeoPiLaunchArguments(source.launchArgs).pipe(
                 Effect.mapError(nativeError),
-              );
-              return yield* managedHost.launch({
-                providerInstanceId: profile.providerInstanceId,
-                profile: source.env.OMP_PROFILE ?? null,
-                binary: source.binary,
-                env: source.env,
-                cwd: canonicalCwd,
-                ...(file ? { sessionFile: file } : {}),
-                extra,
-                registry: registryJson(profile),
-                canonicalize,
-                verifyLease: (binding) => verifyLease(profile, binding),
-                readHolderPid: Effect.suspend(findHolder).pipe(
-                  Effect.map((row) => row?.inUse?.pid),
+              ),
+              registry: registryJson(profile),
+              canonicalize,
+              queryLease: (file) => queryManagedLease(profile, file, canonicalCwd),
+              controlEnabled: runCatalog(
+                profile,
+                ["config", "get", "control.enabled", "--json"],
+                canonicalCwd,
+              ).pipe(
+                Effect.mapError(nativeError),
+                Effect.flatMap((result) =>
+                  result.ok
+                    ? decodeControlSetting(result.out).pipe(
+                        Effect.map((setting) => setting.value),
+                        Effect.orElseSucceed(() => false),
+                      )
+                    : Effect.succeed(false),
                 ),
-                controlEnabled: runCatalog(
-                  profile,
-                  ["config", "get", "control.enabled", "--json"],
-                  canonicalCwd,
-                ).pipe(
-                  Effect.mapError(nativeError),
-                  Effect.flatMap((result) =>
-                    result.ok
-                      ? decodeControlSetting(result.out).pipe(
-                          Effect.map((setting) => setting.value),
-                          Effect.orElseSucceed(() => false),
-                        )
-                      : Effect.succeed(false),
-                  ),
-                ),
-              });
-            }),
-          () =>
-            Effect.map(findHolder(), (row) =>
-              row?.inUse && row.control?.pid === row.inUse.pid ? row.control.instanceId : undefined,
-            ),
-        );
-        if (selected.kind === "bound") {
-          managedOwner = selected.binding.owner;
-          managedFile = selected.binding.sessionFile;
-        } else contendedInstance = selected.instanceId;
+              ),
+            });
+        managedOwner = binding.owner;
+        managedFile = binding.sessionFile;
       }
       const startupUi = yield* Deferred.make<void>();
       let ownedPid: number | undefined;
@@ -3451,17 +3439,6 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           };
         });
       if (managedOwner) return yield* attach(managedOwner.instanceId);
-      if (contendedInstance) {
-        const connection = yield* attach(contendedInstance);
-        observer.frame({
-          type: "extension_ui_request",
-          id: "neocode-tmux-contended",
-          method: "notify",
-          message:
-            "The native session was already open elsewhere. NeoCode attached to its existing owner.",
-        } as SessionEventFrame);
-        return connection;
-      }
       if (row?.inUse) return yield* attach(row.control?.instanceId);
       if (mode === "attach") return yield* fail("No NeoPi owns this session yet.", "no_owner");
       const extra = ordinaryArgs ?? (yield* parseNeoPiLaunchArguments(source.launchArgs));

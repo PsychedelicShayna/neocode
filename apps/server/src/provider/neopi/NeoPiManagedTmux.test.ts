@@ -3,10 +3,11 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { SpawnExecutableResolution, type SpawnExecutableResolver } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   bindManagedTmuxOwner,
-  bindOrStartManagedTmux,
+  rebindManagedTmux,
   makeManagedTmuxHost,
   managedControlPublication,
   managedTmuxLaunchPlan,
@@ -41,6 +42,7 @@ vi.mock("node:fs/promises", () => ({
     mode: 0o700,
   })),
   mkdir: vi.fn(async () => {}),
+  link: vi.fn(async () => {}),
   writeFile,
   rename: vi.fn(async () => {}),
   rm: vi.fn(async () => {}),
@@ -427,23 +429,17 @@ describe("managed tmux owner startup", () => {
   effectIt.effect("rebinds a persisted owner by its complete identity without launching", () =>
     Effect.gen(function* () {
       const rebind = vi.fn(() => Effect.succeed(binding));
-      const launch = vi.fn(() => Effect.succeed(binding));
-      expect(yield* bindOrStartManagedTmux(binding, rebind, launch)).toEqual({
-        kind: "bound",
-        binding,
-      });
+      expect(yield* rebindManagedTmux(binding, rebind)).toEqual(binding);
       expect(rebind).toHaveBeenCalledExactlyOnceWith(binding);
-      expect(launch).not.toHaveBeenCalled();
       rebind.mockReturnValue(Effect.succeed({ ...binding, owner: { ...owner, imageId: "other" } }));
-      expect(yield* Effect.flip(bindOrStartManagedTmux(binding, rebind, launch))).toMatchObject({
+      expect(yield* Effect.flip(rebindManagedTmux(binding, rebind))).toMatchObject({
         code: "tmux_owner_changed",
       });
-      expect(launch).not.toHaveBeenCalled();
     }),
   );
 
   effectIt.effect(
-    "discards a lease-losing startup and selects the original holder without typing into the pane",
+    "discards a lease-losing startup and refuses work without typing into the pane",
     () =>
       Effect.gen(function* () {
         exec.mockReset();
@@ -451,7 +447,7 @@ describe("managed tmux owner startup", () => {
         exec.mockImplementation(async (_file: string, args: string[]) => {
           if (args.includes("new-session") || args.includes("#{session_id}"))
             return { stdout: "$2\n" };
-          if (args.includes("list-panes")) return { stdout: "$2|@3|%4|321|0|off\n" };
+          if (args.includes("list-panes")) return { stdout: "$2|@3|%4|321|1|off\n" };
           if (args.includes("kill-session")) {
             // The server was replaced after the last list-panes, which returned $2.
             if (args.at(-1) === "$2") replacementKilled = true;
@@ -460,34 +456,32 @@ describe("managed tmux owner startup", () => {
           throw new Error("Unexpected tmux command");
         });
         const host = makeManagedTmuxHost(ownedState, executable, "linux");
-        const verifyLease = vi.fn(() => Effect.void);
-        const start = () =>
-          host.launch({
-            ...source,
-            env: {},
-            providerInstanceId: ProviderInstanceId.make("neopi"),
-            profile: null,
-            sessionFile,
-            registry: Effect.succeed('{"version":1,"sessions":[]}'),
-            canonicalize: Effect.succeed,
-            controlEnabled: Effect.succeed(true),
-            readHolderPid: Effect.succeed(999),
-            verifyLease,
-          });
-        const rebind = vi.fn(() =>
-          Effect.succeed({
-            ...binding,
-            providerInstanceId: ProviderInstanceId.make("neopi"),
-            profile: null,
-          }),
-        );
-        const findHolder = vi.fn(() => Effect.succeed("original-holder"));
+        const queryLease = vi
+          .fn()
+          .mockReturnValueOnce(Effect.succeed(leaseOutput({ status: "not_held", sessionFile })))
+          .mockReturnValueOnce(
+            Effect.succeed(
+              leaseOutput({
+                ...held,
+                holder: { ...held.holder, pid: 999 },
+              }),
+            ),
+          );
         expect(
-          yield* bindOrStartManagedTmux<ManagedTmuxBinding>(undefined, rebind, start, findHolder),
-        ).toEqual({
-          kind: "contended",
-          instanceId: "original-holder",
-        });
+          yield* Effect.flip(
+            host.launch({
+              ...source,
+              env: {},
+              providerInstanceId: ProviderInstanceId.make("neopi"),
+              profile: null,
+              sessionFile,
+              registry: Effect.succeed('{"version":1,"sessions":[]}'),
+              canonicalize: Effect.succeed,
+              controlEnabled: Effect.succeed(true),
+              queryLease,
+            }),
+          ),
+        ).toMatchObject({ code: "session_in_use", message: expect.stringContaining("PID 999") });
         const commands = exec.mock.calls.map(([, args]) => args);
         const launches = commands.filter((args) => args.includes("new-session"));
         expect(launches).toHaveLength(1);
@@ -498,31 +492,107 @@ describe("managed tmux owner startup", () => {
         ]);
         expect(replacementKilled).toBe(false);
         expect(commands.some((args) => args.includes("send-keys"))).toBe(false);
-        expect(verifyLease).not.toHaveBeenCalled();
-        expect(rebind).not.toHaveBeenCalled();
+        expect(queryLease.mock.calls).toEqual([[sessionFile], [sessionFile]]);
       }),
   );
 
-  it("requires native evidence that the authenticated pane PID holds the lease", () => {
-    const catalog = {
-      id: owner.sessionId,
-      inUse: { pid: owner.pid },
-      control: { instanceId: owner.instanceId },
-    };
-    expect(() => verifyManagedTmuxLease(owner, catalog)).not.toThrow();
-    // The already authenticated pane and publication remain live when the gate is free.
-    // An advisory sidecar reporting the same PID is not a catalog inUse observation.
-    const advisoryOnly = { ...catalog, inUse: null, leaseRecordPid: owner.pid };
-    for (const reported of [
-      undefined,
-      advisoryOnly,
-      { ...catalog, inUse: { pid: 0 } },
-      { ...catalog, inUse: { pid: 999 } },
-      { ...catalog, control: { instanceId: "other" } },
-    ]) {
-      expect(() => verifyManagedTmuxLease(owner, reported)).toThrow(
-        expect.objectContaining({ code: "tmux_lease_unverified" }),
-      );
-    }
+  const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+  const leaseOutput = (report: unknown) => ({
+    ok: true,
+    out: encodeJson(report),
+    err: "",
   });
+  const held = {
+    status: "held",
+    sessionFile,
+    holder: { pid: owner.pid, instanceId: owner.instanceId, imageId: owner.imageId },
+  };
+
+  effectIt.effect(
+    "accepts the exact file lease attested by the authenticated pane PID and control image",
+    () => verifyManagedTmuxLease(binding, Effect.succeed(leaseOutput(held))),
+  );
+
+  for (const [report, reason] of [
+    [{ ...held, holder: { ...held.holder, pid: 999 } }, /held by PID 999/],
+    [{ ...held, holder: { ...held.holder, imageId: "different" } }, /control identity/],
+    [{ ...held, sessionFile: "/other.jsonl" }, /different session file/],
+    [{ status: "held_unknown", sessionFile, leaseRecordPid: owner.pid }, /could not attest/],
+    [{ status: "not_held", sessionFile }, /not held/],
+    [
+      { status: "inspection_failed", sessionFile, reason: "native probe unavailable" },
+      /native probe unavailable/,
+    ],
+  ] as const) {
+    effectIt.effect(`refuses an unverified lease: ${reason.source}`, () =>
+      Effect.gen(function* () {
+        const failure = yield* Effect.flip(
+          verifyManagedTmuxLease(binding, Effect.succeed(leaseOutput(report))),
+        );
+        expect(failure.message).toMatch(reason);
+      }),
+    );
+  }
+
+  effectIt.effect(
+    "refuses older NeoPi with an actionable reason instead of falling back to its catalog",
+    () =>
+      Effect.gen(function* () {
+        const failure = yield* Effect.flip(
+          verifyManagedTmuxLease(
+            binding,
+            Effect.succeed({
+              ok: false,
+              out: "",
+              err: "error: Unknown option '--file'.",
+            }),
+          ),
+        );
+        expect(failure).toMatchObject({
+          code: "tmux_lease_unsupported",
+          message: expect.stringContaining("NeoPi too old for tmux sessions"),
+        });
+      }),
+  );
+
+  for (const [report, accepted] of [
+    [held, true],
+    [{ ...held, holder: { ...held.holder, pid: 999 } }, false],
+  ] as const) {
+    effectIt.effect(
+      `only binds a brand-new untitled session with an attested pane (${accepted})`,
+      () =>
+        Effect.gen(function* () {
+          exec.mockReset();
+          exec.mockImplementation(async (_file: string, args: string[]) => {
+            if (args.includes("new-session") || args.includes("#{session_id}"))
+              return { stdout: "$2\n" };
+            if (args.includes("list-panes")) return { stdout: "$2|@3|%4|321|0|off\n" };
+            if (args.includes("kill-session")) return { stdout: "" };
+            throw new Error("Unexpected tmux command");
+          });
+          const host = makeManagedTmuxHost(ownedState, executable, "linux");
+          const result = yield* host
+            .launch({
+              ...source,
+              env: {},
+              providerInstanceId: ProviderInstanceId.make("neopi"),
+              profile: "work",
+              registry: Effect.succeed(encodeJson({ version: 1, sessions: [entry] })),
+              canonicalize: Effect.succeed,
+              controlEnabled: Effect.succeed(true),
+              queryLease: (file) => {
+                expect(file).toBe(sessionFile);
+                return Effect.succeed(leaseOutput(report));
+              },
+            })
+            .pipe(Effect.result);
+          expect(result._tag).toBe(accepted ? "Success" : "Failure");
+          if (result._tag === "Success") expect(result.success.sessionFile).toBe(sessionFile);
+          const commands = exec.mock.calls.map(([, args]) => args);
+          expect(commands.some((args) => args.includes("kill-session"))).toBe(!accepted);
+          expect(commands.some((args) => args.includes("send-keys"))).toBe(false);
+        }),
+    );
+  }
 });

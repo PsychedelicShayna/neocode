@@ -69,12 +69,20 @@ NeoCode refuses the managed open. Update older NeoPi builds before enabling
 this mode. Missing tmux or disabled control is also an error; NeoCode does not
 fall back to a direct owner while the setting is on.
 
-Managed launch arguments accept only supported settings options, such as
-`--model` or `--no-skills`; send prompts from NeoCode after opening the
-session. NeoCode does not retry a rejected lease in the background. It pins
-the launch executable's path and SHA-256 for a saved owner: if the executable
-changed, restore it to reconnect. Owners saved before executable pinning
-cannot be reopened in managed mode.
+Managed tmux launches do not accept configured **Launch arguments**. Set
+defaults in the NeoPi profile and send prompts from NeoCode after opening
+the session. NeoCode does not retry a rejected lease in the background.
+
+NeoCode records the launch executable's path and SHA-256 for each managed
+owner. After an in-place upgrade, the current CLI can reconnect only if it
+attests the exact session-file lease to the same pane PID and running NeoPi
+identity. A different executable path or a missing legacy pin is refused.
+If NeoCode cannot verify the saved owner, exit with `/exit` in its TUI, or
+choose **Force Stop** from the session's NeoCode menu if it is available.
+Force Stop ends the process without a graceful exit and requires a
+verified Linux process identity and pidfd. After both the old pane and
+process have exited, reopen the session. NeoCode verifies the new owner's
+lease and records the current executable for that owner.
 
 ### Attach a prestarted NeoPi TUI
 

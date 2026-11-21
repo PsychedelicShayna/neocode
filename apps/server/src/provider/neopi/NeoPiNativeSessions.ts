@@ -3019,49 +3019,80 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   });
   const resolver = yield* SpawnExecutableResolution;
   const platform = yield* HostProcessPlatform;
-  const pinManagedBinary = Effect.fnUntraced(function* (
+  const refusedSavedOwners = new Map<string, string>();
+  const stopBeforeReopen =
+    "Exit with /exit in the old TUI, or, if available, use Force Stop in NeoCode to end it without a graceful exit. Then reopen the session.";
+  const resolveManagedBinaryPath = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
-    saved?: NonNullable<ManagedTmuxBinding["neoPiBinary"]>,
+    onError: () => NeoPiNativeSessionsError,
   ) {
     const { binary, env } = profile.source;
-    const changed = () =>
-      saved
-        ? fail(
-            "The managed owner was started with a different NeoPi executable. Restore it to reconnect.",
-            "tmux_binary_changed",
-          )
-        : fail(
-            "Could not identify the NeoPi executable for a managed launch.",
-            "tmux_launch_failed",
-          );
     const candidate = binary.includes("/")
       ? NodePath.resolve(config.cwd, binary)
       : resolver(binary, platform, { ...process.env, ...env });
-    if (!candidate) return yield* changed();
-    const path = yield* fs.realPath(candidate).pipe(Effect.mapError(changed));
-    if (saved && saved.path !== path) return yield* changed();
+    if (!candidate) return yield* onError();
+    return yield* fs.realPath(candidate).pipe(Effect.mapError(onError));
+  });
+  const pinManagedBinary = Effect.fnUntraced(function* (profile: NeoPiNativeProfile) {
+    const unavailable = () =>
+      fail("Could not identify the NeoPi executable for a managed launch.", "tmux_launch_failed");
+    const path = yield* resolveManagedBinaryPath(profile, unavailable);
     const sha256 = yield* Effect.tryPromise({
       try: async (signal) => {
         const hash = NodeCrypto.createHash("sha256");
         for await (const chunk of NodeFS.createReadStream(path, { signal })) hash.update(chunk);
         return hash.digest("hex");
       },
-      catch: changed,
+      catch: unavailable,
     });
-    if (saved && saved.sha256 !== sha256) return yield* changed();
     return { path, sha256 };
   });
   const verifySavedBinary = Effect.fnUntraced(function* (
     profile: NeoPiNativeProfile,
     binding: ManagedTmuxBinding,
   ) {
-    if (!binding.neoPiBinary)
+    const saved = binding.neoPiBinary;
+    if (!saved) {
+      refusedSavedOwners.set(binding.sessionFile, binding.owner.imageId);
       return yield* fail(
-        "This owner predates executable pinning and cannot be reopened in managed mode.",
+        `This managed owner predates executable pinning. ${stopBeforeReopen}`,
         "tmux_binary_changed",
       );
-    yield* pinManagedBinary(profile, binding.neoPiBinary);
-    return { ...profile, source: { ...profile.source, binary: binding.neoPiBinary.path } };
+    }
+    const changed = () =>
+      fail(
+        `The configured NeoPi executable path differs from the managed owner's path. ${stopBeforeReopen}`,
+        "tmux_binary_changed",
+      );
+    const path = yield* resolveManagedBinaryPath(profile, changed).pipe(Effect.result);
+    if (path._tag === "Failure" || path.success !== saved.path) {
+      refusedSavedOwners.set(binding.sessionFile, binding.owner.imageId);
+      return yield* changed();
+    }
+    // The same path can be replaced by a nightly update while the old process
+    // remains alive. Its lease and running image, not the bytes now on disk,
+    // determine whether the current CLI can safely attach.
+    return { ...profile, source: { ...profile.source, binary: path.success } };
+  });
+  const attestSavedOwner = Effect.fnUntraced(function* (
+    profile: NeoPiNativeProfile,
+    binding: ManagedTmuxBinding,
+    retryRejected = true,
+  ) {
+    const { sessionFile, owner } = binding;
+    const attested = yield* attestManagedOwner(
+      profile,
+      owner,
+      sessionFile,
+      config.cwd,
+      retryRejected,
+    ).pipe(Effect.result);
+    if (attested._tag === "Failure") {
+      refusedSavedOwners.set(sessionFile, owner.imageId);
+      return yield* fail(`${attested.failure.message} ${stopBeforeReopen}`, attested.failure.code);
+    }
+    if (refusedSavedOwners.get(sessionFile) === owner.imageId)
+      refusedSavedOwners.delete(sessionFile);
   });
   const assertManagedProfile = (profile: NeoPiNativeProfile, binding: ManagedTmuxBinding) =>
     binding.providerInstanceId === profile.providerInstanceId &&
@@ -3078,17 +3109,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   ) {
     yield* assertManagedProfile(profile, binding);
     const pinned = yield* verifySavedBinary(profile, binding);
+    yield* attestSavedOwner(pinned, binding, retryRejected);
     const resolved = yield* rebindManagedTmux(binding, (saved) =>
       probeManaged(pinned, { ...target, sessionFile: saved.sessionFile }).pipe(
         Effect.map((owner) => ({ ...saved, owner })),
       ),
-    );
-    yield* attestManagedOwner(
-      pinned,
-      resolved.owner,
-      resolved.sessionFile,
-      config.cwd,
-      retryRejected,
     );
     return { ...resolved, binaryPath: pinned.source.binary };
   });
@@ -3123,6 +3148,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           now,
           forcing.has(key),
         );
+        const authorityRefused = refusedSavedOwners.get(binding.sessionFile) === key;
         // Legacy bindings can use the original publication's birth time even if
         // the endpoint is unresponsive. Never infer identity from the PID alone.
         const identity =
@@ -3142,7 +3168,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             : compacting
               ? "compaction"
               : null,
-          canForceStop: stop === "unconfirmed" && liveness === "alive" && identity !== undefined,
+          canForceStop:
+            liveness === "alive" &&
+            !forcing.has(key) &&
+            ((stop === "unconfirmed" && identity !== undefined) ||
+              (authorityRefused && binding.process !== undefined)),
         };
         return { live, managed, identity };
       });
@@ -3211,13 +3241,24 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             );
           yield* assertManagedProfile(profile, binding);
           if (input.action === "force") {
-            const [panes, registry] = yield* Effect.all(
-              [managedHost.panes, registryJson(profile)],
-              { concurrency: 2 },
-            );
-            const { managed, identity } = yield* inspect(binding, panes, registry, null);
-            if (managed.liveness === "exited") return;
-            if (!managed.canForceStop || !identity || forcing.has(input.imageId))
+            const authorityRefused =
+              refusedSavedOwners.get(binding.sessionFile) === binding.owner.imageId;
+            const panes = yield* managedHost.panes;
+            let identity;
+            if (authorityRefused) {
+              // A refused owner is only eligible by its saved Linux process identity.
+              // Do not open control or invoke the configured NeoPi CLI in this branch.
+              const observed = yield* managedHost.observe(binding, panes);
+              if (observed.liveness === "exited") return;
+              if (observed.liveness === "alive") identity = binding.process;
+            } else {
+              const pinned = yield* verifySavedBinary(profile, binding);
+              const registry = yield* registryJson(pinned);
+              const inspected = yield* inspect(binding, panes, registry, null);
+              if (inspected.managed.liveness === "exited") return;
+              if (inspected.managed.canForceStop) identity = inspected.identity;
+            }
+            if (!identity || forcing.has(input.imageId))
               return yield* fail(
                 "This owner is not eligible for Force Stop.",
                 "tmux_force_not_available",
@@ -3239,7 +3280,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
               "tmux_owner_changed",
             );
           const pinned = yield* verifySavedBinary(profile, binding);
-          yield* attestManagedOwner(pinned, binding.owner, binding.sessionFile, config.cwd);
+          yield* attestSavedOwner(pinned, binding);
           yield* profile.validate;
           yield* submitManagedStopOnce(
             managedHost.markStop(binding),
@@ -3299,8 +3340,18 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           "profile_conflict",
         );
       // The catalog supplies cwd and ordinary attachment discovery, not managed lease proof.
-      const saved =
+      let saved =
         managedHost && input.sessionFile ? yield* managedHost.read(input.sessionFile) : undefined;
+      if (managedHost && saved && mode !== "attach") {
+        yield* assertManagedProfile(profile, saved);
+        const observed = yield* managedHost.observe(saved, yield* managedHost.panes);
+        if (observed.liveness === "exited") {
+          yield* managedHost.retireExited(saved);
+          if (refusedSavedOwners.get(saved.sessionFile) === saved.owner.imageId)
+            refusedSavedOwners.delete(saved.sessionFile);
+          saved = undefined;
+        }
+      }
       const fixture = saved ? undefined : isManaged(profile.providerInstanceId, input.sessionFile);
       const row =
         !saved && !fixture && input.sessionFile

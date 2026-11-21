@@ -3684,22 +3684,38 @@ describe("opening native sessions with optional managed tmux", () => {
     "invalid launch arguments with a live owner",
     "prestarted owner without a matching lease",
     "saved owner after a binary change",
-    "saved owner after a same-path binary replacement",
+    "saved owner with unknown liveness after a binary change",
+    "attested owner after a same-path binary replacement",
+    "unattested owner after a same-path binary replacement",
+    "exited owner after a binary change",
+    "exited owner without a binary pin",
     "saved owner without a binary pin",
     "graceful stop without a matching lease",
   ] as const) {
     const invalidArgs = scenario === "invalid launch arguments with a live owner";
     const fixtureOwner = scenario === "prestarted owner without a matching lease";
-    const changedPath = scenario === "saved owner after a binary change";
-    const changedBytes = scenario === "saved owner after a same-path binary replacement";
-    const missingPin = scenario === "saved owner without a binary pin";
+    const changedPath =
+      scenario === "saved owner after a binary change" ||
+      scenario === "exited owner after a binary change" ||
+      scenario === "saved owner with unknown liveness after a binary change";
+    const attestedUpgrade = scenario === "attested owner after a same-path binary replacement";
+    const changedBytes =
+      attestedUpgrade || scenario === "unattested owner after a same-path binary replacement";
+    const missingPin =
+      scenario === "saved owner without a binary pin" ||
+      scenario === "exited owner without a binary pin";
+    const exitedOwner = scenario.startsWith("exited owner");
+    const unknownOwner = scenario === "saved owner with unknown liveness after a binary change";
     const changedBinary = changedPath || changedBytes || missingPin;
     const stopOwner = scenario === "graceful stop without a matching lease";
     const savedOwner = changedBinary || stopOwner;
-    const name =
-      invalidArgs || fixtureOwner || savedOwner
-        ? `rejects ${scenario} before opening a control pipe`
-        : `uses the ordinary open path with ${scenario} managed state`;
+    const name = exitedOwner
+      ? `reaches a new managed launch with ${scenario}`
+      : attestedUpgrade
+        ? "reattaches to the same lease holder after a same-path binary replacement"
+        : invalidArgs || fixtureOwner || savedOwner
+          ? `rejects ${scenario} before opening a control pipe`
+          : `uses the ordinary open path with ${scenario} managed state`;
     it.live(name, () =>
       Effect.gen(function* () {
         vi.stubEnv("T3CODE_NEOPI_TMUX", undefined);
@@ -3756,6 +3772,7 @@ describe("opening native sessions with optional managed tmux", () => {
               }
             : {}),
           owner,
+          process: { start: "1001", image: "1:2002" },
         } satisfies ManagedTmux.ManagedTmuxBinding;
         const bindingPath = NodePath.join(directory, `${key}.json`);
         yield* fs.writeFileString(
@@ -3765,6 +3782,15 @@ describe("opening native sessions with optional managed tmux", () => {
         yield* fs.chmod(bindingPath, 0o600);
         const probeOwner = vi.spyOn(ManagedTmux, "resolveManagedTmuxOwner");
         yield* Effect.addFinalizer(() => Effect.sync(() => probeOwner.mockRestore()));
+        const launch = vi.fn(() =>
+          Effect.fail(
+            new NeoPiNativeSessionsError({
+              code: "session_in_use",
+              message: "A different writer acquired the session lease.",
+            }),
+          ),
+        );
+        const force = vi.fn((_binding: ManagedTmux.ManagedTmuxBinding) => Effect.void);
         if (fixtureOwner) {
           vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", encodeOptOutFixture(binding));
           probeOwner.mockReturnValue(Effect.succeed(owner));
@@ -3775,7 +3801,13 @@ describe("opening native sessions with optional managed tmux", () => {
           makeHost.mockReturnValue({
             ...host,
             panes: Effect.succeed([]),
-            observe: () => Effect.succeed({ liveness: "alive", process: undefined }),
+            ...(exitedOwner ? { launch } : {}),
+            force,
+            observe: () =>
+              Effect.succeed({
+                liveness: exitedOwner ? "exited" : unknownOwner ? "unknown" : "alive",
+                process: undefined,
+              }),
           });
           probeOwner.mockReturnValue(Effect.succeed(owner));
         }
@@ -3865,7 +3897,19 @@ describe("opening native sessions with optional managed tmux", () => {
                             data:
                               request.type === "get_state"
                                 ? { sessionId: owner.sessionId, sessionFile, messageCount: 0 }
-                                : {},
+                                : request.type === "get_status"
+                                  ? {
+                                      instanceId: owner.instanceId,
+                                      imageId: owner.imageId,
+                                      pid: owner.pid,
+                                      role: "tui",
+                                      ready: true,
+                                      cwd,
+                                      tmux: { pane: owner.pane },
+                                      revisions: { generation: 1 },
+                                      session: { sessionId: owner.sessionId, sessionFile },
+                                    }
+                                  : {},
                           }),
                         );
                       }).pipe(Sink.ensuring(finish)),
@@ -3890,7 +3934,13 @@ describe("opening native sessions with optional managed tmux", () => {
                             }),
                           )
                         : lease
-                          ? Stream.make(encode({ status: "not_held", sessionFile }))
+                          ? Stream.make(
+                              encode(
+                                attestedUpgrade
+                                  ? { status: "held", sessionFile, holder: owner }
+                                  : { status: "not_held", sessionFile },
+                              ),
+                            )
                           : Stream.fromQueue(stdout),
                       stderr: Stream.empty,
                       all: Stream.empty,
@@ -3927,11 +3977,45 @@ describe("opening native sessions with optional managed tmux", () => {
           assert.equal(spawned.length, 3, "a different owner instance gets one attestation");
           return;
         }
+        if (exitedOwner) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, "session_in_use");
+          assert.equal(yield* fs.exists(bindingPath), false);
+          assert.equal(launch.mock.calls.length, 1);
+          assert.equal(probeOwner.mock.calls.length, 0);
+          assert.deepEqual(spawned, [["sessions", "list", "--json", "--session-dir", cwd]]);
+          return;
+        }
+        if (attestedUpgrade) {
+          const opened = yield* service.open(ref);
+          assert.equal(opened.attachment, "terminal");
+          assert.deepEqual(spawned, [
+            ["session", "lease", "--file", sessionFile, "--json"],
+            ["ctl", "pipe", owner.instanceId, "--label", "neocode-native"],
+          ]);
+          assert.equal(probeOwner.mock.calls.length, 1);
+          assert.equal(yield* fs.readFileString(bindingPath), encodeOptOutFixture(binding));
+          yield* service.close({ ref });
+          return;
+        }
         if (changedBinary) {
           const result = yield* service.open(ref).pipe(Effect.flip);
-          assert.equal(result.code, "tmux_binary_changed");
+          assert.equal(result.code, changedBytes ? "tmux_lease_unverified" : "tmux_binary_changed");
+          assert.match(result.message, /Stop.*NeoCode.*reopen/i);
+          assert.equal(yield* fs.exists(bindingPath), true);
           assert.equal(probeOwner.mock.calls.length, 0);
-          assert.deepEqual(spawned, []);
+          if (changedBytes) {
+            const forceStop = { ref, imageId: owner.imageId, action: "force" } as const;
+            const gracefulError = yield* service
+              .stopManaged({ ...forceStop, action: "stop" })
+              .pipe(Effect.flip);
+            assert.equal(gracefulError.code, "tmux_lease_unverified");
+            assert.equal(force.mock.calls.length, 0);
+            yield* service.stopManaged(forceStop);
+            assert.deepEqual(force.mock.calls, [[binding]]);
+          }
+          const leaseArgs = ["session", "lease", "--file", sessionFile, "--json"];
+          assert.deepEqual(spawned, changedBytes ? [leaseArgs, leaseArgs] : []);
           return;
         }
         if (stopOwner) {

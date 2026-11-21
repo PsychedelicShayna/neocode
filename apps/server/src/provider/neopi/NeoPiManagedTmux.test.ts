@@ -378,7 +378,7 @@ describe("managed tmux owner startup", () => {
   const source = {
     binary: "/opt/npi nightly",
     cwd: "/workspace dir",
-    extra: ["--model", "fixture"],
+    extra: [],
     executable,
   };
   const neoPiBinary = { path: source.binary, sha256: "a".repeat(64) };
@@ -396,22 +396,15 @@ describe("managed tmux owner startup", () => {
       Effect.gen(function* () {
         expect(yield* managedTmuxLaunchPlan(source)).toEqual([
           "/opt/npi nightly",
-          "--cwd",
-          "/workspace dir",
+          "--cwd=/workspace dir",
           "--no-title",
-          "--model",
-          "fixture",
           "--new-session",
         ]);
         expect(yield* managedTmuxLaunchPlan({ ...source, sessionFile })).toEqual([
           "/opt/npi nightly",
-          "--cwd",
-          "/workspace dir",
+          "--cwd=/workspace dir",
           "--no-title",
-          "--model",
-          "fixture",
-          "--session",
-          sessionFile,
+          `--session=${sessionFile}`,
         ]);
       }),
   );
@@ -427,10 +420,13 @@ describe("managed tmux owner startup", () => {
     }),
   );
 
-  effectIt.effect("refuses positional startup work hidden among managed options", () =>
+  effectIt.effect("refuses configured argv before a shadowed option can submit a prompt", () =>
     Effect.gen(function* () {
       for (const extra of [
         ["do work"],
+        ["--model", "plain-startup-prompt"],
+        ["--model=plain-startup-prompt"],
+        ["--no-skills"],
         ["--model", "fixture", "do work"],
         ["--no-skills", "do work"],
         ["--unknown", "do work"],

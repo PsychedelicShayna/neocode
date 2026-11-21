@@ -511,33 +511,6 @@ const requireUnheldLease = Effect.fnUntraced(function* (
   });
 });
 
-// Only options with known arity and no startup action may precede attestation.
-const managedOptions: Readonly<Record<string, "switch" | "value">> = {
-  "--hide-thinking": "switch",
-  "--no-context-files": "switch",
-  "--no-extensions": "switch",
-  "--no-lsp": "switch",
-  "--no-mcp": "switch",
-  "--no-pty": "switch",
-  "--no-rules": "switch",
-  "--no-skills": "switch",
-  "--no-title": "switch",
-  "--no-tools": "switch",
-  "--append-system-prompt": "value",
-  "--max-fps": "value",
-  "--model": "value",
-  "--models": "value",
-  "--motion": "value",
-  "--provider": "value",
-  "--service-tier": "value",
-  "--smol": "value",
-  "--slow": "value",
-  "--spinner-interval": "value",
-  "--system-prompt": "value",
-  "--thinking": "value",
-  "--tools": "value",
-};
-
 export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   readonly executable: string | undefined;
   readonly binary: string;
@@ -548,28 +521,18 @@ export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   if (!input.executable) return yield* tmuxMissing();
   if (input.extra.some((arg) => arg.split("=", 1)[0] === "--no-control-socket"))
     return yield* unavailable();
-  for (let i = 0; i < input.extra.length; i++) {
-    const arg = input.extra[i]!;
-    const equals = arg.indexOf("=");
-    const option = managedOptions[equals < 0 ? arg : arg.slice(0, equals)];
-    if (option === "switch" && equals < 0) continue;
-    if (option === "value") {
-      // A separate option value must not be mistaken for another flag or attachment.
-      const value = equals < 0 ? input.extra[++i] : arg.slice(equals + 1);
-      if (value && !value.startsWith("-") && !value.startsWith("@")) continue;
-    }
+  if (input.extra.length > 0)
     return yield* tmuxError(
       "tmux_launch_failed",
-      "Only supported settings options are allowed for managed tmux launches; send prompts after opening the session.",
+      "Managed tmux launches do not accept configured NeoPi launch arguments. Clear Launch arguments in NeoCode settings and configure defaults in the NeoPi profile.",
     );
-  }
+  // Extensions can shadow builtins. Keep each value in the same token as its
+  // option so NeoPi's extension-aware reparse never treats it as a prompt.
   return [
     input.binary,
-    "--cwd",
-    input.cwd,
+    `--cwd=${input.cwd}`,
     "--no-title",
-    ...input.extra,
-    ...(input.sessionFile ? ["--session", input.sessionFile] : ["--new-session"]),
+    input.sessionFile ? `--session=${input.sessionFile}` : "--new-session",
   ];
 });
 
@@ -739,6 +702,28 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
   };
 });
 
+// Only retirees unlink bindings. Serialize compare-and-unlink across server
+// processes; publication still uses a no-replace link. A lock on the private
+// directory itself needs no crash recovery.
+const unlinkExitedBinding = `
+import fcntl, hashlib, os, sys
+directory, name, expected, stop = sys.argv[1:]
+fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fcntl.flock(fd, fcntl.LOCK_EX)
+try:
+    entry = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    with os.fdopen(entry, 'rb') as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != expected:
+            sys.exit(42)
+    os.unlink(name, dir_fd=fd)
+except FileNotFoundError:
+    sys.exit(42)
+try:
+    os.unlink(stop, dir_fd=fd)
+except FileNotFoundError:
+    pass
+`;
+
 export const makeManagedTmuxHost = (
   stateDir: string,
   executable: string | undefined,
@@ -792,27 +777,56 @@ export const makeManagedTmuxHost = (
       "tmux_storage_unavailable",
       "The managed tmux identities could not be read or saved.",
     );
+  const readPrivateBinding = async (file: string) => {
+    await checkDirectory();
+    const path = bindingFile(file);
+    const stat = await NodeFSP.lstat(path);
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+      throw new Error("Not a private binding");
+    const raw = await NodeFSP.readFile(path, "utf8");
+    const binding = decodeBinding(raw);
+    if (binding.sessionFile !== file || binding.socket !== socket)
+      throw new Error("Wrong tmux identity");
+    return { raw, binding };
+  };
   const read = (file: string) =>
     Effect.tryPromise({
       try: async () => {
-        let raw: string;
         try {
-          await checkDirectory();
-          const path = bindingFile(file);
-          const stat = await NodeFSP.lstat(path);
-          if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
-            throw new Error("Not a private binding");
-          raw = await NodeFSP.readFile(path, "utf8");
+          return (await readPrivateBinding(file)).binding;
         } catch (cause) {
           if (isMissing(cause)) return undefined;
           throw cause;
         }
-        const binding = decodeBinding(raw);
-        if (binding.sessionFile !== file || binding.socket !== socket)
-          throw new Error("Wrong tmux identity");
-        return binding;
       },
       catch: storageError,
+    });
+  const retireExited = (binding: ManagedTmuxBinding) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        const { raw, binding: current } = await readPrivateBinding(binding.sessionFile);
+        if (encodeBinding(current) !== encodeBinding(binding)) throw changedOwner();
+        await exec(
+          "/usr/bin/python3",
+          [
+            "-I",
+            "-S",
+            "-c",
+            unlinkExitedBinding,
+            directory,
+            NodePath.basename(bindingFile(binding.sessionFile)),
+            NodeCrypto.createHash("sha256").update(raw).digest("hex"),
+            NodePath.basename(stopFile(binding)),
+          ],
+          { signal, timeout: 3000, maxBuffer: 65536 },
+        );
+      },
+      catch: (cause) =>
+        isNativeSessionsError(cause) ||
+        isMissing(cause) ||
+        (cause instanceof Error && "code" in cause && cause.code === 42)
+          ? changedOwner()
+          : storageError(),
     });
   const list = Effect.tryPromise({
     try: async () => {
@@ -941,7 +955,7 @@ export const makeManagedTmuxHost = (
   };
   const observe = (binding: ManagedTmuxBinding, rows: readonly string[] | undefined) =>
     Effect.promise(() => evidence(binding, rows));
-  const force = (binding: ManagedTmuxBinding) =>
+  const force = (binding: ManagedTmuxBinding): Effect.Effect<void, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
       if (platform !== "linux" || !binding.process)
         return yield* tmuxError(
@@ -1141,5 +1155,5 @@ export const makeManagedTmuxHost = (
             }).pipe(Effect.ignore),
     );
   });
-  return { read, list, launch, target, panes, observe, force, stopTime, markStop };
+  return { read, list, launch, target, panes, observe, retireExited, force, stopTime, markStop };
 };

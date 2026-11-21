@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, useCallback, useSyncExternalStore, type ReactNode } from "react";
+import { act, useCallback, useSyncExternalStore, type ComponentProps, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { it } from "@effect/vitest";
 import { describe, expect, vi } from "vite-plus/test";
@@ -36,6 +36,7 @@ import { EnvironmentRegistry } from "../../../../../packages/client-runtime/src/
 import { EnvironmentSupervisor } from "../../../../../packages/client-runtime/src/connection/supervisor";
 import type { WsRpcProtocolClient } from "../../../../../packages/client-runtime/src/rpc/protocol";
 import type { RpcSession } from "../../../../../packages/client-runtime/src/rpc/session";
+import type { NativeSessionComposer } from "./NativeSessionComposer";
 import { NativeMobileModels, NativeSessionScreen } from "./NativeSessionScreen";
 
 type Router = ReturnType<typeof StackRouter>;
@@ -246,7 +247,12 @@ vi.mock("../../state/use-composer-drafts", () => ({
   setComposerDraftText: vi.fn(),
   waitForComposerDraftsLoaded: vi.fn(),
 }));
-vi.mock("./NativeSessionComposer", () => ({ NativeSessionComposer: () => null }));
+vi.mock("./NativeSessionComposer", () => ({
+  NativeSessionComposer: ({
+    argumentSuggestions,
+  }: Pick<ComponentProps<typeof NativeSessionComposer>, "argumentSuggestions">) =>
+    argumentSuggestions.map(({ label, value }) => <span key={value}>{label}</span>),
+}));
 vi.mock("./NativeSessionWorkspaceControls", () => ({
   NativeSessionWorkspaceControls: () => null,
   NativeSessionAgents: () => null,

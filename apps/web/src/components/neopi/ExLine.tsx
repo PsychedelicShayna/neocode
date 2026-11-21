@@ -14,7 +14,7 @@ import {
 } from "react";
 import { dispatchCommand, findCommand } from "../../commandTable";
 import { EX_LINE_INPUT_ATTRIBUTE, guardHeldKey } from "../../lib/exLineFocus";
-import { getLastFocusedTerminal } from "../../lib/terminalFocus";
+import { getJustEscapedTerminal, getLastFocusedTerminal } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { selectNativeSession, useNativeSessionSelection } from "../../state/neopiNativeSessions";
 import { toastManager } from "../ui/toast";
@@ -107,12 +107,16 @@ export function ExLine({
   activePanelSurfaceIsTerminal: boolean;
   onClose: () => void;
 }) {
-  // Read before the input takes focus: where Escape returns to.
-  const [returnFocus] = useState(() =>
-    document.activeElement instanceof HTMLElement && document.activeElement !== document.body
-      ? document.activeElement
-      : null,
-  );
+  // Snapshot the origin before the input takes focus. A terminal escape
+  // releases the keyboard to BODY and is a return target only for splits.
+  const [{ returnFocus, escapedTerminal: initialEscapedTerminal }] = useState(() => ({
+    returnFocus:
+      document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+        ? document.activeElement
+        : null,
+    escapedTerminal: getJustEscapedTerminal(),
+  }));
+  const escapedTerminal = useRef(initialEscapedTerminal);
   const [state, setState] = useState(EX_LINE_INITIAL);
   const tabs = useNativeSessionSelection((selection) => selection.tabs);
   const [labels, setLabels] = useState<ReadonlyMap<string, SessionLabel>>(new Map());
@@ -135,12 +139,24 @@ export function ExLine({
 
   useEffect(() => {
     inputRef.current?.focus();
+    if (escapedTerminal.current === null) return;
+    // Taking focus for Ex keeps the snapshot; any subsequent focus invalidates it.
+    const clearEscapedTerminal = () => {
+      escapedTerminal.current = null;
+    };
+    document.addEventListener("focusin", clearEscapedTerminal, { capture: true, once: true });
+    return () => document.removeEventListener("focusin", clearEscapedTerminal, true);
   }, [inputRef]);
 
   const apply = (effect: ExLineEffect) => {
     if (effect.kind !== "close" && history[0] !== state.text) history.unshift(state.text);
+    const isSplit =
+      effect.kind === "run" &&
+      (effect.command === "terminal.split" || effect.command === "terminal.splitVertical");
+    const splitTerminal = isSplit ? getLastFocusedTerminal() : null;
     onClose();
-    if (returnFocus?.isConnected) returnFocus.focus();
+    const focusTarget = returnFocus ?? (isSplit ? escapedTerminal.current : null);
+    if (focusTarget?.isConnected) focusTarget.focus();
     else inputRef.current?.blur();
     if (effect.kind === "switchSession") {
       const match = matches.find((candidate) => candidate.key === effect.key);
@@ -148,7 +164,9 @@ export function ExLine({
       return;
     }
     if (effect.kind !== "run") return;
-    const dispatch = dispatchCommand(effect.command, { terminal: getLastFocusedTerminal() });
+    const dispatch = dispatchCommand(effect.command, {
+      terminal: isSplit ? splitTerminal : getLastFocusedTerminal(),
+    });
     if (dispatch.status !== "ran") return;
     void dispatch.done.catch((cause) =>
       toastManager.add({

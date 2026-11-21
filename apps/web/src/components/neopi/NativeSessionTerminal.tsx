@@ -25,9 +25,14 @@ import {
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import { closeNativeTerminal } from "./closeNativeTerminal";
 
+interface TerminalSplitOptions {
+  readonly focusNewTerminal?: boolean;
+  readonly reveal?: boolean;
+}
+
 export interface NativeSessionTerminalHandle {
   newTerminal: () => void;
-  splitTerminal: (direction?: "horizontal" | "vertical") => void;
+  splitTerminal: (direction?: "horizontal" | "vertical", options?: TerminalSplitOptions) => void;
   closeActiveTerminal: () => void;
   /** Closes one terminal after the same confirmation `closeActiveTerminal` asks for. */
   closeTerminal: (terminalId: string) => void;
@@ -133,10 +138,16 @@ function NativeSessionTerminalBody({
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const closeTerminal = useAtomCommand(terminalEnvironment.close, "terminal close");
   const [localFocusRequestId, setLocalFocusRequestId] = useState(0);
+  const [autoFocus, setAutoFocus] = useState(true);
+  const requestFocus = useCallback(() => {
+    setAutoFocus(true);
+    setLocalFocusRequestId((value) => value + 1);
+  }, []);
   const [hasOpened, setHasOpened] = useState(visible);
 
   const synchronizeVisibility = useEffectEvent((open: boolean) => {
     if (open) setHasOpened(true);
+    else setAutoFocus(true);
     if (!surface) useTerminalUiStateStore.getState().setTerminalOpen(target, open);
   });
   useEffect(() => {
@@ -186,7 +197,8 @@ function NativeSessionTerminalBody({
   );
 
   const createTerminal = useCallback(
-    (kind: "new" | "horizontal" | "vertical") => {
+    (kind: "new" | "horizontal" | "vertical", options?: TerminalSplitOptions) => {
+      const { focusNewTerminal = true, reveal = true } = options ?? {};
       const store = useTerminalUiStateStore.getState();
       const current = selectThreadTerminalUiState(store.terminalUiStateByThreadKey, target);
       const terminalId = nextTerminalId([
@@ -197,17 +209,23 @@ function NativeSessionTerminalBody({
       if (surface) {
         const panels = useRightPanelStore.getState();
         if (kind === "new") panels.openTerminal(target, terminalId);
-        else panels.splitTerminal(target, surface.id, terminalId, kind);
+        else
+          panels.splitTerminal(target, surface.id, terminalId, kind, {
+            activate: focusNewTerminal,
+            reveal,
+          });
       } else if (kind === "new") store.newTerminal(target, terminalId);
-      else if (kind === "vertical") store.splitTerminalVertical(target, terminalId);
-      else store.splitTerminal(target, terminalId);
-      setLocalFocusRequestId((value) => value + 1);
+      else if (kind === "vertical")
+        store.splitTerminalVertical(target, terminalId, focusNewTerminal);
+      else store.splitTerminal(target, terminalId, focusNewTerminal);
+      if (focusNewTerminal) requestFocus();
+      else if (reveal) setAutoFocus(false);
       void openTerminal({
         environmentId: target.environmentId,
         input: { threadId, terminalId, cwd, providerInstanceId: target.ref.providerInstanceId },
       });
     },
-    [cwd, openTerminal, sessions, target, threadId, panelIds, surface],
+    [cwd, openTerminal, sessions, target, threadId, panelIds, surface, requestFocus],
   );
 
   const removeTerminal = useCallback(
@@ -221,10 +239,10 @@ function NativeSessionTerminalBody({
           surfaceId: surface?.id ?? null,
         });
         if (result._tag === "Failure") return;
-        setLocalFocusRequestId((value) => value + 1);
+        requestFocus();
       })();
     },
-    [closeTerminal, target, threadId, surface?.id],
+    [closeTerminal, target, threadId, surface?.id, requestFocus],
   );
 
   useImperativeHandle(controllerRef, () => {
@@ -235,7 +253,7 @@ function NativeSessionTerminalBody({
     };
     return {
       newTerminal: () => createTerminal("new"),
-      splitTerminal: (direction = "horizontal") => createTerminal(direction),
+      splitTerminal: (direction = "horizontal", options) => createTerminal(direction, options),
       closeActiveTerminal: () => confirmAndClose(activeTerminalId),
       closeTerminal: confirmAndClose,
     };
@@ -254,6 +272,7 @@ function NativeSessionTerminalBody({
         activeTerminalId={activeTerminalId}
         terminalGroups={terminalGroups}
         activeTerminalGroupId={surface?.id ?? ui.activeTerminalGroupId}
+        autoFocus={autoFocus}
         focusRequestId={focusRequestId + localFocusRequestId}
         onSplitTerminal={() => createTerminal("horizontal")}
         onSplitTerminalVertical={() => createTerminal("vertical")}
@@ -262,7 +281,7 @@ function NativeSessionTerminalBody({
           if (surface)
             useRightPanelStore.getState().activateTerminal(target, surface.id, terminalId);
           else useTerminalUiStateStore.getState().setActiveTerminal(target, terminalId);
-          setLocalFocusRequestId((value) => value + 1);
+          requestFocus();
         }}
         onCloseTerminal={removeTerminal}
         onHeightChange={(height) =>

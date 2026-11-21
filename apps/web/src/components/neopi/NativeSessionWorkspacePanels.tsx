@@ -364,21 +364,27 @@ export function NativeSessionWorkspacePanels({
     direction: "horizontal" | "vertical",
     invocation: CommandInvocation | undefined,
   ) => {
+    // ExLine returns focus itself; keyboard shortcuts and palette commands
+    // still select and focus the new terminal.
+    const focusNewTerminal = invocation === undefined;
     const located = locateTerminal(invocation);
     if (located?.surfaceId) {
-      useRightPanelStore.getState().activateSurface(target, located.surfaceId);
-      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction);
+      // An Ex split must leave a closed right panel closed.
+      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction, {
+        focusNewTerminal,
+        reveal: panel.isOpen,
+      });
       return;
     }
     if (located) {
       useTerminalUiStateStore.getState().setActiveTerminal(target, located.terminalId);
       useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-      drawerRef.current?.splitTerminal(direction);
+      drawerRef.current?.splitTerminal(direction, { focusNewTerminal });
       return;
     }
     if (getTerminalFocusOwner() !== "right-panel")
       useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-    focusedTerminalController()?.splitTerminal(direction);
+    focusedTerminalController()?.splitTerminal(direction, { focusNewTerminal });
   };
   useCommandHandlers("workspace", {
     "terminal.toggle": {

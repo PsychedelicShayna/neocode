@@ -259,6 +259,7 @@ function upsertTerminalIntoGroups(
   terminalId: string,
   mode: "split" | "new",
   splitDirection: "horizontal" | "vertical" = "horizontal",
+  activateSplit = true,
 ): ThreadTerminalUiState {
   const normalized = normalizeThreadTerminalUiState(state);
   const effectiveMode: "split" | "new" = normalized.terminalIds.length === 0 ? "new" : mode;
@@ -344,7 +345,7 @@ function upsertTerminalIntoGroups(
     ...normalized,
     terminalOpen: true,
     terminalIds,
-    activeTerminalId: terminalId,
+    activeTerminalId: activateSplit ? terminalId : normalized.activeTerminalId,
     terminalGroups,
     activeTerminalGroupId: destinationGroup.id,
   });
@@ -374,8 +375,9 @@ function splitThreadTerminal(
   state: ThreadTerminalUiState,
   terminalId: string,
   direction: "horizontal" | "vertical" = "horizontal",
+  activate = true,
 ): ThreadTerminalUiState {
-  return upsertTerminalIntoGroups(state, terminalId, "split", direction);
+  return upsertTerminalIntoGroups(state, terminalId, "split", direction, activate);
 }
 
 function newThreadTerminal(
@@ -569,8 +571,8 @@ interface TerminalUiStateStoreState {
   suppressedTerminalIdsByThreadKey: Record<string, string[]>;
   setTerminalOpen: (threadRef: WorkspaceRef, open: boolean) => void;
   setTerminalHeight: (threadRef: WorkspaceRef, height: number) => void;
-  splitTerminal: (threadRef: WorkspaceRef, terminalId: string) => void;
-  splitTerminalVertical: (threadRef: WorkspaceRef, terminalId: string) => void;
+  splitTerminal: (threadRef: WorkspaceRef, terminalId: string, activate?: boolean) => void;
+  splitTerminalVertical: (threadRef: WorkspaceRef, terminalId: string, activate?: boolean) => void;
   newTerminal: (threadRef: WorkspaceRef, terminalId: string) => void;
   returnTerminalGroup: (
     threadRef: WorkspaceRef,
@@ -648,16 +650,24 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
         },
         setTerminalHeight: (threadRef, height) =>
           updateTerminal(threadRef, (state) => setThreadTerminalHeight(state, height)),
-        splitTerminal: (threadRef, terminalId) =>
-          updateTerminal(threadRef, (state) => splitThreadTerminal(state, terminalId), {
-            terminalId,
-            suppressed: false,
-          }),
-        splitTerminalVertical: (threadRef, terminalId) =>
-          updateTerminal(threadRef, (state) => splitThreadTerminal(state, terminalId, "vertical"), {
-            terminalId,
-            suppressed: false,
-          }),
+        splitTerminal: (threadRef, terminalId, activate) =>
+          updateTerminal(
+            threadRef,
+            (state) => splitThreadTerminal(state, terminalId, "horizontal", activate),
+            {
+              terminalId,
+              suppressed: false,
+            },
+          ),
+        splitTerminalVertical: (threadRef, terminalId, activate) =>
+          updateTerminal(
+            threadRef,
+            (state) => splitThreadTerminal(state, terminalId, "vertical", activate),
+            {
+              terminalId,
+              suppressed: false,
+            },
+          ),
         newTerminal: (threadRef, terminalId) =>
           updateTerminal(threadRef, (state) => newThreadTerminal(state, terminalId), {
             terminalId,

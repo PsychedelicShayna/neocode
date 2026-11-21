@@ -45,8 +45,13 @@ When NeoPi asks a question in a session NeoCode runs, it appears above the
 composer without taking focus. Choose an option or type your own answer (in the
 composer on web and desktop, or in the question card on mobile). For a
 multi-choice question you can do both, or continue without selecting anything.
-Your message draft is preserved.
-Terminal-attached sessions still use NeoPi's existing prompts.
+Your message draft is preserved. Terminal-attached sessions keep using their
+existing prompts.
+
+In a session NeoCode runs, NeoPi forms also appear above the composer. Fill in
+the required fields, then select **Submit form** or **Dismiss**. If NeoPi
+closes the form or its time runs out, the form disappears without sending
+your unfinished edits.
 
 When NeoPi fails to start a turn in a saved conversation, web and desktop return
 the unsent prompt and its attachments to an empty composer. If you've already

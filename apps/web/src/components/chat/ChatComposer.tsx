@@ -992,6 +992,7 @@ export type NativeChatComposerProps = Pick<
   routeKind: "native";
   composerDraftTarget: NativeSessionTarget;
   routeThreadRef: NativeSessionTarget;
+  nativeForm?: ReactNode;
   nativeAsk?:
     | (NativeAskProgress & {
         id: string;
@@ -1072,6 +1073,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   } = props;
   const nativeSession = props.routeKind === "native" ? props.nativeSession : null;
   const nativeAsk = props.routeKind === "native" ? (props.nativeAsk ?? null) : null;
+  const nativeForm = props.routeKind === "native" ? props.nativeForm : null;
   const isAnsweringNativeAsk = nativeAsk !== null;
   const legacy = props.routeKind === "native" ? null : props;
   const {
@@ -4378,7 +4380,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setIsTasksDrawerOpen((open) => !open);
   }, []);
   const hasBannerItems = (legacy?.bannerItems.length ?? 0) > 0;
-  const hasBlockingComposerTopDrawer = activePendingApproval !== null || hasPendingUserInput;
+  const hasBlockingComposerTopDrawer =
+    activePendingApproval !== null || hasPendingUserInput || Boolean(nativeForm);
   const showInlineTasksBadge =
     activeTasksProgress !== null &&
     activeTaskSteps !== null &&
@@ -5616,6 +5619,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onAdvance={(questionId) => nativeAsk.dispatch({ type: "advance", questionId })}
                   onDismiss={() => nativeAsk.dispatch({ type: "dismiss" })}
                 />
+              </ComposerBanner.Root>
+            </ComposerBanner.Attachment>
+          ) : null}
+          {nativeForm ? (
+            <ComposerBanner.Attachment>
+              <ComposerBanner.Root data-chat-composer-top-drawer="true" variant="info">
+                {nativeForm}
               </ComposerBanner.Root>
             </ComposerBanner.Attachment>
           ) : null}

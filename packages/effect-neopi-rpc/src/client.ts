@@ -572,7 +572,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
               ui.method === "select" ||
               ui.method === "confirm" ||
               ui.method === "input" ||
-              ui.method === "editor")
+              ui.method === "editor" ||
+              ui.method === "ask" ||
+              ui.method === "form")
           ) {
             if (ui.method === "cancel") {
               if (typeof ui.targetId === "string" && startupUiPending.delete(ui.targetId))

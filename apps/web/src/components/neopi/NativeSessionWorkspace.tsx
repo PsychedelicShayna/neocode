@@ -127,6 +127,7 @@ import {
   type NativeAskAction,
   type NativeAskDraft,
 } from "@t3tools/client-runtime/neopi-native-ask";
+import { NativeSessionForm } from "./NativeSessionForm";
 import { restoreNativeEditor } from "./neopiNativeDraft";
 import { restoreNativeQueuedDraft } from "./neopiNativeQueueDraft";
 import type { ComposerSubmissionIntent } from "../../composer-logic";
@@ -1115,6 +1116,19 @@ export function NativeSessionView({
               onExpandImage={setExpandedImage}
               onFileOpen={openComposerFile}
               nativeSession={nativeSessionComposer}
+              nativeForm={
+                obligation?.kind === "form" ? (
+                  <NativeSessionForm
+                    key={obligation.id}
+                    form={obligation}
+                    respond={async (response) => {
+                      const current = nativeSessionAtoms.cached(target);
+                      if (current?.dialogs.some((frame) => frame.id === response.id))
+                        await request(response);
+                    }}
+                  />
+                ) : null
+              }
               nativeAsk={
                 ask
                   ? {

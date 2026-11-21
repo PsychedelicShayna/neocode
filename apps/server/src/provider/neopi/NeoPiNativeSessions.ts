@@ -44,6 +44,7 @@ import {
 } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import { MAX_RPC_REASSEMBLED_BYTES } from "effect-neopi-rpc/frame";
+import { FormUiResponse, type SetFormDialogCommand } from "effect-neopi-rpc/form";
 import type { NonEmptyReadonlyArray } from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -154,6 +155,26 @@ const JournalIdentity = Schema.Struct({
 const UiResponse = Schema.StructWithRest(Schema.Struct({ id: Schema.String }), [
   NeoPiNativeSessionRecord,
 ]);
+const decodeFormResponse = Schema.decodeUnknownEffect(FormUiResponse);
+
+const enableNativeDialog = (
+  client: NeoPiRpcClient,
+  type: "set_ask_dialog" | SetFormDialogCommand["type"],
+) =>
+  client.request({ type, enabled: true }).pipe(
+    Effect.catchIf(
+      (error) =>
+        error.command === type &&
+        (error.code === "unsupported_command" ||
+          (error.code === undefined &&
+            (error.message === `Unknown command: ${type}` ||
+              error.message ===
+                (type === "set_ask_dialog"
+                  ? "Ask-dialog negotiation is unavailable on this transport"
+                  : "Form-dialog negotiation is unavailable on this transport")))),
+      () => Effect.void,
+    ),
+  );
 const ControlIdentity = Schema.Struct({
   session: StateIdentity,
   cwd: Schema.String,
@@ -1325,7 +1346,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
             frame.method === "confirm" ||
             frame.method === "input" ||
             frame.method === "editor" ||
-            frame.method === "ask"
+            frame.method === "ask" ||
+            frame.method === "form"
           )
             pendingUi.set(frame.id, frame);
         }
@@ -2053,8 +2075,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         const response = yield* Schema.decodeUnknownEffect(UiResponse)(command);
         // A timeout/abort may have settled the question before a click or delayed
         // single-choice advance reached the server.
-        if (!session.pendingUi.has(response.id)) return { accepted: false };
-        yield* client.respondUi(response);
+        const pending = session.pendingUi.get(response.id);
+        if (!pending) return { accepted: false };
+        yield* client.respondUi(
+          pending.method === "form" ? yield* decodeFormResponse(command) : response,
+        );
         session.pendingUi.delete(response.id);
         session.projection.settleObligation(response.id, "answered");
         notifyChanged(session);
@@ -2799,7 +2824,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
 });
 
 /** Uses the configured runtime/profile and its existing CLI + RPC/control transports. No SQL bindings. */
-export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(function* () {
+export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(function* ({
+  enableAttachedNativeDialogs = false,
+}: { enableAttachedNativeDialogs?: boolean } = {}) {
   const instances = yield* ProviderInstanceRegistry;
   const fs = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -3444,7 +3471,8 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
               request.method === "confirm" ||
               request.method === "input" ||
               request.method === "editor" ||
-              request.method === "ask"
+              request.method === "ask" ||
+              request.method === "form"
             )
               Deferred.doneUnsafe(startupUi, Effect.void);
             frame(request);
@@ -3603,6 +3631,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             });
             attachedCwd = yield* fs.realPath(cwd);
           }
+          // Keep dialogs in the pane until PsychedelicShayna/neopi#TBD-provenance-followup fixes deferred dialog origin routing.
+          if (enableAttachedNativeDialogs) {
+            yield* enableNativeDialog(client, "set_ask_dialog");
+            yield* enableNativeDialog(client, "set_form_dialog");
+          }
           return {
             client,
             attachment: "terminal" as const,
@@ -3637,13 +3670,8 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       );
       if (attempt._tag === "Success") {
         const { client, hostTools } = attempt.success;
-        // Only stdio owners can opt in. A terminal control pipe has no setter in v19.
-        yield* client.request({ type: "set_ask_dialog", enabled: true }).pipe(
-          Effect.catchIf(
-            (error) => error.command === "set_ask_dialog" && error.code === undefined,
-            () => Effect.void,
-          ),
-        );
+        yield* enableNativeDialog(client, "set_ask_dialog");
+        yield* enableNativeDialog(client, "set_form_dialog");
         let booting = true;
         const readState = Effect.suspend(() => {
           const ordinary = client.request({ type: "get_state", includeDump: false }).pipe(

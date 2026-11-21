@@ -61,6 +61,7 @@ import {
 } from "../../state/use-composer-drafts";
 import { restoreNativeMobileQueuedDraft } from "../../state/native-queued-draft";
 import { NativeSessionComposer } from "./NativeSessionComposer";
+import { NativeSessionForm } from "./NativeSessionForm";
 import {
   NativeSessionWorkspaceControls,
   NativeSessionAgents,
@@ -646,6 +647,16 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           ask={obligation}
           request={request}
           onAnswered={() => markAnswered(obligation.id)}
+        />
+      ) : null}
+      {obligation?.kind === "form" ? (
+        <NativeSessionForm
+          key={obligation.id}
+          form={obligation}
+          respond={async (response) => {
+            await request(response);
+            markAnswered(obligation.id);
+          }}
         />
       ) : null}
       <View className="gap-2 border-t border-border px-4 py-3">

@@ -1,3 +1,6 @@
+import { FormUiRequest } from "effect-neopi-rpc/form";
+import * as Schema from "effect/Schema";
+import type { NativeForm } from "./neopiNativeForm.ts";
 import { nativeRecord } from "./neopiNativeSessions.ts";
 
 interface NativeAskOption {
@@ -21,12 +24,26 @@ export interface NativeAsk {
   readonly questions: readonly [NativeAskQuestion, ...NativeAskQuestion[]];
 }
 
+const decodeForm = Schema.decodeUnknownOption(FormUiRequest);
+
 export function selectNativeSessionDialog(
   dialogs: readonly Record<string, unknown>[],
   dismissed?: ReadonlySet<string>,
-): NativeAsk | { kind: "modal"; id: string; dialog: Record<string, unknown> } | null {
+): NativeAsk | NativeForm | { kind: "modal"; id: string; dialog: Record<string, unknown> } | null {
   for (const dialog of dialogs) {
     if (typeof dialog.id !== "string" || dismissed?.has(dialog.id)) continue;
+    if (dialog.type === "extension_ui_request" && dialog.method === "form") {
+      const form = decodeForm(dialog);
+      if (form._tag === "Some") {
+        return {
+          kind: "form",
+          id: form.value.id,
+          sections: form.value.sections,
+          acceptImages: form.value.acceptImages === true,
+        };
+      }
+      continue;
+    }
     if (dialog.type !== "extension_ui_request" || dialog.method !== "ask") {
       return { kind: "modal", id: dialog.id, dialog };
     }

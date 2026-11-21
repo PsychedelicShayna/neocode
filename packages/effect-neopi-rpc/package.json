@@ -17,6 +17,10 @@
       "types": "./src/schema.ts",
       "import": "./src/schema.ts"
     },
+    "./form": {
+      "types": "./src/form.ts",
+      "import": "./src/form.ts"
+    },
     "./frame": {
       "types": "./src/frame.ts",
       "import": "./src/frame.ts"

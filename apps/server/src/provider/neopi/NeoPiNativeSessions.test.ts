@@ -958,6 +958,50 @@ describe("canonical native session lifecycle", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("forwards a typed form submission and drops replies after NeoPi cancels", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      const publish = (id: string) =>
+        native.publish({
+          type: "extension_ui_request",
+          id,
+          method: "form",
+          sections: [],
+          hidden: [{ name: "context", value: "retained-by-owner" }],
+          timeout: 30000,
+        });
+      yield* publish("form-1");
+      yield* lease.next("obligation-opened", (env) => env.id === "form-1");
+      const data = { engine: "pg", replicas: 3, flags: ["read"] };
+      const submit = { type: "extension_ui_response", id: "form-1", data };
+      assert.deepEqual(yield* service.request({ ref: originalRef, command: submit }), {
+        accepted: true,
+      });
+      yield* lease.next("obligation-settled", (env) => env.id === "form-1");
+
+      yield* publish("form-2");
+      yield* lease.next("obligation-opened", (env) => env.id === "form-2");
+      yield* native.publish({
+        type: "extension_ui_request",
+        id: "cancel-form-2",
+        method: "cancel",
+        targetId: "form-2",
+      });
+      yield* lease.next("obligation-settled", (env) => env.id === "form-2");
+      assert.deepEqual(
+        yield* service.request({
+          ref: originalRef,
+          command: { ...submit, id: "form-2" },
+        }),
+        { accepted: false },
+      );
+      assert.deepEqual(native.uiResponses, [submit]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("passes dictation commands to the native owner and serves their outcome", () =>
     Effect.gen(function* () {
       const { service } = yield* fixture();
@@ -3739,6 +3783,9 @@ describe("opening native sessions with optional managed tmux", () => {
     "stale",
     "unsafe directory",
     "live owner",
+    "live owner with attached dialogs enabled",
+    "live older owner with attached dialogs enabled",
+    "older stdio owner without typed Form",
     "invalid launch arguments with a live owner",
     "prestarted owner without a matching lease",
     "saved owner after a binary change",
@@ -3753,6 +3800,10 @@ describe("opening native sessions with optional managed tmux", () => {
     "unconfirmed stop with a matching saved process",
     "unconfirmed stop with a reused PID",
   ] as const) {
+    const legacyAttached = scenario === "live older owner with attached dialogs enabled";
+    const enableAttachedNativeDialogs =
+      legacyAttached || scenario === "live owner with attached dialogs enabled";
+    const legacyForm = scenario === "older stdio owner without typed Form";
     const invalidArgs = scenario === "invalid launch arguments with a live owner";
     const fixtureOwner = scenario === "prestarted owner without a matching lease";
     const changedPath =
@@ -3809,7 +3860,7 @@ describe("opening native sessions with optional managed tmux", () => {
         const binary = NodePath.join(cwd, "npi");
         const binaryData = "mock NeoPi executable";
         yield* fs.writeFileString(binary, binaryData, { mode: 0o700 });
-        const live = scenario === "live owner" || invalidArgs;
+        const live = scenario === "live owner" || enableAttachedNativeDialogs || invalidArgs;
         const owner = {
           executable: "/fixture/tmux",
           session: "$0",
@@ -3859,7 +3910,7 @@ describe("opening native sessions with optional managed tmux", () => {
         );
         const force = vi.fn((_binding: ManagedTmux.ManagedTmuxBinding) => Effect.void);
         const requests: string[] = [];
-        const askNegotiations: Array<boolean | undefined> = [];
+        const dialogNegotiations: Array<{ type: string; enabled?: boolean | undefined }> = [];
         const gracefulExit = yield* Deferred.make<void>();
         const observeProcess = unconfirmedStop
           ? vi
@@ -3926,7 +3977,9 @@ describe("opening native sessions with optional managed tmux", () => {
         const spawned: ReadonlyArray<string>[] = [];
         const encode = (value: unknown) =>
           new TextEncoder().encode(`${encodeOptOutFixture(value)}\n`);
-        const service = yield* makeNeoPiNativeSessions().pipe(
+        const service = yield* makeNeoPiNativeSessions(
+          enableAttachedNativeDialogs ? { enableAttachedNativeDialogs } : undefined,
+        ).pipe(
           Effect.provide(
             Layer.mergeAll(
               configLayer(cwd, cwd),
@@ -3970,17 +4023,24 @@ describe("opening native sessions with optional managed tmux", () => {
                       stdin: Sink.forEach((chunk: Uint8Array) => {
                         const request = decodeOptOutRequest(new TextDecoder().decode(chunk));
                         requests.push(request.type);
-                        if (request.type === "set_ask_dialog")
-                          askNegotiations.push(request.enabled);
+                        const dialog =
+                          request.type === "set_ask_dialog" || request.type === "set_form_dialog";
+                        if (dialog)
+                          dialogNegotiations.push({ type: request.type, enabled: request.enabled });
+                        const rejected =
+                          (legacyAttached && dialog) ||
+                          (legacyForm && request.type === "set_form_dialog");
                         return Queue.offer(
                           stdout,
                           encode({
                             type: "response",
                             id: request.id,
                             command: request.type,
-                            success: true,
-                            data:
-                              request.type === "get_state"
+                            success: !rejected,
+                            ...(rejected ? { error: `Unknown command: ${request.type}` } : {}),
+                            data: dialog
+                              ? { enabled: request.enabled }
+                              : request.type === "get_state"
                                 ? { sessionId: owner.sessionId, sessionFile, messageCount: 0 }
                                 : request.type === "get_status"
                                   ? {
@@ -4189,7 +4249,15 @@ describe("opening native sessions with optional managed tmux", () => {
         }
         const opened = yield* service.open(ref);
         assert.equal(opened.attachment, live ? "terminal" : "owned");
-        assert.deepEqual(askNegotiations, live ? [] : [true]);
+        assert.deepEqual(
+          dialogNegotiations,
+          !live || enableAttachedNativeDialogs
+            ? [
+                { type: "set_ask_dialog", enabled: true },
+                { type: "set_form_dialog", enabled: true },
+              ]
+            : [],
+        );
         assert.deepEqual(spawned, [
           ["sessions", "list", "--json", "--session-dir", cwd],
           live

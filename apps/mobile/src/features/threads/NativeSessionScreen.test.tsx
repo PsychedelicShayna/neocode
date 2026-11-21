@@ -117,6 +117,8 @@ vi.mock("../../state/use-atom-command", () => ({
 
 // Native visuals and unrelated composer persistence are outside this regression.
 // In particular, both exit handlers below are supplied by the real screen.
+vi.mock("expo-image", () => ({ Image: () => null }));
+vi.mock("expo-image-picker", () => ({ launchImageLibraryAsync: vi.fn() }));
 vi.mock("../../state/native-queued-draft", () => ({
   restoreNativeMobileQueuedDraft: vi.fn(),
 }));
@@ -140,6 +142,24 @@ vi.mock("react-native", async () => {
     View: Box,
     ScrollView: Box,
     KeyboardAvoidingView: Box,
+    TextInput: ({
+      accessibilityLabel,
+      value,
+      editable,
+      onChangeText,
+    }: {
+      accessibilityLabel: string;
+      value: string;
+      editable: boolean;
+      onChangeText: (value: string) => void;
+    }) => (
+      <input
+        aria-label={accessibilityLabel}
+        disabled={!editable}
+        value={value}
+        onInput={(event) => onChangeText(event.currentTarget.value)}
+      />
+    ),
     FlatList: forwardRef<
       { scrollToEnd: () => void },
       {
@@ -831,6 +851,94 @@ describe("NativeSessionScreen Ask", () => {
     }),
   );
 });
+
+it.effect(
+  "renders Form above the composer, validates required input, and answers without hidden data",
+  () =>
+    Effect.gen(function* () {
+      const sent = vi.fn();
+      const h = yield* makeHarness({
+        session: { ...session, attachment: "owned" },
+        request: (command) =>
+          Effect.sync(() => {
+            if (command.type === "extension_ui_response") sent(command);
+            return {};
+          }),
+      });
+      yield* Effect.promise(async () => {
+        const screen = mountScreen(h);
+        try {
+          await act(async () => {
+            screen.render();
+            await screen.selectCanonicalSession();
+            h.flush();
+          });
+          const form = {
+            type: "extension_ui_request",
+            method: "form",
+            id: "mobile-form",
+            timeout: 30000,
+            hidden: [{ name: "context", value: "server-only" }],
+            sections: [
+              {
+                title: [{ text: "Database" }],
+                fieldset: true,
+                blocks: [
+                  {
+                    kind: "field",
+                    field: {
+                      kind: "text",
+                      type: "number",
+                      name: "replicas",
+                      label: [{ text: "Replicas" }],
+                      placeholder: "",
+                      required: true,
+                      rows: 1,
+                      value: "",
+                      multiline: false,
+                      min: 1,
+                    },
+                  },
+                ],
+              },
+            ],
+          };
+          await act(() => h.openDialog(form));
+          const focused = screen.focused();
+          const field = focused.querySelector<HTMLInputElement>(
+            '[aria-label="Replicas (required)"]',
+          )!;
+          const composer = focused.querySelector('[aria-label="Composer"]')!;
+          expect(
+            field.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING,
+          ).toBeTruthy();
+          expect(focused.querySelector('[role="dialog"]')).toBeNull();
+          expect(focused.textContent).not.toContain("server-only");
+          await act(() => screen.click("Submit form"));
+          expect(focused.textContent).toContain("Enter a value.");
+          expect(sent).not.toHaveBeenCalled();
+          await act(() => {
+            field.value = "3";
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+          });
+          await act(() => screen.click("Submit form"));
+          expect(sent).toHaveBeenCalledExactlyOnceWith({
+            type: "extension_ui_response",
+            id: form.id,
+            data: { replicas: 3 },
+          });
+          expect(focused.textContent).not.toContain("Database");
+          await act(() => h.openDialog({ ...form, id: "expired-form" }));
+          expect(focused.textContent).toContain("Database");
+          await act(() => h.cancelDialog("expired-form"));
+          expect(focused.textContent).not.toContain("Database");
+          expect(sent).toHaveBeenCalledTimes(1);
+        } finally {
+          await screen.cleanup();
+        }
+      });
+    }),
+);
 
 describe("NativeSessionScreen exit and canonical reselection", () => {
   it.effect("Back releases the closed watch boundary before reopening the same session", () =>

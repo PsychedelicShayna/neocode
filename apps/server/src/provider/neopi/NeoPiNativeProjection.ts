@@ -520,6 +520,7 @@ const DIALOG_METHODS: ReadonlySet<string> = new Set([
   "input",
   "editor",
   "ask",
+  "form",
 ]);
 
 /** `get_state` fields and the event that changes each, folded into one `setting:<property>` key. */

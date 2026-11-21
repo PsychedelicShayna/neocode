@@ -35,16 +35,18 @@ Read ports from the `[dev-runner]` output. Worktrees derive stable preferences f
 but occupied ports can shift them. `T3CODE_PORT_OFFSET` or `T3CODE_DEV_INSTANCE` can select a
 different preference when needed.
 
-### Host existing native sessions in tmux
+### Host native sessions in tmux
 
 Set `T3CODE_NEOPI_TMUX=1` in the **NeoCode server's** environment and restart
-NeoCode. This is off by default and requires Linux or macOS, `tmux` on the
-server's `PATH`, and NeoPi control enabled for the configured profile.
+NeoCode. This is off by default and requires Linux, `tmux` on the server's
+`PATH`, and NeoPi with control enabled and exact-file lease queries.
 
-When you open a populated native session that has no live owner, NeoCode starts
-its NeoPi TUI on a private tmux socket in the NeoCode state directory. Open
-**TUI** to see the same owner. Closing the view or restarting NeoCode does not
-stop the owner; reopening the session reconnects to it without starting another.
+When you start a new native session or open an existing one without a live
+owner, NeoCode starts its NeoPi TUI on a private tmux socket in the NeoCode
+state directory. NeoCode proceeds only if NeoPi attests that the exact pane
+process owns the session file lease, including before the first turn is written.
+Open **TUI** to see the same owner. Closing the view or restarting NeoCode
+does not stop the owner; reopening the session reconnects without starting another.
 In the **Agents** panel, select a subagent and choose **Monitor**, or choose
 **Monitor** beside an advisor. This opens a separate tmux window in the
 embedded terminal, without starting or replacing the session's NeoPi writer.
@@ -62,11 +64,28 @@ the session is in use but cannot be attached. It does not start a replacement
 while the session is in use. The managed **TUI** view is not available for
 these owners while the opt-in is off.
 
-NeoPi v19's catalog omits untouched, untitled sessions and cannot report their
-file lease. NeoCode refuses to drive these sessions in tmux, including a
-brand-new session. Use the default (direct) mode to start a new session. A
-missing tmux or disabled control is an error, not a reason to start a direct
-owner while the setting is on.
+If another writer holds the lease or NeoPi cannot attest the pane's lease,
+NeoCode refuses the managed open. Update older NeoPi builds before enabling
+this mode. Missing tmux or disabled control is also an error; NeoCode does not
+fall back to a direct owner while the setting is on.
+
+Managed tmux launches do not accept configured **Launch arguments**. Set
+defaults in the NeoPi profile and send prompts from NeoCode after opening
+the session. NeoCode does not retry a rejected lease in the background.
+
+NeoCode records the launch executable's path and SHA-256 for each managed
+owner. After an in-place upgrade, the current CLI can reconnect only if it
+attests the exact session-file lease to the same pane PID and running NeoPi
+identity. A different executable path or a missing legacy pin is refused.
+If NeoCode cannot verify the saved owner, exit with `/exit` in its TUI, or
+choose **Force Stop** from the session's NeoCode menu if it is available.
+Force Stop ends the process without a graceful exit. It requires the exact
+live pane and the Linux process identity recorded in its binding, which is
+checked again before signaling via pidfd. This also applies when graceful
+Stop is unconfirmed. If Force Stop refuses because the pane or process
+changed during the final checks, NeoCode directs you to exit with `/exit`
+in the old TUI and reopen after both the old pane and process have exited.
+On reopen, NeoCode verifies the new owner's lease and records its executable.
 
 ### Attach a prestarted NeoPi TUI
 
@@ -89,6 +108,9 @@ only pane in the only window of the configured tmux session; do not leave a
 wrapper process as the pane's PID. Leave control enabled. Set `exit-unattached
 off`, `destroy-unattached off`, `allow-passthrough off`, `window-size latest`,
 and `aggressive-resize off` in the dedicated tmux configuration.
+
+Use a NeoPi release with exact-file lease queries. A registry match is not
+enough: the exact-file lease must attest that pane before NeoCode attaches.
 
 Open the existing native session and select **TUI** at the far right of its
 status bar. Closing the view detaches its tmux client, not the NeoPi owner.

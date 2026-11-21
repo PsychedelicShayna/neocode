@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- managed state filenames use the canonical session hash.
 import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import { assert, describe, it } from "@effect/vitest";
 import { NodeFileSystem } from "@effect/platform-node";
@@ -20,6 +21,7 @@ import {
 import type { ProcessExit, SessionEventFrame } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -38,6 +40,7 @@ import { deriveServerPaths, layerTest as configLayer } from "../../config.ts";
 import { layerTest as settingsLayer } from "../../serverSettings.ts";
 import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.ts";
 import * as HostToolBridge from "./NeoPiHostToolBridge.ts";
+import * as ManagedProcess from "./NeoPiManagedProcess.ts";
 import * as ManagedTmux from "./NeoPiManagedTmux.ts";
 import { registerNeoPiSessionCatalogSource } from "./NeoPiSessionCatalogSource.ts";
 import {
@@ -2632,6 +2635,42 @@ describe("server wiring review round", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("ends recovery and passive discovery on the first rejected tmux attestation", () =>
+    Effect.gen(function* () {
+      const { dependencies, native } = yield* fixture("terminal");
+      let attempts = 0;
+      const service = yield* makeNeoPiNativeSessionsWith({
+        ...dependencies,
+        connect: (...args) => {
+          attempts++;
+          return dependencies.connect(...args);
+        },
+      });
+      yield* service.open(originalRef);
+      const lease = yield* follow(service, originalRef);
+      yield* lease.next("lifecycle", observing);
+      native.attachError = new NeoPiNativeSessionsError({
+        code: "tmux_lease_unverified",
+        message: "Different writer holds the lease",
+      });
+      yield* Deferred.succeed(native.exit!, ownerExited);
+      yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(attempts, 2);
+      assert.equal(
+        (yield* lease.next("lifecycle", (envelope) => envelope.state === "incompatible")).reason,
+        "Different writer holds the lease",
+      );
+      yield* Fiber.join(lease.fiber);
+
+      const passive = yield* follow(service, originalRef);
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(attempts, 3);
+      yield* passive.next("lifecycle", (envelope) => envelope.state === "incompatible");
+      yield* Fiber.join(passive.fiber);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("a discovery cancelled while its candidate connects closes that candidate", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture("terminal");
@@ -3639,22 +3678,60 @@ const decodeOptOutRequest = Schema.decodeSync(
   Schema.fromJsonString(Schema.Struct({ id: Schema.String, type: Schema.String })),
 );
 
-describe("opening native sessions with managed tmux disabled", () => {
+describe("opening native sessions with optional managed tmux", () => {
   for (const scenario of [
     "malformed",
     "stale",
     "unsafe directory",
     "live owner",
     "invalid launch arguments with a live owner",
+    "prestarted owner without a matching lease",
+    "saved owner after a binary change",
+    "saved owner with unknown liveness after a binary change",
+    "attested owner after a same-path binary replacement",
+    "unattested owner after a same-path binary replacement",
+    "exited owner after a binary change",
+    "exited owner without a binary pin",
+    "saved owner without a binary pin",
+    "graceful stop without a matching lease",
+    "unconfirmed stop without a saved process",
+    "unconfirmed stop with a matching saved process",
+    "unconfirmed stop with a reused PID",
   ] as const) {
     const invalidArgs = scenario === "invalid launch arguments with a live owner";
-    const name = invalidArgs
-      ? `rejects ${scenario} before attaching`
-      : `uses the ordinary open path with ${scenario} managed state`;
+    const fixtureOwner = scenario === "prestarted owner without a matching lease";
+    const changedPath =
+      scenario === "saved owner after a binary change" ||
+      scenario === "exited owner after a binary change" ||
+      scenario === "saved owner with unknown liveness after a binary change";
+    const attestedUpgrade = scenario === "attested owner after a same-path binary replacement";
+    const changedBytes =
+      attestedUpgrade || scenario === "unattested owner after a same-path binary replacement";
+    const missingPin =
+      scenario === "saved owner without a binary pin" ||
+      scenario === "exited owner without a binary pin";
+    const exitedOwner = scenario.startsWith("exited owner");
+    const unknownOwner = scenario === "saved owner with unknown liveness after a binary change";
+    const changedBinary = changedPath || changedBytes || missingPin;
+    const stopOwner = scenario === "graceful stop without a matching lease";
+    const unconfirmedStop = scenario.startsWith("unconfirmed stop");
+    const missingProcess = scenario === "unconfirmed stop without a saved process";
+    const reusedPid = scenario === "unconfirmed stop with a reused PID";
+    const savedOwner = changedBinary || stopOwner || unconfirmedStop;
+    const name = unconfirmedStop
+      ? `gates Force Stop after ${scenario}`
+      : exitedOwner
+        ? `reaches a new managed launch with ${scenario}`
+        : attestedUpgrade
+          ? "reattaches to the same lease holder after a same-path binary replacement"
+          : invalidArgs || fixtureOwner || savedOwner
+            ? `rejects ${scenario} before opening a control pipe`
+            : `uses the ordinary open path with ${scenario} managed state`;
     it.live(name, () =>
       Effect.gen(function* () {
         vi.stubEnv("T3CODE_NEOPI_TMUX", undefined);
         vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", undefined);
+        const createHost = ManagedTmux.makeManagedTmuxHost;
         const makeHost = vi.spyOn(ManagedTmux, "makeManagedTmuxHost");
         const hostTools = vi
           .spyOn(HostToolBridge, "makeNeoPiNativeHostToolPump")
@@ -3674,6 +3751,9 @@ describe("opening native sessions with managed tmux disabled", () => {
         yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
         if (scenario === "unsafe directory") yield* fs.chmod(directory, 0o755);
         yield* fs.writeFileString(sessionFile, "");
+        const binary = NodePath.join(cwd, "npi");
+        const binaryData = "mock NeoPi executable";
+        yield* fs.writeFileString(binary, binaryData, { mode: 0o700 });
         const live = scenario === "live owner" || invalidArgs;
         const owner = {
           executable: "/fixture/tmux",
@@ -3686,13 +3766,25 @@ describe("opening native sessions with managed tmux disabled", () => {
           sessionId: "existing-session",
         };
         const key = NodeCrypto.createHash("sha256").update(sessionFile).digest("hex");
+        const processIdentity = { start: "1001", image: "1:2002" };
         const binding = {
           socket: NodePath.join(directory, "s"),
           session: "managed",
           sessionFile,
           providerInstanceId: instanceId,
           profile: null,
+          ...(savedOwner && !missingPin
+            ? {
+                neoPiBinary: {
+                  path: changedPath ? `${binary}-previous` : binary,
+                  sha256: NodeCrypto.createHash("sha256")
+                    .update(changedBytes ? "previous executable" : binaryData)
+                    .digest("hex"),
+                },
+              }
+            : {}),
           owner,
+          ...(!missingProcess ? { process: processIdentity } : {}),
         } satisfies ManagedTmux.ManagedTmuxBinding;
         const bindingPath = NodePath.join(directory, `${key}.json`);
         yield* fs.writeFileString(
@@ -3700,6 +3792,50 @@ describe("opening native sessions with managed tmux disabled", () => {
           scenario === "malformed" ? "not JSON" : encodeOptOutFixture(binding),
         );
         yield* fs.chmod(bindingPath, 0o600);
+        const probeOwner = vi.spyOn(ManagedTmux, "resolveManagedTmuxOwner");
+        yield* Effect.addFinalizer(() => Effect.sync(() => probeOwner.mockRestore()));
+        const launch = vi.fn(() =>
+          Effect.fail(
+            new NeoPiNativeSessionsError({
+              code: "session_in_use",
+              message: "A different writer acquired the session lease.",
+            }),
+          ),
+        );
+        const force = vi.fn((_binding: ManagedTmux.ManagedTmuxBinding) => Effect.void);
+        const requests: string[] = [];
+        const gracefulExit = yield* Deferred.make<void>();
+        const observeProcess = unconfirmedStop
+          ? vi
+              .spyOn(ManagedProcess, "observeManagedProcess")
+              .mockResolvedValue({ state: "alive", identity: processIdentity })
+          : undefined;
+        if (observeProcess)
+          yield* Effect.addFinalizer(() => Effect.sync(() => observeProcess.mockRestore()));
+        if (fixtureOwner) {
+          vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", encodeOptOutFixture(binding));
+          probeOwner.mockReturnValue(Effect.succeed(owner));
+        }
+        if (savedOwner) {
+          vi.stubEnv("T3CODE_NEOPI_TMUX", "1");
+          const host = createHost(stateDir, owner.executable, "linux");
+          makeHost.mockReturnValue({
+            ...host,
+            panes: Effect.succeed([
+              `${binding.session}|${owner.session}|${owner.window}|${owner.pane}|${owner.pid}|0`,
+            ]),
+            ...(exitedOwner ? { launch } : {}),
+            force,
+            observe: unconfirmedStop
+              ? host.observe
+              : () =>
+                  Effect.succeed({
+                    liveness: exitedOwner ? "exited" : unknownOwner ? "unknown" : "alive",
+                    forceTargetVerified: !exitedOwner && !unknownOwner,
+                  }),
+          });
+          probeOwner.mockReturnValue(Effect.succeed(owner));
+        }
 
         const instance = registerNeoPiSessionCatalogSource(
           {
@@ -3722,7 +3858,7 @@ describe("opening native sessions with managed tmux disabled", () => {
             },
           },
           {
-            binary: "/fixture/npi",
+            binary,
             env: {},
             profile: "default",
             ...(invalidArgs ? { launchArgs: "--fork" } : {}),
@@ -3750,13 +3886,15 @@ describe("opening native sessions with managed tmux disabled", () => {
                       return yield* Effect.die("Unexpected piped child command");
                     spawned.push(command.args);
                     const catalog = command.args[0] === "sessions";
+                    const lease = command.args[0] === "session" && command.args[1] === "lease";
+                    const publication = command.args[0] === "ctl" && command.args[1] === "list";
                     const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
                     const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
                     const finish = Queue.end(stdout).pipe(
                       Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
                       Effect.asVoid,
                     );
-                    if (!catalog)
+                    if (!catalog && !lease && !publication)
                       yield* Queue.offer(
                         stdout,
                         encode({
@@ -3767,13 +3905,15 @@ describe("opening native sessions with managed tmux disabled", () => {
                       );
                     return ChildProcessSpawner.makeHandle({
                       pid: ChildProcessSpawner.ProcessId(123),
-                      exitCode: catalog
-                        ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
-                        : Deferred.await(exited),
+                      exitCode:
+                        catalog || lease || publication
+                          ? Effect.succeed(ChildProcessSpawner.ExitCode(0))
+                          : Deferred.await(exited),
                       isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
                       kill: () => finish,
                       stdin: Sink.forEach((chunk: Uint8Array) => {
                         const request = decodeOptOutRequest(new TextDecoder().decode(chunk));
+                        requests.push(request.type);
                         return Queue.offer(
                           stdout,
                           encode({
@@ -3784,8 +3924,26 @@ describe("opening native sessions with managed tmux disabled", () => {
                             data:
                               request.type === "get_state"
                                 ? { sessionId: owner.sessionId, sessionFile, messageCount: 0 }
-                                : {},
+                                : request.type === "get_status"
+                                  ? {
+                                      instanceId: owner.instanceId,
+                                      imageId: owner.imageId,
+                                      pid: owner.pid,
+                                      role: "tui",
+                                      ready: true,
+                                      cwd,
+                                      tmux: { pane: owner.pane },
+                                      revisions: { generation: 1 },
+                                      session: { sessionId: owner.sessionId, sessionFile },
+                                    }
+                                  : {},
                           }),
+                        ).pipe(
+                          Effect.tap(() =>
+                            request.type === "slash"
+                              ? Deferred.succeed(gracefulExit, undefined)
+                              : Effect.void,
+                          ),
                         );
                       }).pipe(Sink.ensuring(finish)),
                       stdout: catalog
@@ -3808,7 +3966,34 @@ describe("opening native sessions with managed tmux disabled", () => {
                               ],
                             }),
                           )
-                        : Stream.fromQueue(stdout),
+                        : lease
+                          ? Stream.make(
+                              encode(
+                                attestedUpgrade || unconfirmedStop
+                                  ? { status: "held", sessionFile, holder: owner }
+                                  : { status: "not_held", sessionFile },
+                              ),
+                            )
+                          : publication
+                            ? Stream.make(
+                                encode({
+                                  version: 1,
+                                  sessions: [
+                                    {
+                                      meta: {
+                                        ...owner,
+                                        profile: binding.profile,
+                                        role: "tui",
+                                        sessionFile,
+                                        tmuxPane: owner.pane,
+                                        procStartTicks: Number(processIdentity.start),
+                                      },
+                                      snapshot: null,
+                                    },
+                                  ],
+                                }),
+                              )
+                            : Stream.fromQueue(stdout),
                       stderr: Stream.empty,
                       all: Stream.empty,
                       getInputFd: () => Sink.drain,
@@ -3821,6 +4006,119 @@ describe("opening native sessions with managed tmux disabled", () => {
           ),
         );
         const ref = { providerInstanceId: instanceId, sessionFile };
+        if (unconfirmedStop) {
+          const stop = { ref, imageId: owner.imageId } as const;
+          yield* service.stopManaged({ ...stop, action: "stop" });
+          yield* Deferred.await(gracefulExit).pipe(Effect.timeout("3 seconds"));
+          assert.deepEqual(requests, ["get_status", "slash"]);
+          const stopKey = NodeCrypto.createHash("sha256")
+            .update(`${sessionFile}\0${owner.imageId}`)
+            .digest("hex");
+          const past = ((yield* Clock.currentTimeMillis) - 13_000) / 1000;
+          yield* Effect.promise(() =>
+            NodeFSP.utimes(NodePath.join(directory, `stop-${stopKey}`), past, past),
+          );
+          if (reusedPid)
+            observeProcess?.mockResolvedValue({
+              state: "alive",
+              identity: { ...processIdentity, start: "1002" },
+            });
+          const catalog = yield* service.list({ providerInstanceId: instanceId });
+          const managed = catalog.sessions.find(
+            (session) => session.ref.sessionFile === sessionFile,
+          )?.managed;
+          assert.ok(managed);
+          assert.equal(managed.stop, "unconfirmed");
+          const result = yield* service
+            .stopManaged({ ...stop, action: "force" })
+            .pipe(Effect.result);
+          const allowed = !missingProcess && !reusedPid;
+          assert.deepEqual(
+            { offered: managed.canForceStop, dispatched: result._tag, hostCalls: force.mock.calls },
+            {
+              offered: allowed,
+              dispatched: allowed ? "Success" : "Failure",
+              hostCalls: allowed ? [[binding]] : [],
+            },
+          );
+          if (result._tag === "Failure") {
+            assert.equal(result.failure.code, "tmux_force_not_available");
+            assert.match(result.failure.message, /exit with \/exit.*reopen/i);
+          }
+          return;
+        }
+        if (fixtureOwner) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, "tmux_lease_unverified");
+          assert.deepEqual(spawned, [["session", "lease", "--file", sessionFile, "--json"]]);
+          assert.equal(makeHost.mock.calls.length, 0);
+          const view = yield* service.managedTmuxView(ref).pipe(Effect.flip);
+          assert.equal(view.code, "tmux_lease_unverified");
+          assert.deepEqual(spawned, [
+            ["session", "lease", "--file", sessionFile, "--json"],
+            ["session", "lease", "--file", sessionFile, "--json"],
+          ]);
+          const passive = yield* follow(service, ref);
+          yield* passive.next("lifecycle", (envelope) => envelope.state === "incompatible");
+          yield* Fiber.join(passive.fiber);
+          assert.equal(spawned.length, 2, "passive discovery must reuse this owner's refusal");
+
+          probeOwner.mockReturnValue(Effect.succeed({ ...owner, instanceId: "successor-control" }));
+          const successor = yield* follow(service, ref);
+          yield* successor.next("lifecycle", (envelope) => envelope.state === "incompatible");
+          yield* Fiber.join(successor.fiber);
+          assert.equal(spawned.length, 3, "a different owner instance gets one attestation");
+          return;
+        }
+        if (exitedOwner) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, "session_in_use");
+          assert.equal(yield* fs.exists(bindingPath), false);
+          assert.equal(launch.mock.calls.length, 1);
+          assert.equal(probeOwner.mock.calls.length, 0);
+          assert.deepEqual(spawned, [["sessions", "list", "--json", "--session-dir", cwd]]);
+          return;
+        }
+        if (attestedUpgrade) {
+          const opened = yield* service.open(ref);
+          assert.equal(opened.attachment, "terminal");
+          assert.deepEqual(spawned, [
+            ["session", "lease", "--file", sessionFile, "--json"],
+            ["ctl", "pipe", owner.instanceId, "--label", "neocode-native"],
+          ]);
+          assert.equal(probeOwner.mock.calls.length, 1);
+          assert.equal(yield* fs.readFileString(bindingPath), encodeOptOutFixture(binding));
+          yield* service.close({ ref });
+          return;
+        }
+        if (changedBinary) {
+          const result = yield* service.open(ref).pipe(Effect.flip);
+          assert.equal(result.code, changedBytes ? "tmux_lease_unverified" : "tmux_binary_changed");
+          assert.match(result.message, /Stop.*NeoCode.*reopen/i);
+          assert.equal(yield* fs.exists(bindingPath), true);
+          assert.equal(probeOwner.mock.calls.length, 0);
+          if (changedBytes) {
+            const forceStop = { ref, imageId: owner.imageId, action: "force" } as const;
+            const gracefulError = yield* service
+              .stopManaged({ ...forceStop, action: "stop" })
+              .pipe(Effect.flip);
+            assert.equal(gracefulError.code, "tmux_lease_unverified");
+            assert.equal(force.mock.calls.length, 0);
+            yield* service.stopManaged(forceStop);
+            assert.deepEqual(force.mock.calls, [[binding]]);
+          }
+          const leaseArgs = ["session", "lease", "--file", sessionFile, "--json"];
+          assert.deepEqual(spawned, changedBytes ? [leaseArgs, leaseArgs] : []);
+          return;
+        }
+        if (stopOwner) {
+          const result = yield* service
+            .stopManaged({ ref, imageId: owner.imageId, action: "stop" })
+            .pipe(Effect.result);
+          assert.deepEqual(spawned, [["session", "lease", "--file", sessionFile, "--json"]]);
+          assert.equal(result._tag === "Failure" && result.failure.code, "tmux_lease_unverified");
+          return;
+        }
         if (invalidArgs) {
           const result = yield* service.open(ref).pipe(Effect.result);
           assert.equal(result._tag, "Failure");

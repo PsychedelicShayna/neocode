@@ -106,9 +106,11 @@ const wrongSession = () =>
     message: "This managed tmux pane belongs to a different native session or profile.",
     code: "session_changed",
   });
-const changedOwner = () =>
+export const managedForceStopRecovery = "Exit with /exit in the old TUI, then reopen the session.";
+
+const changedOwner = (recovery = "Reopen the view.") =>
   new NeoPiNativeSessionsError({
-    message: "The managed tmux pane's NeoPi control identity changed. Reopen the view.",
+    message: `The managed tmux pane's NeoPi control identity changed. ${recovery}`,
     code: "tmux_owner_changed",
   });
 const noOwner = () =>
@@ -329,6 +331,8 @@ const Binding = Schema.Struct({
   session: Schema.String,
   ...NeoPiNativeSessionRef.fields,
   profile: Schema.NullOr(Schema.String),
+  // Keep legacy records readable so they are refused explicitly, not treated as absent.
+  neoPiBinary: Schema.optional(Schema.Struct({ path: Schema.String, sha256: Schema.String })),
   process: Schema.optional(Schema.Struct({ start: Schema.String, image: Schema.String })),
   owner: Schema.Struct({
     executable: Schema.String,
@@ -380,7 +384,7 @@ export function managedControlPublication(
           return { kind: "changed" as const };
       }
     }
-    return { kind: "same" as const, snapshot, start: meta.procStartTicks ?? undefined };
+    return { kind: "same" as const, snapshot };
   }
   return undefined;
 }
@@ -391,9 +395,6 @@ const decodeBinding = Schema.decodeUnknownSync(bindingJson);
 const encodeBinding = Schema.encodeSync(bindingJson);
 const tmuxError = (code: string, message: string) =>
   new NeoPiNativeSessionsError({ code, message });
-
-const sessionInUse = () =>
-  tmuxError("session_in_use", "The native session is already open elsewhere.");
 
 export const rebindManagedTmux = Effect.fnUntraced(function* <B extends TmuxBindingIdentity>(
   saved: B,
@@ -410,42 +411,107 @@ export const rebindManagedTmux = Effect.fnUntraced(function* <B extends TmuxBind
   return binding;
 });
 
-export const bindOrStartManagedTmux = Effect.fnUntraced(function* <B extends TmuxBindingIdentity>(
-  saved: B | undefined,
-  rebind: (saved: B) => Effect.Effect<B, NeoPiNativeSessionsError>,
-  start: () => Effect.Effect<B, NeoPiNativeSessionsError>,
-  findHolder: () => Effect.Effect<string | undefined, NeoPiNativeSessionsError> = () =>
-    Effect.undefined,
+const LeaseHolder = Schema.Struct({
+  pid: Schema.Int,
+  instanceId: Schema.NonEmptyString,
+  imageId: Schema.NonEmptyString,
+});
+const LeaseReport = Schema.fromJsonString(
+  Schema.Union([
+    Schema.Struct({
+      status: Schema.Literal("held"),
+      sessionFile: Schema.String,
+      holder: LeaseHolder,
+    }),
+    Schema.Struct({ status: Schema.Literal("held_unknown"), sessionFile: Schema.String }),
+    Schema.Struct({ status: Schema.Literal("not_held"), sessionFile: Schema.String }),
+    Schema.Struct({
+      status: Schema.Literal("inspection_failed"),
+      sessionFile: Schema.String,
+      reason: Schema.String,
+    }),
+  ]),
+);
+const decodeLeaseReport = Schema.decodeUnknownOption(LeaseReport);
+
+interface LeaseCommandOutput {
+  readonly ok: boolean;
+  readonly out: string;
+  readonly err: string;
+}
+
+const unverifiedLease = (reason: string) =>
+  tmuxError("tmux_lease_unverified", `Could not verify the NeoPi session lease: ${reason}`);
+
+function leaseHolder(sessionFile: string, output: LeaseCommandOutput) {
+  if (!output.ok) {
+    const diagnostic = output.err || output.out;
+    if (/(?:unknown|unrecognized|unsupported|unexpected) (?:option|flag).*--file/i.test(diagnostic))
+      throw tmuxError(
+        "tmux_lease_unsupported",
+        "NeoPi too old for tmux sessions. Update NeoPi to a release with exact-file lease queries.",
+      );
+    throw unverifiedLease(diagnostic.trim().split("\n", 1)[0] || "the lease command failed.");
+  }
+  const decoded = decodeLeaseReport(output.out);
+  if (decoded._tag === "None") throw unverifiedLease("NeoPi returned an invalid lease report.");
+  const report = decoded.value;
+  if (report.sessionFile !== sessionFile)
+    throw unverifiedLease("NeoPi reported a different session file.");
+  switch (report.status) {
+    case "held":
+      return report.holder;
+    case "not_held":
+      return undefined;
+    case "held_unknown":
+      throw unverifiedLease("the lease is held, but NeoPi could not attest its holder.");
+    case "inspection_failed":
+      throw unverifiedLease(report.reason || "NeoPi could not inspect the lease.");
+  }
+}
+
+export const verifyManagedTmuxLease = Effect.fnUntraced(function* (
+  binding: Pick<TmuxBindingIdentity, "sessionFile" | "owner">,
+  query: Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>,
 ) {
-  if (saved) return { kind: "bound" as const, binding: yield* rebindManagedTmux(saved, rebind) };
-  const started = yield* Effect.suspend(start).pipe(Effect.result);
-  if (started._tag === "Success") return { kind: "bound" as const, binding: started.success };
-  if (started.failure.code !== "session_in_use") return yield* started.failure;
-  const instanceId = yield* findHolder();
-  if (!instanceId) return yield* started.failure;
-  return { kind: "contended" as const, instanceId };
+  const output = yield* query;
+  return yield* Effect.try({
+    try: () => {
+      const holder = leaseHolder(binding.sessionFile, output);
+      if (!holder) throw unverifiedLease("the lease is not held.");
+      if (holder.pid !== binding.owner.pid)
+        throw unverifiedLease(
+          `the lease is held by PID ${holder.pid}, not managed pane PID ${binding.owner.pid}.`,
+        );
+      if (
+        holder.instanceId !== binding.owner.instanceId ||
+        holder.imageId !== binding.owner.imageId
+      )
+        throw unverifiedLease(
+          "the lease holder's control identity does not match the managed pane.",
+        );
+    },
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : unverifiedLease(String(cause))),
+  });
 });
 
-export function verifyManagedTmuxLease(
-  owner: ManagedTmuxOwner,
-  catalog:
-    | {
-        readonly id: string;
-        readonly inUse: { readonly pid: number } | null;
-        readonly control: { readonly instanceId: string } | null;
-      }
-    | undefined,
+const requireUnheldLease = Effect.fnUntraced(function* (
+  file: string,
+  query: Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>,
 ) {
-  if (
-    catalog?.inUse?.pid !== owner.pid ||
-    catalog.id !== owner.sessionId ||
-    catalog.control?.instanceId !== owner.instanceId
-  )
-    throw tmuxError(
-      "tmux_lease_unverified",
-      "NeoPi did not verify the managed tmux owner's session lease. NeoPi v19 cannot verify untitled sessions that are absent from its catalog.",
-    );
-}
+  const output = yield* query;
+  return yield* Effect.try({
+    try: () => {
+      const holder = leaseHolder(file, output);
+      if (holder)
+        throw tmuxError(
+          "session_in_use",
+          `The native session is already open elsewhere (PID ${holder.pid}).`,
+        );
+    },
+    catch: (cause) => (isNativeSessionsError(cause) ? cause : unverifiedLease(String(cause))),
+  });
+});
 
 export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   readonly executable: string | undefined;
@@ -457,20 +523,18 @@ export const managedTmuxLaunchPlan = Effect.fnUntraced(function* (input: {
   if (!input.executable) return yield* tmuxMissing();
   if (input.extra.some((arg) => arg.split("=", 1)[0] === "--no-control-socket"))
     return yield* unavailable();
-  // Managed owners need an interactive TUI with durable native identity, not a startup prompt
-  // supplied through positional arguments or a different mode after the option terminator.
-  if (input.extra.some((arg) => arg === "--" || arg === "--print"))
+  if (input.extra.length > 0)
     return yield* tmuxError(
       "tmux_launch_failed",
-      "NeoPi launch arguments must keep managed sessions interactive.",
+      "Managed tmux launches do not accept configured NeoPi launch arguments. Clear Launch arguments in NeoCode settings and configure defaults in the NeoPi profile.",
     );
+  // Extensions can shadow builtins. Keep each value in the same token as its
+  // option so NeoPi's extension-aware reparse never treats it as a prompt.
   return [
     input.binary,
-    "--cwd",
-    input.cwd,
+    `--cwd=${input.cwd}`,
     "--no-title",
-    ...input.extra,
-    ...(input.sessionFile ? ["--session", input.sessionFile] : ["--new-session"]),
+    input.sessionFile ? `--session=${input.sessionFile}` : "--new-session",
   ];
 });
 
@@ -640,6 +704,28 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
   };
 });
 
+// Only retirees unlink bindings. Serialize compare-and-unlink across server
+// processes; publication still uses a no-replace link. A lock on the private
+// directory itself needs no crash recovery.
+const unlinkExitedBinding = `
+import fcntl, hashlib, os, sys
+directory, name, expected, stop = sys.argv[1:]
+fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+fcntl.flock(fd, fcntl.LOCK_EX)
+try:
+    entry = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    with os.fdopen(entry, 'rb') as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != expected:
+            sys.exit(42)
+    os.unlink(name, dir_fd=fd)
+except FileNotFoundError:
+    sys.exit(42)
+try:
+    os.unlink(stop, dir_fd=fd)
+except FileNotFoundError:
+    pass
+`;
+
 export const makeManagedTmuxHost = (
   stateDir: string,
   executable: string | undefined,
@@ -693,27 +779,56 @@ export const makeManagedTmuxHost = (
       "tmux_storage_unavailable",
       "The managed tmux identities could not be read or saved.",
     );
+  const readPrivateBinding = async (file: string) => {
+    await checkDirectory();
+    const path = bindingFile(file);
+    const stat = await NodeFSP.lstat(path);
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
+      throw new Error("Not a private binding");
+    const raw = await NodeFSP.readFile(path, "utf8");
+    const binding = decodeBinding(raw);
+    if (binding.sessionFile !== file || binding.socket !== socket)
+      throw new Error("Wrong tmux identity");
+    return { raw, binding };
+  };
   const read = (file: string) =>
     Effect.tryPromise({
       try: async () => {
-        let raw: string;
         try {
-          await checkDirectory();
-          const path = bindingFile(file);
-          const stat = await NodeFSP.lstat(path);
-          if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)
-            throw new Error("Not a private binding");
-          raw = await NodeFSP.readFile(path, "utf8");
+          return (await readPrivateBinding(file)).binding;
         } catch (cause) {
           if (isMissing(cause)) return undefined;
           throw cause;
         }
-        const binding = decodeBinding(raw);
-        if (binding.sessionFile !== file || binding.socket !== socket)
-          throw new Error("Wrong tmux identity");
-        return binding;
       },
       catch: storageError,
+    });
+  const retireExited = (binding: ManagedTmuxBinding) =>
+    Effect.tryPromise({
+      try: async (signal) => {
+        const { raw, binding: current } = await readPrivateBinding(binding.sessionFile);
+        if (encodeBinding(current) !== encodeBinding(binding)) throw changedOwner();
+        await exec(
+          "/usr/bin/python3",
+          [
+            "-I",
+            "-S",
+            "-c",
+            unlinkExitedBinding,
+            directory,
+            NodePath.basename(bindingFile(binding.sessionFile)),
+            NodeCrypto.createHash("sha256").update(raw).digest("hex"),
+            NodePath.basename(stopFile(binding)),
+          ],
+          { signal, timeout: 3000, maxBuffer: 65536 },
+        );
+      },
+      catch: (cause) =>
+        isNativeSessionsError(cause) ||
+        isMissing(cause) ||
+        (cause instanceof Error && "code" in cause && cause.code === 42)
+          ? changedOwner()
+          : storageError(),
     });
   const list = Effect.tryPromise({
     try: async () => {
@@ -825,10 +940,12 @@ export const makeManagedTmuxHost = (
       (rows.includes(`${exact}1`) || !rows.some((row) => row.startsWith(prefix)));
     const observed = await observeManagedProcess(platform, owner.pid);
     const expected = binding.process;
-    const sameProcess =
+    const matchesSavedProcess =
+      expected !== undefined &&
       observed.state === "alive" &&
-      (!expected ||
-        (observed.identity.start === expected.start && observed.identity.image === expected.image));
+      observed.identity.start === expected.start &&
+      observed.identity.image === expected.image;
+    const sameProcess = observed.state === "alive" && (!expected || matchesSavedProcess);
     const oldProcessGone =
       observed.state === "gone" ||
       (expected && observed.state === "alive" && observed.identity.start !== expected.start);
@@ -838,39 +955,45 @@ export const makeManagedTmuxHost = (
         : live && (sameProcess || (platform !== "linux" && observed.state === "unknown"))
           ? "alive"
           : "unknown";
-    return { liveness, process: observed.state === "alive" ? observed.identity : undefined };
+    return { liveness, forceTargetVerified: platform === "linux" && live && matchesSavedProcess };
   };
   const observe = (binding: ManagedTmuxBinding, rows: readonly string[] | undefined) =>
     Effect.promise(() => evidence(binding, rows));
-  const force = (binding: ManagedTmuxBinding) =>
+  const force = (binding: ManagedTmuxBinding): Effect.Effect<void, NeoPiNativeSessionsError> =>
     Effect.gen(function* () {
       if (platform !== "linux" || !binding.process)
         return yield* tmuxError(
           "tmux_force_unsupported",
           "Force Stop requires a verified Linux process image.",
         );
-      const owner = yield* readPane(target(binding.session));
+      const owner = yield* readPane(target(binding.session)).pipe(
+        Effect.mapError((error) =>
+          error.code === "tmux_no_owner"
+            ? tmuxError(error.code, `${error.message} ${managedForceStopRecovery}`)
+            : error,
+        ),
+      );
       if (
         owner.session !== binding.owner.session ||
         owner.window !== binding.owner.window ||
         owner.pane !== binding.owner.pane ||
         owner.pid !== binding.owner.pid
       )
-        return yield* changedOwner();
+        return yield* changedOwner(managedForceStopRecovery);
       const identity = binding.process;
       yield* Effect.tryPromise({
         try: (signal) => killManagedProcess(owner.pid, identity, signal),
         catch: () =>
           tmuxError(
             "tmux_force_unconfirmed",
-            "Could not signal the exact managed owner with a pidfd.",
+            `Could not signal the exact managed owner with a pidfd. ${managedForceStopRecovery}`,
           ),
       });
     });
   const launch = Effect.fnUntraced(function* (input: {
     readonly providerInstanceId: ManagedTmuxBinding["providerInstanceId"];
     readonly profile: string | null;
-    readonly binary: string;
+    readonly neoPiBinary: NonNullable<ManagedTmuxBinding["neoPiBinary"]>;
     readonly env: Record<string, string>;
     readonly cwd: string;
     readonly sessionFile?: string;
@@ -878,14 +1001,24 @@ export const makeManagedTmuxHost = (
     readonly controlEnabled: Effect.Effect<boolean, NeoPiNativeSessionsError>;
     readonly registry: Effect.Effect<string | undefined>;
     readonly canonicalize: (file: string) => Effect.Effect<string, NeoPiNativeSessionsError>;
-    readonly readHolderPid: Effect.Effect<number | undefined, NeoPiNativeSessionsError>;
-    readonly verifyLease: (
-      binding: ManagedTmuxBinding,
-    ) => Effect.Effect<void, NeoPiNativeSessionsError>;
+    readonly queryLease: (
+      file: string,
+    ) => Effect.Effect<LeaseCommandOutput, NeoPiNativeSessionsError>;
   }) {
     if (executable === undefined) return yield* tmuxMissing();
-    const argv = yield* managedTmuxLaunchPlan({ ...input, executable });
+    if (platform !== "linux")
+      return yield* tmuxError(
+        "tmux_lease_unsupported",
+        "NeoPi tmux sessions require Linux file lease queries.",
+      );
+    const argv = yield* managedTmuxLaunchPlan({
+      ...input,
+      executable,
+      binary: input.neoPiBinary.path,
+    });
     if (!(yield* input.controlEnabled)) return yield* unavailable();
+    if (input.sessionFile)
+      yield* requireUnheldLease(input.sessionFile, input.queryLease(input.sessionFile));
     const session = `native-${NodeCrypto.randomUUID()}`;
     const launchFile = NodePath.join(directory, `${session}.sh`);
     const paneTarget = target(session);
@@ -975,6 +1108,7 @@ export const makeManagedTmuxHost = (
                   session,
                   providerInstanceId: input.providerInstanceId,
                   profile: input.profile,
+                  neoPiBinary: input.neoPiBinary,
                 };
                 if (binding.owner.session !== id) return yield* changedOwner();
                 const observed = yield* Effect.promise(() =>
@@ -985,7 +1119,7 @@ export const makeManagedTmuxHost = (
                   found.success.procStartTicks === Number(observed.identity.start)
                     ? { ...binding, process: observed.identity }
                     : binding;
-                yield* input.verifyLease(binding);
+                yield* verifyManagedTmuxLease(binding, input.queryLease(binding.sessionFile));
                 yield* save(lockedBinding).pipe(
                   Effect.tap(() =>
                     Effect.sync(() => {
@@ -996,22 +1130,21 @@ export const makeManagedTmuxHost = (
                 );
                 return lockedBinding;
               }
-              if (
-                input.sessionFile &&
-                (found.failure.code === "tmux_control_unavailable" ||
-                  found.failure.code === "tmux_no_owner")
-              ) {
-                const pane = yield* readPane(paneTarget).pipe(Effect.option);
-                const holder = yield* input.readHolderPid;
-                if (holder && (pane._tag === "None" || pane.value.pid !== holder))
-                  return yield* sessionInUse();
-              }
               if (found.failure.code !== "tmux_control_unavailable") return yield* found.failure;
               yield* Effect.sleep("250 millis");
             }
-          }).pipe(Effect.timeoutOption("15 seconds"));
-          if (result._tag === "None") return yield* unavailable();
-          return result.value;
+          }).pipe(Effect.timeout("15 seconds"), Effect.result);
+          if (result._tag === "Failure") {
+            // A competing writer can win after the initial check. The losing pane can stop
+            // or stay unready in NeoPi's conflict chooser; never respond to that chooser.
+            if (
+              input.sessionFile &&
+              (!isNativeSessionsError(result.failure) || result.failure.code === "tmux_no_owner")
+            )
+              yield* requireUnheldLease(input.sessionFile, input.queryLease(input.sessionFile));
+            return yield* isNativeSessionsError(result.failure) ? result.failure : unavailable();
+          }
+          return result.success;
         }),
       (id) =>
         persisted
@@ -1032,5 +1165,5 @@ export const makeManagedTmuxHost = (
             }).pipe(Effect.ignore),
     );
   });
-  return { read, list, launch, target, panes, observe, force, stopTime, markStop };
+  return { read, list, launch, target, panes, observe, retireExited, force, stopTime, markStop };
 };

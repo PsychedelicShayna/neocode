@@ -6,6 +6,8 @@ import {
   type EnvironmentId,
   type NeoPiNativeDemandItem,
   type NeoPiNativeObservationLifecycle,
+  type NeoPiNativeSessionsListInput,
+  type NeoPiNativeSessionsListResult,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionsWatchInput,
 } from "@t3tools/contracts";
@@ -96,6 +98,9 @@ export function createNativeSessionAtoms<R, E>(
   >(() =>
     Effect.runSync(SubscriptionRef.make<ReadonlyMap<string, NativeSessionActivity>>(new Map())),
   );
+  const closedActivity = Atom.family((_environmentId: EnvironmentId) => new Map<string, number>());
+  const catalogReadRevision = new WeakMap<NeoPiNativeSessionsListResult, number>();
+  let lastCatalogReadStarted = 0;
   const activity = Atom.family(
     (environmentId: EnvironmentId): Atom.Atom<ReadonlyMap<string, NativeSessionActivity>> =>
       Atom.subscriptionRef(activityRef(environmentId)),
@@ -162,11 +167,54 @@ export function createNativeSessionAtoms<R, E>(
         if (feed) cache.set(key, reduceNativeSessionFeed(feed, update));
       }
     });
-  const list = createEnvironmentRpcQueryAtomFamily(runtime, {
+  const readList = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "native-sessions:list",
     tag: WS_METHODS.neopiNativeSessionsList,
     staleTimeMs: 5_000,
+    execute: (input) =>
+      Effect.gen(function* () {
+        const revision = ++lastCatalogReadStarted;
+        const snapshot = yield* rpcRequest(WS_METHODS.neopiNativeSessionsList, input);
+        catalogReadRevision.set(snapshot, revision);
+        return snapshot;
+      }),
   });
+  const fullList = Atom.family((environmentId: EnvironmentId) => {
+    const source = readList({ environmentId, input: {} });
+    return source.pipe(
+      Atom.transform((get) => {
+        const releaseConfirmedActivity = (result: Atom.Type<typeof source>) => {
+          if (!AsyncResult.isSuccess(result)) return;
+          const revision = catalogReadRevision.get(result.value);
+          if (revision === undefined) return;
+
+          const held = closedActivity(environmentId);
+          if (held.size === 0) return;
+          const observed = activityRef(environmentId);
+          const previous = SubscriptionRef.getUnsafe(observed);
+          let updated: Map<string, NativeSessionActivity> | undefined;
+          for (const [key, closedAfterRevision] of held) {
+            if (revision <= closedAfterRevision) continue;
+            held.delete(key);
+            (updated ??= new Map(previous)).delete(key);
+          }
+          if (updated) Effect.runSync(SubscriptionRef.set(observed, updated));
+        };
+        get.subscribe(source, (result) => {
+          // Publish the covering snapshot before removing the overrides it replaces.
+          get.setSelf(result);
+          releaseConfirmedActivity(result);
+        });
+        const result = get.once(source);
+        releaseConfirmedActivity(result);
+        return result;
+      }),
+    );
+  });
+  const list = (target: { environmentId: EnvironmentId; input: NeoPiNativeSessionsListInput }) =>
+    target.input.providerInstanceId === undefined && target.input.cwd === undefined
+      ? fullList(target.environmentId)
+      : readList(target);
   /**
    * The observation controller (r12 C5). One essential `watch` per visible view
    * is its lease; bulk state comes through one cursor `read` at a time; credit
@@ -188,15 +236,22 @@ export function createNativeSessionAtoms<R, E>(
           let activity: NativeSessionActivity | undefined;
           const publishActivity = (next: NativeSessionActivity | undefined) => {
             if (observed === null || activity === next) return Effect.void;
-            activity = next;
             return SubscriptionRef.update(observed, (previous) => {
+              activity = next;
+              closedActivity(environmentId).delete(key);
               const updated = new Map(previous);
               if (next === undefined) updated.delete(key);
               else updated.set(key, next);
               return updated;
             });
           };
-          yield* Effect.addFinalizer(() => publishActivity(undefined));
+          yield* Effect.addFinalizer(() => {
+            if (activity === undefined || activity === "working") return publishActivity(undefined);
+            // Reads already in flight may still describe an earlier state of the owner.
+            return Effect.sync(() => {
+              closedActivity(environmentId).set(key, lastCatalogReadStarted);
+            });
+          });
           const external = yield* Queue.unbounded<NativeSessionUpdate>();
           const demandSignal = yield* Queue.sliding<void>(1);
           const restart = yield* Queue.sliding<void>(1);

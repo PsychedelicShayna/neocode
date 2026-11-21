@@ -42,6 +42,8 @@ An idle runtime started by NeoCode is then released to save memory. Active turns
 unanswered questions, running background jobs, and live subagents keep it running.
 Returning to its tab opens the saved session again; your unsent draft stays intact.
 This idle release never stops a session owned by a terminal.
+If the sidebar already showed that a session finished, closing its view won't
+bring back a stale **Working** badge while the next session list loads.
 
 ### Stop a managed NeoPi session
 

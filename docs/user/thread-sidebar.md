@@ -54,7 +54,8 @@ compaction in progress, an owner that needs input, and an exited owner.
 
 Right-click the session and choose **Stop** to request NeoPi's normal shutdown.
 NeoCode tells you if this interrupts a reply or compaction. If the row says
-**Stop needs input**, open the session's **TUI** and answer NeoPi's prompt.
+**Stop needs input**, open the session's **TUI** and answer NeoPi's prompt in
+the right panel.
 **Stop requested** means a request was made, not that the process has exited.
 
 If the row says **Stop unconfirmed**, **Force Stop** is available on Linux when

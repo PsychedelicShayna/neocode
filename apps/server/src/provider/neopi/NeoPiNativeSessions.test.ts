@@ -4258,6 +4258,29 @@ describe("opening native sessions with optional managed tmux", () => {
               ]
             : [],
         );
+        if (
+          scenario === "live owner" ||
+          scenario === "live owner with attached dialogs enabled" ||
+          scenario === "stale"
+        ) {
+          const canNegotiate = !live || enableAttachedNativeDialogs;
+          const commands = [
+            { type: "set_ask_dialog", enabled: false },
+            { type: "set_form_dialog", enabled: false },
+          ];
+          const firstExplicit = dialogNegotiations.length;
+          const results = yield* Effect.forEach(commands, (command) =>
+            service.request({ ref, command }).pipe(Effect.result),
+          );
+          assert.deepEqual(dialogNegotiations.slice(firstExplicit), canNegotiate ? commands : []);
+          for (const result of results) {
+            if (canNegotiate) {
+              assert.deepEqual(result._tag === "Success" && result.success, { enabled: false });
+            } else {
+              assert.equal(result._tag === "Failure" && result.failure.code, "unsupported_command");
+            }
+          }
+        }
         assert.deepEqual(spawned, [
           ["sessions", "list", "--json", "--session-dir", cwd],
           live

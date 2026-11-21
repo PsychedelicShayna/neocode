@@ -372,6 +372,7 @@ export interface NeoPiNativeFrameObserver {
   readonly resulted: (id: string) => void;
 }
 export interface NeoPiNativeSessionsDependencies {
+  readonly enableAttachedNativeDialogs?: boolean;
   readonly profileIds: Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
   readonly profileChanges?: Stream.Stream<void>;
   readonly profile: (
@@ -2047,6 +2048,15 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       }
       const client = session.native.client;
       const command = input.command;
+      if (
+        !dependencies.enableAttachedNativeDialogs &&
+        session.native.attachment === "terminal" &&
+        (command.type === "set_ask_dialog" || command.type === "set_form_dialog")
+      )
+        return yield* fail(
+          "Native dialog negotiation is disabled for terminal-attached sessions.",
+          "unsupported_command",
+        );
       if (
         command.type === "set_host_tools" ||
         command.type === "serve" ||
@@ -3732,6 +3742,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     }).pipe(Effect.mapError(nativeError));
   const profileChanges = yield* instances.subscribeChanges;
   return yield* makeNeoPiNativeSessionsWith({
+    enableAttachedNativeDialogs,
     profileChanges: Stream.fromSubscription(profileChanges),
     profileIds: Effect.gen(function* () {
       const all = yield* instances.listInstances;

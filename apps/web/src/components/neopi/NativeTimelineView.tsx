@@ -1,6 +1,7 @@
 import type { LegendListRef } from "@legendapp/list/react";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import type { TranscriptRow } from "@t3tools/client-runtime/neopi-transcript";
+import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useTheme } from "../../hooks/useTheme";
@@ -13,7 +14,7 @@ import {
   notifyTimelinePageScroll,
   useLeaveLiveEdgeOnScroll,
 } from "../chat/useLeaveLiveEdgeOnScroll";
-import { projectNativeTimeline } from "./nativeTimeline";
+import { createNativeTimelineProjector } from "./nativeTimeline";
 
 const NO_TURN_DIFFS: [] = [];
 const noop = () => {};
@@ -30,6 +31,7 @@ export function NativeTimelineView(props: {
   /** The author label on the assistant's messages: the session's own name and designation. */
   readonly assistantName?: string;
   readonly environmentId: EnvironmentId;
+  readonly projectId?: ProjectId;
   /** Stable per native file; must not parse as a scoped thread key. */
   readonly timelineKey: string;
   readonly cwd: string | undefined;
@@ -50,6 +52,10 @@ export function NativeTimelineView(props: {
   readonly toolLosses?: ReadonlyMap<string, readonly { readonly text: string }[]>;
 }) {
   const settings = useEnvironmentSettings(props.environmentId);
+  const responseStreamingMode = useMemo(
+    () => resolveProjectSettings(settings, props.projectId ?? null).settings.responseStreamingMode,
+    [settings, props.projectId],
+  );
   const { resolvedTheme } = useTheme();
   const localListRef = useRef<LegendListRef | null>(null);
   const listRef = props.listRef ?? localListRef;
@@ -57,9 +63,11 @@ export function NativeTimelineView(props: {
     () => (props.hideThinking ? props.rows.filter((row) => row.kind !== "thinking") : props.rows),
     [props.rows, props.hideThinking],
   );
+  const [project] = useState(createNativeTimelineProjector);
   const timeline = useMemo(
-    () => projectNativeTimeline(visibleRows, props.busy, props.toolLosses, props.runPaused),
-    [visibleRows, props.busy, props.toolLosses, props.runPaused],
+    () =>
+      project(visibleRows, props.busy, props.toolLosses, props.runPaused, responseStreamingMode),
+    [project, visibleRows, props.busy, props.toolLosses, props.runPaused, responseStreamingMode],
   );
   const [liveFollow, setLiveFollow] = useState(true);
   const [isAtEnd, setIsAtEnd] = useState(true);

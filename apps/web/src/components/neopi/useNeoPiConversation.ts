@@ -152,5 +152,6 @@ export function useNeoPiConversation(threadRef: ScopedThreadRef) {
     error: observation.error ?? pagingError,
     loading: connection === null && observation.error === null,
     busy: feed && history === "live" ? feed.busy : null,
+    runPaused: feed !== null && history === "live" && feed.runPause !== null,
   };
 }

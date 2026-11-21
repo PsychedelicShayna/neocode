@@ -9530,6 +9530,7 @@ export default function ChatView(props: ChatViewProps) {
                 <NeoPiConversation
                   key={`${activeThreadKey}:${activeThread.session?.providerInstanceId ?? "unstarted"}`}
                   threadRef={activeThreadRef}
+                  projectId={activeThread.projectId}
                   cwd={gitCwd ?? undefined}
                   composerInset={composerTimelineInset}
                   onOpenTree={addNativeHistorySurface}

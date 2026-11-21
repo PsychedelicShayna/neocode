@@ -623,6 +623,10 @@ function applyNativeRead(
       type: "message",
       messageId: value.messageId,
       message: value.message,
+      ...(value.textAppendGeneration === undefined
+        ? {}
+        : { textAppendGeneration: value.textAppendGeneration }),
+      ...(value.phase !== "open" || value.runSettled ? { ended: true } : {}),
       ...(value.stopOutcome ? { stopOutcome: value.stopOutcome } : {}),
     });
     if (value.entryId !== null && conversation.identity)

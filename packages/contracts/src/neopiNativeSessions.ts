@@ -215,6 +215,10 @@ export const NeoPiNativeEntityValue = Schema.Union([
     phase: Schema.Literals(["open", "ended", "durable"]),
     entryId: Schema.NullOr(Schema.String),
     message: NeoPiNativeObservedMessage,
+    /** Open text blocks in one generation grow only by appending. */
+    textAppendGeneration: Schema.optionalKey(Schema.String),
+    /** The run ended without message_end; the body can still receive a late final update. */
+    runSettled: Schema.optionalKey(Schema.Literal(true)),
     stopOutcome: Schema.optionalKey(NeoPiStopOutcome),
   }),
   /** Folded tool state; a terminal or background-final update stays until its durable result joins. */

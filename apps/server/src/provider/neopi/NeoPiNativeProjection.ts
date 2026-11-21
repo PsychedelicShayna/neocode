@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import type {
   NeoPiEditFilePreview,
   NeoPiNativeEntityValue,
@@ -1519,12 +1520,35 @@ export class NeoPiNativeProjection {
       return;
     const { message, stopOutcome } = observeNeoPiMessage(native);
     this.#lastMessageId = messageId;
+    const assistantEvent = asRecord(frame.assistantMessageEvent);
+    const eventType = assistantEvent?.type;
+    // Snapshots and unknown updates carry no append guarantee. A text delta
+    // starts a new generation if needed; thinking and tool-call events only
+    // preserve an existing generation because they do not touch text blocks.
+    const previousGeneration = held?.class === "message" ? held.textAppendGeneration : undefined;
+    const textAppendGeneration =
+      type === "message_update" && frame.snapshot !== true && message.role === "assistant"
+        ? eventType === "text_delta" && typeof assistantEvent?.delta === "string"
+          ? (previousGeneration ?? NodeCrypto.randomUUID())
+          : eventType === "thinking_start" ||
+              eventType === "thinking_delta" ||
+              eventType === "thinking_end" ||
+              eventType === "toolcall_start" ||
+              eventType === "toolcall_delta" ||
+              eventType === "toolcall_end"
+            ? previousGeneration
+            : undefined
+        : undefined;
     const value: MessageValue = {
       class: "message",
       messageId,
       phase: type === "message_end" ? "ended" : "open",
       entryId: null,
       message,
+      ...(textAppendGeneration === undefined ? {} : { textAppendGeneration }),
+      ...(type === "message_update" && held?.class === "message" && held.runSettled
+        ? { runSettled: true as const }
+        : {}),
       ...(stopOutcome === undefined ? {} : { stopOutcome }),
     };
     this.store.put(key, value);
@@ -1759,12 +1783,23 @@ export class NeoPiNativeProjection {
   #runEnded(): void {
     this.#heldEntries.clear();
     const orphans: string[] = [];
-    for (const record of this.store.values())
+    for (const record of this.store.values()) {
+      const value = record.value;
       if (
-        record.value?.class === "editPreview" &&
-        this.store.get(toolKey(record.value.toolCallId))?.value?.class !== "tool"
-      )
+        value?.class === "message" &&
+        value.phase === "open" &&
+        value.message.role === "assistant"
+      ) {
+        // A terminal run may omit message_end. Keep its last observed body and
+        // mark it settled so that a later run doesn't buffer it again.
+        if (!value.runSettled) this.store.put(record.key, { ...value, runSettled: true });
+      } else if (
+        value?.class === "editPreview" &&
+        this.store.get(toolKey(value.toolCallId))?.value?.class !== "tool"
+      ) {
         orphans.push(record.key);
+      }
+    }
     for (const key of orphans) this.store.remove(key);
   }
 

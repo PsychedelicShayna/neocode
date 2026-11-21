@@ -101,6 +101,89 @@ describe("NeoPiNativeProjection", () => {
     },
   );
 
+  it("only adds append provenance on text deltas and drops it on replacements or end", () => {
+    const projection = published();
+    const messageId = "live";
+    projection.fold({ type: "message_start", messageId, message: assistant("First") });
+    assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
+    projection.fold({
+      type: "message_update",
+      messageId,
+      message: assistant("First paragraph"),
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " paragraph" },
+    });
+    const initial = servedMessage(projection, messageId)?.textAppendGeneration;
+    assert.isString(initial);
+    const content: Record<string, unknown>[] = assistant("First paragraph").content;
+    for (const event of [
+      {
+        type: "thinking_delta",
+        block: { type: "thinking", thinking: "Considering next steps." },
+        delta: "Considering next steps.",
+      },
+      {
+        type: "toolcall_delta",
+        block: { type: "toolCall", id: "call", name: "read", arguments: { path: "src" } },
+        delta: '{"path":"src',
+      },
+    ]) {
+      content.push(event.block);
+      projection.fold({
+        type: "message_update",
+        messageId,
+        message: { role: "assistant", content: [...content] },
+        assistantMessageEvent: {
+          type: event.type,
+          contentIndex: content.length - 1,
+          delta: event.delta,
+        },
+      });
+      assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial, event.type);
+    }
+    let previousGeneration = initial;
+    for (const replacement of [
+      { type: "message_start", snapshot: true },
+      {
+        type: "message_update",
+        snapshot: true,
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " not an append" },
+      },
+      { type: "message_update" },
+    ]) {
+      projection.fold({ ...replacement, messageId, message: assistant("Replacement") });
+      assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
+      projection.fold({
+        type: "message_update",
+        messageId,
+        message: assistant("Replacement appended"),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " appended" },
+      });
+      const generation = servedMessage(projection, messageId)?.textAppendGeneration;
+      assert.isString(generation);
+      assert.notEqual(generation, previousGeneration);
+      previousGeneration = generation;
+    }
+    projection.fold({ type: "message_end", messageId, message: assistant("Replacement final") });
+    assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
+  });
+
+  it("settles an open assistant body without a message_end, but not during a resumable pause", () => {
+    const projection = published();
+    const messageId = "unfinished";
+    const message = assistant("First.\n\nUnfinished tail");
+    projection.fold({ type: "agent_start" });
+    projection.fold({ type: "message_start", messageId, message });
+    projection.fold({ type: "agent_end", isTerminal: false, yielded: true });
+    assert.isUndefined(servedMessage(projection, messageId)?.runSettled);
+    projection.fold({ type: "session_settled" });
+    assert.deepInclude(servedMessage(projection, messageId), { runSettled: true, message });
+    projection.fold({ type: "agent_start" });
+    assert.isTrue(servedMessage(projection, messageId)?.runSettled);
+    const final = assistant("First.\n\nUnfinished tail received before the late end.");
+    projection.fold({ type: "message_end", messageId, message: final });
+    assert.deepInclude(servedMessage(projection, messageId), { phase: "ended", message: final });
+  });
+
   it("S3 after message_end no read serves an open or shorter body until the durable entry joins", () => {
     const projection = published();
     const messageId = "live-1";

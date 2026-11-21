@@ -164,23 +164,41 @@ describe("managed tmux pane lookup", () => {
     await expect(lookup(await prepare("own"))).rejects.toMatchObject({ code: "tmux_no_owner" });
   });
 
-  it("uses one server PATH resolution and never attaches to a recycled session ID", async () => {
+  it("uses one server PATH resolution and refuses a replacement of the configured session", async () => {
     const target = await prepare();
     await lookup(target);
     const owner = await lookup(target);
     expect(exec.mock.calls.map(([file]) => file)).toEqual([executable, executable]);
-    expect(managedTmuxClient(target, owner)).toEqual({
-      executable,
-      args: ["-N", "-S", socket, "attach-session", "-E", "-t", "=owner:"],
-    });
-    // The original exact name is gone; only its numeric ID still resolves.
+    // After the probe, the original ID is gone and the configured name resolves to $9.
     exec.mockImplementation(async (_file: string, args: readonly string[]) => {
-      if (args.at(-1) === "$2") return { stdout: otherPane };
-      throw new Error("can't find session: owner");
+      if (args.at(-1) === "=owner:") return { stdout: otherPane };
+      throw new Error(`can't find session: ${args.at(-1)}`);
     });
     const client = managedTmuxClient(target, owner);
-    await expect(exec(client.executable, client.args)).rejects.toThrow("can't find session: owner");
+    await expect(exec(client.executable, client.args)).rejects.toThrow("can't find session: $2");
+    expect(client).toEqual({
+      executable,
+      args: ["-N", "-S", socket, "attach-session", "-E", "-t", "$2"],
+    });
     expect(resolveExecutable).toHaveBeenCalledExactlyOnceWith("tmux", "linux", env);
+  });
+
+  it("targets the exact generated owner name even when its numeric ID is reused", async () => {
+    const target = await prepare();
+    const owner = await lookup(target);
+    const binding: ManagedTmuxBinding = {
+      ...config,
+      session: "native-01234567-89ab-4def-8123-456789abcdef",
+      owner,
+    };
+    exec.mockImplementation(async (_file: string, args: readonly string[]) => {
+      if (args.at(-1) === "$2") return { stdout: otherPane };
+      throw new Error(`can't find session: ${args.at(-1)}`);
+    });
+    const client = managedTmuxClient(binding, owner);
+    await expect(exec(client.executable, client.args)).rejects.toThrow(
+      "can't find session: =native-01234567-89ab-4def-8123-456789abcdef:",
+    );
   });
 
   it("refuses explicitly without probing when tmux is absent from the server PATH", async () => {

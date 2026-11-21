@@ -259,12 +259,16 @@ export const sameManagedTmuxOwner = (a: ManagedTmuxOwner, b: ManagedTmuxOwner) =
   a.pid === b.pid;
 
 export const managedTmuxClient = (
-  config: Pick<TmuxTarget, "socket" | "session">,
+  config: ManagedTmuxConfig | TmuxBindingIdentity,
   owner: ManagedTmuxOwner,
-) => ({
-  executable: owner.executable,
-  args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", `=${config.session}:`],
-});
+) => {
+  // A configured name can be reused; a generated UUID survives numeric ID reuse.
+  const target = "owner" in config ? `=${config.session}:` : owner.session;
+  return {
+    executable: owner.executable,
+    args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", target],
+  };
+};
 
 const resolvePublication = Effect.fnUntraced(function* (
   config: TmuxTarget,

@@ -8,6 +8,7 @@ import {
   type NativeSessionVisitState,
 } from "@t3tools/client-runtime/neopi-native-session-attention";
 import type { NativeSessionList } from "@t3tools/client-runtime/neopi-native-sessions";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
   EnvironmentId,
   NeoPiManagedSessionLifecycle,
@@ -757,7 +758,8 @@ export function NativeEnvironmentAttentionList({
                   ? `Stop "${row.title}"? This interrupts ${work}.`
                   : null;
             if (prompt && !(await api.dialogs.confirm(prompt, { variant: "destructive" }))) return;
-            await stopManaged({
+            setError(null);
+            const response = await stopManaged({
               environmentId,
               input: {
                 ref: { providerInstanceId: row.providerInstanceId, sessionFile: row.sessionFile },
@@ -765,6 +767,7 @@ export function NativeEnvironmentAttentionList({
                 imageId,
               },
             });
+            if (response._tag === "Failure") throw squashAtomCommandFailure(response);
           })
           .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
       },

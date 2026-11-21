@@ -3,8 +3,11 @@ import {
   NEOPI_NATIVE_OBSERVATION_ERROR_CODES,
   NeoPiNativeSessionsError,
   WS_METHODS,
+  type EnvironmentId,
   type NeoPiNativeDemandItem,
   type NeoPiNativeObservationLifecycle,
+  type NeoPiNativeSessionsListInput,
+  type NeoPiNativeSessionsListResult,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionsWatchInput,
 } from "@t3tools/contracts";
@@ -21,6 +24,10 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { request as rpcRequest } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import {
+  observedNativeSessionActivity,
+  type NativeSessionActivity,
+} from "../neopiNativeSessionAttention.ts";
 import {
   emptyNativeSessionFeed,
   nativeJournalPage,
@@ -84,6 +91,19 @@ export function createNativeSessionAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   const cache = new Map<string, NativeSessionFeed>();
+  type ActivityRef = SubscriptionRef.SubscriptionRef<ReadonlyMap<string, NativeSessionActivity>>;
+  // A passive projection of the live session views. Reading it never acquires a lease.
+  const activityRef = Atom.family<EnvironmentId, ActivityRef>(() =>
+    Effect.runSync(SubscriptionRef.make<ReadonlyMap<string, NativeSessionActivity>>(new Map())),
+  );
+  // Handoff revisions must live as long as their activity, not in a weak atom family of their own.
+  const closedActivity = new WeakMap<ActivityRef, Map<string, number>>();
+  const catalogReadRevision = new WeakMap<NeoPiNativeSessionsListResult, number>();
+  let lastCatalogReadStarted = 0;
+  const activity = Atom.family(
+    (environmentId: EnvironmentId): Atom.Atom<ReadonlyMap<string, NativeSessionActivity>> =>
+      Atom.subscriptionRef(activityRef(environmentId)),
+  );
   /**
    * Live observations per session key: updates published from outside the
    * controller (commands) reach every one. A session view and a thread view of
@@ -146,11 +166,54 @@ export function createNativeSessionAtoms<R, E>(
         if (feed) cache.set(key, reduceNativeSessionFeed(feed, update));
       }
     });
-  const list = createEnvironmentRpcQueryAtomFamily(runtime, {
+  const readList = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "native-sessions:list",
     tag: WS_METHODS.neopiNativeSessionsList,
     staleTimeMs: 5_000,
+    execute: (input) =>
+      Effect.gen(function* () {
+        const revision = ++lastCatalogReadStarted;
+        const snapshot = yield* rpcRequest(WS_METHODS.neopiNativeSessionsList, input);
+        catalogReadRevision.set(snapshot, revision);
+        return snapshot;
+      }),
   });
+  const fullList = Atom.family((environmentId: EnvironmentId) => {
+    const source = readList({ environmentId, input: {} });
+    return source.pipe(
+      Atom.transform((get) => {
+        const releaseConfirmedActivity = (result: Atom.Type<typeof source>) => {
+          if (!AsyncResult.isSuccess(result)) return;
+          const revision = catalogReadRevision.get(result.value);
+          if (revision === undefined) return;
+
+          const observed = activityRef(environmentId);
+          const held = closedActivity.get(observed);
+          if (!held?.size) return;
+          const previous = SubscriptionRef.getUnsafe(observed);
+          let updated: Map<string, NativeSessionActivity> | undefined;
+          for (const [key, closedAfterRevision] of held) {
+            if (revision <= closedAfterRevision) continue;
+            held.delete(key);
+            (updated ??= new Map(previous)).delete(key);
+          }
+          if (updated) Effect.runSync(SubscriptionRef.set(observed, updated));
+        };
+        get.subscribe(source, (result) => {
+          // Publish the covering snapshot before removing the overrides it replaces.
+          get.setSelf(result);
+          releaseConfirmedActivity(result);
+        });
+        const result = get.once(source);
+        releaseConfirmedActivity(result);
+        return result;
+      }),
+    );
+  });
+  const list = (target: { environmentId: EnvironmentId; input: NeoPiNativeSessionsListInput }) =>
+    target.input.providerInstanceId === undefined && target.input.cwd === undefined
+      ? fullList(target.environmentId)
+      : readList(target);
   /**
    * The observation controller (r12 C5). One essential `watch` per visible view
    * is its lease; bulk state comes through one cursor `read` at a time; credit
@@ -168,6 +231,31 @@ export function createNativeSessionAtoms<R, E>(
           const supervisor = yield* EnvironmentSupervisor;
           const environmentId = supervisor.target.environmentId;
           const key = nativeSessionKey({ environmentId, ref: input.ref });
+          const observed = input.purpose === "thread" ? null : activityRef(environmentId);
+          let activity: NativeSessionActivity | undefined;
+          const publishActivity = (next: NativeSessionActivity | undefined) => {
+            if (observed === null || activity === next) return Effect.void;
+            return SubscriptionRef.update(observed, (previous) => {
+              activity = next;
+              closedActivity.get(observed)?.delete(key);
+              const updated = new Map(previous);
+              if (next === undefined) updated.delete(key);
+              else updated.set(key, next);
+              return updated;
+            });
+          };
+          yield* Effect.addFinalizer(() => {
+            if (observed === null || activity === undefined) return Effect.void;
+            // Keep the last observed status until a read started after the view closed.
+            return Effect.sync(() => {
+              let held = closedActivity.get(observed);
+              if (!held) {
+                held = new Map();
+                closedActivity.set(observed, held);
+              }
+              held.set(key, lastCatalogReadStarted);
+            });
+          });
           const external = yield* Queue.unbounded<NativeSessionUpdate>();
           const demandSignal = yield* Queue.sliding<void>(1);
           const restart = yield* Queue.sliding<void>(1);
@@ -176,10 +264,10 @@ export function createNativeSessionAtoms<R, E>(
           const handedOffKeys = new Set<string>();
           let current = cache.get(key) ?? emptyNativeSessionFeed();
           const apply = (update: NativeSessionUpdate) =>
-            Effect.sync(() => {
+            Effect.suspend(() => {
               const wasMoved = current.movedTo != null;
               const next = reduceNativeSessionFeed(current, update);
-              if (next === current) return;
+              if (next === current) return Effect.void;
               current = next;
               cache.set(key, next);
               // The moved session's own observation starts from what is already
@@ -192,6 +280,12 @@ export function createNativeSessionAtoms<R, E>(
                 }
               }
               Queue.offerUnsafe(out, next);
+              // A warm feed can still say connected before the new lease replays its status.
+              return publishActivity(
+                next.observer.phase === "observing" || next.observer.phase === "building"
+                  ? observedNativeSessionActivity(next)
+                  : undefined,
+              );
             });
           const purpose = input.purpose ?? "session";
           const join = <A>(registry: Map<string, Set<A>>, value: A) => {
@@ -436,6 +530,7 @@ export function createNativeSessionAtoms<R, E>(
   });
   return {
     list,
+    activity,
     open,
     request,
     close: createEnvironmentRpcCommand(runtime, {

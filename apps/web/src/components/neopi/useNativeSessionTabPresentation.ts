@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { observedNativeSessionActivity } from "@t3tools/client-runtime/neopi-native-session-attention";
 import {
   NATIVE_RUN_PAUSE_LABELS,
   nativeRecord,
@@ -34,10 +35,10 @@ const selectStatus = (result: FeedResult): TabStatus => {
   if (!AsyncResult.isSuccess(result))
     return AsyncResult.isInitial(result) ? "connecting" : "offline";
   const feed = result.value;
-  if (!feed.connected) return "offline";
-  if (feed.dialogs.length > 0) return "attention";
-  if (feed.busy) return "working";
-  if (feed.runPause) return feed.runPause;
+  const activity = observedNativeSessionActivity(feed);
+  if (activity === undefined) return "offline";
+  if (activity === "waiting") return "attention";
+  if (activity !== "idle") return activity;
   return feed.session?.attachment === "terminal" ? "terminal" : "ready";
 };
 const selectSessionName = (result: FeedResult): string => {

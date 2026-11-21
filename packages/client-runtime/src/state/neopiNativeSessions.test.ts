@@ -10,6 +10,7 @@ import {
   type NeoPiNativeInboxRecord,
   type NeoPiNativeObservationDomain,
   type NeoPiNativeSessionsCreditInput,
+  type NeoPiNativeSessionsListResult,
   type NeoPiNativeSessionsReadInput,
   type NeoPiNativeSessionsReadResult,
   type NeoPiNativeSessionsSetDemandInput,
@@ -22,15 +23,18 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import type { SupervisorConnectionState } from "../connection/model.ts";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import { resolveNativeSessionStatus } from "../neopiNativeSessionAttention.ts";
 import {
   NATIVE_INBOX_GAP_LIMIT,
   NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
   nativeObservationStatus,
+  nativeSessionKey,
   nativeTranscriptRows,
   reduceNativeSessionFeed,
   type NativeSession,
@@ -142,6 +146,10 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
   const creditWindow = options.creditWindow ?? 4;
   const leases = yield* Queue.unbounded<FakeLease>();
   const reads = yield* Queue.unbounded<FakeRead>();
+  const catalogs =
+    yield* Queue.unbounded<
+      Deferred.Deferred<NeoPiNativeSessionsListResult, NeoPiNativeSessionsError>
+    >();
   const demands = yield* Queue.unbounded<NeoPiNativeSessionsSetDemandInput>();
   const byId = new Map<string, FakeLease>();
   let leaseCount = 0;
@@ -149,6 +157,15 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
   let opens = 0;
   let prompts = 0;
   const client = {
+    [WS_METHODS.neopiNativeSessionsList]: () =>
+      Effect.gen(function* () {
+        const reply = yield* Deferred.make<
+          NeoPiNativeSessionsListResult,
+          NeoPiNativeSessionsError
+        >();
+        yield* Queue.offer(catalogs, reply);
+        return yield* Deferred.await(reply);
+      }),
     [WS_METHODS.neopiNativeSessionsOpen]: () =>
       Effect.sync(() => {
         opens++;
@@ -233,8 +250,20 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
   const connection = { client } as RpcSession;
   const environmentId = EnvironmentId.make("native-remote");
   const sessionRef = yield* SubscriptionRef.make(Option.some(connection));
+  const initialState: SupervisorConnectionState = {
+    desired: true,
+    network: "online",
+    phase: "connected",
+    stage: null,
+    attempt: 0,
+    generation: 1,
+    lastFailure: null,
+    retryAt: null,
+  };
+  const state = yield* SubscriptionRef.make(initialState);
   const supervisor = EnvironmentSupervisor.of({
     target: { environmentId },
+    state,
     session: sessionRef,
   } as EnvironmentSupervisor["Service"]);
   const environments = EnvironmentRegistry.of({
@@ -268,6 +297,7 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
     sessionRef,
     leases,
     reads,
+    catalogs,
     /** The next read of one lease; reads of released leases are skipped. */
     readOf: (leaseId: string) =>
       Stream.fromQueue(reads).pipe(
@@ -282,6 +312,162 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
 });
 
 describe("native observation controller", () => {
+  it.effect("publishes sidebar activity from the view's lease without opening another", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const activity = h.atoms.activity(h.target.environmentId);
+        const key = nativeSessionKey(h.target);
+        const waitFor = (status: "idle" | "working" | "waiting" | undefined) =>
+          AtomRegistry.toStream(h.registry, activity).pipe(
+            Stream.filter((current) => current.get(key) === status),
+            Stream.runHead,
+            Effect.asVoid,
+          );
+        yield* AtomRegistry.mount(h.registry, activity);
+        expect(h.registry.get(activity).size).toBe(0);
+        expect(h.counts().active).toBe(0);
+
+        const unmount = h.registry.mount(h.watch);
+        const lease = yield* Queue.take(h.leases);
+        yield* waitFor("idle");
+        yield* lease.push({
+          type: "status",
+          revision: h.nextRevision(),
+          live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
+        });
+        yield* waitFor("working");
+        yield* lease.push({
+          type: "obligation-opened",
+          revision: h.nextRevision(),
+          id: "question",
+          request: { type: "extension_ui_request", id: "question", method: "select" },
+        });
+        yield* waitFor("waiting");
+        yield* Effect.promise(() =>
+          h.atoms.request.run(h.registry, {
+            environmentId: h.target.environmentId,
+            input: { ref, command: { type: "extension_ui_response", id: "question" } },
+          }),
+        );
+        yield* waitFor("working");
+        yield* lease.push({
+          type: "status",
+          revision: h.nextRevision(),
+          live: { state: "idle", isStreaming: false, pendingDialogs: 0, branch: null },
+        });
+        yield* waitFor("idle");
+
+        expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 1 });
+        unmount();
+        expect(h.registry.get(activity).get(key)).toBe("idle");
+        yield* Deferred.await(lease.released);
+        expect(h.counts().active).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    ["idle", "busy", "idle"],
+    ["idle", "busy", "busy"],
+    ["working", "idle", "idle"],
+    ["working", "idle", "busy"],
+  ] as const)(
+    "holds observed %s over cached and late %s until a post-close read returns %s",
+    ([observedStatus, staleState, freshState]) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeHarness();
+          const { environmentId } = h.target;
+          const activity = h.atoms.activity(environmentId);
+          const catalog = h.atoms.list({ environmentId, input: {} });
+          const waitForCatalog = (snapshot: NeoPiNativeSessionsListResult) =>
+            AtomRegistry.toStream(h.registry, catalog).pipe(
+              Stream.filter((result) => AsyncResult.isSuccess(result) && result.value === snapshot),
+              Stream.runHead,
+            );
+          const summary = (state: "idle" | "busy", sessionRef = ref) => ({
+            ref: sessionRef,
+            sessionId: "session",
+            cwd: "/workspace",
+            title: null,
+            firstMessage: "",
+            modifiedAt: "2026-11-21T10:00:00Z",
+            owner: { kind: "none" as const },
+            live: { state, isStreaming: state === "busy", pendingDialogs: 0, branch: null },
+          });
+          const statuses = (snapshot: NeoPiNativeSessionsListResult) =>
+            snapshot.sessions.map((entry) =>
+              resolveNativeSessionStatus(
+                entry,
+                { baseline: entry.modifiedAt, visited: {} },
+                false,
+                h.registry.get(activity).get(nativeSessionKey({ environmentId, ref: entry.ref })),
+              ),
+            );
+          const other = { ...ref, sessionFile: "/sessions/other.jsonl" };
+          const otherStatus = staleState === "idle" ? "idle" : "working";
+          yield* AtomRegistry.mount(h.registry, activity);
+          yield* AtomRegistry.mount(h.registry, catalog);
+          const cached = {
+            sessions: [summary(staleState), summary(staleState, other)],
+            diagnostics: [],
+          };
+          yield* Deferred.succeed(yield* Queue.take(h.catalogs), cached);
+          yield* waitForCatalog(cached);
+          h.registry.refresh(catalog);
+          const oldRead = yield* Queue.take(h.catalogs);
+          const unmount = h.registry.mount(h.watch);
+          const lease = yield* Queue.take(h.leases);
+          if (observedStatus === "working") {
+            yield* lease.push({
+              type: "status",
+              revision: h.nextRevision(),
+              live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
+            });
+          }
+          yield* AtomRegistry.toStream(h.registry, activity).pipe(
+            Stream.filter((current) => current.get(nativeSessionKey(h.target)) === observedStatus),
+            Stream.runHead,
+          );
+
+          unmount();
+          yield* Deferred.await(lease.released);
+          expect(statuses(cached)).toEqual([observedStatus, otherStatus]);
+          const stale = { ...cached };
+          yield* Deferred.succeed(oldRead, stale);
+          yield* waitForCatalog(stale);
+          expect(statuses(stale)).toEqual([observedStatus, otherStatus]);
+
+          h.registry.refresh(catalog);
+          const failedRead = yield* Queue.take(h.catalogs);
+          yield* Deferred.fail(
+            failedRead,
+            new NeoPiNativeSessionsError({ message: "unavailable" }),
+          );
+          yield* AtomRegistry.toStream(h.registry, catalog).pipe(
+            Stream.filter(AsyncResult.isFailure),
+            Stream.runHead,
+          );
+          expect(statuses(stale)).toEqual([observedStatus, otherStatus]);
+
+          h.registry.refresh(catalog);
+          const freshRead = yield* Queue.take(h.catalogs);
+          const fresh = {
+            sessions: [summary(freshState), summary(staleState, other)],
+            diagnostics: [],
+          };
+          yield* Deferred.succeed(freshRead, fresh);
+          yield* waitForCatalog(fresh);
+          expect(statuses(fresh)).toEqual([
+            freshState === "idle" ? "idle" : "working",
+            otherStatus,
+          ]);
+          expect(h.registry.get(activity).has(nativeSessionKey(h.target))).toBe(false);
+        }),
+      ),
+  );
+
   it.effect("does not create orphan feeds for commands without an observation", () =>
     Effect.scoped(
       Effect.gen(function* () {

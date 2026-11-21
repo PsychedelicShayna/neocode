@@ -1,13 +1,18 @@
+import { useAtomValue } from "@effect/atom-react";
 import {
   managedSessionSidebarLabel,
   nativeSessionProjectLabel,
+  nativeSessionSection,
   partitionNativeSessions,
   type NativeSessionEntry,
   type NativeSessionSections,
   type NativeSessionStatus,
   type NativeSessionVisitState,
 } from "@t3tools/client-runtime/neopi-native-session-attention";
-import type { NativeSessionList } from "@t3tools/client-runtime/neopi-native-sessions";
+import {
+  nativeSessionKey,
+  type NativeSessionList,
+} from "@t3tools/client-runtime/neopi-native-sessions";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
   EnvironmentId,
@@ -125,6 +130,7 @@ function toRowModel(
   active: boolean,
 ): RowModel {
   const { ref } = session;
+  const settled = nativeSessionSection(session, status) === "settled";
   return {
     key: `${ref.providerInstanceId}:${ref.sessionFile}`,
     providerInstanceId: ref.providerInstanceId,
@@ -135,7 +141,7 @@ function toRowModel(
     project: nativeSessionProjectLabel(session.cwd),
     liveBranch: session.live?.branch ?? null,
     status,
-    settled: session.settledAt !== undefined,
+    settled,
     active,
     locked: session.owner.kind === "process" && !session.owner.attachable,
     terminalOwned: session.owner.kind === "process",
@@ -144,7 +150,7 @@ function toRowModel(
     stopState: session.managed?.stop,
     stopWork: session.managed?.work ?? null,
     canForceStop: session.managed?.canForceStop ?? false,
-    timeLabel: compactTimeLabel(session.settledAt ?? session.modifiedAt),
+    timeLabel: compactTimeLabel((settled ? session.settledAt : undefined) ?? session.modifiedAt),
   };
 }
 
@@ -568,6 +574,7 @@ export function NativeEnvironmentAttentionList({
   open: OpenNativeSession;
 }) {
   const result = useEnvironmentQuery(nativeSessionAtoms.list({ environmentId, input: {} }));
+  const activity = useAtomValue(nativeSessionAtoms.activity(environmentId));
   const { refresh } = result;
   const pollingStop =
     result.data?.sessions.some(
@@ -668,7 +675,14 @@ export function NativeEnvironmentAttentionList({
             .includes(deferredQuery),
         )
       : sessions;
-    const sections = partitionNativeSessions(matching, visits, openFile);
+    const sections = partitionNativeSessions(
+      matching,
+      visits,
+      openFile,
+      activity.size === 0
+        ? undefined
+        : (ref) => activity.get(nativeSessionKey({ environmentId, ref })),
+    );
     const modelOf = (entry: NativeSessionEntry<NativeSessionSummary>) =>
       toRowModel(entry, entry.session.ref.sessionFile === openFile);
     const built: ListItem[] = searching
@@ -677,7 +691,17 @@ export function NativeEnvironmentAttentionList({
           .map((entry) => ({ kind: "row", model: modelOf(entry), section: "recent" }))
       : buildItems({ sections, modelOf, shelfExpanded, settledVisible });
     return built;
-  }, [sessions, searching, deferredQuery, visits, openFile, shelfExpanded, settledVisible]);
+  }, [
+    sessions,
+    searching,
+    deferredQuery,
+    visits,
+    openFile,
+    activity,
+    environmentId,
+    shelfExpanded,
+    settledVisible,
+  ]);
 
   const [error, setError] = useState<string | null>(null);
   // Guards a second click while the first open is still in flight.

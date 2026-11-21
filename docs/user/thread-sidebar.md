@@ -42,6 +42,9 @@ An idle runtime started by NeoCode is then released to save memory. Active turns
 unanswered questions, running background jobs, and live subagents keep it running.
 Returning to its tab opens the saved session again; your unsent draft stays intact.
 This idle release never stops a session owned by a terminal.
+Closing a session view keeps its last sidebar status until the session list refreshes.
+A reply still in progress stays **Working**, and a finished reply doesn't briefly
+show **Working** again.
 
 ### Stop a managed NeoPi session
 
@@ -163,8 +166,9 @@ request. Hover a row or right-click it to **Settle** or **Un-settle** it; sessio
 working or waiting cannot be settled. A settled session returns on its own when it becomes
 busy or gets new activity. Settling persists on the server, so it follows you across
 devices. **Working** means the NeoPi process running the session is streaming a reply or
-compacting; **Waiting** means it has a question, approval or plan review open. Panes you
-opened yourself, a queued message, and sessions with no running NeoPi show neither. A
+compacting; **Waiting** means it has a question, approval or plan review open. An open
+session's sidebar status updates with its session tab. Panes you opened yourself, a
+queued message, and sessions with no running NeoPi show neither. A
 session open in a terminal on a NeoPi older than the one NeoCode follows cannot be opened
 here until you restart it. Search lists matches from every section in one list.
 

@@ -259,7 +259,11 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
-import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+import {
+  ComposerPendingUserInputCard,
+  ComposerPendingUserInputPanel,
+} from "./ComposerPendingUserInputPanel";
+import type { NativeAskAction, NativeAskProgress } from "../neopi/nativeAsk";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import { ComposerControl, ComposerControlIcon, ComposerControlSeparator } from "./ComposerControl";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
@@ -988,6 +992,14 @@ export type NativeChatComposerProps = Pick<
   routeKind: "native";
   composerDraftTarget: NativeSessionTarget;
   routeThreadRef: NativeSessionTarget;
+  nativeAsk?:
+    | (NativeAskProgress & {
+        id: string;
+        questionCount: number;
+        isResponding: boolean;
+        dispatch: (action: NativeAskAction) => void;
+      })
+    | null;
   nativeSession: {
     commands: readonly NativeSlashCommand[];
     /** A terminal NeoPi runs every command; an owned session cannot run terminal-only ones. */
@@ -1059,6 +1071,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onFileOpen,
   } = props;
   const nativeSession = props.routeKind === "native" ? props.nativeSession : null;
+  const nativeAsk = props.routeKind === "native" ? (props.nativeAsk ?? null) : null;
+  const isAnsweringNativeAsk = nativeAsk !== null;
   const legacy = props.routeKind === "native" ? null : props;
   const {
     supportsQuestionAttachments = false,
@@ -1077,9 +1091,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activePendingApproval = null,
     pendingApprovals = EMPTY_LEGACY_COMPOSER_LIST,
     pendingUserInputs = EMPTY_LEGACY_COMPOSER_LIST,
-    activePendingProgress = null,
+    activePendingProgress: legacyPendingProgress = null,
     activePendingResolvedAnswers = null,
-    activePendingIsResponding = false,
+    activePendingIsResponding: legacyPendingIsResponding = false,
     activePendingDraftAnswers = EMPTY_LEGACY_COMPOSER_ANSWERS,
     activePendingQuestionIndex = 0,
     respondingRequestIds = EMPTY_LEGACY_COMPOSER_LIST,
@@ -1105,6 +1119,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     handleInteractionModeChange,
     onImplementPlanInNewThread,
   } = legacy ?? {};
+  const activePendingProgress: LegacyChatComposerProps["activePendingProgress"] =
+    nativeAsk ?? legacyPendingProgress;
+  const activePendingIsResponding = nativeAsk?.isResponding ?? legacyPendingIsResponding;
+  const hasPendingUserInput = isAnsweringNativeAsk || pendingUserInputs.length > 0;
   const onCompactContext = nativeSession?.onCompactContext ?? legacy?.onCompactContext;
   const setMultipleModelSelections = useCallback<
     LegacyChatComposerProps["onMultipleModelSelectionsChange"]
@@ -2155,6 +2173,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   // An argument menu exists only while NeoPi has completions for it.
   const composerMenuOpen =
+    !isAnsweringNativeAsk &&
     Boolean(composerTrigger) &&
     (composerTrigger?.kind !== "slash-argument" || composerMenuItems.length > 0);
   const composerMenuSearchKey = composerTrigger
@@ -2185,12 +2204,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
 
   const isComposerApprovalState = activePendingApproval !== null;
+  const showPromptDraft = !isComposerApprovalState && !isAnsweringNativeAsk;
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const isChoiceOnlyPendingQuestion =
     activePendingProgress?.activeQuestion?.allowCustomAnswer === false;
   const showComposerTopDrawer =
     isComposerApprovalState ||
-    pendingUserInputs.length > 0 ||
+    hasPendingUserInput ||
     (showPlanFollowUpPrompt && activeProposedPlan !== null);
   const showComposerAttachAction =
     fileStagingLimit !== null &&
@@ -2292,19 +2312,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const expandedControlsLayout = useComposerControlsLayout();
   const pendingPrimaryAction = useMemo(
     () =>
-      activePendingProgress
+      nativeAsk
         ? {
-            questionIndex: activePendingProgress.questionIndex,
-            isLastQuestion: activePendingProgress.isLastQuestion,
-            canAdvance:
-              activePendingProgress.canAdvance &&
-              !attachmentBlockReason &&
-              !(questionPreparations[attachmentTargetKey] ?? 0),
-            isResponding: activePendingIsResponding,
-            isComplete: Boolean(activePendingResolvedAnswers),
+            questionIndex: nativeAsk.questionIndex,
+            isLastQuestion: nativeAsk.isLastQuestion,
+            canAdvance: nativeAsk.canAdvance,
+            isResponding: nativeAsk.isResponding,
+            isComplete: nativeAsk.canAdvance,
           }
-        : null,
+        : activePendingProgress
+          ? {
+              questionIndex: activePendingProgress.questionIndex,
+              isLastQuestion: activePendingProgress.isLastQuestion,
+              canAdvance:
+                activePendingProgress.canAdvance &&
+                !attachmentBlockReason &&
+                !(questionPreparations[attachmentTargetKey] ?? 0),
+              isResponding: activePendingIsResponding,
+              isComplete: Boolean(activePendingResolvedAnswers),
+            }
+          : null,
     [
+      nativeAsk,
       activePendingIsResponding,
       activePendingProgress,
       activePendingResolvedAnswers,
@@ -2736,6 +2765,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     requestId: string | null;
     questionId: string | null;
   } | null>(null);
+  const nativeAskTextRef = useRef("");
 
   useEffect(() => {
     const nextCustomAnswer = activePendingProgress?.customAnswer;
@@ -2753,12 +2783,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       return;
     }
 
-    const nextRequestId = activePendingUserInput?.requestId ?? null;
+    const nextRequestId = nativeAsk?.id ?? activePendingUserInput?.requestId ?? null;
     const nextQuestionId = activePendingProgress?.activeQuestion?.id ?? null;
     const questionChanged =
       lastSyncedPendingInputRef.current?.requestId !== nextRequestId ||
       lastSyncedPendingInputRef.current?.questionId !== nextQuestionId;
-    const textChangedExternally = promptRef.current !== nextCustomAnswer;
+    const textChangedExternally =
+      (isAnsweringNativeAsk ? nativeAskTextRef.current : promptRef.current) !== nextCustomAnswer;
 
     lastSyncedPendingInputRef.current = {
       requestId: nextRequestId,
@@ -2769,15 +2800,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       return;
     }
 
-    promptRef.current = nextCustomAnswer;
+    if (isAnsweringNativeAsk) nativeAskTextRef.current = nextCustomAnswer;
+    else promptRef.current = nextCustomAnswer;
     const { cursor, trigger } = composerStateAtPromptEnd(nextCustomAnswer);
     setComposerCursor(cursor);
-    resetComposerTrigger(trigger);
+    resetComposerTrigger(isAnsweringNativeAsk ? null : trigger);
     setComposerHighlightedItemId(null);
   }, [
     activePendingProgress?.customAnswer,
     activePendingProgress?.activeQuestion?.id,
     activePendingUserInput?.requestId,
+    nativeAsk?.id,
+    isAnsweringNativeAsk,
     prompt,
     promptRef,
     resetComposerTrigger,
@@ -2940,6 +2974,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       cursorAdjacentToMention: boolean,
       contextIds: string[],
     ) => {
+      if (nativeAsk) {
+        nativeAskTextRef.current = nextPrompt;
+        setComposerCursor(nextCursor);
+        nativeAsk.dispatch({
+          type: "custom",
+          questionId: nativeAsk.activeQuestion.id,
+          text: nextPrompt,
+        });
+        return;
+      }
       if (activePendingProgress?.activeQuestion && pendingUserInputs.length > 0) {
         if (activePendingProgress.activeQuestion.allowCustomAnswer === false) return;
         setComposerCursor(nextCursor);
@@ -3047,6 +3091,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       activePendingProgress?.activeQuestion,
       completeCommandArgument,
       pendingUserInputs.length,
+      nativeAsk,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,
       setPrompt,
@@ -3084,6 +3129,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         citationComment?: { start: number; sourceAnchor: AssistantCitationSourceAnchor };
       },
     ): boolean => {
+      if (isAnsweringNativeAsk) return false;
       if (
         activePendingUserInput &&
         activePendingProgress?.activeQuestion?.allowCustomAnswer === false
@@ -3142,6 +3188,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [
       activePendingProgress?.activeQuestion,
+      isAnsweringNativeAsk,
       activePendingUserInput,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,
@@ -3417,6 +3464,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const submitComposer = useCallback(
     (event?: { preventDefault: () => void }, intent: ComposerSubmissionIntent = "foreground") => {
+      if (nativeAsk) {
+        event?.preventDefault();
+        nativeAsk.dispatch({ type: "advance", questionId: nativeAsk.activeQuestion.id });
+        return;
+      }
       // A send while a pasted image is still compressing would strand that
       // image: the turn snapshot wouldn't include it, and it would surface
       // in the *next* draft instead. Only oversized images hit this — small
@@ -3466,6 +3518,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [
       activeThreadId,
       activePendingProgress,
+      nativeAsk,
       attachmentTargetKey,
       blurMobileComposerAfterSend,
       sendDisabledReason,
@@ -3489,7 +3542,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       compactDisabled ||
       noProviderAvailable ||
       activePendingApproval !== null ||
-      pendingUserInputs.length > 0 ||
+      hasPendingUserInput ||
       phase === "running" ||
       isSendBusy ||
       isConnecting ||
@@ -3506,7 +3559,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isSendBusy,
     noProviderAvailable,
     onCompactContext,
-    pendingUserInputs.length,
+    hasPendingUserInput,
     phase,
   ]);
 
@@ -3544,7 +3597,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       if (event.shiftKey || event.altKey || event.metaKey || event.ctrlKey || event.isComposing) {
         return false;
       }
-      if (isComposerApprovalState || pendingUserInputs.length > 0) return false;
+      if (isComposerApprovalState || hasPendingUserInput) return false;
       // A composer holding an image, file, picked element, preview
       // annotation, or review comment is not empty. Recalling text into it
       // would send the old prompt with the new context, which is never what
@@ -3585,7 +3638,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerPreviewAnnotations.length,
       composerReviewComments.length,
       isComposerApprovalState,
-      pendingUserInputs.length,
+      hasPendingUserInput,
       promptRef,
       replacePromptFromHistory,
     ],
@@ -3599,6 +3652,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     event: KeyboardEvent,
     isTaskItem = false,
   ) => {
+    if (nativeAsk) {
+      if (key !== "Enter" || event.isComposing || event.keyCode === 229) return false;
+      const intent = composerSubmissionIntentForEnter({
+        isMobileViewport,
+        shiftKey: event.shiftKey,
+        modifierKey: event.metaKey || event.ctrlKey,
+        isDraftThread: false,
+        isRunning: false,
+        sendShortcut: settings.sendShortcut,
+        prompt: nativeAskTextRef.current,
+      });
+      if (!intent) return false;
+      submitComposer(undefined, intent);
+      return true;
+    }
     if (key === "Tab" && event.shiftKey) {
       if (!planModeUiEnabled) return false;
       toggleInteractionMode?.();
@@ -4310,8 +4378,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setIsTasksDrawerOpen((open) => !open);
   }, []);
   const hasBannerItems = (legacy?.bannerItems.length ?? 0) > 0;
-  const hasBlockingComposerTopDrawer =
-    activePendingApproval !== null || pendingUserInputs.length > 0;
+  const hasBlockingComposerTopDrawer = activePendingApproval !== null || hasPendingUserInput;
   const showInlineTasksBadge =
     activeTasksProgress !== null &&
     activeTaskSteps !== null &&
@@ -4675,7 +4742,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   ): Promise<boolean> => {
     if (!composerResourceId || files.length === 0 || isRevertingCheckpointRef.current) return false;
     if (
-      pendingUserInputs.length > 0 &&
+      hasPendingUserInput &&
       (!supportsQuestionAttachments ||
         activePendingProgress?.activeQuestion?.allowCustomAnswer === false ||
         activePendingIsResponding)
@@ -4701,7 +4768,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       (options?.selection !== undefined ||
         isConnecting ||
         isComposerApprovalState ||
-        pendingUserInputs.length > 0 ||
+        hasPendingUserInput ||
         projectSelectionRequired ||
         stripInlineContextReferences(promptRef.current).trim().length > 0);
 
@@ -4942,7 +5009,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectionOverride?: { start: number; end: number },
   ): boolean => {
     const questionCanAttach =
-      pendingUserInputs.length === 0 ||
+      !hasPendingUserInput ||
       (supportsQuestionAttachments &&
         activePendingProgress?.activeQuestion?.allowCustomAnswer !== false &&
         !activePendingIsResponding);
@@ -5013,6 +5080,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   };
 
   const onComposerPaste = (event: React.ClipboardEvent<HTMLElement>) => {
+    if (isAnsweringNativeAsk) return;
     const files = Array.from(event.clipboardData.files);
     const plainText = event.clipboardData.getData("text/plain");
     const bypassAutoAttachment = Date.now() <= pasteAsTextShortcutUntilRef.current;
@@ -5056,7 +5124,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         text.length === 0 ||
         isConnecting ||
         isComposerApprovalState ||
-        pendingUserInputs.length > 0 ||
+        hasPendingUserInput ||
         projectSelectionRequired ||
         (options?.citationCommentAnchor && !composerEditorRef.current)
       ) {
@@ -5091,7 +5159,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       applyPromptReplacement,
       isComposerApprovalState,
       isConnecting,
-      pendingUserInputs.length,
+      hasPendingUserInput,
       projectSelectionRequired,
       promptRef,
       readComposerSnapshot,
@@ -5312,7 +5380,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         );
       },
       addTerminalContext: (selection: TerminalContextSelection) => {
-        if (!composerResourceId || isChoiceOnlyPendingQuestion) return;
+        if (!composerResourceId || isChoiceOnlyPendingQuestion || isAnsweringNativeAsk) return;
         const snapshot = readComposerSnapshot();
         const context = {
           id: randomUUID(),
@@ -5409,7 +5477,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       isConnecting,
       isComposerApprovalState,
       isChoiceOnlyPendingQuestion,
-      pendingUserInputs.length,
+      hasPendingUserInput,
+      isAnsweringNativeAsk,
       projectSelectionRequired,
       applyPromptReplacement,
       isComposerModelPickerOpen,
@@ -5530,6 +5599,26 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               </ComposerBanner.Root>
             </ComposerBanner.Attachment>
           ) : null}
+          {nativeAsk ? (
+            <ComposerBanner.Attachment>
+              <ComposerBanner.Root data-chat-composer-top-drawer="true" variant="info">
+                <ComposerPendingUserInputCard
+                  key={nativeAsk.id}
+                  activeQuestion={nativeAsk.activeQuestion}
+                  questionCount={nativeAsk.questionCount}
+                  questionIndex={nativeAsk.questionIndex}
+                  selectedOptionValues={nativeAsk.selectedOptionValues}
+                  isResponding={nativeAsk.isResponding}
+                  allowsEmptySelection
+                  onToggleOption={(questionId, label) =>
+                    nativeAsk.dispatch({ type: "option", questionId, label })
+                  }
+                  onAdvance={(questionId) => nativeAsk.dispatch({ type: "advance", questionId })}
+                  onDismiss={() => nativeAsk.dispatch({ type: "dismiss" })}
+                />
+              </ComposerBanner.Root>
+            </ComposerBanner.Attachment>
+          ) : null}
           {!activityStackItem &&
           isTasksDrawerOpen &&
           !hasBlockingComposerTopDrawer &&
@@ -5593,7 +5682,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 !composerBodyResize.pinned && "max-h-[40dvh]",
               )}
             >
-              {isStashMenuOpen && !composerMenuOpen && !isComposerApprovalState && (
+              {isStashMenuOpen && !composerMenuOpen && showPromptDraft && (
                 <ComposerCommandMenuLayer anchor={composerMenuAnchor}>
                   <ComposerStashMenu
                     entries={stashQueue}
@@ -5627,7 +5716,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 </ComposerCommandMenuLayer>
               )}
 
-              {!isComposerApprovalState &&
+              {showPromptDraft &&
                 (uncommittedSnapShotIds.length > 0 ||
                   composerVideos.length > 0 ||
                   standaloneComposerImages.length > 0) && (
@@ -5873,7 +5962,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   </div>
                 )}
 
-              {!isComposerApprovalState && composerOtherFiles.length > 0 && (
+              {showPromptDraft && composerOtherFiles.length > 0 && (
                 <div className="mb-3 flex flex-col gap-1">
                   {composerOtherFiles.map((file) => {
                     const fileCanUpload =
@@ -5995,8 +6084,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     }
                     cursor={composerCursor}
                     contextRecords={composerContextRecords}
-                    buildContextClipboardFragment={buildContextClipboardFragment}
-                    importContextFragment={importContextFragment}
+                    buildContextClipboardFragment={
+                      isAnsweringNativeAsk ? undefined : buildContextClipboardFragment
+                    }
+                    importContextFragment={isAnsweringNativeAsk ? undefined : importContextFragment}
                     skills={selectedProviderSkills}
                     className={cn(
                       "max-h-none overflow-y-visible",
@@ -6125,7 +6216,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       </Tooltip>
                     </>
                   ) : null}
-                  {dictation ? (
+                  {dictation && !isAnsweringNativeAsk ? (
                     <ComposerDictationButton dictation={dictation} shortcut={dictationShortcut} />
                   ) : null}
                   <ComposerFooterPrimaryActions
@@ -6154,7 +6245,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isPreparingWorktree={isPreparingWorktree}
                     hasSendableContent={composerSendState.hasSendableContent}
                     preserveComposerFocusOnPointerDown={isMobileViewport}
-                    onPreviousPendingQuestion={() => onPreviousActivePendingUserInputQuestion?.()}
+                    onPreviousPendingQuestion={() => {
+                      if (nativeAsk) nativeAsk.dispatch({ type: "previous" });
+                      else onPreviousActivePendingUserInputQuestion?.();
+                    }}
                     onInterrupt={handleInterruptPrimaryAction}
                     onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
                     compactDisabled={

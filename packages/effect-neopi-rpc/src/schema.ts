@@ -34,6 +34,7 @@ export interface UiRequestFrame {
     | "confirm"
     | "input"
     | "editor"
+    | "ask"
     | "cancel"
     | "notify"
     | "setStatus"

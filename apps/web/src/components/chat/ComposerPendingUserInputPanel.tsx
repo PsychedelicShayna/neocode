@@ -1,4 +1,4 @@
-import { type ApprovalRequestId } from "@t3tools/contracts";
+import type { ApprovalRequestId, UserInputQuestion } from "@t3tools/contracts";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { type PendingUserInput } from "../../session-logic";
 import {
@@ -32,40 +32,55 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   if (pendingUserInputs.length === 0) return null;
   const activePrompt = pendingUserInputs[0];
   if (!activePrompt) return null;
+  const progress = derivePendingUserInputProgress(activePrompt.questions, answers, questionIndex);
+  if (!progress.activeQuestion) return null;
 
   return (
     <ComposerPendingUserInputCard
       key={activePrompt.requestId}
-      prompt={activePrompt}
+      activeQuestion={progress.activeQuestion}
       isResponding={respondingRequestIds.includes(activePrompt.requestId)}
-      answers={answers}
-      questionIndex={questionIndex}
+      questionCount={activePrompt.questions.length}
+      questionIndex={progress.questionIndex}
+      selectedOptionValues={progress.usingCustomAnswer ? [] : progress.selectedOptionValues}
       onToggleOption={onToggleOption}
       onAdvance={onAdvance}
-      onDismiss={onDismiss}
+      onDismiss={activePrompt.dismissible ? () => onDismiss(activePrompt.requestId) : undefined}
     />
   );
 });
 
-const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard({
-  prompt,
+type CardQuestion = Omit<UserInputQuestion, "options"> & {
+  options: readonly {
+    label: string;
+    value?: string | undefined;
+    description?: string;
+    preview?: string;
+    recommended?: boolean;
+  }[];
+};
+
+export const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard({
+  activeQuestion,
   isResponding,
-  answers,
+  questionCount,
   questionIndex,
+  selectedOptionValues,
   onToggleOption,
   onAdvance,
   onDismiss,
+  allowsEmptySelection = false,
 }: {
-  prompt: PendingUserInput;
+  activeQuestion: CardQuestion;
   isResponding: boolean;
-  answers: Record<string, PendingUserInputDraftAnswer>;
+  questionCount: number;
+  selectedOptionValues: readonly string[];
   questionIndex: number;
   onToggleOption: (questionId: string, optionValue: string) => void;
-  onAdvance: () => void;
-  onDismiss: (requestId: ApprovalRequestId) => void;
+  onAdvance: (questionId: string) => void;
+  onDismiss?: (() => void) | undefined;
+  allowsEmptySelection?: boolean;
 }) {
-  const progress = derivePendingUserInputProgress(prompt.questions, answers, questionIndex);
-  const activeQuestion = progress.activeQuestion;
   const autoAdvanceTimerRef = useRef<number | null>(null);
   const onAdvanceRef = useRef(onAdvance);
   const [optimisticSingleSelect, setOptimisticSingleSelect] = useState<{
@@ -86,26 +101,17 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   }, [onAdvance]);
 
   useEffect(() => {
-    if (!activeQuestion || activeQuestion.multiSelect || !optimisticSingleSelect) {
+    if (activeQuestion.multiSelect || !optimisticSingleSelect) {
       return;
     }
     if (optimisticSingleSelect.questionId !== activeQuestion.id) {
       setOptimisticSingleSelect(null);
       return;
     }
-    if (
-      progress.customAnswer.trim().length === 0 &&
-      progress.selectedOptionValues.includes(optimisticSingleSelect.optionValue)
-    ) {
+    if (selectedOptionValues.includes(optimisticSingleSelect.optionValue)) {
       setOptimisticSingleSelect(null);
     }
-  }, [
-    activeQuestion,
-    optimisticSingleSelect,
-    progress.customAnswer,
-    progress.selectedOptionValues,
-  ]);
-
+  }, [activeQuestion, optimisticSingleSelect, selectedOptionValues]);
   // A delayed selection belongs to one question, not the next callback in the card.
   useEffect(() => {
     return () => {
@@ -114,7 +120,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         autoAdvanceTimerRef.current = null;
       }
     };
-  }, [activeQuestion?.id, isResponding]);
+  }, [activeQuestion.id, isResponding]);
 
   const handleOptionSelection = useCallback(
     (questionId: string, optionValue: string) => {
@@ -129,7 +135,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       }
       autoAdvanceTimerRef.current = window.setTimeout(() => {
         autoAdvanceTimerRef.current = null;
-        onAdvanceRef.current();
+        onAdvanceRef.current(questionId);
       }, 200);
     },
     [activeQuestion, onToggleOption],
@@ -142,7 +148,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   useEffect(() => {
     if (!activeQuestion || isResponding || isCollapsed) return;
     const handler = (event: globalThis.KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey
+      )
+        return;
       const target = event.target;
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
         return;
@@ -165,12 +178,6 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [activeQuestion, handleOptionSelection, isCollapsed, isResponding]);
-
-  if (!activeQuestion) {
-    return null;
-  }
-
-  const customAnswerActive = progress.customAnswer.trim().length > 0;
 
   return (
     <Collapsible
@@ -198,13 +205,13 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           ) : null}
         </ComposerBanner.Content>
         <ComposerBanner.Actions>
-          {prompt.questions.length > 1 ? (
+          {questionCount > 1 ? (
             <span className="text-3xs font-medium text-muted-foreground tabular-nums">
-              {questionIndex + 1}/{prompt.questions.length}
+              {questionIndex + 1}/{questionCount}
             </span>
           ) : null}
           <ComposerBanner.ToggleIcon expanded={!isCollapsed} />
-          {prompt.dismissible ? (
+          {onDismiss ? (
             // Sits inside the trigger button, so stop the click from toggling
             // the disclosure. Dismiss closes the question without a reply.
             <ComposerBanner.Dismiss
@@ -216,13 +223,13 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
               onClick={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                onDismiss(prompt.requestId);
+                onDismiss();
               }}
               onKeyDown={(event) => {
                 if (event.key !== "Enter" && event.key !== " ") return;
                 event.preventDefault();
                 event.stopPropagation();
-                onDismiss(prompt.requestId);
+                if (!isResponding) onDismiss();
               }}
             />
           ) : null}
@@ -233,7 +240,11 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
           <ComposerBanner.Body className="pe-1 pb-1 wrap-anywhere">
             <p className="text-sm text-foreground/85">{activeQuestion.question}</p>
             {activeQuestion.multiSelect ? (
-              <p className="mt-1 text-secondary-label text-xs">Select one or more options.</p>
+              <p className="mt-1 text-secondary-label text-xs">
+                {allowsEmptySelection
+                  ? "Select any options, or leave blank."
+                  : "Select one or more options."}
+              </p>
             ) : null}
             <div className="mt-2 space-y-0.5">
               {activeQuestion.options.map((option, index) => {
@@ -242,8 +253,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                   optimisticSingleSelect?.questionId === activeQuestion.id &&
                   optimisticSingleSelect.optionValue === optionValue;
                 const isSelected =
-                  isOptimisticallySelected ||
-                  (!customAnswerActive && progress.selectedOptionValues.includes(optionValue));
+                  isOptimisticallySelected || selectedOptionValues.includes(optionValue);
                 const shortcutKey = index < 9 ? index + 1 : null;
                 const className = cn(
                   "group flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left outline-none transition-colors duration-150 focus-visible:ring-1 focus-visible:ring-primary/25",
@@ -256,9 +266,19 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
                 const content = (
                   <>
                     <div className="min-w-0 flex-1 flex flex-col gap-0.5">
-                      <span className="text-sm font-medium">{option.label}</span>
+                      <span className="text-sm font-medium">
+                        {option.label}
+                        {option.recommended ? (
+                          <span className="ms-2 text-secondary-label text-2xs">Recommended</span>
+                        ) : null}
+                      </span>
                       {option.description && option.description !== option.label ? (
                         <span className="text-secondary-label text-2xs">{option.description}</span>
+                      ) : null}
+                      {option.preview ? (
+                        <pre className="whitespace-pre-wrap text-secondary-label text-2xs">
+                          {option.preview}
+                        </pre>
                       ) : null}
                     </div>
                     {isSelected ? (

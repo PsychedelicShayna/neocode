@@ -2051,6 +2051,9 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
       // UI and approval answers are one-way side channels, never correlated RPC requests.
       if (command.type === "extension_ui_response") {
         const response = yield* Schema.decodeUnknownEffect(UiResponse)(command);
+        // A timeout/abort may have settled the question before a click or delayed
+        // single-choice advance reached the server.
+        if (!session.pendingUi.has(response.id)) return { accepted: false };
         yield* client.respondUi(response);
         session.pendingUi.delete(response.id);
         session.projection.settleObligation(response.id, "answered");
@@ -3440,7 +3443,8 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
               request.method === "select" ||
               request.method === "confirm" ||
               request.method === "input" ||
-              request.method === "editor"
+              request.method === "editor" ||
+              request.method === "ask"
             )
               Deferred.doneUnsafe(startupUi, Effect.void);
             frame(request);
@@ -3633,6 +3637,13 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       );
       if (attempt._tag === "Success") {
         const { client, hostTools } = attempt.success;
+        // Only stdio owners can opt in. A terminal control pipe has no setter in v19.
+        yield* client.request({ type: "set_ask_dialog", enabled: true }).pipe(
+          Effect.catchIf(
+            (error) => error.command === "set_ask_dialog" && error.code === undefined,
+            () => Effect.void,
+          ),
+        );
         let booting = true;
         const readState = Effect.suspend(() => {
           const ordinary = client.request({ type: "get_state", includeDump: false }).pipe(

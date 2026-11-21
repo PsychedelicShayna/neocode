@@ -382,7 +382,7 @@ export function managedControlPublication(
           return { kind: "changed" as const };
       }
     }
-    return { kind: "same" as const, snapshot, start: meta.procStartTicks ?? undefined };
+    return { kind: "same" as const, snapshot };
   }
   return undefined;
 }
@@ -938,10 +938,12 @@ export const makeManagedTmuxHost = (
       (rows.includes(`${exact}1`) || !rows.some((row) => row.startsWith(prefix)));
     const observed = await observeManagedProcess(platform, owner.pid);
     const expected = binding.process;
-    const sameProcess =
+    const matchesSavedProcess =
+      expected !== undefined &&
       observed.state === "alive" &&
-      (!expected ||
-        (observed.identity.start === expected.start && observed.identity.image === expected.image));
+      observed.identity.start === expected.start &&
+      observed.identity.image === expected.image;
+    const sameProcess = observed.state === "alive" && (!expected || matchesSavedProcess);
     const oldProcessGone =
       observed.state === "gone" ||
       (expected && observed.state === "alive" && observed.identity.start !== expected.start);
@@ -951,7 +953,7 @@ export const makeManagedTmuxHost = (
         : live && (sameProcess || (platform !== "linux" && observed.state === "unknown"))
           ? "alive"
           : "unknown";
-    return { liveness, process: observed.state === "alive" ? observed.identity : undefined };
+    return { liveness, forceTargetVerified: platform === "linux" && live && matchesSavedProcess };
   };
   const observe = (binding: ManagedTmuxBinding, rows: readonly string[] | undefined) =>
     Effect.promise(() => evidence(binding, rows));

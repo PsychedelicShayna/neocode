@@ -3128,7 +3128,10 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
         registry: string | undefined,
         branch: string | null,
       ) {
-        const { liveness: physical, process } = yield* managedHost.observe(binding, panes);
+        const { liveness: physical, forceTargetVerified } = yield* managedHost.observe(
+          binding,
+          panes,
+        );
         const publication = managedControlPublication(binding, registry);
         const liveness =
           physical === "alive" && publication?.kind === "changed" ? "unknown" : physical;
@@ -3149,12 +3152,6 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           forcing.has(key),
         );
         const authorityRefused = refusedSavedOwners.get(binding.sessionFile) === key;
-        // Legacy bindings can use the original publication's birth time even if
-        // the endpoint is unresponsive. Never infer identity from the PID alone.
-        const identity =
-          publication?.kind === "same" && process && publication.start === Number(process.start)
-            ? (binding.process ?? process)
-            : undefined;
         const streaming = control?.busy?.streaming ?? control?.session?.isStreaming;
         const compacting = control?.busy?.compacting ?? control?.session?.isCompacting;
         const managed: NeoPiManagedSessionLifecycle = {
@@ -3171,10 +3168,10 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
           canForceStop:
             liveness === "alive" &&
             !forcing.has(key) &&
-            ((stop === "unconfirmed" && identity !== undefined) ||
-              (authorityRefused && binding.process !== undefined)),
+            forceTargetVerified &&
+            (stop === "unconfirmed" || authorityRefused),
         };
-        return { live, managed, identity };
+        return { live, managed };
       });
       const decorate: NonNullable<NeoPiNativeSessionsDependencies["managedLifecycleList"]> = (
         rows,
@@ -3244,30 +3241,30 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             const authorityRefused =
               refusedSavedOwners.get(binding.sessionFile) === binding.owner.imageId;
             const panes = yield* managedHost.panes;
-            let identity;
+            let allowed: boolean;
             if (authorityRefused) {
               // A refused owner is only eligible by its saved Linux process identity.
               // Do not open control or invoke the configured NeoPi CLI in this branch.
               const observed = yield* managedHost.observe(binding, panes);
               if (observed.liveness === "exited") return;
-              if (observed.liveness === "alive") identity = binding.process;
+              allowed = observed.forceTargetVerified;
             } else {
               const pinned = yield* verifySavedBinary(profile, binding);
               const registry = yield* registryJson(pinned);
               const inspected = yield* inspect(binding, panes, registry, null);
               if (inspected.managed.liveness === "exited") return;
-              if (inspected.managed.canForceStop) identity = inspected.identity;
+              allowed = inspected.managed.canForceStop;
             }
-            if (!identity || forcing.has(input.imageId))
+            if (!allowed || forcing.has(input.imageId))
               return yield* fail(
-                "This owner is not eligible for Force Stop.",
+                "This owner is not eligible for Force Stop. Exit with /exit in the old TUI, then reopen the session.",
                 "tmux_force_not_available",
               );
             yield* profile.validate;
             if (forcing.has(input.imageId)) return;
             forcing.add(input.imageId);
             yield* managedHost
-              .force({ ...binding, process: identity })
+              .force(binding)
               .pipe(Effect.ensuring(Effect.sync(() => forcing.delete(input.imageId))));
             return;
           }

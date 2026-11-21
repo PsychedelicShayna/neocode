@@ -79,10 +79,12 @@ attests the exact session-file lease to the same pane PID and running NeoPi
 identity. A different executable path or a missing legacy pin is refused.
 If NeoCode cannot verify the saved owner, exit with `/exit` in its TUI, or
 choose **Force Stop** from the session's NeoCode menu if it is available.
-Force Stop ends the process without a graceful exit and requires a
-verified Linux process identity and pidfd. After both the old pane and
-process have exited, reopen the session. NeoCode verifies the new owner's
-lease and records the current executable for that owner.
+Force Stop ends the process without a graceful exit. It requires the exact
+live pane and the Linux process identity recorded in its binding, which is
+checked again before signaling via pidfd. This also applies when graceful
+Stop is unconfirmed. After both the old pane and process have exited, reopen
+the session. NeoCode verifies the new owner's lease and records the current
+executable for that owner.
 
 ### Attach a prestarted NeoPi TUI
 

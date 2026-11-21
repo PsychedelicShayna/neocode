@@ -441,13 +441,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     desktopOnly: true,
   },
   {
-    id: "text-generation-model",
-    title: "Text generation model",
-    to: "/settings/general",
-    scope: "project-defaults",
-    searchTerms: ["generated thread titles source control content default provider"],
-  },
-  {
     id: "diagnostics",
     title: "Diagnostics",
     to: "/settings/general",
@@ -522,6 +515,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/providers",
     searchTerms: [
       "neopi models all models providers effort rules custom favorite hidden inference sign in",
+      "session titles text generation generated thread branch names commit messages pull request descriptions",
     ],
   },
   {
@@ -689,16 +683,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/source-control",
     searchTerms: ["repository pr pull request description structure"],
     environmentOnly: true,
-  },
-  {
-    id: "source-control-writer-model",
-    title: "Source control writer model",
-    to: "/settings/source-control",
-    searchTerms: [
-      "override generated commit change request pr titles descriptions branch bookmark",
-    ],
-    environmentOnly: true,
-    scope: "project-defaults",
   },
   {
     id: "project-actions",

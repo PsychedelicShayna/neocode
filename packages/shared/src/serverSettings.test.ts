@@ -4,7 +4,6 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   UsageLimitSourceId,
-  type ServerProvider,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
 import { describe, expect, it } from "vite-plus/test";
@@ -16,7 +15,6 @@ import {
   getThreadRuntimeReadOnlyReason,
   isModelSelectionProviderEnabled,
   parsePersistedServerObservabilitySettings,
-  resolveSourceControlWriterModelSelection,
   resolveProjectAgentBrowserAccess,
   resolveProjectAutoPull,
 } from "./serverSettings.ts";
@@ -27,24 +25,62 @@ const FOLDED_SERVER_SETTINGS = { ...DEFAULT_SERVER_SETTINGS, projectSettingsFold
 describe("serverSettings helpers", () => {
   it("keeps old runtime settings but never treats them as an enabled execution choice", () => {
     const instanceId = ProviderInstanceId.make("legacy");
-    const legacy = { driver: ProviderDriverKind.make("codex"), enabled: true, config: { homePath: "/saved/codex" } };
+    const legacy = {
+      driver: ProviderDriverKind.make("codex"),
+      enabled: true,
+      config: { homePath: "/saved/codex" },
+    };
     const settings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: { [instanceId]: legacy } };
-    expect(isModelSelectionProviderEnabled(settings, { instanceId, model: "old-model" })).toBe(false);
+    expect(isModelSelectionProviderEnabled(settings, { instanceId, model: "old-model" })).toBe(
+      false,
+    );
     expect(settings.providerInstances[instanceId]).toBe(legacy);
-    expect(isModelSelectionProviderEnabled(settings, { instanceId: ProviderInstanceId.make("neopi"), model: "openai-codex/current" })).toBe(true);
+    expect(
+      isModelSelectionProviderEnabled(settings, {
+        instanceId: ProviderInstanceId.make("neopi"),
+        model: "openai-codex/current",
+      }),
+    ).toBe(true);
   });
 
   it("makes legacy history read-only even when a draft selects NeoPi", () => {
-    const modelSelection = { instanceId: ProviderInstanceId.make("neopi"), model: "anthropic/current" };
-    expect(getThreadRuntimeReadOnlyReason({ modelSelection, session: { providerName: "claudeAgent" }, settings: DEFAULT_SERVER_SETTINGS })).toContain("read-only");
-    expect(getThreadRuntimeReadOnlyReason({ modelSelection, session: { providerName: "neopi" }, settings: DEFAULT_SERVER_SETTINGS })).toBeNull();
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("neopi"),
+      model: "anthropic/current",
+    };
+    expect(
+      getThreadRuntimeReadOnlyReason({
+        modelSelection,
+        session: { providerName: "claudeAgent" },
+        settings: DEFAULT_SERVER_SETTINGS,
+      }),
+    ).toContain("read-only");
+    expect(
+      getThreadRuntimeReadOnlyReason({
+        modelSelection,
+        session: { providerName: "neopi" },
+        settings: DEFAULT_SERVER_SETTINGS,
+      }),
+    ).toBeNull();
   });
 
   it("distinguishes native inference-provider names from runtime identity", () => {
     const instanceId = ProviderInstanceId.make("personal");
-    const settings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: { [instanceId]: { driver: ProviderDriverKind.make("neopi"), enabled: true } } };
-    for (const model of ["openai-codex/current", "anthropic/current", "cursor/current", "openrouter/current"]) {
-      expect(getThreadRuntimeReadOnlyReason({ modelSelection: { instanceId, model }, settings })).toBeNull();
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("neopi"), enabled: true },
+      },
+    };
+    for (const model of [
+      "openai-codex/current",
+      "anthropic/current",
+      "cursor/current",
+      "openrouter/current",
+    ]) {
+      expect(
+        getThreadRuntimeReadOnlyReason({ modelSelection: { instanceId, model }, settings }),
+      ).toBeNull();
     }
   });
   it("changes a cleanup rule without replacing the machine's other rules", () => {
@@ -288,207 +324,6 @@ describe("serverSettings helpers", () => {
     });
   });
 
-  it("replaces text generation selection when provider/model are provided", () => {
-    const current = {
-      ...DEFAULT_SERVER_SETTINGS,
-      textGenerationModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-        [
-          { id: "reasoningEffort", value: "high" },
-          { id: "fastMode", value: true },
-        ],
-      ),
-    };
-
-    expect(
-      applyServerSettingsPatch(current, {
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5.4-mini",
-        },
-      }).textGenerationModelSelection,
-    ).toEqual({
-      instanceId: "codex",
-      model: "gpt-5.4-mini",
-    });
-  });
-
-  it("still deep merges text generation selection when only options are provided", () => {
-    const current = {
-      ...DEFAULT_SERVER_SETTINGS,
-      textGenerationModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-        [
-          { id: "reasoningEffort", value: "high" },
-          { id: "fastMode", value: true },
-        ],
-      ),
-    };
-
-    expect(
-      applyServerSettingsPatch(current, {
-        textGenerationModelSelection: {
-          options: [{ id: "fastMode", value: false }],
-        },
-      }).textGenerationModelSelection,
-    ).toEqual({
-      instanceId: "codex",
-      model: "gpt-5.4-mini",
-      options: [
-        { id: "reasoningEffort", value: "high" },
-        { id: "fastMode", value: false },
-      ],
-    });
-  });
-
-  it("replaces text generation selection across providers without leaking stale options", () => {
-    const current = {
-      ...DEFAULT_SERVER_SETTINGS,
-      textGenerationModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-        [
-          { id: "reasoningEffort", value: "high" },
-          { id: "fastMode", value: true },
-        ],
-      ),
-    };
-
-    expect(
-      applyServerSettingsPatch(current, {
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("opencode"),
-          model: "openai/gpt-5",
-        },
-      }).textGenerationModelSelection,
-    ).toEqual({
-      instanceId: "opencode",
-      model: "openai/gpt-5",
-    });
-  });
-
-  it("accepts array-based text generation selection patches", () => {
-    expect(
-      applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("opencode"),
-          model: "openai/gpt-5",
-          options: [
-            { id: "variant", value: "prod" },
-            { id: "agent", value: "build" },
-          ],
-        },
-      }).textGenerationModelSelection,
-    ).toEqual({
-      instanceId: "opencode",
-      model: "openai/gpt-5",
-      options: [
-        { id: "variant", value: "prod" },
-        { id: "agent", value: "build" },
-      ],
-    });
-  });
-
-  it("replaces source control writer selection without retaining stale options", () => {
-    const current = {
-      ...DEFAULT_SERVER_SETTINGS,
-      sourceControlWriterModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-        [{ id: "reasoningEffort", value: "high" }],
-      ),
-    };
-
-    expect(
-      applyServerSettingsPatch(current, {
-        sourceControlWriterModelSelection: {
-          instanceId: ProviderInstanceId.make("opencode"),
-          model: "openai/gpt-5",
-        },
-      }).sourceControlWriterModelSelection,
-    ).toEqual({
-      instanceId: "opencode",
-      model: "openai/gpt-5",
-    });
-  });
-
-  it("clears source control writer selection with null", () => {
-    const current = {
-      ...DEFAULT_SERVER_SETTINGS,
-      sourceControlWriterModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-      ),
-    };
-
-    expect(
-      applyServerSettingsPatch(current, {
-        sourceControlWriterModelSelection: null,
-      }).sourceControlWriterModelSelection,
-    ).toBeNull();
-  });
-
-  it("falls back from a disabled source control writer provider without clearing its selection", () => {
-    const instanceId = ProviderInstanceId.make("codex_writer");
-    const sourceControlWriterModelSelection = createModelSelection(instanceId, "gpt-5.4-mini");
-    const settings = {
-      ...DEFAULT_SERVER_SETTINGS,
-      providerInstances: {
-        [instanceId]: {
-          driver: ProviderDriverKind.make("codex"),
-          enabled: false,
-          config: {},
-        },
-      },
-      sourceControlWriterModelSelection,
-    };
-
-    expect(isModelSelectionProviderEnabled(settings, sourceControlWriterModelSelection)).toBe(
-      false,
-    );
-    expect(resolveSourceControlWriterModelSelection(settings)).toBe(
-      settings.textGenerationModelSelection,
-    );
-    expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
-  });
-
-  it("falls back from an unavailable source control writer provider", () => {
-    const instanceId = ProviderInstanceId.make("missing_writer");
-    const sourceControlWriterModelSelection = createModelSelection(instanceId, "missing-model");
-    const settings = {
-      ...DEFAULT_SERVER_SETTINGS,
-      providerInstances: {
-        [instanceId]: {
-          driver: ProviderDriverKind.make("missing-driver"),
-          config: {},
-        },
-      },
-      sourceControlWriterModelSelection,
-    };
-    const unavailableProvider = {
-      instanceId,
-      driver: ProviderDriverKind.make("missing-driver"),
-      enabled: false,
-      installed: false,
-      version: null,
-      status: "disabled",
-      auth: { status: "unknown" },
-      checkedAt: "2026-07-27T00:00:00.000Z",
-      availability: "unavailable",
-      unavailableReason: "This provider driver is not available in this build.",
-      models: [],
-      slashCommands: [],
-      skills: [],
-    } satisfies ServerProvider;
-
-    expect(resolveSourceControlWriterModelSelection(settings, [unavailableProvider])).toBe(
-      settings.textGenerationModelSelection,
-    );
-    expect(settings.sourceControlWriterModelSelection).toBe(sourceControlWriterModelSelection);
-  });
-
   it("replaces providerInstances maps so omitted instance fields are cleared", () => {
     const codexId = ProviderInstanceId.make("codex");
     const current = {
@@ -617,10 +452,7 @@ describe("serverSettings helpers", () => {
     };
 
     const next = applyServerSettingsPatch(current, {
-      sourceControlWriterModelSelection: createModelSelection(
-        ProviderInstanceId.make("codex"),
-        "gpt-5.4-mini",
-      ),
+      addProjectBaseDirectory: "~/Development",
     });
 
     expect(next.backgroundActivity).toEqual({

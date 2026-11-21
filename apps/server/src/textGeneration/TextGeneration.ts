@@ -1,7 +1,7 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ChatAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type { ChatAttachment, ProviderInstanceId } from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -18,8 +18,6 @@ export interface CommitMessageGenerationInput {
   /** When true, the model also returns a semantic branch name for the change. */
   includeBranch?: boolean;
   policy?: TextGenerationPolicy | undefined;
-  /** What model and provider to use for generation. */
-  modelSelection: ModelSelection;
 }
 
 export interface CommitMessageGenerationResult {
@@ -38,8 +36,6 @@ export interface PrContentGenerationInput {
   diffPatch: string;
   changeRequestTemplate?: string | undefined;
   policy?: TextGenerationPolicy | undefined;
-  /** What model and provider to use for generation. */
-  modelSelection: ModelSelection;
 }
 
 export interface PrContentGenerationResult {
@@ -51,8 +47,8 @@ export interface BranchNameGenerationInput {
   cwd: string;
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  /** What model and provider to use for generation. */
-  modelSelection: ModelSelection;
+  /** The thread's NeoPi runtime profile, if available. */
+  instanceId?: ProviderInstanceId | undefined;
 }
 
 export interface BranchNameGenerationResult {
@@ -66,8 +62,8 @@ export interface ThreadTitleGenerationInput {
   /** Present when replacing an existing title from the current thread history. */
   previousTitle?: string | undefined;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  /** What model and provider to use for generation. */
-  modelSelection: ModelSelection;
+  /** The thread's NeoPi runtime profile, if available. */
+  instanceId?: ProviderInstanceId | undefined;
 }
 
 export interface ThreadTitleGenerationResult {
@@ -118,19 +114,28 @@ type TextGenerationOp =
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
   operation: TextGenerationOp,
-  instanceId: ProviderInstanceId,
+  instanceId?: ProviderInstanceId,
 ): Effect.Effect<ProviderInstance["textGeneration"], TextGenerationError> =>
-  registry.getInstance(instanceId).pipe(
-    Effect.flatMap((instance) =>
-      instance
+  registry.listInstances.pipe(
+    Effect.flatMap((instances) => {
+      let first: ProviderInstance | undefined;
+      let defaultInstance: ProviderInstance | undefined;
+      for (const instance of instances) {
+        if (instance.driverKind !== "neopi" || !instance.enabled) continue;
+        if (instance.instanceId === instanceId) return Effect.succeed(instance.textGeneration);
+        first ??= instance;
+        if (instance.instanceId === "neopi") defaultInstance = instance;
+      }
+      const instance = defaultInstance ?? first;
+      return instance
         ? Effect.succeed(instance.textGeneration)
         : Effect.fail(
             new TextGenerationError({
               operation,
-              detail: `No provider instance registered for id '${instanceId}'.`,
+              detail: "No enabled NeoPi runtime is available for text generation.",
             }),
-          ),
-    ),
+          );
+    }),
   );
 
 /** @public Service construction is part of the canonical Effect module API. */
@@ -139,19 +144,19 @@ export const make = Effect.gen(function* () {
   const sourceControl = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   return TextGeneration.of({
     generateCommitMessage: (input) =>
-      resolveInstance(registry, "generateCommitMessage", input.modelSelection.instanceId).pipe(
+      resolveInstance(registry, "generateCommitMessage").pipe(
         Effect.flatMap((textGeneration) => textGeneration.generateCommitMessage(input)),
       ),
     generatePrContent: (input) =>
-      resolveInstance(registry, "generatePrContent", input.modelSelection.instanceId).pipe(
+      resolveInstance(registry, "generatePrContent").pipe(
         Effect.flatMap((textGeneration) => textGeneration.generatePrContent(input)),
       ),
     generateBranchName: (input) =>
-      resolveInstance(registry, "generateBranchName", input.modelSelection.instanceId).pipe(
+      resolveInstance(registry, "generateBranchName", input.instanceId).pipe(
         Effect.flatMap((textGeneration) => textGeneration.generateBranchName(input)),
       ),
     generateThreadTitle: (input) =>
-      resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
+      resolveInstance(registry, "generateThreadTitle", input.instanceId).pipe(
         Effect.flatMap((textGeneration) =>
           Effect.gen(function* () {
             const linkedContext =

@@ -74,21 +74,6 @@ describe("resolveProjectSettings", () => {
     expect(resolveProjectSettings(settings, otherProjectId).settings.defaultAutoPull).toBe(true);
   });
 
-  it("keeps the environment text generation model when the override's provider is disabled", () => {
-    const disabledSelection = createModelSelection(ProviderInstanceId.make("claudeAgent"), "opus");
-    const settings = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
-      providers: { claudeAgent: { enabled: false } },
-      projectSettingsOverrides: {
-        [projectId]: { set: { textGenerationModelSelection: disabledSelection } },
-      },
-    });
-    const resolved = resolveProjectSettings(settings, projectId);
-    expect(resolved.settings.textGenerationModelSelection).toEqual(
-      settings.textGenerationModelSelection,
-    );
-    expect(resolved.sources.textGenerationModelSelection).toBe("environment");
-  });
-
   it("honours the aggregate's own fields only until the server has folded them", () => {
     const settings = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
       providers: { codex: { enabled: true } },

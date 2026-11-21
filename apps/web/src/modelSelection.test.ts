@@ -1,12 +1,11 @@
 import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@t3tools/contracts/settings";
 import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3tools/contracts";
 import { expect, it } from "vite-plus/test";
-import { deriveProviderInstanceEntries, NO_PROVIDER_MODEL_SELECTION } from "./providerInstances";
+import { deriveProviderInstanceEntries } from "./providerInstances";
 import {
   getAppModelOptionsForInstance,
   getCustomModelOptionsByInstance,
   resolveAppModelSelectionForInstance,
-  resolveAppModelSelectionState,
 } from "./modelSelection";
 
 const model = (slug: string, isDefault = false) => ({
@@ -35,45 +34,13 @@ const settings = (overrides: Partial<UnifiedSettings> = {}): UnifiedSettings => 
   ...overrides,
 });
 
-it("replaces an obsolete runtime default without carrying its model or options into NeoPi", () => {
-  const old = {
-    instanceId: ProviderInstanceId.make("claudeAgent"),
-    model: "old-model",
-    options: [{ id: "effort", value: "max" }],
-  };
-  const configured = settings({ textGenerationModelSelection: old });
-  const legacy = provider("claudeAgent", { driver: ProviderDriverKind.make("claudeAgent") });
-  expect(resolveAppModelSelectionState(configured, [legacy, provider()])).toEqual({
-    instanceId: ProviderInstanceId.make("neopi"),
-    model: "openai-codex/current",
-  });
-  expect(configured.textGenerationModelSelection).toBe(old);
-});
-
-it("preserves explicit NeoPi instance and inference-provider selection", () => {
-  const selected = { instanceId: ProviderInstanceId.make("personal"), model: "anthropic/current" };
-  expect(
-    resolveAppModelSelectionState(settings({ textGenerationModelSelection: selected }), [
-      provider(),
-      provider("personal"),
-    ]),
-  ).toEqual(selected);
-});
-
 it("preserves newly selected native roles and virtual IDs before the catalog refreshes", () => {
   const work = provider("work", { models: [model("cached/default", true)] });
   const personal = provider("personal", { models: [model("personal/default", true)] });
   for (const selector of ["@new-project-role", "custom-route/virtual/Review.V2:Exact"]) {
-    const selected = { instanceId: work.instanceId, model: selector };
     expect(
       resolveAppModelSelectionForInstance(work.instanceId, settings(), [work, personal], selector),
     ).toBe(selector);
-    expect(
-      resolveAppModelSelectionState(settings({ textGenerationModelSelection: selected }), [
-        work,
-        personal,
-      ]),
-    ).toEqual(selected);
   }
 });
 
@@ -169,20 +136,4 @@ it("retains a missing native selection and shows it as unavailable in the cached
       (option) => option.slug === "anthropic/retired",
     )?.isUnavailable,
   ).toBe(true);
-});
-
-it("does not invent a usable model when no NeoPi catalog is available", () => {
-  const legacy = provider("codex", { driver: ProviderDriverKind.make("codex") });
-  expect(resolveAppModelSelectionState(settings(), [legacy])).toEqual(NO_PROVIDER_MODEL_SELECTION);
-  expect(
-    resolveAppModelSelectionState(
-      settings({
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("removed"),
-          model: "old",
-        },
-      }),
-      [provider("neopi", { models: [] })],
-    ),
-  ).toEqual(NO_PROVIDER_MODEL_SELECTION);
 });

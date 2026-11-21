@@ -1,5 +1,5 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
-import { TextGenerationError, type ModelSelection } from "@t3tools/contracts";
+import { TextGenerationError } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import * as Deferred from "effect/Deferred";
@@ -71,7 +71,6 @@ export const makeNeoPiTextGeneration = (
     readonly cwd: string;
     readonly prompt: string;
     readonly outputSchema: S;
-    readonly modelSelection: ModelSelection;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -105,7 +104,7 @@ export const makeNeoPiTextGeneration = (
         .makeClient({
           spawn: input.spawn,
           command: input.binary,
-          args: launchArgs(args.cwd, sessionDir, modelArg(args.modelSelection)),
+          args: launchArgs(args.cwd, sessionDir),
           cwd: args.cwd,
           env: input.env,
           requestTimeoutMs: deadlineMs,
@@ -126,6 +125,18 @@ export const makeNeoPiTextGeneration = (
         Effect.flatMap((exit) => Deferred.fail(settled, exitError(args.operation, exit))),
         Effect.ignore,
         Effect.forkScoped,
+      );
+
+      // Let NeoPi resolve the role in this profile and working directory.
+      yield* client.request({ type: "set_role", role: "title" }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TextGenerationError({
+              operation: args.operation,
+              detail: cause.message,
+              cause,
+            }),
+        ),
       );
 
       const handle = yield* client.prompt({ type: "prompt", message }).pipe(
@@ -189,7 +200,6 @@ export const makeNeoPiTextGeneration = (
         cwd: request.cwd,
         prompt,
         outputSchema,
-        modelSelection: request.modelSelection,
       });
       return {
         subject: sanitizeCommitSubject(generated.subject),
@@ -216,7 +226,6 @@ export const makeNeoPiTextGeneration = (
         cwd: request.cwd,
         prompt,
         outputSchema,
-        modelSelection: request.modelSelection,
       });
       return {
         title: sanitizePrTitle(generated.title),
@@ -235,7 +244,6 @@ export const makeNeoPiTextGeneration = (
         cwd: request.cwd,
         prompt,
         outputSchema,
-        modelSelection: request.modelSelection,
       });
       return {
         branch: sanitizeBranchFragment(generated.branch),
@@ -255,7 +263,6 @@ export const makeNeoPiTextGeneration = (
         cwd: request.cwd,
         prompt,
         outputSchema,
-        modelSelection: request.modelSelection,
       });
       return {
         title: sanitizeThreadTitle(generated.title),
@@ -271,15 +278,7 @@ export const makeNeoPiTextGeneration = (
   } satisfies TextGeneration.TextGeneration["Service"];
 };
 
-const modelArg = (selection: ModelSelection): string | undefined => {
-  const model = selection.model.trim();
-  if (model.length === 0) {
-    return undefined;
-  }
-  return model;
-};
-
-const launchArgs = (cwd: string, sessionDir: string, model: string | undefined): Array<string> => [
+const launchArgs = (cwd: string, sessionDir: string): Array<string> => [
   "--mode",
   "rpc",
   "--cwd",
@@ -292,7 +291,6 @@ const launchArgs = (cwd: string, sessionDir: string, model: string | undefined):
   "--no-skills",
   "--no-rules",
   "--no-title",
-  ...(model === undefined ? [] : ["--model", model]),
 ];
 
 const isTerminalAgentEnd = (frame: SessionEventFrame): boolean =>

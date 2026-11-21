@@ -57,10 +57,7 @@ import {
   type ThreadTitleMessage,
 } from "../../textGeneration/ThreadTitleContext.ts";
 import { canReplaceThreadTitle, DEFAULT_THREAD_TITLE } from "../threadTitles.ts";
-import {
-  resolveSourceControlWriterModelSelection,
-  ServerSettingsService,
-} from "../../serverSettings.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
@@ -908,6 +905,7 @@ const make = Effect.gen(function* () {
     "maybeGenerateAndRenameWorktreeBranchForFirstTurn",
   )(function* (input: {
     readonly threadId: ThreadId;
+    readonly instanceId: ModelSelection["instanceId"];
     readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly messageText: string;
@@ -924,20 +922,11 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
-      const settings = yield* projectSettingsForThread(input.threadId);
-      const modelSelection =
-        settings.sourceControlWriterModelSelection === null
-          ? settings.textGenerationModelSelection
-          : resolveSourceControlWriterModelSelection(
-              settings,
-              yield* providerRegistry.getProviders,
-            );
-
       const generated = yield* textGeneration.generateBranchName({
         cwd,
         message: input.messageText,
         ...(attachments.length > 0 ? { attachments } : {}),
-        modelSelection,
+        instanceId: input.instanceId,
       });
       if (!generated) return;
 
@@ -968,6 +957,7 @@ const make = Effect.gen(function* () {
   const maybeGenerateThreadTitleForFirstTurn = Effect.fn("maybeGenerateThreadTitleForFirstTurn")(
     function* (input: {
       readonly threadId: ThreadId;
+      readonly instanceId: ModelSelection["instanceId"];
       readonly cwd: string;
       readonly messageText: string;
       readonly attachments?: ReadonlyArray<ChatAttachment>;
@@ -977,16 +967,12 @@ const make = Effect.gen(function* () {
     }) {
       const attachments = input.attachments ?? [];
       yield* Effect.gen(function* () {
-        const { textGenerationModelSelection: modelSelection } = yield* projectSettingsForThread(
-          input.threadId,
-        );
-
         const generated = yield* textGeneration
           .generateThreadTitle({
             cwd: input.cwd,
             message: input.messageText,
             ...(attachments.length > 0 ? { attachments } : {}),
-            modelSelection,
+            instanceId: input.instanceId,
           })
           .pipe(
             Effect.retry({
@@ -1075,16 +1061,12 @@ const make = Effect.gen(function* () {
         thread,
         projects: project ? [project] : [],
       }) ?? process.cwd();
-    const { textGenerationModelSelection: modelSelection } = resolveProjectSettings(
-      yield* serverSettingsService.getSettings,
-      thread.projectId,
-    ).settings;
     const generated = yield* textGeneration.generateThreadTitle({
       cwd,
       message,
       previousTitle,
       ...(attachments.length > 0 ? { attachments } : {}),
-      modelSelection,
+      instanceId: thread.modelSelection.instanceId,
     });
     if (generated.title === DEFAULT_THREAD_TITLE || generated.title === previousTitle) {
       return { _tag: "Completed", title: undefined } as const;
@@ -1322,6 +1304,7 @@ const make = Effect.gen(function* () {
           projects: project ? [project] : [],
         }) ?? process.cwd();
       const generationInput = {
+        instanceId: (event.payload.modelSelection ?? thread.modelSelection).instanceId,
         messageText: assistantCitationsToPlainText(message.text),
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),

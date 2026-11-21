@@ -1,5 +1,4 @@
 import {
-  isProviderAvailable,
   resolveProviderInstanceEnabled,
   type ModelSelection,
   type ProjectId,
@@ -15,7 +14,6 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { deepMerge } from "./Struct.ts";
 import { fromLenientJson } from "./schemaJson.ts";
-import { createModelSelection } from "./model.ts";
 import {
   getBackgroundActivityBaseProfile,
   normalizeBackgroundActivitySettings,
@@ -97,24 +95,6 @@ export function getThreadRuntimeReadOnlyReason(input: {
     : "This saved thread's runtime is unavailable. Its history is read-only.";
 }
 
-export function resolveSourceControlWriterModelSelection(
-  settings: ServerSettings,
-  providers?: ReadonlyArray<ServerProvider>,
-): ModelSelection {
-  const selection = settings.sourceControlWriterModelSelection;
-  if (!selection || !isModelSelectionProviderEnabled(settings, selection)) {
-    return settings.textGenerationModelSelection;
-  }
-  if (providers === undefined) {
-    return selection;
-  }
-
-  const provider = providers.find((candidate) => candidate.instanceId === selection.instanceId);
-  return provider?.enabled === true && isProviderAvailable(provider)
-    ? selection
-    : settings.textGenerationModelSelection;
-}
-
 export interface PersistedServerObservabilitySettings {
   readonly otlpTracesUrl: string | undefined;
   readonly otlpMetricsUrl: string | undefined;
@@ -150,30 +130,6 @@ export function parsePersistedServerObservabilitySettings(
     return extractPersistedServerObservabilitySettings(decoded.value);
   }
   return { otlpTracesUrl: undefined, otlpMetricsUrl: undefined, otlpLogsUrl: undefined };
-}
-
-function shouldReplaceTextGenerationModelSelection(
-  patch: ServerSettingsPatch["textGenerationModelSelection"] | undefined,
-): boolean {
-  return Boolean(patch && (patch.instanceId !== undefined || patch.model !== undefined));
-}
-
-function mergeModelSelectionOptionsById(input: {
-  current: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }> | undefined;
-  patch: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }> | undefined;
-}): Array<{ id: string; value: string | boolean }> | undefined {
-  if (input.patch === undefined) {
-    return input.current ? [...input.current] : undefined;
-  }
-  if (input.patch.length === 0) {
-    return undefined;
-  }
-
-  const merged = new Map((input.current ?? []).map((selection) => [selection.id, selection.value]));
-  for (const selection of input.patch) {
-    merged.set(selection.id, selection.value);
-  }
-  return [...merged.entries()].map(([id, value]) => ({ id, value }));
 }
 
 /** Upsert each patched entry; `null` removes it. Entries the patch omits are untouched. */
@@ -274,7 +230,6 @@ function applySettingsValuesPatch(
   current: ServerSettings,
   patch: ServerSettingsPatch,
 ): ServerSettings {
-  const selectionPatch = patch.textGenerationModelSelection;
   const {
     automaticGitFetchInterval,
     providerHealthRefreshInterval,
@@ -383,9 +338,6 @@ function applySettingsValuesPatch(
           ),
         }
       : {}),
-    ...(patch.sourceControlWriterModelSelection !== undefined
-      ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
-      : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
   };
@@ -395,29 +347,12 @@ function applySettingsValuesPatch(
   const resolvedBackgroundActivity = resolveBackgroundActivitySettings(
     normalizedBackgroundActivity,
   );
-  const nextWithReplacements = {
+  return {
     ...nextWithReplacementsBase,
     backgroundActivity: normalizedBackgroundActivity,
     automaticGitFetchInterval: resolvedBackgroundActivity.automaticGitFetchInterval,
     providerHealthRefreshInterval: resolvedBackgroundActivity.providerHealthRefreshInterval,
     backgroundActivityProfile: resolvedBackgroundActivity.profile,
-  };
-  if (!selectionPatch) {
-    return nextWithReplacements;
-  }
-
-  const instanceId = selectionPatch.instanceId ?? current.textGenerationModelSelection.instanceId;
-  const model = selectionPatch.model ?? current.textGenerationModelSelection.model;
-  const options = shouldReplaceTextGenerationModelSelection(selectionPatch)
-    ? selectionPatch.options
-    : mergeModelSelectionOptionsById({
-        current: current.textGenerationModelSelection.options,
-        patch: selectionPatch.options,
-      });
-
-  return {
-    ...nextWithReplacements,
-    textGenerationModelSelection: createModelSelection(instanceId, model, options),
   };
 }
 

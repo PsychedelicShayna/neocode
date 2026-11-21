@@ -29,7 +29,6 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   VcsStatusResult,
-  ModelSelection,
   type ProjectId,
   SourceControlProviderError,
   type SourceControlProviderKind,
@@ -63,7 +62,6 @@ import {
   repositoryConventionsTextGenerationPolicy,
 } from "../textGeneration/TextGenerationPresets.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
-import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
@@ -94,7 +92,6 @@ export type GitBranchPullRequest = NonNullable<VcsStatusResult["pr"]> & {
 };
 
 interface SourceControlTextGenerationSettings {
-  readonly modelSelection: ModelSelection;
   readonly style: SourceControlWritingStyleSettings;
 }
 
@@ -697,7 +694,6 @@ export const make = Effect.gen(function* () {
   const gitCore = yield* GitVcsDriver.GitVcsDriver;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const textGeneration = yield* TextGeneration.TextGeneration;
-  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const crypto = yield* Crypto.Crypto;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -775,22 +771,11 @@ export const make = Effect.gen(function* () {
         case "repo_conventions": {
           const subjects = yield* readRecentCommitSubjects(cwd);
           const agentInstructions = yield* readRepositoryInstructions(cwd, "AGENTS.md");
-          const isClaudeWriter =
-            settings.modelSelection.instanceId === "claudeAgent" ||
-            (yield* providerRegistry.getProviders).some(
-              (provider) =>
-                provider.instanceId === settings.modelSelection.instanceId &&
-                provider.driver === "claudeAgent",
-            );
-          const claudeInstructions = isClaudeWriter
-            ? yield* readRepositoryInstructions(cwd, "CLAUDE.md")
-            : "";
           const examples = [
             ...(subjects.length > 0
               ? [["Recent commit subjects from this repository:", ...subjects].join("\n")]
               : []),
             ...(agentInstructions ? [`Local AGENTS.md:\n${agentInstructions}`] : []),
-            ...(claudeInstructions ? [`Local CLAUDE.md:\n${claudeInstructions}`] : []),
           ].join("\n\n");
           if (!examples) {
             return repositoryConventionsTextGenerationPolicy;
@@ -1875,7 +1860,6 @@ export const make = Effect.gen(function* () {
           stagedPatch: limitContext(context.stagedPatch, 50_000),
           ...(input.includeBranch ? { includeBranch: true } : {}),
           ...(policy ? { policy } : {}),
-          modelSelection: input.settings.modelSelection,
         })
         .pipe(Effect.map((result) => sanitizeCommitMessage(result)));
 
@@ -2066,7 +2050,6 @@ export const make = Effect.gen(function* () {
       diffPatch: limitContext(rangeContext.diffPatch, 60_000),
       ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
       ...(policy ? { policy } : {}),
-      modelSelection: settings.modelSelection,
     });
 
     const bodyFile = path.join(
@@ -2704,22 +2687,7 @@ export const make = Effect.gen(function* () {
         let preResolvedCommitSuggestion: CommitAndBranchSuggestion | undefined = undefined;
 
         const textGenerationSettings = yield* projectSettingsFor(input).pipe(
-          Effect.flatMap((settings) =>
-            settings.sourceControlWriterModelSelection === null
-              ? Effect.succeed({
-                  modelSelection: settings.textGenerationModelSelection,
-                  style: settings.sourceControlWritingStyle,
-                })
-              : providerRegistry.getProviders.pipe(
-                  Effect.map((providers) => ({
-                    modelSelection: ServerSettings.resolveSourceControlWriterModelSelection(
-                      settings,
-                      providers,
-                    ),
-                    style: settings.sourceControlWritingStyle,
-                  })),
-                ),
-          ),
+          Effect.map((settings) => ({ style: settings.sourceControlWritingStyle })),
           Effect.mapError(
             (cause) =>
               new GitManagerError({

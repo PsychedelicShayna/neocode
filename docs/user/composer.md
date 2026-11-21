@@ -148,6 +148,10 @@ NeoPi owns the model catalog and role configuration. Use **Settings → Roles** 
 inspect the catalog and manage native model roles. Configure an unlisted model
 in NeoPi rather than adding a separate NeoCode runtime.
 
+Choose **Session titles** in Roles to set the model NeoCode uses for automatic
+thread titles, title regeneration, branch names, commit messages, and pull
+request titles and descriptions.
+
 The switcher's filter searches the native catalog, including models outside the
 visible rows. Missing catalog facts remain unknown instead of being filled with
 invented limits or prices.

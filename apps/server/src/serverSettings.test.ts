@@ -1,6 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
-  DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectId,
   ProjectScript,
@@ -81,37 +80,6 @@ const recordProviderUsage = (provider: string, instanceId: string | null = provi
   });
 
 it.layer(NodeServices.layer)("server settings", (it) => {
-  it.effect(
-    "respects an explicit disabled native default when finding a text-generation fallback",
-    () =>
-      Effect.gen(function* () {
-        const service = yield* ServerSettingsModule.ServerSettingsService;
-        const defaultId = ProviderInstanceId.make("neopi");
-        const workId = ProviderInstanceId.make("native-work");
-        const legacyId = ProviderInstanceId.make("saved-codex");
-        const next = yield* service.updateSettings({
-          providerInstances: {
-            [defaultId]: {
-              driver: ProviderDriverKind.make("neopi"),
-              enabled: false,
-              config: { profile: "personal" },
-            },
-            [workId]: {
-              driver: ProviderDriverKind.make("neopi"),
-              enabled: true,
-              config: { profile: "work" },
-            },
-            [legacyId]: { driver: ProviderDriverKind.make("codex"), enabled: true, config: {} },
-          },
-          textGenerationModelSelection: { instanceId: legacyId, model: "saved-model" },
-        });
-        assert.equal(next.textGenerationModelSelection.instanceId, workId);
-        assert.equal(next.providerInstances[defaultId]?.enabled, false);
-        assert.deepEqual(next.providerInstances[defaultId]?.config, { profile: "personal" });
-        assert.deepEqual(next.providerInstances[workId]?.config, { profile: "work" });
-      }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
   it.effect("preserves context when reading a provider environment secret fails", () => {
     const platformCause = PlatformError.systemError({
       _tag: "PermissionDenied",
@@ -182,40 +150,35 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           providers: { codex: { binaryPath: "/tmp/codex" } },
         },
       );
-
-      assert.deepEqual(
-        yield* decodeSettingsPatch({
-          textGenerationModelSelection: {
-            options: [{ id: "fastMode", value: false }],
-          },
-        }),
-        {
-          textGenerationModelSelection: {
-            options: [{ id: "fastMode", value: false }],
-          },
-        },
-      );
     }),
   );
 
-  it.effect(
-    "decodes legacy object-shaped textGenerationModelSelection.options from settings.json",
-    () =>
-      Effect.gen(function* () {
-        const decoded = yield* decodeServerSettings({
-          textGenerationModelSelection: {
-            provider: ProviderDriverKind.make("codex"),
-            model: "gpt-5.4-mini",
-            options: { reasoningEffort: "low" },
-          },
-        });
-
-        assert.deepEqual(decoded.textGenerationModelSelection, {
-          instanceId: ProviderInstanceId.make("codex"),
+  it.effect("ignores retired generation model settings without losing other saved settings", () =>
+    Effect.gen(function* () {
+      const decoded = yield* decodeServerSettings({
+        addProjectBaseDirectory: "~/Development",
+        textGenerationModelSelection: {
+          provider: "codex",
           model: "gpt-5.4-mini",
-          options: [{ id: "reasoningEffort", value: "low" }],
-        });
-      }),
+          options: { reasoningEffort: "low" },
+        },
+        sourceControlWriterModelSelection: "obsolete",
+        projectSettingsOverrides: {
+          "project-1": {
+            textGenerationModelSelection: "obsolete",
+            sourceControlWriterModelSelection: "obsolete",
+            sourceControlWritingStyle: { customInstructions: "Be terse." },
+          },
+        },
+      });
+      assert.equal(decoded.addProjectBaseDirectory, "~/Development");
+      assert.notProperty(decoded, "textGenerationModelSelection");
+      assert.notProperty(decoded, "sourceControlWriterModelSelection");
+      const project = decoded.projectSettingsOverrides[ProjectId.make("project-1")];
+      assert.notProperty(project, "textGenerationModelSelection");
+      assert.notProperty(project, "sourceControlWriterModelSelection");
+      assert.equal(project?.sourceControlWritingStyle?.customInstructions, "Be terse.");
+    }),
   );
 
   it.effect("keeps fresh harness defaults disabled after saving and reloading settings", () =>
@@ -380,18 +343,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
             customModels: ["claude-custom"],
           },
         },
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("neopi"),
-          model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-          options: createModelSelection(
-            ProviderInstanceId.make("neopi"),
-            DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-            [
-              { id: "reasoningEffort", value: "high" },
-              { id: "fastMode", value: true },
-            ],
-          ).options!,
-        },
       });
 
       const next = yield* serverSettings.updateSettings({
@@ -399,9 +350,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           codex: {
             binaryPath: "/opt/homebrew/bin/codex",
           },
-        },
-        textGenerationModelSelection: {
-          options: [{ id: "fastMode", value: false }],
         },
       });
 
@@ -411,17 +359,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.equal(next.providers.claudeAgent.enabled, true);
       assert.equal(next.providers.claudeAgent.binaryPath, "/usr/local/bin/claude");
       assert.deepEqual(next.providers.claudeAgent.customModels, ["claude-custom"]);
-      assert.deepEqual(
-        next.textGenerationModelSelection,
-        createModelSelection(
-          ProviderInstanceId.make("neopi"),
-          DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-          [
-            { id: "reasoningEffort", value: "high" },
-            { id: "fastMode", value: false },
-          ],
-        ),
-      );
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -502,72 +439,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     ).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("keeps model backends and options when switching NeoPi instances", () =>
-    Effect.gen(function* () {
-      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-      const personal = ProviderInstanceId.make("personal");
-      const work = ProviderInstanceId.make("work");
-      yield* serverSettings.updateSettings({
-        providerInstances: {
-          [personal]: {
-            driver: ProviderDriverKind.make("neopi"),
-            enabled: true,
-            config: { profile: "personal" },
-          },
-          [work]: {
-            driver: ProviderDriverKind.make("neopi"),
-            enabled: true,
-            config: { profile: "work" },
-          },
-        },
-        textGenerationModelSelection: {
-          instanceId: personal,
-          model: "anthropic/current",
-          options: [
-            { id: "reasoningEffort", value: "high" },
-            { id: "fastMode", value: true },
-          ],
-        },
-      });
-      const selection = {
-        instanceId: work,
-        model: "openai-codex/current",
-        options: [{ id: "reasoningEffort", value: "low" }],
-      };
-      const next = yield* serverSettings.updateSettings({
-        textGenerationModelSelection: selection,
-      });
-      assert.deepEqual(next.textGenerationModelSelection, selection);
-      assert.deepEqual(next.providerInstances[personal]?.config, { profile: "personal" });
-      assert.deepEqual(next.providerInstances[work]?.config, { profile: "work" });
-    }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
-  it.effect("preserves custom provider instance text generation selections", () =>
-    Effect.gen(function* () {
-      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-
-      const next = yield* serverSettings.updateSettings({
-        providerInstances: {
-          [ProviderInstanceId.make("claude_openrouter")]: {
-            driver: ProviderDriverKind.make("neopi"),
-            enabled: true,
-            config: { customModels: ["openai/gpt-5.5"] },
-          },
-        },
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("claude_openrouter"),
-          model: "openai/gpt-5.5",
-        },
-      });
-
-      assert.deepEqual(next.textGenerationModelSelection, {
-        instanceId: ProviderInstanceId.make("claude_openrouter"),
-        model: "openai/gpt-5.5",
-      });
-    }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
   it.effect(
     "uses explicit provider instance enabled state over legacy provider enabled state",
     () =>
@@ -588,145 +459,31 @@ it.layer(NodeServices.layer)("server settings", (it) => {
               config: { customModels: ["openai/gpt-5.5"] },
             },
           },
-          textGenerationModelSelection: {
-            instanceId,
-            model: "openai/gpt-5.5",
-          },
         });
 
-        assert.deepEqual(next.textGenerationModelSelection, {
-          instanceId,
-          model: "openai/gpt-5.5",
-        });
+        assert.equal(next.providers.neopi.enabled, false);
+        assert.equal(resolveProviderInstanceEnabled(next.providerInstances[instanceId]!), true);
       }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
-  it.effect("preserves unknown runtime settings while using NeoPi for text generation", () =>
+  it.effect("preserves unknown runtime settings", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
       const serverConfig = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
       const instanceId = ProviderInstanceId.make("openrouter_text");
-      const selection = { instanceId, model: "openai/gpt-5.5" };
       const legacy = {
         driver: ProviderDriverKind.make("openrouter"),
         enabled: true,
-        config: { customModels: [selection.model] },
+        config: { customModels: ["openai/gpt-5.5"] },
       };
       const next = yield* serverSettings.updateSettings({
         providerInstances: { [instanceId]: legacy },
-        textGenerationModelSelection: selection,
       });
-      assert.deepEqual(
-        next.textGenerationModelSelection,
-        DEFAULT_SERVER_SETTINGS.textGenerationModelSelection,
-      );
       assert.deepEqual(next.providerInstances[instanceId], legacy);
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       const persisted = JSON.parse(yield* fileSystem.readFileString(serverConfig.settingsPath));
-      assert.deepEqual(persisted.textGenerationModelSelection, selection);
       assert.deepEqual(persisted.providerInstances[instanceId], legacy);
-    }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
-  it.effect(
-    "preserves the source control writer selection when its provider instance is disabled",
-    () =>
-      Effect.gen(function* () {
-        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-        const serverConfig = yield* ServerConfig.ServerConfig;
-        const fileSystem = yield* FileSystem.FileSystem;
-        const instanceId = ProviderInstanceId.make("codex_writer");
-        const sourceControlWriterModelSelection = {
-          instanceId,
-          model: "gpt-5.4-mini",
-        };
-
-        yield* serverSettings.updateSettings({
-          providerInstances: {
-            [instanceId]: {
-              driver: ProviderDriverKind.make("neopi"),
-              enabled: true,
-              config: {},
-            },
-          },
-          sourceControlWriterModelSelection,
-        });
-
-        const next = yield* serverSettings.updateSettings({
-          providerInstances: {
-            [instanceId]: {
-              driver: ProviderDriverKind.make("neopi"),
-              enabled: false,
-              config: {},
-            },
-          },
-        });
-
-        assert.deepEqual(next.sourceControlWriterModelSelection, sourceControlWriterModelSelection);
-        assert.deepEqual(
-          ServerSettingsModule.resolveSourceControlWriterModelSelection(next),
-          next.textGenerationModelSelection,
-        );
-        assert.deepEqual(
-          (yield* serverSettings.getSettings).sourceControlWriterModelSelection,
-          sourceControlWriterModelSelection,
-        );
-
-        const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
-        assert.deepEqual(
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
-          JSON.parse(raw).sourceControlWriterModelSelection,
-          sourceControlWriterModelSelection,
-        );
-
-        const restored = yield* serverSettings.updateSettings({
-          providerInstances: {
-            [instanceId]: {
-              driver: ProviderDriverKind.make("neopi"),
-              enabled: true,
-              config: {},
-            },
-          },
-        });
-        assert.deepEqual(
-          ServerSettingsModule.resolveSourceControlWriterModelSelection(restored),
-          sourceControlWriterModelSelection,
-        );
-      }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
-  it.effect("drops stale text generation options when resetting model selection", () =>
-    Effect.gen(function* () {
-      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-
-      yield* serverSettings.updateSettings({
-        providers: { codex: { enabled: true } },
-        textGenerationModelSelection: {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-          options: createModelSelection(
-            ProviderInstanceId.make("codex"),
-            DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-            [
-              { id: "reasoningEffort", value: "high" },
-              { id: "fastMode", value: true },
-            ],
-          ).options!,
-        },
-      });
-
-      const next = yield* serverSettings.updateSettings({
-        textGenerationModelSelection: {
-          instanceId: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.instanceId,
-          model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-        },
-      });
-
-      assert.deepEqual(next.textGenerationModelSelection, {
-        instanceId: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.instanceId,
-        model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
-      });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 
@@ -833,24 +590,6 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.isFalse(settings.providerInstances[ProviderInstanceId.make("grok")]?.enabled);
       assert.isFalse(settings.providerInstances[ProviderInstanceId.make("opencode")]?.enabled);
       assert.isFalse(settings.providerInstances[ProviderInstanceId.make("cursor")]?.enabled);
-    }).pipe(Effect.provide(makeServerSettingsLayer())),
-  );
-
-  it.effect("skips a disabled provider instance when picking the text generation fallback", () =>
-    Effect.gen(function* () {
-      const serverConfig = yield* ServerConfig.ServerConfig;
-      const fileSystem = yield* FileSystem.FileSystem;
-      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
-      // Obsolete provider settings are still readable, but cannot become a
-      // text-generation fallback merely because an older build enabled them.
-      yield* fileSystem.writeFileString(
-        serverConfig.settingsPath,
-        '{"providerInstances":{"codex":{"driver":"codex","enabled":false,"config":{}}}}',
-      );
-
-      const settings = yield* serverSettings.getSettings;
-
-      assert.equal(settings.textGenerationModelSelection.instanceId, "neopi");
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 

@@ -182,7 +182,6 @@ describe("searchSettings", () => {
       "network-access",
       "publish-agent-activity",
       "provider-health-check-interval",
-      "source-control-writer-model",
       "source-control-writing-style",
       "t3-connect",
       "tailscale-https",
@@ -247,7 +246,7 @@ describe("searchSettings", () => {
     const ids = searchSettings("model").map((item) => item.id);
     expect(ids[0]).toBe("default-model");
     expect(ids.indexOf("keybinding-modelPicker.toggle")).toBeGreaterThan(
-      ids.indexOf("text-generation-model"),
+      ids.indexOf("default-model"),
     );
   });
 
@@ -387,7 +386,7 @@ describe("settings search targets", () => {
   );
 
   it("lets project-scopable rows resolve at every server-backed scope", () => {
-    const model = getSettingsSearchTargetScope("text-generation-model")!;
+    const model = getSettingsSearchTargetScope("default-model")!;
     expect(isSettingsSearchScopeAvailable(model.scope, "all")).toBe(true);
     expect(isSettingsSearchScopeAvailable(model.scope, "environment")).toBe(true);
     expect(isSettingsSearchScopeAvailable(model.scope, "project")).toBe(true);

@@ -6,8 +6,6 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { ProviderInstanceId } from "@t3tools/contracts";
-import { createModelSelection } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
@@ -26,11 +24,6 @@ const MOCK_PEER_PATH = new URL(
   "../../../../packages/effect-neopi-rpc/test/fixtures/neopi-mock-peer.ts",
   import.meta.url,
 ).pathname;
-const TEST_MODEL = createModelSelection(
-  ProviderInstanceId.make("neopi"),
-  "openai-codex/gpt-5.6-luna",
-);
-const CURRENT_MODEL = createModelSelection(ProviderInstanceId.make("neopi"), "");
 const PROFILE = "neopi-text-generation-test";
 const GENERATED_REPLY = {
   subject:
@@ -52,6 +45,7 @@ interface SpawnCapture {
 
 interface HarnessOptions {
   readonly responseText?: string;
+  readonly titleRoleError?: string;
   readonly peerSource?: string;
   readonly peerArgs?: ReadonlyArray<string>;
   readonly deadlineMs?: number;
@@ -65,7 +59,7 @@ interface Harness {
   readonly sinkEvents: { count: number };
 }
 
-const scenarioFor = (reply: string) => ({
+const scenarioFor = (reply: string, titleRoleError?: string) => ({
   scenario: [
     {
       emit: [
@@ -88,6 +82,19 @@ const scenarioFor = (reply: string) => ({
           command: "negotiate_protocol",
           success: true,
           data: { protocolVersion: 2 },
+        },
+      ],
+    },
+    {
+      on: { type: "set_role", role: "title" },
+      emit: [
+        {
+          id: "$id",
+          type: "response",
+          command: "set_role",
+          ...(titleRoleError === undefined
+            ? { success: true }
+            : { success: false, code: "role_unresolved", error: titleRoleError }),
         },
       ],
     },
@@ -133,6 +140,8 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.type === "negotiate_protocol") {
     void write({ id: message.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (message.type === "set_role" && message.role === "title") {
+    void write({ id: message.id, type: "response", command: "set_role", success: true });
   } else if (message.type === "prompt") {
     void (async () => {
       await write({ id: message.id, type: "response", command: "prompt", success: true });
@@ -156,6 +165,8 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.type === "negotiate_protocol") {
     void write({ id: message.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (message.type === "set_role" && message.role === "title") {
+    void write({ id: message.id, type: "response", command: "set_role", success: true });
   } else if (message.type === "prompt") {
     void (async () => {
       await write({ id: message.id, type: "response", command: "prompt", success: true });
@@ -181,6 +192,8 @@ lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.type === "negotiate_protocol") {
     void write({ id: message.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (message.type === "set_role" && message.role === "title") {
+    void write({ id: message.id, type: "response", command: "set_role", success: true });
   } else if (message.type === "prompt") {
     void (async () => {
       await write({ id: message.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
@@ -213,6 +226,7 @@ const makeHarness = (
           scenarioFor(
             options.responseText ??
               `\n\u0060\u0060\u0060json\n${GENERATED_JSON}\n\u0060\u0060\u0060\n`,
+            options.titleRoleError,
           ),
         ),
         "utf8",
@@ -293,7 +307,7 @@ const waitForFile = (path: string): Effect.Effect<boolean> =>
     return false;
   });
 
-it.live("generates all four text operations through a trimmed disposable RPC loadout", () =>
+it.live("selects NeoPi's title role before prompting for every generated artifact", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
@@ -304,7 +318,6 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           stagedSummary: "M apps/server/src/provider/neopi/NeoPiSessionRuntime.ts",
           stagedPatch: "diff --git a/runtime.ts b/runtime.ts",
           includeBranch: true,
-          modelSelection: TEST_MODEL,
         });
         const pr = yield* textGeneration.generatePrContent({
           cwd: process.cwd(),
@@ -313,17 +326,14 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           commitSummary: "Add NeoPi RPC support",
           diffSummary: "1 file changed",
           diffPatch: "diff --git a/provider.ts b/provider.ts",
-          modelSelection: TEST_MODEL,
         });
         const branch = yield* textGeneration.generateBranchName({
           cwd: process.cwd(),
           message: "Add a NeoPi provider branch",
-          modelSelection: TEST_MODEL,
         });
         const title = yield* textGeneration.generateThreadTitle({
           cwd: process.cwd(),
           message: "Implement NeoPi automatic titles",
-          modelSelection: CURRENT_MODEL,
         });
 
         expect(commit.subject).toBe(sanitizeCommitSubject(GENERATED_REPLY.subject));
@@ -355,13 +365,27 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           expect(capture.args).toContain("rpc");
           expect(capture.args).toContain("--no-title");
           expect(capture.args).toContain("--cwd");
+          expect(capture.args).not.toContain("--model");
           expect(capture.env.OMP_PROFILE).toBe(PROFILE);
           expect(NodeFS.existsSync(capture.sessionDir)).toBe(false);
         }
-        expect(captures[0]?.args).toContain("--model");
-        expect(captures[0]?.args).toContain("openai-codex/gpt-5.6-luna");
-        const titleArgs = captures[3]?.args ?? [];
-        expect(titleArgs).not.toContain("--model");
+      }),
+    ),
+  ),
+);
+
+it.live("fails generation when NeoPi cannot resolve the title role", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { textGeneration, sinkEvents } = yield* makeHarness({
+          titleRoleError: 'No available model for role "title"',
+        });
+        const error = yield* textGeneration
+          .generateThreadTitle({ cwd: process.cwd(), message: "Generate a title" })
+          .pipe(Effect.flip);
+        expect(error.detail).toBe('No available model for role "title"');
+        expect(sinkEvents.count).toBe(0);
       }),
     ),
   ),
@@ -378,7 +402,6 @@ it.live("fails invalid JSON as TextGenerationError and still removes the session
           .generateThreadTitle({
             cwd: process.cwd(),
             message: "Generate a title",
-            modelSelection: TEST_MODEL,
           })
           .pipe(
             Effect.match({
@@ -459,7 +482,6 @@ it.live("keeps only the successful retry after a partial JSON draft fails", () =
         const title = yield* textGeneration.generateThreadTitle({
           cwd: process.cwd(),
           message: "Generate a title",
-          modelSelection: TEST_MODEL,
         });
         expect(title.title).toBe("Recovered title");
       }),
@@ -499,7 +521,6 @@ it.live("answers from the last attempt after a burst of deltas nobody could queu
         const title = yield* textGeneration.generateThreadTitle({
           cwd: process.cwd(),
           message: "Generate a title",
-          modelSelection: TEST_MODEL,
         });
         expect(title.title).toBe("After the burst");
         // Every frame was folded in the parser path as it arrived: none waited in a queue for a
@@ -554,7 +575,6 @@ it.live("rejects a failed final assistant attempt rather than publishing an earl
             .generateThreadTitle({
               cwd: process.cwd(),
               message: "Generate a title",
-              modelSelection: TEST_MODEL,
             })
             .pipe(
               Effect.match({
@@ -617,7 +637,6 @@ it.live("uses the last complete answer when the model corrects itself", () =>
         const title = yield* textGeneration.generateThreadTitle({
           cwd: process.cwd(),
           message: "Generate a title",
-          modelSelection: TEST_MODEL,
         });
         expect(title.title).toBe("Corrected final title");
       }),
@@ -634,7 +653,6 @@ it.live("includes the stderr tail when the RPC peer exits mid-stream", () =>
           .generateThreadTitle({
             cwd: process.cwd(),
             message: "Generate a title",
-            modelSelection: TEST_MODEL,
           })
           .pipe(
             Effect.match({
@@ -668,7 +686,6 @@ it.live("closes the RPC process when the generation deadline expires", () =>
           .generateThreadTitle({
             cwd: process.cwd(),
             message: "Generate a title",
-            modelSelection: TEST_MODEL,
           })
           .pipe(
             Effect.match({
@@ -708,7 +725,6 @@ it.live("closes the RPC process when a generation fiber is interrupted", () =>
           .generateThreadTitle({
             cwd: process.cwd(),
             message: "Generate a title",
-            modelSelection: TEST_MODEL,
           })
           .pipe(Effect.forkChild);
         expect(yield* waitForFile(marker)).toBe(true);

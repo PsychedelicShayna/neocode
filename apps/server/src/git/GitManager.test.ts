@@ -24,13 +24,7 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 
-import {
-  DEFAULT_SERVER_SETTINGS,
-  GitCommandError,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  TextGenerationError,
-} from "@t3tools/contracts";
+import { GitCommandError, TextGenerationError } from "@t3tools/contracts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as GitLabCli from "../sourceControl/GitLabCli.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
@@ -46,7 +40,6 @@ import type { SourceControlProvider } from "../sourceControl/SourceControlProvid
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
-import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "./GitManager.ts";
 
@@ -691,9 +684,6 @@ function makeManager(input?: {
 
   const managerLayer = Layer.mergeAll(
     Layer.succeed(TextGeneration.TextGeneration, textGeneration),
-    Layer.mock(ProviderRegistry.ProviderRegistry)({
-      getProviders: Effect.succeed([]),
-    }),
     Layer.succeed(
       ProjectSetupScriptRunner.ProjectSetupScriptRunner,
       input?.setupScriptRunner ?? {
@@ -2886,46 +2876,6 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
-  it.effect("falls back when the dedicated source control writer is unavailable", () =>
-    Effect.gen(function* () {
-      const repoDir = yield* makeTempDir("t3code-git-manager-");
-      yield* initRepo(repoDir);
-      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\nworld\n");
-      const missingInstanceId = ProviderInstanceId.make("missing_writer");
-      let generatedModelSelection:
-        | TextGeneration.CommitMessageGenerationInput["modelSelection"]
-        | undefined;
-
-      const { manager } = yield* makeManager({
-        serverSettings: {
-          providerInstances: {
-            [missingInstanceId]: {
-              driver: ProviderDriverKind.make("missing-driver"),
-              config: {},
-            },
-          },
-          sourceControlWriterModelSelection: {
-            instanceId: missingInstanceId,
-            model: "missing-model",
-          },
-        },
-        textGeneration: {
-          generateCommitMessage: (input) => {
-            generatedModelSelection = input.modelSelection;
-            return Effect.succeed({ subject: "Use the available writer", body: "" });
-          },
-        },
-      });
-
-      yield* runStackedAction(manager, {
-        cwd: repoDir,
-        action: "commit",
-      });
-
-      expect(generatedModelSelection).toEqual(DEFAULT_SERVER_SETTINGS.textGenerationModelSelection);
-    }),
-  );
-
   it.effect("includes local agent instructions when recent history is empty", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
@@ -2933,19 +2883,13 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* runGit(repoDir, ["config", "user.email", "test@example.com"]);
       yield* runGit(repoDir, ["config", "user.name", "Test User"]);
       const agentInstructions = "Use lowercase source control text.";
-      const claudeInstructions = "Keep pull request bodies brief.";
       NodeFS.writeFileSync(NodePath.join(repoDir, "AGENTS.md"), agentInstructions);
-      NodeFS.writeFileSync(NodePath.join(repoDir, "CLAUDE.md"), claudeInstructions);
       NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\n");
       yield* runGit(repoDir, ["add", "README.md"]);
       let generatedPolicy: TextGeneration.CommitMessageGenerationInput["policy"] = undefined;
 
       const { manager } = yield* makeManager({
         serverSettings: {
-          textGenerationModelSelection: {
-            instanceId: ProviderInstanceId.make("claudeAgent"),
-            model: "claude-sonnet-4-6",
-          },
           sourceControlWritingStyle: {
             mode: "repo_conventions" as const,
           },
@@ -2964,8 +2908,8 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
 
       expect(generatedPolicy).toEqual({
         kind: "repo_conventions",
-        commitInstructions: `Follow the repository's established commit message style when examples are available.\n\nLocal AGENTS.md:\n${agentInstructions}\n\nLocal CLAUDE.md:\n${claudeInstructions}`,
-        changeRequestInstructions: `Follow the repository's established change request title and body style when examples are available.\n\nLocal AGENTS.md:\n${agentInstructions}\n\nLocal CLAUDE.md:\n${claudeInstructions}`,
+        commitInstructions: `Follow the repository's established commit message style when examples are available.\n\nLocal AGENTS.md:\n${agentInstructions}`,
+        changeRequestInstructions: `Follow the repository's established change request title and body style when examples are available.\n\nLocal AGENTS.md:\n${agentInstructions}`,
         inferRepositoryConventions: true,
       });
     }),

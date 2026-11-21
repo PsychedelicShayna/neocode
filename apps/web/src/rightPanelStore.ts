@@ -157,6 +157,7 @@ interface RightPanelStoreState {
     surfaceId: string,
     terminalId: string,
     direction?: "horizontal" | "vertical",
+    activate?: boolean,
   ) => void;
   activateTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
   closeTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
@@ -641,7 +642,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             upsertSurface(current, terminalSurface(terminalId)),
           ),
         ),
-      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal") =>
+      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal", activate = true) =>
         set((state) =>
           userAction(state, workspaceKey(ref), (current) => ({
             ...current,
@@ -655,7 +656,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
                 terminalIds: surface.terminalIds.includes(terminalId)
                   ? surface.terminalIds
                   : [...surface.terminalIds, terminalId],
-                activeTerminalId: terminalId,
+                activeTerminalId: activate ? terminalId : surface.activeTerminalId,
                 ...(direction === "vertical" ? { splitDirection: "vertical" as const } : {}),
               };
             }),

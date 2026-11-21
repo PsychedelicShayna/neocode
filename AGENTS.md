@@ -410,6 +410,8 @@ Fork-owned additions are not upstream touches. URL registration lives in `apps/d
 
 The executable-selection, capability-refresh and catalog-isolation changes stay in the NeoPi-owned paths above: `apps/server/src/provider/Drivers/NeoPiDriver.ts`, `apps/server/src/provider/Layers/{NeoPiProvider,NeoPiProvider.test}.ts`, `apps/server/src/provider/neopi/{NeoPiBinarySelection,NeoPiBinarySelection.test,NeoPiSessionCatalog,NeoPiSessionCatalog.test,NeoPiSessionCatalogSource}.ts`, `apps/web/src/components/neopi/{NeoPiBinarySelectionNote,NeoPiSessionPicker,NeoPiSessionPicker.test}.tsx` and `packages/contracts/src/neopiSessions.ts`. Display identity changes in `apps/server/src/provider/Layers/NeoPiProvider.ts` and `apps/server/src/provider/neopi/mappers/tools.ts` retain the `t3-code` tool key.
 
+`apps/server/src/provider/neopi/NeoPiNativeSessions{,.test}.ts` excludes the initial host-tool mount announcement from a fresh owned session's inbox without hiding genuine missed records.
+
 ## Agent skills
 
 ### Issue tracker

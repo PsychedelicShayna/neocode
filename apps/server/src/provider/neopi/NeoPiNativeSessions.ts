@@ -352,6 +352,8 @@ export interface NeoPiNativeConnection {
     "capabilities" | "request" | "respondUi" | "writeFrame" | "exit"
   >;
   readonly attachment: "owned" | "terminal";
+  /** Set only when the authenticated terminal handshake advertises rich dialog provenance. */
+  readonly richDialogProvenance?: boolean;
   readonly managedTmux?: ManagedTmuxOwner & { readonly sessionFile: string };
   readonly cwd: string;
   /** A startup dialog can block stdio commands; the native control reader remains available. */
@@ -372,7 +374,6 @@ export interface NeoPiNativeFrameObserver {
   readonly resulted: (id: string) => void;
 }
 export interface NeoPiNativeSessionsDependencies {
-  readonly enableAttachedNativeDialogs?: boolean;
   readonly profileIds: Effect.Effect<ReadonlyArray<ProviderInstanceId>>;
   readonly profileChanges?: Stream.Stream<void>;
   readonly profile: (
@@ -2076,11 +2077,11 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           session.takeoverRequested = true;
         yield* Deferred.await(session.recovery);
       }
-      const client = session.native.client;
+      const { client, attachment, richDialogProvenance } = session.native;
       const command = input.command;
       if (
-        !dependencies.enableAttachedNativeDialogs &&
-        session.native.attachment === "terminal" &&
+        attachment === "terminal" &&
+        !richDialogProvenance &&
         (command.type === "set_ask_dialog" || command.type === "set_form_dialog")
       )
         return yield* fail(
@@ -2865,9 +2866,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
 });
 
 /** Uses the configured runtime/profile and its existing CLI + RPC/control transports. No SQL bindings. */
-export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(function* ({
-  enableAttachedNativeDialogs = false,
-}: { enableAttachedNativeDialogs?: boolean } = {}) {
+export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(function* () {
   const instances = yield* ProviderInstanceRegistry;
   const fs = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -3672,14 +3671,16 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             });
             attachedCwd = yield* fs.realPath(cwd);
           }
-          // Keep dialogs in the pane until PsychedelicShayna/neopi#878 fixes deferred dialog origin routing.
-          if (enableAttachedNativeDialogs) {
+          // The RPC client's capabilities come from this pipe's initial ready frame.
+          const richDialogProvenance = client.capabilities.has("rich_dialog_provenance_v1");
+          if (richDialogProvenance) {
             yield* enableNativeDialog(client, "set_ask_dialog");
             yield* enableNativeDialog(client, "set_form_dialog");
           }
           return {
             client,
             attachment: "terminal" as const,
+            richDialogProvenance,
             cwd: attachedCwd,
             ...(managedOwner && managedFile
               ? { managedTmux: { ...managedOwner, sessionFile: managedFile } }
@@ -3773,7 +3774,6 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
     }).pipe(Effect.mapError(nativeError));
   const profileChanges = yield* instances.subscribeChanges;
   return yield* makeNeoPiNativeSessionsWith({
-    enableAttachedNativeDialogs,
     profileChanges: Stream.fromSubscription(profileChanges),
     profileIds: Effect.gen(function* () {
       const all = yield* instances.listInstances;

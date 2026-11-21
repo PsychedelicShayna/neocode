@@ -47,12 +47,15 @@ composer on web and desktop, or in the question card on mobile). For a
 multi-choice question you can do both, or continue without selecting anything.
 Your message draft is preserved.
 
-In a session NeoCode runs, NeoPi forms also appear above the composer. Fill in
-the required fields, then select **Submit form** or **Dismiss**. Field errors
-first appear after an invalid submission and update as you edit. If NeoPi
-closes the form or its time runs out, the form disappears without sending
-your unfinished edits.
-In terminal-attached sessions, questions and forms stay in the terminal.
+NeoPi forms also appear above the composer. Fill in the required fields, then
+select **Submit form** or **Dismiss**. Field errors first appear after an invalid
+submission and update as you edit. If NeoPi closes the form or its time runs out,
+the form disappears without sending your unfinished edits.
+
+In terminal-attached sessions, a current NeoPi also shows questions and forms
+from work you send in NeoCode. You can answer in either place; the first answer
+or dismissal wins. Dialogs opened by the terminal itself or by another attachment
+stay in the terminal. With older versions of NeoPi, answer in the terminal.
 
 When NeoPi fails to start a turn in a saved conversation, web and desktop return
 the unsent prompt and its attachments to an empty composer. If you've already

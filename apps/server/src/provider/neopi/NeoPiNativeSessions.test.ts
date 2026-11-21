@@ -3782,9 +3782,9 @@ describe("opening native sessions with optional managed tmux", () => {
     "malformed",
     "stale",
     "unsafe directory",
-    "live owner",
-    "live owner with attached dialogs enabled",
-    "live older owner with attached dialogs enabled",
+    "live owner with rich dialog provenance",
+    "live owner without rich dialog provenance",
+    "live owner with an unknown rich dialog capability",
     "older stdio owner without typed Form",
     "invalid launch arguments with a live owner",
     "prestarted owner without a matching lease",
@@ -3800,9 +3800,9 @@ describe("opening native sessions with optional managed tmux", () => {
     "unconfirmed stop with a matching saved process",
     "unconfirmed stop with a reused PID",
   ] as const) {
-    const legacyAttached = scenario === "live older owner with attached dialogs enabled";
-    const enableAttachedNativeDialogs =
-      legacyAttached || scenario === "live owner with attached dialogs enabled";
+    const richDialogs = scenario === "live owner with rich dialog provenance";
+    const unknownRichDialogs = scenario === "live owner with an unknown rich dialog capability";
+    const liveOwner = scenario.startsWith("live owner");
     const legacyForm = scenario === "older stdio owner without typed Form";
     const invalidArgs = scenario === "invalid launch arguments with a live owner";
     const fixtureOwner = scenario === "prestarted owner without a matching lease";
@@ -3860,7 +3860,7 @@ describe("opening native sessions with optional managed tmux", () => {
         const binary = NodePath.join(cwd, "npi");
         const binaryData = "mock NeoPi executable";
         yield* fs.writeFileString(binary, binaryData, { mode: 0o700 });
-        const live = scenario === "live owner" || enableAttachedNativeDialogs || invalidArgs;
+        const live = liveOwner || invalidArgs;
         const owner = {
           executable: "/fixture/tmux",
           session: "$0",
@@ -3911,6 +3911,11 @@ describe("opening native sessions with optional managed tmux", () => {
         const force = vi.fn((_binding: ManagedTmux.ManagedTmuxBinding) => Effect.void);
         const requests: string[] = [];
         const dialogNegotiations: Array<{ type: string; enabled?: boolean | undefined }> = [];
+        const dialogReplies = yield* Queue.unbounded<unknown>();
+        let advertiseRichDialogs = richDialogs;
+        let controlPipe:
+          | { send: (frame: unknown) => Effect.Effect<void>; finish: Effect.Effect<void> }
+          | undefined;
         const gracefulExit = yield* Deferred.make<void>();
         const observeProcess = unconfirmedStop
           ? vi
@@ -3977,9 +3982,7 @@ describe("opening native sessions with optional managed tmux", () => {
         const spawned: ReadonlyArray<string>[] = [];
         const encode = (value: unknown) =>
           new TextEncoder().encode(`${encodeOptOutFixture(value)}\n`);
-        const service = yield* makeNeoPiNativeSessions(
-          enableAttachedNativeDialogs ? { enableAttachedNativeDialogs } : undefined,
-        ).pipe(
+        const service = yield* makeNeoPiNativeSessions().pipe(
           Effect.provide(
             Layer.mergeAll(
               configLayer(cwd, cwd),
@@ -4003,13 +4006,25 @@ describe("opening native sessions with optional managed tmux", () => {
                       Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
                       Effect.asVoid,
                     );
+                    if (command.args[0] === "ctl" && command.args[1] === "pipe") {
+                      controlPipe = {
+                        send: (frame) => Queue.offer(stdout, encode(frame)).pipe(Effect.asVoid),
+                        finish,
+                      };
+                    }
                     if (!catalog && !lease && !publication)
                       yield* Queue.offer(
                         stdout,
                         encode({
                           type: "ready",
                           protocolVersion: 1,
-                          capabilities: ["control_v1", "session_journal", "session_journal_events"],
+                          capabilities: [
+                            "control_v1",
+                            "session_journal",
+                            "session_journal_events",
+                            ...(advertiseRichDialogs ? ["rich_dialog_provenance_v1"] : []),
+                            ...(unknownRichDialogs ? ["rich_dialog_provenance_v2"] : []),
+                          ],
                         }),
                       );
                     return ChildProcessSpawner.makeHandle({
@@ -4021,15 +4036,16 @@ describe("opening native sessions with optional managed tmux", () => {
                       isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
                       kill: () => finish,
                       stdin: Sink.forEach((chunk: Uint8Array) => {
-                        const request = decodeOptOutRequest(new TextDecoder().decode(chunk));
+                        const text = new TextDecoder().decode(chunk);
+                        const request = decodeOptOutRequest(text);
                         requests.push(request.type);
+                        if (request.type === "extension_ui_response")
+                          return Queue.offer(dialogReplies, JSON.parse(text));
                         const dialog =
                           request.type === "set_ask_dialog" || request.type === "set_form_dialog";
                         if (dialog)
                           dialogNegotiations.push({ type: request.type, enabled: request.enabled });
-                        const rejected =
-                          (legacyAttached && dialog) ||
-                          (legacyForm && request.type === "set_form_dialog");
+                        const rejected = legacyForm && request.type === "set_form_dialog";
                         return Queue.offer(
                           stdout,
                           encode({
@@ -4251,19 +4267,14 @@ describe("opening native sessions with optional managed tmux", () => {
         assert.equal(opened.attachment, live ? "terminal" : "owned");
         assert.deepEqual(
           dialogNegotiations,
-          !live || enableAttachedNativeDialogs
+          !live || richDialogs
             ? [
                 { type: "set_ask_dialog", enabled: true },
                 { type: "set_form_dialog", enabled: true },
               ]
             : [],
         );
-        if (
-          scenario === "live owner" ||
-          scenario === "live owner with attached dialogs enabled" ||
-          scenario === "stale"
-        ) {
-          const canNegotiate = !live || enableAttachedNativeDialogs;
+        const explicitDialogs = Effect.fnUntraced(function* (canNegotiate: boolean) {
           const commands = [
             { type: "set_ask_dialog", enabled: false },
             { type: "set_form_dialog", enabled: false },
@@ -4280,6 +4291,47 @@ describe("opening native sessions with optional managed tmux", () => {
               assert.equal(result._tag === "Failure" && result.failure.code, "unsupported_command");
             }
           }
+        });
+        if (richDialogs) {
+          const pipe = controlPipe;
+          if (!pipe) return yield* Effect.die("Expected an attached control pipe");
+          const lease = yield* follow(service, ref);
+          const dialogs = [
+            {
+              id: "attached-ask",
+              request: {
+                method: "ask",
+                questions: [{ id: "choice", question: "Pick one", options: [{ label: "A" }] }],
+              },
+              answer: { answers: [{ id: "choice", selectedOptions: ["A"] }] },
+            },
+            {
+              id: "attached-form",
+              request: { method: "form", sections: [] },
+              answer: { data: { engine: "pg", replicas: 3 } },
+            },
+          ];
+          for (const { id, request, answer } of dialogs) {
+            yield* pipe.send({ type: "extension_ui_request", id, ...request });
+            yield* lease.next("obligation-opened", (envelope) => envelope.id === id);
+            const command = { type: "extension_ui_response", id, ...answer };
+            assert.deepEqual(yield* service.request({ ref, command }), { accepted: true });
+            assert.deepEqual(yield* Queue.take(dialogReplies), command);
+            yield* lease.next("obligation-settled", (envelope) => envelope.id === id);
+          }
+          yield* explicitDialogs(true);
+
+          advertiseRichDialogs = false;
+          const beforeReconnect = dialogNegotiations.length;
+          yield* pipe.finish;
+          yield* lease.next("lifecycle", (envelope) => envelope.state === "reconnecting");
+          const { session } = yield* lease.next("session");
+          assert.equal(session.attachment, "terminal");
+          assert.notEqual(controlPipe, pipe);
+          assert.deepEqual(dialogNegotiations.slice(beforeReconnect), []);
+          yield* explicitDialogs(false);
+        } else if (liveOwner || scenario === "stale") {
+          yield* explicitDialogs(!live);
         }
         assert.deepEqual(spawned, [
           ["sessions", "list", "--json", "--session-dir", cwd],
@@ -4295,6 +4347,12 @@ describe("opening native sessions with optional managed tmux", () => {
                 "--session",
                 sessionFile,
               ],
+          ...(richDialogs
+            ? [
+                ["sessions", "list", "--json", "--session-dir", cwd],
+                ["ctl", "pipe", owner.instanceId, "--label", "neocode-native"],
+              ]
+            : []),
         ]);
         assert.equal(makeHost.mock.calls.length, 0);
         yield* service.close({ ref });

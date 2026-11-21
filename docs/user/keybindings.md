@@ -226,9 +226,9 @@ size keys change the terminal size in **Settings → Appearance**: the terminal 
 with Advanced typography, otherwise the monospace font. These keys can be rebound;
 Settings warns when another rule uses a key they hold in the terminal.
 
-In a native NeoPi workspace, `mod+n` runs `terminal.new` from a focused
-terminal. It opens a shell in the bottom drawer without replacing the NeoPi
-TUI tab.
+In a native NeoPi workspace, use `:new` from the command line or choose
+**New terminal** in the command palette to open an ordinary shell in the bottom
+drawer, even while the NeoPi TUI is open in the side panel.
 
 If an integrated terminal cannot attach, the failure appears inside that terminal
 even when its shell is quiet. Reconnect the environment before trying again.
@@ -261,8 +261,9 @@ stays hidden until you show that terminal.
 
 After `:b` and a space, the matching sessions appear above the line. Tab,
 Shift+Tab and the arrow keys move the pick; nothing changes until you press Enter.
-Split and close commands act on the terminal you focused last, and closing one
-asks for confirmation as its close button does.
+If the terminal you last focused is an ordinary shell, the command line's split
+and close commands act on it. These commands do not split or close the managed
+NeoPi TUI. Closing a shell asks for confirmation, just like its close button.
 
 Any command ID from **Settings → Keybindings** that the open session handles also
 works by name, for example `:rightPanel.toggle` or `:agents.hub.toggle`. Commands

@@ -37,6 +37,7 @@ import { FlatList, KeyboardAvoidingView, Platform, ScrollView, View } from "reac
 import { AppText as Text } from "../../components/AppText";
 import { MaterialButton } from "../../components/MaterialButton";
 import { ScreenHeader } from "../../components/ScreenHeader";
+import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import {
   nativeSessionAtoms,
   useNativeSession,
@@ -60,6 +61,7 @@ import { NativeField, NativeModal, NativeError } from "./NativeNeoPiControls";
 import { NeoPiJournalContent } from "./NeoPiJournalContent";
 import { NativeCommandOutput } from "./NativeCommandOutput";
 import { NativeSessionMobileTree } from "./NativeSessionMobileTree";
+import { FloatingWorkingControl } from "./floating-working-control";
 import { NeoPiModelsEntry } from "./NeoPiModelsScreen";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -118,6 +120,8 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
   const { feed, request, error } = useNativeSession(target);
   const timelineRef = useRef<FlatList<NativeTranscriptRow>>(null);
   const nearEndRef = useRef(false);
+  const [showScrollToEnd, setShowScrollToEnd] = useState(false);
+  const { themeAppearance } = useAppearancePreferences();
   const followRevisionRef = useRef(feed.conversation.revision);
   followRevisionRef.current = feed.conversation.revision;
   const followRowsRef = useRef<readonly NativeTranscriptRow[]>([]);
@@ -152,6 +156,12 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     submissionFollow.cancel();
   }, [submissionFollow]);
   useEffect(() => cancelSubmissionFollow, [cancelSubmissionFollow]);
+  const updateScrollToEndVisibility = () => {
+    const { height, viewport, offset } = layoutRef.current;
+    const atEnd = height - viewport - offset <= viewport * 0.1;
+    if (viewport > 0) setShowScrollToEnd(!atEnd);
+    return atEnd;
+  };
   const reconnect = useNativeSessionReconnect(target);
   const ownerlessRef = useRef(false);
   ownerlessRef.current = !feed.connected;
@@ -494,6 +504,7 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         onLayout={({ nativeEvent }) => {
           layoutRef.current.viewport = nativeEvent.layout.height;
           submissionFollow.changed();
+          if (!nearEndRef.current) updateScrollToEndVisibility();
         }}
         onScrollBeginDrag={() => {
           cancelSubmissionFollow();
@@ -506,17 +517,14 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
             offset: nativeEvent.contentOffset.y,
           };
           submissionFollow.changed();
-          nearEndRef.current =
-            nativeEvent.contentSize.height -
-              nativeEvent.layoutMeasurement.height -
-              nativeEvent.contentOffset.y <=
-            nativeEvent.layoutMeasurement.height * 0.1;
+          nearEndRef.current = updateScrollToEndVisibility();
         }}
         scrollEventThrottle={16}
         onContentSizeChange={(_, height) => {
           layoutRef.current.height = height;
           submissionFollow.changed();
           if (nearEndRef.current) timelineRef.current?.scrollToEnd({ animated: false });
+          else updateScrollToEndVisibility();
         }}
         data={rows}
         keyExtractor={(entry) => entry.id}
@@ -571,6 +579,16 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
         }
       />
       <View className="gap-2 border-t border-border px-4 py-3">
+        <FloatingWorkingControl
+          colorScheme={themeAppearance}
+          status={null}
+          devicePreview={null}
+          showScrollToEnd={showScrollToEnd}
+          onScrollToEnd={() => {
+            nearEndRef.current = true;
+            timelineRef.current?.scrollToEnd({ animated: false });
+          }}
+        />
         {[
           ...feed.queue.steering.map((text, index) => ({ lane: "steering" as const, text, index })),
           ...feed.queue.followUp.map((text, index) => ({ lane: "followUp" as const, text, index })),

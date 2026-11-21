@@ -3639,8 +3639,18 @@ const decodeOptOutRequest = Schema.decodeSync(
 );
 
 describe("opening native sessions with managed tmux disabled", () => {
-  for (const scenario of ["malformed", "stale", "unsafe directory", "live owner"] as const) {
-    it.live(`uses the ordinary open path with ${scenario} managed state`, () =>
+  for (const scenario of [
+    "malformed",
+    "stale",
+    "unsafe directory",
+    "live owner",
+    "invalid launch arguments with a live owner",
+  ] as const) {
+    const invalidArgs = scenario === "invalid launch arguments with a live owner";
+    const name = invalidArgs
+      ? `rejects ${scenario} before attaching`
+      : `uses the ordinary open path with ${scenario} managed state`;
+    it.live(name, () =>
       Effect.gen(function* () {
         vi.stubEnv("T3CODE_NEOPI_TMUX", undefined);
         vi.stubEnv("T3CODE_NEOPI_MANAGED_TMUX", undefined);
@@ -3663,7 +3673,7 @@ describe("opening native sessions with managed tmux disabled", () => {
         yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
         if (scenario === "unsafe directory") yield* fs.chmod(directory, 0o755);
         yield* fs.writeFileString(sessionFile, "");
-        const live = scenario === "live owner";
+        const live = scenario === "live owner" || invalidArgs;
         const owner = {
           executable: "/fixture/tmux",
           session: "$0",
@@ -3714,6 +3724,7 @@ describe("opening native sessions with managed tmux disabled", () => {
             binary: "/fixture/npi",
             env: {},
             profile: "default",
+            ...(invalidArgs ? { launchArgs: "--fork" } : {}),
             capabilities: new Set(["exit_with_parent"]),
             probe: { status: "compatible", version: "fixture" },
           },
@@ -3809,6 +3820,16 @@ describe("opening native sessions with managed tmux disabled", () => {
           ),
         );
         const ref = { providerInstanceId: instanceId, sessionFile };
+        if (invalidArgs) {
+          const result = yield* service.open(ref).pipe(Effect.result);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.equal(result.failure.message, "NeoPi launch arguments may not override --fork");
+          }
+          assert.deepEqual(spawned, [["sessions", "list", "--json", "--session-dir", cwd]]);
+          assert.equal(makeHost.mock.calls.length, 0);
+          return;
+        }
         const opened = yield* service.open(ref);
         assert.equal(opened.attachment, live ? "terminal" : "owned");
         assert.deepEqual(spawned, [

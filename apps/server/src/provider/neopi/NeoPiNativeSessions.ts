@@ -2948,6 +2948,9 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       const cwd = row?.cwd ?? input.cwd ?? config.cwd;
       const canonicalCwd = yield* fs.realPath(cwd);
       let managedOwner = fixture ? yield* probeManaged(profile, fixture) : undefined;
+      // Keep the ordinary path's settings validation ahead of attach and no_owner.
+      const ordinaryArgs =
+        managedHost || fixture ? undefined : yield* parseNeoPiLaunchArguments(source.launchArgs);
       let managedFile = fixture?.sessionFile;
       let contendedInstance: string | undefined;
       if (managedHost && (saved || (mode !== "attach" && !fixture && !row?.inUse))) {
@@ -3207,7 +3210,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       }
       if (row?.inUse) return yield* attach(row.control?.instanceId);
       if (mode === "attach") return yield* fail("No NeoPi owns this session yet.", "no_owner");
-      const extra = yield* parseNeoPiLaunchArguments(source.launchArgs);
+      const extra = ordinaryArgs ?? (yield* parseNeoPiLaunchArguments(source.launchArgs));
       const args = [
         "--mode",
         "rpc-ui",

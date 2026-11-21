@@ -6,9 +6,8 @@ import { appAtomRegistry } from "./atomRegistry";
 
 export const SLOW_RPC_ACK_THRESHOLD_MS = 15_000;
 /**
- * Some requests are slow by design — they shell out to a package manager on the
- * server and only respond once the install finishes. Warning about those after
- * 15s is noise, so they get a much longer leash.
+ * Long polls and server-side maintenance can take more than 15s by design.
+ * Give them longer before warning without hiding genuinely stalled requests.
  */
 export const LONG_RUNNING_RPC_ACK_THRESHOLD_MS = 120_000;
 export const MAX_TRACKED_RPC_ACK_REQUESTS = 256;
@@ -33,6 +32,7 @@ const untrackedRpcAckMethods = new Set<string>([
   WS_METHODS.serverGetUsageSummary,
 ]);
 const longRunningRpcAckMethods = new Set<string>([
+  WS_METHODS.neopiNativeSessionsRead,
   WS_METHODS.serverRefreshProviders,
   WS_METHODS.serverUpdateServer,
 ]);

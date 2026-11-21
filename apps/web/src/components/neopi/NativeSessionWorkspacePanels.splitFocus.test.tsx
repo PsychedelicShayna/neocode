@@ -6,6 +6,8 @@ import { act, createRef, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import { runCommand } from "~/commandTable";
+import { TERMINAL_INPUT_CLASS_NAME } from "~/lib/terminalFocus";
+import type * as GhosttySurface from "~/terminal/ghostty/surface";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "~/rightPanelLayout";
 import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 import { useTerminalUiStateStore } from "~/terminalUiStateStore";
@@ -26,12 +28,19 @@ vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: () => async () => ({ _tag: "Success" }),
 }));
 vi.mock("~/state/query", () => ({ useEnvironmentQuery: () => ({}) }));
-vi.mock("~/terminal/ghostty/surface", () => ({
+vi.mock("~/terminal/ghostty/surface", async (importOriginal) => ({
+  ...(await importOriginal<typeof GhosttySurface>()),
   GhosttyTerminalSurface: {
-    create: async (container: HTMLElement) => {
+    create: async (
+      container: HTMLElement,
+      options: GhosttySurface.GhosttyTerminalSurfaceOptions,
+    ) => {
       const input = container.appendChild(document.createElement("textarea"));
+      input.className = TERMINAL_INPUT_CLASS_NAME;
+      input.addEventListener("keydown", (event) => options.beforeKey(event));
       return {
         focus: () => input.focus(),
+        encodeKeyPressAndRelease: () => "\u001c",
         dispose: () => input.remove(),
         isAtBottom: () => true,
         fit: () => {},
@@ -114,7 +123,7 @@ async function mount(terminalOpen: boolean) {
   });
 }
 
-async function submit(command: string) {
+async function submit(command: string, key = "Enter") {
   // Use the registered command directly: the default keybinding deliberately
   // leaves Ctrl+; to the shell while terminal focus is active.
   await act(() => runCommand("exLine.open"));
@@ -125,10 +134,8 @@ async function submit(command: string) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
   await act(async () => {
-    input.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
-    );
-    document.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    document.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
   });
 }
 
@@ -173,3 +180,39 @@ it("splits the last-focused terminal without reopening its closed right-panel sh
   expect(panel.isOpen).toBe(false);
   expect(document.activeElement).toBe(composer);
 });
+
+it.each([
+  ["split", "Enter", false, true],
+  ["vsplit", "Enter", false, true],
+  ["split", "Escape", false, false],
+  ["split", "Enter", true, false],
+] as const)(
+  "after the terminal escape, :%s on %s (intervening focus: %s, returns to terminal: %s)",
+  async (command, key, interveningFocus, returnsToTerminal) => {
+    await mount(true);
+    const terminal = host.querySelector<HTMLTextAreaElement>("[data-terminal-id] textarea")!;
+    terminal.focus();
+    act(() => {
+      for (let i = 0; i < 2; i++) {
+        terminal.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "\\",
+            code: "Backslash",
+            ctrlKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+    });
+    expect(document.activeElement).toBe(document.body);
+    if (interveningFocus) {
+      const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
+      composer.focus();
+      composer.blur();
+    }
+    await submit(command, key);
+    expect(host.querySelectorAll("[data-terminal-id]")).toHaveLength(key === "Escape" ? 1 : 2);
+    expect(document.activeElement).toBe(returnsToTerminal ? terminal : document.body);
+  },
+);

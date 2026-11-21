@@ -249,10 +249,11 @@ recall earlier commands until the app restarts.
 | `:ene`    | Start a new thread (`chat.new`)                                                                 |
 | `:b name` | Switch to an open session tab whose title or agent name contains `name`                         |
 
-`:split` and `:vsplit` open the pane without moving the keyboard to it. The
-terminal split buttons and shortcuts still focus the new pane. If showing the
-split would reopen a modal or maximized right panel, it stays hidden until you
-open the panel.
+`:split` and `:vsplit` open the pane without moving the keyboard to it. If you
+open the command line right after leaving a terminal, they return the keyboard
+to that original terminal. The split buttons and shortcuts still focus the new
+pane. If showing the split would reopen a modal or maximized right panel, it
+stays hidden until you show that terminal.
 
 After `:b` and a space, the matching sessions appear above the line. Tab,
 Shift+Tab and the arrow keys move the pick; nothing changes until you press Enter.

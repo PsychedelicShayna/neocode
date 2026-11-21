@@ -50,6 +50,7 @@ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { readTextFromClipboard, writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { cn } from "~/lib/utils";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
+import { leaveTerminalFocus } from "~/lib/terminalFocus";
 import {
   observeSelectionActions,
   resolveSelectionActionPosition,
@@ -548,7 +549,7 @@ export function TerminalViewport({
           // clauses, which would keep GUI shortcuts from resolving.
           const activeElement = document.activeElement;
           if (activeElement instanceof HTMLElement && mount.contains(activeElement)) {
-            activeElement.blur();
+            leaveTerminalFocus(activeElement);
           }
         },
       });

@@ -34,14 +34,29 @@ function readFocusedTerminal(): TerminalIdentity | null {
 }
 
 let lastFocusedTerminal: TerminalIdentity | null = null;
+let justEscapedTerminal: WeakRef<HTMLElement> | null = null;
 if (typeof document !== "undefined") {
   document.addEventListener(
     "focusin",
     () => {
+      justEscapedTerminal = null;
       lastFocusedTerminal = readFocusedTerminal() ?? lastFocusedTerminal;
     },
     true,
   );
+}
+
+/** Release terminal input for workspace shortcuts without focusing another control. */
+export function leaveTerminalFocus(element: HTMLElement): void {
+  element.blur();
+  justEscapedTerminal = document.activeElement === document.body ? new WeakRef(element) : null;
+}
+
+/** Ex splits can return to a terminal immediately after its focus escape. */
+export function getJustEscapedTerminal(): HTMLElement | null {
+  if (document.activeElement !== document.body) return null;
+  const element = justEscapedTerminal?.deref();
+  return element?.isConnected ? element : null;
 }
 
 /**

@@ -14,7 +14,7 @@ import {
 } from "react";
 import { dispatchCommand, findCommand } from "../../commandTable";
 import { EX_LINE_INPUT_ATTRIBUTE, guardHeldKey } from "../../lib/exLineFocus";
-import { getLastFocusedTerminal } from "../../lib/terminalFocus";
+import { getJustEscapedTerminal, getLastFocusedTerminal } from "../../lib/terminalFocus";
 import { cn } from "../../lib/utils";
 import { selectNativeSession, useNativeSessionSelection } from "../../state/neopiNativeSessions";
 import { toastManager } from "../ui/toast";
@@ -107,12 +107,15 @@ export function ExLine({
   activePanelSurfaceIsTerminal: boolean;
   onClose: () => void;
 }) {
-  // Read before the input takes focus: where Escape returns to.
-  const [returnFocus] = useState(() =>
-    document.activeElement instanceof HTMLElement && document.activeElement !== document.body
-      ? document.activeElement
-      : null,
-  );
+  // Snapshot the origin before the input takes focus. A terminal escape
+  // releases the keyboard to BODY and is a return target only for splits.
+  const [{ returnFocus, escapedTerminal }] = useState(() => ({
+    returnFocus:
+      document.activeElement instanceof HTMLElement && document.activeElement !== document.body
+        ? document.activeElement
+        : null,
+    escapedTerminal: getJustEscapedTerminal(),
+  }));
   const [state, setState] = useState(EX_LINE_INITIAL);
   const tabs = useNativeSessionSelection((selection) => selection.tabs);
   const [labels, setLabels] = useState<ReadonlyMap<string, SessionLabel>>(new Map());
@@ -140,7 +143,11 @@ export function ExLine({
   const apply = (effect: ExLineEffect) => {
     if (effect.kind !== "close" && history[0] !== state.text) history.unshift(state.text);
     onClose();
-    if (returnFocus?.isConnected) returnFocus.focus();
+    const isSplit =
+      effect.kind === "run" &&
+      (effect.command === "terminal.split" || effect.command === "terminal.splitVertical");
+    const focusTarget = returnFocus ?? (isSplit ? escapedTerminal : null);
+    if (focusTarget?.isConnected) focusTarget.focus();
     else inputRef.current?.blur();
     if (effect.kind === "switchSession") {
       const match = matches.find((candidate) => candidate.key === effect.key);

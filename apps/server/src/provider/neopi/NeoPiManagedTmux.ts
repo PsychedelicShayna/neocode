@@ -258,9 +258,12 @@ export const sameManagedTmuxOwner = (a: ManagedTmuxOwner, b: ManagedTmuxOwner) =
   a.pane === b.pane &&
   a.pid === b.pid;
 
-export const managedTmuxClient = (config: Pick<TmuxTarget, "socket">, owner: ManagedTmuxOwner) => ({
+export const managedTmuxClient = (
+  config: Pick<TmuxTarget, "socket" | "session">,
+  owner: ManagedTmuxOwner,
+) => ({
   executable: owner.executable,
-  args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", owner.session],
+  args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", `=${config.session}:`],
 });
 
 const resolvePublication = Effect.fnUntraced(function* (
@@ -527,12 +530,14 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
 }) {
   const { owner, socket } = input;
   const name = `monitor-${NodeCrypto.randomUUID()}`;
+  // Session IDs can be reused when a new tmux server starts on the same socket.
+  const target = `=${name}:`;
   const launchFile = NodePath.join(NodePath.dirname(socket), `${name}.sh`);
   const capabilityFile = `${launchFile}.cap`;
   const prefix = ["-N", "-S", socket];
   const run = (args: string[]) =>
     exec(owner.executable, [...prefix, ...args], { timeout: 3000, maxBuffer: 65536 });
-  const cleanup = async (target: string) => {
+  const cleanup = async () => {
     // Normal detach may have removed the session before the stream finalizer ran.
     await run(["kill-session", "-t", target]).catch(() => undefined);
     await Promise.all([
@@ -540,7 +545,7 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
       NodeFSP.rm(capabilityFile, { force: true }),
     ]);
   };
-  const id = yield* Effect.acquireRelease(
+  yield* Effect.acquireRelease(
     Effect.tryPromise({
       try: async () => {
         await checkPrivateSocket(socket);
@@ -558,11 +563,9 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
           const script = `/bin/rm -f -- ${shellQuote(launchFile)}\n${managedPaneExports(input.env)}printf '\\n\\n'\nexec ${argv.map(shellQuote).join(" ")}\n`;
           await NodeFSP.writeFile(capabilityFile, input.capability, { mode: 0o600, flag: "wx" });
           await NodeFSP.writeFile(launchFile, script, { mode: 0o600, flag: "wx" });
-          const { stdout } = await run([
+          await run([
             "new-session",
-            "-dEP",
-            "-F",
-            "#{session_id}",
+            "-dE",
             "-s",
             name,
             "-n",
@@ -577,46 +580,43 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
             "set-option",
             "-w",
             "-t",
-            `=${name}:`,
+            target,
             "remain-on-exit",
             "failed",
             ";",
             "set-option",
             "-t",
-            `=${name}:`,
+            target,
             "prefix",
             "None",
             ";",
             "set-option",
             "-t",
-            `=${name}:`,
+            target,
             "prefix2",
             "None",
             ";",
             "set-option",
             "-t",
-            `=${name}:`,
+            target,
             "status",
             "off",
             ";",
             "respawn-pane",
             "-k",
             "-t",
-            `=${name}:`,
+            target,
             "/bin/sh",
             launchFile,
           ]);
-          const session = stdout.trim();
-          if (!/^\$\d+$/.test(session)) throw new Error("No tmux monitor ID returned");
-          return session;
         } catch (cause) {
-          await cleanup(`=${name}:`);
+          await cleanup();
           throw cause;
         }
       },
       catch: () => tmuxError("tmux_monitor_launch", "Could not open the NeoPi agent monitor."),
     }),
-    (session) => Effect.promise(() => cleanup(session)).pipe(Effect.ignoreCause({ log: true })),
+    () => Effect.promise(cleanup).pipe(Effect.ignoreCause({ log: true })),
   );
   return {
     executable: owner.executable,
@@ -625,11 +625,11 @@ export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
       "attach-session",
       "-E",
       "-t",
-      id,
+      target,
       ";",
       "set-option",
       "-t",
-      id,
+      target,
       "destroy-unattached",
       "on",
     ],
@@ -1023,7 +1023,8 @@ export const makeManagedTmuxHost = (
                 "-F",
                 "#{session_id}",
               ]);
-              if (pane.stdout.trim() === id) await run(["-N", "kill-session", "-t", id]);
+              if (pane.stdout.trim() === id)
+                await run(["-N", "kill-session", "-t", `=${session}:`]);
             }).pipe(Effect.ignore),
     );
   });

@@ -164,15 +164,22 @@ describe("managed tmux pane lookup", () => {
     await expect(lookup(await prepare("own"))).rejects.toMatchObject({ code: "tmux_no_owner" });
   });
 
-  it("uses one server PATH resolution for pane probes and attaches by verified session id", async () => {
+  it("uses one server PATH resolution and never attaches to a recycled session ID", async () => {
     const target = await prepare();
     await lookup(target);
     const owner = await lookup(target);
     expect(exec.mock.calls.map(([file]) => file)).toEqual([executable, executable]);
     expect(managedTmuxClient(target, owner)).toEqual({
       executable,
-      args: ["-N", "-S", socket, "attach-session", "-E", "-t", "$2"],
+      args: ["-N", "-S", socket, "attach-session", "-E", "-t", "=owner:"],
     });
+    // The original exact name is gone; only its numeric ID still resolves.
+    exec.mockImplementation(async (_file: string, args: readonly string[]) => {
+      if (args.at(-1) === "$2") return { stdout: otherPane };
+      throw new Error("can't find session: owner");
+    });
+    const client = managedTmuxClient(target, owner);
+    await expect(exec(client.executable, client.args)).rejects.toThrow("can't find session: owner");
     expect(resolveExecutable).toHaveBeenCalledExactlyOnceWith("tmux", "linux", env);
   });
 
@@ -201,9 +208,7 @@ describe("managed tmux monitor", () => {
       Effect.gen(function* () {
         writeFile.mockClear();
         exec.mockReset();
-        exec.mockImplementation(async (_file: string, args: string[]) => ({
-          stdout: args.includes("new-session") ? "$9\n" : "",
-        }));
+        exec.mockResolvedValue({ stdout: "" });
         const observed = yield* Effect.gen(function* () {
           const client = yield* open();
           expect(exec.mock.calls.some(([, args]) => args.includes("kill-session"))).toBe(false);
@@ -211,7 +216,7 @@ describe("managed tmux monitor", () => {
         }).pipe(Effect.scoped);
         const [tmux, launch] = exec.mock.calls[0]!;
         expect(tmux).toBe(executable);
-        expect(launch.slice(0, 5)).toEqual(["-N", "-S", socket, "new-session", "-dEP"]);
+        expect(launch.slice(0, 5)).toEqual(["-N", "-S", socket, "new-session", "-dE"]);
         expect(launch).toContain("remain-on-exit");
         expect(launch).toContain("failed"); // NeoPi's authoritative connection-limit refusal stays visible.
         expect(launch).not.toContain(owner.session);
@@ -227,15 +232,23 @@ describe("managed tmux monitor", () => {
         );
         expect(scriptWrite?.[1]).not.toMatch(/--(?:session|new-session|mode|exit-with-parent)\b/);
         expect(scriptWrite?.[1]).not.toContain("a".repeat(64));
-        expect(observed.args.slice(0, 8)).toEqual([
+        const name = launch[launch.indexOf("-s") + 1];
+        expect(name).toMatch(/^monitor-[0-9a-f-]{36}$/);
+        const target = `=${name}:`;
+        expect(observed.args).toEqual([
           "-N",
           "-S",
           socket,
           "attach-session",
           "-E",
           "-t",
-          "$9",
+          target,
           ";",
+          "set-option",
+          "-t",
+          target,
+          "destroy-unattached",
+          "on",
         ]);
         expect(exec.mock.calls.at(-1)?.[1]).toEqual([
           "-N",
@@ -243,9 +256,39 @@ describe("managed tmux monitor", () => {
           socket,
           "kill-session",
           "-t",
-          "$9",
+          target,
         ]);
       }),
+  );
+
+  effectIt.effect("leaves a replacement owner alone when tmux reuses the monitor's ID", () =>
+    Effect.gen(function* () {
+      const replacement = { attached: false, destroyUnattached: "off", alive: true };
+      let restarted = false;
+      exec.mockReset();
+      exec.mockImplementation(async (_file: string, args: string[]) => {
+        if (args[3] === "new-session") return { stdout: "$0\n" };
+        if (!restarted) throw new Error("Expected the tmux server to have restarted");
+
+        for (const command of args.slice(3).join(" ").split(" ; ")) {
+          const [verb, ...options] = command.split(" ");
+          const target = options[options.indexOf("-t") + 1];
+          if (target !== "$0") continue; // The old monitor name is absent on the new server.
+          if (verb === "attach-session") replacement.attached = true;
+          if (verb === "set-option") replacement.destroyUnattached = options.at(-1)!;
+          if (verb === "kill-session") replacement.alive = false;
+        }
+        return { stdout: "" };
+      });
+
+      yield* Effect.gen(function* () {
+        const client = yield* open();
+        restarted = true;
+        yield* Effect.promise(() => exec(client.executable, client.args));
+      }).pipe(Effect.scoped);
+
+      expect(replacement).toEqual({ attached: false, destroyUnattached: "off", alive: true });
+    }),
   );
 
   it("pins a grant to the requested agent and refuses writable advisor grants", () => {
@@ -386,11 +429,16 @@ describe("managed tmux owner startup", () => {
     () =>
       Effect.gen(function* () {
         exec.mockReset();
+        let replacementKilled = false;
         exec.mockImplementation(async (_file: string, args: string[]) => {
           if (args.includes("new-session") || args.includes("#{session_id}"))
             return { stdout: "$2\n" };
           if (args.includes("list-panes")) return { stdout: "$2|@3|%4|321|0|off\n" };
-          if (args.includes("kill-session")) return { stdout: "" };
+          if (args.includes("kill-session")) {
+            // The server was replaced after the last list-panes, which returned $2.
+            if (args.at(-1) === "$2") replacementKilled = true;
+            throw new Error("can't find session");
+          }
           throw new Error("Unexpected tmux command");
         });
         const host = makeManagedTmuxHost(ownedState, executable, "linux");
@@ -423,10 +471,14 @@ describe("managed tmux owner startup", () => {
           instanceId: "original-holder",
         });
         const commands = exec.mock.calls.map(([, args]) => args);
-        expect(commands.filter((args) => args.includes("new-session"))).toHaveLength(1);
+        const launches = commands.filter((args) => args.includes("new-session"));
+        expect(launches).toHaveLength(1);
+        const launch = launches[0]!;
+        const name = launch[launch.indexOf("-s") + 1];
         expect(commands.filter((args) => args.includes("kill-session"))).toEqual([
-          ["-u", "-S", ownedSocket, "-N", "kill-session", "-t", "$2"],
+          ["-u", "-S", ownedSocket, "-N", "kill-session", "-t", `=${name}:`],
         ]);
+        expect(replacementKilled).toBe(false);
         expect(commands.some((args) => args.includes("send-keys"))).toBe(false);
         expect(verifyLease).not.toHaveBeenCalled();
         expect(rebind).not.toHaveBeenCalled();

@@ -156,3 +156,18 @@ it("opens an ordinary terminal in the drawer", async () => {
   expect(input!.closest(panelContent)).toBeNull();
   expect(host.querySelector(managedView)).toBeNull();
 });
+
+it("opens a new terminal in the drawer when the managed TUI has focus", async () => {
+  await clickButton("Show NeoPi TUI");
+  const tui = host.querySelector(`${panelContent} ${managedView}`);
+  const tuiInput = tui?.querySelector("textarea");
+  expect(tuiInput).toBeDefined();
+  await act(async () => tuiInput!.focus());
+  expect(document.activeElement).toBe(tuiInput);
+
+  await act(async () => runCommand("terminal.new"));
+  expect(
+    host.querySelector('[data-terminal-owner="drawer"] [data-terminal-id] textarea'),
+  ).not.toBeNull();
+  expect(host.querySelector(`${panelContent} ${managedView}`)).toBe(tui);
+});

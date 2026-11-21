@@ -428,12 +428,7 @@ export function NativeSessionWorkspacePanels({
     "terminal.new": {
       label: "New terminal",
       available: () => cwd !== null,
-      run: (invocation) => {
-        const located = locateTerminal(invocation);
-        if (located ? located.surfaceId !== null : getTerminalFocusOwner() === "right-panel") {
-          createTerminal();
-          return;
-        }
+      run: () => {
         useTerminalUiStateStore.getState().setTerminalOpen(target, true);
         drawerRef.current?.newTerminal();
       },

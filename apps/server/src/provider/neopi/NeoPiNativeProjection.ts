@@ -1522,24 +1522,23 @@ export class NeoPiNativeProjection {
     this.#lastMessageId = messageId;
     const assistantEvent = asRecord(frame.assistantMessageEvent);
     const eventType = assistantEvent?.type;
-    // Text deltas append to a text block. Thinking and tool-call events touch
-    // only their own blocks, so they do not invalidate the text prefix.
-    // Starts, replacement snapshots, and unrecognized updates get a new key.
+    // Snapshots and unknown updates carry no append guarantee. A text delta
+    // starts a new generation if needed; thinking and tool-call events only
+    // preserve an existing generation because they do not touch text blocks.
+    const previousGeneration = held?.class === "message" ? held.textAppendGeneration : undefined;
     const textAppendGeneration =
-      type === "message_end" || message.role !== "assistant"
-        ? undefined
-        : (type === "message_update" &&
-            frame.snapshot !== true &&
-            ((eventType === "text_delta" && typeof assistantEvent?.delta === "string") ||
-              eventType === "thinking_start" ||
+      type === "message_update" && frame.snapshot !== true && message.role === "assistant"
+        ? eventType === "text_delta" && typeof assistantEvent?.delta === "string"
+          ? (previousGeneration ?? NodeCrypto.randomUUID())
+          : eventType === "thinking_start" ||
               eventType === "thinking_delta" ||
               eventType === "thinking_end" ||
               eventType === "toolcall_start" ||
               eventType === "toolcall_delta" ||
-              eventType === "toolcall_end") &&
-            held?.class === "message" &&
-            held.textAppendGeneration) ||
-          NodeCrypto.randomUUID();
+              eventType === "toolcall_end"
+            ? previousGeneration
+            : undefined
+        : undefined;
     const value: MessageValue = {
       class: "message",
       messageId,

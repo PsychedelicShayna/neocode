@@ -397,8 +397,10 @@ JSON alongside native text, images, reasoning and tool records.
 Under **Settings → General → Response streaming**, choose **Show finished paragraphs**
 to reveal each completed paragraph or code block while NeoPi works. Unfinished
 text stays hidden while the run pauses to continue or wait for background work.
-It appears when the message or run finishes. Native sessions without a saved
-project use their environment's setting.
+It appears when the message or run finishes. In both thread-bound and standalone
+sessions, token streaming shows all received text during a resumable pause, but
+the text is no longer marked as streaming and the turn stays open. Native
+sessions without a saved project use their environment's setting.
 
 In a thread's right panel, choose **Session tree** to inspect alternate branches.
 Filter tools and system events, search loaded entries, and

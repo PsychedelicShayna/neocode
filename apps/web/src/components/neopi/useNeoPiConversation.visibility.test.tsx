@@ -1,9 +1,15 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, type ComponentProps } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
-import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_UNIFIED_SETTINGS,
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  type ResponseStreamingMode,
+} from "@t3tools/contracts";
 import type { NativeSessionFeed } from "@t3tools/client-runtime/neopi-native-sessions";
-import type { TimelineEntry } from "../../session-logic";
+import { createTranscriptProjector } from "@t3tools/client-runtime/neopi-transcript";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 
 const control = vi.hoisted(() => ({
@@ -11,6 +17,7 @@ const control = vi.hoisted(() => ({
   purposes: [] as Array<string | undefined>,
   visibility: "visible" as DocumentVisibilityState,
   feed: undefined as NativeSessionFeed | undefined,
+  responseStreamingMode: "paragraph" as ResponseStreamingMode,
 }));
 vi.mock("../../connection/runtime", () => ({ connectionAtomRuntime: {} }));
 vi.mock("../../state/neopiSessions", () => ({ neopiSessionJournal: {} }));
@@ -23,16 +30,11 @@ vi.mock("../chat/ExpandedImageDialog", () => ({ ExpandedImageDialog: () => null 
 vi.mock("../../hooks/useSettings", () => ({
   useEnvironmentSettings: () => ({
     ...DEFAULT_UNIFIED_SETTINGS,
-    responseStreamingMode: "paragraph",
+    responseStreamingMode: control.responseStreamingMode,
   }),
 }));
 // Keep the actual bound view and native projection; replace only the virtual list.
-vi.mock("../chat/MessagesTimeline", () => ({
-  MessagesTimeline: ({ timelineEntries }: { timelineEntries: TimelineEntry[] }) =>
-    timelineEntries.map((entry) =>
-      entry.kind === "message" ? <p key={entry.message.id}>{entry.message.text}</p> : null,
-    ),
-}));
+vi.mock("../chat/MessagesTimeline", () => ({ MessagesTimeline: () => null }));
 // The thread's ref resolves at once; the controller's lease is an atom lifetime, as in the
 // native session visibility test. The real thread observation atoms compose them. Imports
 // are inside the hoisted mock factories because static bindings are not initialized yet.
@@ -84,6 +86,8 @@ import {
   emptyNativeSessionFeed,
   reduceNativeSessionFeed,
 } from "@t3tools/client-runtime/neopi-native-sessions";
+import { MessagesTimeline } from "../chat/MessagesTimeline";
+import { NativeTimelineView } from "./NativeTimelineView";
 import { NeoPiConversation } from "./NeoPiConversation";
 import { useThreadNativeObservation } from "./useNeoPiConversation";
 
@@ -139,14 +143,21 @@ it("holds a thread lease only while the document is visible, never keyed on focu
   expect(control.leases).toBe(1);
 });
 
-it.each(["async-work", "continuation"] as const)(
-  "keeps the incomplete paragraph hidden in a bound thread waiting for %s",
-  async (runPause) => {
+it.each([
+  ["async-work", "token"],
+  ["continuation", "token"],
+  ["async-work", "paragraph"],
+  ["continuation", "paragraph"],
+] as const)(
+  "matches bound and standalone %s pause presentation in %s mode",
+  async (runPause, mode) => {
     vi.useFakeTimers();
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    control.responseStreamingMode = mode;
     const empty = emptyNativeSessionFeed();
     const ready = "Finished paragraph.\n\n";
-    control.feed = reduceNativeSessionFeed(
+    const body = `${ready}Incomplete tail`;
+    const feed = reduceNativeSessionFeed(
       {
         ...empty,
         busy: true,
@@ -157,10 +168,14 @@ it.each(["async-work", "continuation"] as const)(
           identity: { sessionId: "s-1", sessionFile: "/session", leafId: null },
           pending: [
             {
+              messageId: "prompt",
+              message: { role: "user", content: [{ type: "text", text: "Hello" }] },
+            },
+            {
               messageId: "answer",
               message: {
                 role: "assistant",
-                content: [{ type: "text", text: `${ready}Incomplete tail` }],
+                content: [{ type: "text", text: body }],
               },
             },
           ],
@@ -172,22 +187,64 @@ it.each(["async-work", "continuation"] as const)(
         live: { state: "busy", isStreaming: false, pendingDialogs: 0, branch: null, runPause },
       },
     );
+    control.feed = feed;
+    const standaloneRows = createTranscriptProjector()(
+      {
+        entries: feed.conversation.entries,
+        pending: feed.conversation.pending,
+        leafId: feed.conversation.identity?.leafId ?? null,
+      },
+      { debug: false },
+    );
     await act(async () => {
       renderer = create(
         <AppAtomRegistryProvider>
-          <NeoPiConversation
-            threadRef={threadRef}
-            projectId={ProjectId.make("project")}
-            composerInset={0}
-            ownerStatus={undefined}
-            onOpenTree={() => {}}
-          />
+          <section id="bound">
+            <NeoPiConversation
+              threadRef={threadRef}
+              projectId={ProjectId.make("project")}
+              composerInset={0}
+              ownerStatus={undefined}
+              onOpenTree={() => {}}
+            />
+          </section>
+          <section id="standalone">
+            <NativeTimelineView
+              rows={standaloneRows}
+              busy={feed.busy}
+              runPaused={feed.runPause !== null}
+              environmentId={threadRef.environmentId}
+              timelineKey="standalone"
+              cwd={undefined}
+              loadEarlier={null}
+              onImageExpand={() => {}}
+            />
+          </section>
         </AppAtomRegistryProvider>,
       );
       await vi.runAllTimersAsync();
     });
-    expect(renderer?.root.findAllByType("p").map((node) => node.children.join(""))).toContain(
-      ready,
-    );
+    const presentation = (id: string) => {
+      const { timelineEntries, latestTurn, runningTurnId } = renderer!.root
+        .findByProps({ id })
+        .findByType(MessagesTimeline).props as ComponentProps<typeof MessagesTimeline>;
+      const reply = timelineEntries
+        .flatMap((entry) => (entry.kind === "message" ? [entry.message] : []))
+        .find((message) => message.role === "assistant");
+      return {
+        text: reply?.text,
+        streaming: reply?.streaming,
+        turnState: latestTurn?.state,
+        running: runningTurnId !== null,
+      };
+    };
+    const standalone = presentation("standalone");
+    expect(standalone).toEqual({
+      text: mode === "paragraph" ? ready : body,
+      streaming: false,
+      turnState: "running",
+      running: true,
+    });
+    expect(presentation("bound")).toEqual(standalone);
   },
 );

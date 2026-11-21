@@ -101,19 +101,19 @@ describe("NeoPiNativeProjection", () => {
     },
   );
 
-  it("preserves text append provenance across streaming deltas, but not replacement snapshots or end", () => {
+  it("only adds append provenance on text deltas and drops it on replacements or end", () => {
     const projection = published();
     const messageId = "live";
     projection.fold({ type: "message_start", messageId, message: assistant("First") });
-    const initial = servedMessage(projection, messageId)?.textAppendGeneration;
-    assert.isString(initial);
+    assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
     projection.fold({
       type: "message_update",
       messageId,
       message: assistant("First paragraph"),
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " paragraph" },
     });
-    assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial);
+    const initial = servedMessage(projection, messageId)?.textAppendGeneration;
+    assert.isString(initial);
     const content: Record<string, unknown>[] = assistant("First paragraph").content;
     for (const event of [
       {
@@ -140,15 +140,29 @@ describe("NeoPiNativeProjection", () => {
       });
       assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial, event.type);
     }
-    projection.fold({
-      type: "message_start",
-      messageId,
-      snapshot: true,
-      message: assistant("Replacement"),
-    });
-    const replacement = servedMessage(projection, messageId)?.textAppendGeneration;
-    assert.isString(replacement);
-    assert.notEqual(replacement, initial);
+    let previousGeneration = initial;
+    for (const replacement of [
+      { type: "message_start", snapshot: true },
+      {
+        type: "message_update",
+        snapshot: true,
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " not an append" },
+      },
+      { type: "message_update" },
+    ]) {
+      projection.fold({ ...replacement, messageId, message: assistant("Replacement") });
+      assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
+      projection.fold({
+        type: "message_update",
+        messageId,
+        message: assistant("Replacement appended"),
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " appended" },
+      });
+      const generation = servedMessage(projection, messageId)?.textAppendGeneration;
+      assert.isString(generation);
+      assert.notEqual(generation, previousGeneration);
+      previousGeneration = generation;
+    }
     projection.fold({ type: "message_end", messageId, message: assistant("Replacement final") });
     assert.isUndefined(servedMessage(projection, messageId)?.textAppendGeneration);
   });

@@ -30,14 +30,20 @@ vi.mock("../../localApi", () => ({
     dialogs: { confirm: fixture.confirm },
   }),
 }));
-vi.mock("../../state/neopiNativeSessions", () => ({
-  nativeSessionAtoms: {
-    list: () => "list",
-    setSettled: "set-settled",
-    stopManaged: "stop-managed",
-  },
-  useNativeSessionSelection: () => null,
-}));
+vi.mock("../../state/neopiNativeSessions", async () => {
+  // The hoisted mock factory runs before static imports are initialized.
+  const { Atom } = await import("effect/unstable/reactivity");
+  const activity = Atom.family(() => Atom.make(new Map()));
+  return {
+    nativeSessionAtoms: {
+      list: () => "list",
+      activity,
+      setSettled: "set-settled",
+      stopManaged: "stop-managed",
+    },
+    useNativeSessionSelection: () => null,
+  };
+});
 vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (command: string) =>
     command === "stop-managed" ? fixture.stopManaged : fixture.setSettled,

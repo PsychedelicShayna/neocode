@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { NeoPiRpcError } from "./errors.ts";
+import type { FormUiSubmission } from "./form.ts";
 
 /**
  * Permissive frame model. Unknown `type`s decode to `{ type, ...rest }` and
@@ -35,6 +36,7 @@ export interface UiRequestFrame {
     | "input"
     | "editor"
     | "ask"
+    | "form"
     | "cancel"
     | "notify"
     | "setStatus"
@@ -304,6 +306,8 @@ export interface UiResponseWire {
   readonly confirmed?: boolean;
   readonly cancelled?: true;
   readonly timedOut?: boolean;
+  readonly data?: FormUiSubmission["data"];
+  readonly notes?: FormUiSubmission["notes"];
 }
 
 const decodeJsonLine = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));

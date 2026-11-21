@@ -75,11 +75,8 @@ export function NativeManagedTuiView({
     <section
       aria-label={monitor ? "Managed NeoPi agent monitor" : "Managed NeoPi TUI"}
       data-thread-terminal-drawer
-      className={
-        monitor
-          ? "relative min-h-0 flex-1 overflow-hidden"
-          : "relative h-[min(40dvh,24rem)] shrink-0 overflow-hidden border-t border-border"
-      }
+      data-terminal-owner={monitor ? undefined : "right-panel"}
+      className="relative min-h-0 flex-1 overflow-hidden"
     >
       <TerminalViewport
         advancedTypography={false}

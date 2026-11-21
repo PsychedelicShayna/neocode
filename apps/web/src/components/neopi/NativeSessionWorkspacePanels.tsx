@@ -6,7 +6,11 @@ import {
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import type { PreviewAnnotationPayload, ResolvedKeybindingsConfig } from "@t3tools/contracts";
+import {
+  MANAGED_TMUX_TERMINAL_ID,
+  type PreviewAnnotationPayload,
+  type ResolvedKeybindingsConfig,
+} from "@t3tools/contracts";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
 import * as Arr from "effect/Array";
 import {
@@ -70,9 +74,17 @@ import { NativeBackgroundTasksPanel } from "./NativeBackgroundTasksPanel";
 import { closeNativeTerminal } from "./closeNativeTerminal";
 import { ExLine } from "./ExLine";
 import { ExLineAnchorContext } from "./ExLineAnchor";
-import { NativeSessionTerminal, type NativeSessionTerminalHandle } from "./NativeSessionTerminal";
+import {
+  NativeManagedTuiView,
+  NativeSessionTerminal,
+  type NativeSessionTerminalHandle,
+} from "./NativeSessionTerminal";
 import { useNativePendingFiles } from "./useNativePendingFiles";
 import { useNativeWorkspaceKeys } from "./useNativeWorkspaceKeys";
+
+function isManagedTuiSurface(surface: RightPanelSurface): boolean {
+  return surface.kind === "terminal" && surface.resourceId === MANAGED_TMUX_TERMINAL_ID;
+}
 
 /** Escape belongs to these while one is open; it must not also interrupt the turn. */
 const ESCAPE_OWNING_OVERLAYS = [
@@ -173,16 +185,16 @@ export function NativeSessionWorkspacePanels({
     environmentId: target.environmentId,
     threadId: resourceId,
   });
-  const labels = useMemo(
-    () =>
-      new Map(
-        sessions.map((session) => [
-          session.target.terminalId,
-          resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
-        ]),
-      ),
-    [sessions],
-  );
+  const labels = useMemo(() => {
+    const byId = new Map(
+      sessions.map((session) => [
+        session.target.terminalId,
+        resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
+      ]),
+    );
+    byId.set(MANAGED_TMUX_TERMINAL_ID, "NeoPi TUI");
+    return byId;
+  }, [sessions]);
   const agentModel = useMemo(() => deriveAgentPanelModel({ agents }), [agents]);
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(target.environmentId));
   const gitStatus = useEnvironmentQuery(
@@ -274,7 +286,7 @@ export function NativeSessionWorkspacePanels({
       )
         return;
       const terminalIds = surfaces.flatMap((surface) =>
-        surface.kind === "terminal" ? surface.terminalIds : [],
+        surface.kind === "terminal" && !isManagedTuiSurface(surface) ? surface.terminalIds : [],
       );
       if (
         Arr.isArrayNonEmpty(terminalIds) &&
@@ -294,7 +306,8 @@ export function NativeSessionWorkspacePanels({
             continue;
           }
         }
-        if (surface.kind === "terminal") {
+        // The managed view detaches on unmount; closing its tab must not stop NeoPi.
+        if (surface.kind === "terminal" && !isManagedTuiSurface(surface)) {
           let failed = false;
           for (const terminalId of surface.terminalIds) {
             const result = await closeNativeTerminal({
@@ -443,7 +456,15 @@ export function NativeSessionWorkspacePanels({
           : getTerminalFocusOwner() !== null || terminalUi.terminalOpen,
       run: (invocation) => {
         if (!invocation) {
-          focusedTerminalController()?.closeActiveTerminal();
+          if (
+            getTerminalFocusOwner() === "right-panel" &&
+            activeSurface &&
+            isManagedTuiSurface(activeSurface)
+          ) {
+            useRightPanelStore.getState().closeSurface(target, activeSurface.id);
+          } else {
+            focusedTerminalController()?.closeActiveTerminal();
+          }
           return;
         }
         const located = locateTerminal(invocation);
@@ -617,7 +638,11 @@ export function NativeSessionWorkspacePanels({
           />
         ) : null}
         {panel.surfaces.map((surface) =>
-          surface.kind === "terminal" && cwd ? (
+          isManagedTuiSurface(surface) ? (
+            active(surface) ? (
+              <NativeManagedTuiView key={surface.id} target={target} cwd={cwd ?? ""} />
+            ) : null
+          ) : surface.kind === "terminal" && cwd ? (
             <div
               key={surface.id}
               className={active(surface) ? "flex min-h-0 flex-1 flex-col" : "hidden"}

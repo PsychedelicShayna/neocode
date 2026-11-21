@@ -26,7 +26,7 @@ import {
   transcriptUserText,
   type CommandRow,
 } from "@t3tools/client-runtime/neopi-transcript";
-import type { KeybindingCommand } from "@t3tools/contracts";
+import { MANAGED_TMUX_TERMINAL_ID, type KeybindingCommand } from "@t3tools/contracts";
 import { agentIdentity, nativeSessionIdentityKey } from "@t3tools/shared/agentNames";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useCommandHandlers } from "../../commandTable";
@@ -54,7 +54,6 @@ import { SidebarInset } from "../ui/sidebar";
 import { Dialog, DialogPopup, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { ExLineAnchor } from "./ExLineAnchor";
 import { NativeSessionStatusBar } from "./NativeSessionStatusBar";
-import { NativeManagedTuiView } from "./NativeSessionTerminal";
 import { NativeSessionTabBar } from "./NativeSessionTabBar";
 import { useCreateNativeSession } from "./NativeSessionSidebar";
 import { NativeTimelineView, nativeTimelineKey } from "./NativeTimelineView";
@@ -217,10 +216,8 @@ export function NativeSessionView({
   const { feed, session, conversation, request, error } = useNativeSession(target);
   // Dismissing hides that one message; a different failure shows again.
   const [dismissedError, setDismissedError] = useState<string | null>(null);
-  const [tuiOpenFor, setTuiOpenFor] = useState<string | null>(null);
   const close = useAtomCommand(nativeSessionAtoms.close, { reportFailure: false });
   const key = nativeSessionKey(target);
-  const tuiOpen = tuiOpenFor === key;
   const assistantName = agentIdentity(
     nativeSessionIdentityKey({
       sessionId: session?.sessionId,
@@ -232,6 +229,17 @@ export function NativeSessionView({
   const panelOpen = useRightPanelStore(
     (value) => selectThreadRightPanelState(value.byThreadKey, target).isOpen,
   );
+  const activeTuiTabId = useRightPanelStore(({ byThreadKey }) => {
+    const panel = selectThreadRightPanelState(byThreadKey, target);
+    return panel.isOpen
+      ? panel.surfaces.find(
+          (surface) =>
+            surface.id === panel.activeSurfaceId &&
+            surface.kind === "terminal" &&
+            surface.resourceId === MANAGED_TMUX_TERMINAL_ID,
+        )?.id
+      : undefined;
+  });
   const settings = useEnvironmentSettings(target.environmentId);
   const { resolvedTheme } = useTheme();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -1085,14 +1093,15 @@ export function NativeSessionView({
             onReturnFocus={focusComposer}
           />
         </ComposerSurface.Shell>
-        {tuiOpen ? (
-          <NativeManagedTuiView key={key} target={target} cwd={session?.cwd ?? ""} />
-        ) : null}
         <ExLineAnchor>
           <NativeSessionStatusBar
             target={target}
-            tuiOpen={tuiOpen}
-            onToggleTui={() => setTuiOpenFor(tuiOpen ? null : key)}
+            tuiOpen={activeTuiTabId !== undefined}
+            onToggleTui={() => {
+              const panels = useRightPanelStore.getState();
+              if (activeTuiTabId) panels.closeSurface(target, activeTuiTabId);
+              else panels.openTerminal(target, MANAGED_TMUX_TERMINAL_ID);
+            }}
           />
         </ExLineAnchor>
       </NativeSessionWorkspacePanels>

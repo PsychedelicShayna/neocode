@@ -469,7 +469,7 @@ interface NativeSession {
    * tools are registered with the owner only once something wants them.
    */
   hostToolsWanted: boolean;
-  /** Only a fresh owned open is pending; the first lease or bind completion ends it. */
+  /** Only an owned open is pending; the first lease or bind completion ends it. */
   startupHostToolsBind: "pending" | "binding" | null;
 }
 interface NativeMarkers {
@@ -1319,8 +1319,8 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
      */
     const observer: NeoPiNativeFrameObserver = {
       frame: (frame) => {
-        // Initial host-tool registration can announce its mount before the new
-        // session can be selected. That informational notice is not missed work.
+        // Initial host-tool registration can announce its mount before the first view
+        // attaches. That informational notice is not missed work.
         if (
           frame.type === "notice" &&
           session?.startupHostToolsBind === "binding" &&
@@ -1682,10 +1682,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
           takeoverRequested: false,
           hostToolsWanted: mode === "auto",
           startupHostToolsBind:
-            mode === "auto" &&
-            input.sessionFile === undefined &&
-            native.attachment === "owned" &&
-            native.hostTools !== undefined
+            mode === "auto" && native.attachment === "owned" && native.hostTools !== undefined
               ? "pending"
               : null,
         };

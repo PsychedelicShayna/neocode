@@ -3432,6 +3432,20 @@ describe("attach-only discovery (r12 C5)", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("does not report a reopened owned session's initial xd:// mount notice as missed", () =>
+    Effect.gen(function* () {
+      const { native, service } = yield* fixture();
+      native.bindNotices.push(xdevMountNotice);
+      const { ref, attachment } = yield* service.open(originalRef);
+      assert.equal(attachment, "owned");
+      assert.deepEqual(ref, originalRef);
+      assert.equal(native.binds, 1);
+
+      const first = yield* follow(service, ref);
+      assert.deepEqual((yield* first.pass()).inbox, []);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("still reports other notices missed during a fresh owned session's startup", () =>
     Effect.gen(function* () {
       const { native, service } = yield* fixture();

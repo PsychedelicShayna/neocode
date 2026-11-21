@@ -156,30 +156,37 @@ it.each([
   expect(document.activeElement).toBe(original);
 });
 
-it("splits the last-focused terminal without reopening its closed right-panel sheet", async () => {
-  media.narrow = true;
-  useRightPanelStore.getState().openTerminal(target, "panel-shell");
-  await mount(false);
-  const panelInput = document.querySelector<HTMLTextAreaElement>(
-    '[data-terminal-id="panel-shell"] textarea',
-  );
-  expect(panelInput).not.toBeNull();
-  act(() => panelInput!.focus());
-  expect(document.activeElement).toBe(panelInput);
-  await act(() => runCommand("rightPanel.toggle"));
-  const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
-  composer.focus();
-  await submit("split");
-  const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, target);
-  expect(panel.surfaces).toEqual([
-    expect.objectContaining({
-      terminalIds: ["panel-shell", expect.any(String)],
-      activeTerminalId: "panel-shell",
-    }),
-  ]);
-  expect(panel.isOpen).toBe(false);
-  expect(document.activeElement).toBe(composer);
-});
+it.each([
+  ["split", "sheet"],
+  ["split", "inline"],
+  ["vsplit", "inline"],
+] as const)(
+  ":%s splits the last-focused terminal without reopening its closed %s panel",
+  async (command, layout) => {
+    media.narrow = layout === "sheet";
+    useRightPanelStore.getState().openTerminal(target, "panel-shell");
+    await mount(false);
+    const panelInput = document.querySelector<HTMLTextAreaElement>(
+      '[data-terminal-id="panel-shell"] textarea',
+    );
+    expect(panelInput).not.toBeNull();
+    act(() => panelInput!.focus());
+    expect(document.activeElement).toBe(panelInput);
+    await act(() => runCommand("rightPanel.toggle"));
+    const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
+    composer.focus();
+    await submit(command);
+    const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, target);
+    expect(panel.isOpen).toBe(false);
+    expect(panel.surfaces).toEqual([
+      expect.objectContaining({
+        terminalIds: ["panel-shell", expect.any(String)],
+        activeTerminalId: "panel-shell",
+      }),
+    ]);
+    expect(document.activeElement).toBe(composer);
+  },
+);
 
 it.each([
   ["split", "Enter", false, true],

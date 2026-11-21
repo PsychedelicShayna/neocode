@@ -369,12 +369,10 @@ export function NativeSessionWorkspacePanels({
     const focusNewTerminal = invocation === undefined;
     const located = locateTerminal(invocation);
     if (located?.surfaceId) {
-      // Reopening a sheet captures the keyboard, and a maximized panel
-      // would hide the origin. Split the hidden terminal without revealing it.
-      const reveal = panel.isOpen || (!sheet && !maximized);
+      // An Ex split must leave a closed right panel closed.
       panelControllers.current.get(located.surfaceId)?.splitTerminal(direction, {
         focusNewTerminal,
-        reveal,
+        reveal: panel.isOpen,
       });
       return;
     }

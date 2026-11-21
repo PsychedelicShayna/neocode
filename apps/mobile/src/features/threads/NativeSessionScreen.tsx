@@ -32,6 +32,14 @@ import {
 import { journalEntryLabel } from "@t3tools/client-runtime/neopi-journal";
 import { createNativeSubmissionFollow } from "@t3tools/client-runtime/neopi-submission-follow";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
+import {
+  nativeAskProgress,
+  selectNativeSessionDialog,
+  stepNativeAsk,
+  type NativeAsk,
+  type NativeAskAction,
+  type NativeAskDraft,
+} from "@t3tools/client-runtime/neopi-native-ask";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FlatList, KeyboardAvoidingView, Platform, ScrollView, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
@@ -438,9 +446,15 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
     completions.prefix === argumentPrefix
       ? completions.items.filter((item) => item.value !== argumentPrefix).slice(0, 10)
       : [];
-  const dialog = feed.dialogs.find(
-    (dialog) => typeof dialog.id === "string" && !dismissed.has(dialog.id),
+  const obligation = useMemo(
+    () => selectNativeSessionDialog(feed.dialogs, dismissed),
+    [feed.dialogs, dismissed],
   );
+  const markAnswered = (id: string) => {
+    const next = new Set(answered.get(key)).add(id);
+    answered.set(key, next);
+    setDismissed(next);
+  };
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -578,6 +592,14 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
           )
         }
       />
+      {obligation?.kind === "ask" ? (
+        <NativeMobileAsk
+          key={obligation.id}
+          ask={obligation}
+          request={request}
+          onAnswered={() => markAnswered(obligation.id)}
+        />
+      ) : null}
       <View className="gap-2 border-t border-border px-4 py-3">
         <FloatingWorkingControl
           colorScheme={themeAppearance}
@@ -692,16 +714,12 @@ function NativeSessionBody({ target }: { target: NativeSessionTarget }) {
       {tree ? (
         <NativeSessionMobileTree target={target} request={execute} onClose={() => setTree(false)} />
       ) : null}
-      {dialog ? (
+      {obligation?.kind === "modal" ? (
         <NativeMobileDialog
-          key={String(dialog.id)}
-          dialog={dialog}
+          key={obligation.id}
+          dialog={obligation.dialog}
           request={request}
-          onAnswered={() => {
-            const next = new Set(dismissed).add(String(dialog.id));
-            answered.set(key, next);
-            setDismissed(next);
-          }}
+          onAnswered={() => markAnswered(obligation.id)}
         />
       ) : null}
     </KeyboardAvoidingView>
@@ -819,6 +837,112 @@ export function NativeMobileModels({
   );
 }
 
+function NativeMobileAsk({
+  ask,
+  request,
+  onAnswered,
+}: {
+  ask: NativeAsk;
+  request: Request;
+  onAnswered: () => void;
+}) {
+  const draftRef = useRef<NativeAskDraft>(undefined);
+  const [draft, setDraft] = useState<NativeAskDraft>();
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const {
+    activeQuestion: question,
+    questionIndex,
+    selectedOptionValues,
+    customAnswer,
+    canAdvance,
+    isLastQuestion,
+  } = nativeAskProgress(ask, draft);
+
+  const dispatch = async (action: NativeAskAction) => {
+    if (inFlight.current) return;
+    const next = stepNativeAsk(ask, draftRef.current, action);
+    draftRef.current = next.draft;
+    setDraft(next.draft);
+    if (!next.response) return;
+    inFlight.current = true;
+    setPending(true);
+    setError(null);
+    try {
+      await request(next.response);
+      onAnswered();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      inFlight.current = false;
+      setPending(false);
+    }
+  };
+
+  return (
+    <ScrollView
+      key={question.id}
+      className="grow-0 border-t border-border bg-card"
+      style={{ maxHeight: "40%" }}
+      contentContainerClassName="gap-2 px-4 py-3"
+      keyboardShouldPersistTaps="handled"
+    >
+      <NativeError message={error} />
+      <Text className="text-xs text-foreground-muted">
+        {question.header} · {questionIndex + 1}/{ask.questions.length}
+      </Text>
+      <Text className="font-t3-medium text-foreground">{question.question}</Text>
+      {question.options.map(({ label, description, preview, recommended }) => {
+        const selected = selectedOptionValues.includes(label);
+        return (
+          <View key={label} className="gap-1">
+            <MaterialButton
+              label={`${selected ? "✓ " : ""}${label}${recommended ? " (Recommended)" : ""}`}
+              tone={selected ? "primary" : "secondary"}
+              disabled={pending}
+              onPress={() => void dispatch({ type: "option", questionId: question.id, label })}
+            />
+            {description ? (
+              <Text className="text-sm text-foreground-muted">{description}</Text>
+            ) : null}
+            {preview ? (
+              <Text className="font-mono text-xs text-foreground-muted">{preview}</Text>
+            ) : null}
+          </View>
+        );
+      })}
+      <NativeField
+        label="Other answer"
+        value={customAnswer}
+        disabled={pending}
+        onChange={(text) => void dispatch({ type: "custom", questionId: question.id, text })}
+      />
+      <View className="flex-row flex-wrap items-center gap-2">
+        <MaterialButton
+          label="Dismiss"
+          tone="text"
+          disabled={pending}
+          onPress={() => void dispatch({ type: "dismiss" })}
+        />
+        {questionIndex > 0 ? (
+          <MaterialButton
+            label="Previous"
+            tone="secondary"
+            disabled={pending}
+            onPress={() => void dispatch({ type: "previous" })}
+          />
+        ) : null}
+        <MaterialButton
+          label={isLastQuestion ? "Submit answers" : "Next"}
+          disabled={pending || !canAdvance}
+          onPress={() => void dispatch({ type: "advance", questionId: question.id })}
+        />
+      </View>
+    </ScrollView>
+  );
+}
+
 function NativeMobileDialog({
   dialog,
   request,
@@ -829,9 +953,6 @@ function NativeMobileDialog({
   onAnswered: () => void;
 }) {
   const [value, setValue] = useState(typeof dialog.prefill === "string" ? dialog.prefill : "");
-  const [answers, setAnswers] = useState<
-    Record<string, { selectedOptions: string[]; customInput: string }>
-  >({});
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const toolApproval = dialog.type === "tool_approval_request";
@@ -859,7 +980,6 @@ function NativeMobileDialog({
         ? { decision: "refine", feedback: value || "Plan review cancelled." }
         : { cancelled: true },
     );
-  const questions = Array.isArray(dialog.questions) ? dialog.questions.map(nativeRecord) : [];
   return (
     <NativeModal
       title={String(dialog.title ?? (toolApproval ? `Allow ${dialog.toolName}?` : "NeoPi asks"))}
@@ -974,67 +1094,6 @@ function NativeMobileDialog({
               onPress={() => void respond({ value })}
             />
           </>
-        ) : null}
-        {questions.map((question) => {
-          const id = String(question.id);
-          const answer = answers[id] ?? { selectedOptions: [], customInput: "" };
-          return (
-            <View key={id} className="gap-2">
-              <Text className="font-t3-medium text-foreground">{String(question.question)}</Text>
-              {(Array.isArray(question.options) ? question.options : []).map((item, index) => {
-                const option = nativeRecord(item);
-                const label = String(option.label);
-                const description =
-                  typeof option.description === "string" ? option.description.trim() : "";
-                return (
-                  <View key={index} className="gap-1">
-                    <MaterialButton
-                      label={`${answer.selectedOptions.includes(label) ? "✓ " : ""}${label}`}
-                      tone="secondary"
-                      disabled={pending}
-                      onPress={() =>
-                        setAnswers({
-                          ...answers,
-                          [id]: {
-                            ...answer,
-                            selectedOptions: question.multi
-                              ? answer.selectedOptions.includes(label)
-                                ? answer.selectedOptions.filter((value) => value !== label)
-                                : [...answer.selectedOptions, label]
-                              : [label],
-                          },
-                        })
-                      }
-                    />
-                    {description ? (
-                      <Text className="text-sm text-foreground-muted">{description}</Text>
-                    ) : null}
-                  </View>
-                );
-              })}
-              <NativeField
-                label="Other answer"
-                value={answer.customInput}
-                onChange={(customInput) =>
-                  setAnswers({ ...answers, [id]: { ...answer, customInput } })
-                }
-              />
-            </View>
-          );
-        })}
-        {dialog.method === "ask" ? (
-          <MaterialButton
-            label="Submit answers"
-            disabled={pending}
-            onPress={() =>
-              void respond({
-                answers: questions.map((question) => ({
-                  id: question.id,
-                  ...(answers[String(question.id)] ?? { selectedOptions: [], customInput: "" }),
-                })),
-              })
-            }
-          />
         ) : null}
         <MaterialButton
           label="Cancel"

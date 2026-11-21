@@ -15,6 +15,10 @@
       "types": "./src/neopiNativeSessions.ts",
       "default": "./src/neopiNativeSessions.ts"
     },
+    "./neopi-native-ask": {
+      "types": "./src/neopiNativeAsk.ts",
+      "default": "./src/neopiNativeAsk.ts"
+    },
     "./neopi-native-queue": {
       "types": "./src/neopiNativeQueue.ts",
       "default": "./src/neopiNativeQueue.ts"

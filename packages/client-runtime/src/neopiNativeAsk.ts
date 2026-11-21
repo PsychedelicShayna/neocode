@@ -1,4 +1,4 @@
-import { nativeRecord } from "@t3tools/client-runtime/neopi-native-sessions";
+import { nativeRecord } from "./neopiNativeSessions.ts";
 
 interface NativeAskOption {
   readonly label: string;

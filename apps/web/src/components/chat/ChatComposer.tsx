@@ -1,5 +1,6 @@
 import { getThreadRuntimeReadOnlyReason } from "@t3tools/shared/serverSettings";
 import { workspaceResourceId } from "@t3tools/client-runtime/environment";
+import type { NativeAskAction, NativeAskProgress } from "@t3tools/client-runtime/neopi-native-ask";
 import {
   nativeCommandNeedsTerminal,
   type NativeCommandCompletion,
@@ -263,7 +264,6 @@ import {
   ComposerPendingUserInputCard,
   ComposerPendingUserInputPanel,
 } from "./ComposerPendingUserInputPanel";
-import type { NativeAskAction, NativeAskProgress } from "../neopi/nativeAsk";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import { ComposerControl, ComposerControlIcon, ComposerControlSeparator } from "./ComposerControl";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";

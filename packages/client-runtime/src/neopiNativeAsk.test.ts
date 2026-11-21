@@ -1,14 +1,11 @@
-import {
-  emptyNativeSessionFeed,
-  reduceNativeSessionFeed,
-} from "@t3tools/client-runtime/neopi-native-sessions";
+import { emptyNativeSessionFeed, reduceNativeSessionFeed } from "./neopiNativeSessions.ts";
 import { describe, expect, it } from "vite-plus/test";
 import {
   nativeAskProgress,
   selectNativeSessionDialog,
   stepNativeAsk,
   type NativeAskDraft,
-} from "./nativeAsk";
+} from "./neopiNativeAsk.ts";
 
 const ask = {
   type: "extension_ui_request",

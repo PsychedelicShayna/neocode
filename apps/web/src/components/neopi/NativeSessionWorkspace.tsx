@@ -126,7 +126,7 @@ import {
   stepNativeAsk,
   type NativeAskAction,
   type NativeAskDraft,
-} from "./nativeAsk";
+} from "@t3tools/client-runtime/neopi-native-ask";
 import { restoreNativeEditor } from "./neopiNativeDraft";
 import { restoreNativeQueuedDraft } from "./neopiNativeQueueDraft";
 import type { ComposerSubmissionIntent } from "../../composer-logic";

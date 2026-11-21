@@ -24,9 +24,9 @@ import {
   Trash2,
 } from "lucide-react";
 import {
-  MANAGED_TMUX_TERMINAL_ID,
+  managedTmuxTerminalThreadId,
   type ContextMenuItem,
-  type NeoPiNativeSessionRef,
+  type TerminalAttachInput,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
@@ -342,7 +342,7 @@ interface TerminalViewportProps {
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
   providerInstanceId?: ProviderInstanceId;
-  managedTmux?: NeoPiNativeSessionRef;
+  managedTmux?: TerminalAttachInput["managedTmux"];
   onSessionExited: () => void;
   onAddTerminalContext?: (selection: TerminalContextSelection) => void;
   focusRequestId: number;
@@ -382,7 +382,7 @@ export function TerminalViewport({
   const environmentId = threadRef.environmentId;
   const threadId = useMemo(() => {
     const id = workspaceResourceId(threadRef);
-    return managedTmux ? `${MANAGED_TMUX_TERMINAL_ID}:${id}` : id;
+    return managedTmux ? managedTmuxTerminalThreadId(id, managedTmux.monitor?.viewId) : id;
   }, [managedTmux, threadRef]);
   const shellProviderInstanceId =
     providerInstanceId ?? ("ref" in threadRef ? threadRef.ref.providerInstanceId : undefined);

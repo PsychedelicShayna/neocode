@@ -154,8 +154,12 @@ export class TerminalManager extends Context.Service<
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
     /** A server-resolved tmux client, owned only while its view stream is subscribed. */
     readonly openTmuxView: (
-      input: TerminalOpenInput,
-      target: { readonly executable: string; readonly args: string[] },
+      input: Pick<TerminalOpenInput, "threadId" | "terminalId">,
+      target: Effect.Effect<
+        { readonly executable: string; readonly args: string[]; readonly cwd: string },
+        TerminalError,
+        Scope.Scope
+      >,
     ) => Effect.Effect<void, TerminalError, Scope.Scope>;
 
     /**
@@ -2689,7 +2693,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           resolveLaunchInputEnvironment(input).pipe(Effect.flatMap(openLocked)),
         );
 
-  const tmuxViewSubscribers = new Map<string, number>();
+  const tmuxViews = new Map<string, { subscribers: number; scope: Scope.Closeable }>();
   const openTmuxView: TerminalManager["Service"]["openTmuxView"] = (input, target) => {
     const { threadId, terminalId } = input;
     if (terminalId !== MANAGED_TMUX_TERMINAL_ID)
@@ -2700,22 +2704,36 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       withThreadLock(
         threadId,
         Effect.gen(function* () {
-          yield* withWorkspaceLease(
-            path.resolve(input.cwd),
-            openWithWorkspaceLease(input, { shell: target.executable, args: target.args }),
+          const existing = tmuxViews.get(threadId);
+          if (existing) {
+            existing.subscribers++;
+            return;
+          }
+          yield* Effect.acquireUseRelease(
+            Scope.make(),
+            (scope) =>
+              Effect.gen(function* () {
+                const { executable, args, cwd } = yield* target;
+                yield* withWorkspaceLease(
+                  path.resolve(cwd),
+                  openWithWorkspaceLease({ ...input, cwd }, { shell: executable, args }),
+                );
+                tmuxViews.set(threadId, { subscribers: 1, scope });
+              }).pipe(Effect.provideService(Scope.Scope, scope)),
+            (scope, exit) => (Exit.isFailure(exit) ? Scope.close(scope, exit) : Effect.void),
           );
-          tmuxViewSubscribers.set(threadId, (tmuxViewSubscribers.get(threadId) ?? 0) + 1);
         }),
       ),
       () =>
         withThreadLock(
           threadId,
           Effect.gen(function* () {
-            const remaining = (tmuxViewSubscribers.get(threadId) ?? 1) - 1;
-            if (remaining > 0) tmuxViewSubscribers.set(threadId, remaining);
-            else {
-              tmuxViewSubscribers.delete(threadId);
-              yield* closeSession(threadId, terminalId, true);
+            const view = tmuxViews.get(threadId);
+            if (view && --view.subscribers === 0) {
+              tmuxViews.delete(threadId);
+              yield* closeSession(threadId, terminalId, true).pipe(
+                Effect.ensuring(Scope.close(view.scope, Exit.void)),
+              );
             }
           }),
         ).pipe(Effect.ignoreCause({ log: true })),

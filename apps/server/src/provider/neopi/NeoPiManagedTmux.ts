@@ -258,10 +258,17 @@ export const sameManagedTmuxOwner = (a: ManagedTmuxOwner, b: ManagedTmuxOwner) =
   a.pane === b.pane &&
   a.pid === b.pid;
 
-export const managedTmuxClient = (config: Pick<TmuxTarget, "socket">, owner: ManagedTmuxOwner) => ({
-  executable: owner.executable,
-  args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", owner.session],
-});
+export const managedTmuxClient = (
+  config: ManagedTmuxConfig | TmuxBindingIdentity,
+  owner: ManagedTmuxOwner,
+) => {
+  // A configured name can be reused; a generated UUID survives numeric ID reuse.
+  const target = "owner" in config ? `=${config.session}:` : owner.session;
+  return {
+    executable: owner.executable,
+    args: ["-N", "-S", config.socket, "attach-session", "-E", "-t", target],
+  };
+};
 
 const resolvePublication = Effect.fnUntraced(function* (
   config: TmuxTarget,
@@ -488,6 +495,150 @@ const paneEnvironment = {
   SHLVL: true,
   _: true,
 };
+
+const managedPaneExports = (env: Readonly<Record<string, string>>) =>
+  Object.entries(env)
+    .filter(
+      ([key]) =>
+        !Object.hasOwn(paneEnvironment, key) &&
+        !/^(?:T3CODE_|VITE_|OMP_HOST_)/.test(key) &&
+        /^[A-Za-z_][A-Za-z_0-9]*$/.test(key),
+    )
+    .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
+    .join("");
+
+const MonitorGrant = Schema.Struct({
+  capability: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),
+  agentId: Schema.String,
+  kind: Schema.Literals(["sub", "advisor"]),
+  canChat: Schema.Boolean,
+});
+const decodeMonitorGrant = Schema.decodeUnknownSync(MonitorGrant);
+
+export function decodeManagedMonitorGrant(agentId: string, reply: unknown) {
+  const grant = decodeMonitorGrant(reply);
+  if (grant.agentId !== agentId || (grant.kind === "advisor" && grant.canChat)) {
+    throw tmuxError("tmux_monitor_grant", "NeoPi returned an invalid grant for this agent.");
+  }
+  return grant.capability;
+}
+
+/** The independent session keeps the monitor's selection and size out of the main TUI. */
+export const openManagedTmuxMonitor = Effect.fnUntraced(function* (input: {
+  readonly socket: string;
+  readonly owner: ManagedTmuxOwner;
+  readonly cwd: string;
+  readonly binary: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly capability: string;
+}) {
+  const { owner, socket } = input;
+  const name = `monitor-${NodeCrypto.randomUUID()}`;
+  // Session IDs can be reused when a new tmux server starts on the same socket.
+  const target = `=${name}:`;
+  const launchFile = NodePath.join(NodePath.dirname(socket), `${name}.sh`);
+  const capabilityFile = `${launchFile}.cap`;
+  const prefix = ["-N", "-S", socket];
+  const run = (args: string[]) =>
+    exec(owner.executable, [...prefix, ...args], { timeout: 3000, maxBuffer: 65536 });
+  const cleanup = async () => {
+    // Normal detach may have removed the session before the stream finalizer ran.
+    await run(["kill-session", "-t", target]).catch(() => undefined);
+    await Promise.all([
+      NodeFSP.rm(launchFile, { force: true }),
+      NodeFSP.rm(capabilityFile, { force: true }),
+    ]);
+  };
+  yield* Effect.acquireRelease(
+    Effect.tryPromise({
+      try: async () => {
+        await checkPrivateSocket(socket);
+        try {
+          const argv = [
+            input.binary,
+            "monitor",
+            "attach",
+            owner.instanceId,
+            "--capability-file",
+            capabilityFile,
+          ];
+          // Leave room for tmux's dead-pane banner even if NeoPi refuses the socket
+          // before the embedded client has attached and resized the window.
+          const script = `/bin/rm -f -- ${shellQuote(launchFile)}\n${managedPaneExports(input.env)}printf '\\n\\n'\nexec ${argv.map(shellQuote).join(" ")}\n`;
+          await NodeFSP.writeFile(capabilityFile, input.capability, { mode: 0o600, flag: "wx" });
+          await NodeFSP.writeFile(launchFile, script, { mode: 0o600, flag: "wx" });
+          await run([
+            "new-session",
+            "-dE",
+            "-s",
+            name,
+            "-n",
+            "NeoPi Monitor",
+            "-c",
+            input.cwd,
+            "/bin/sleep",
+            "30",
+            // Configure this window before starting NeoPi. The host, not NeoCode, counts
+            // sockets (including external monitors). Keep its refusal visible in the PTY.
+            ";",
+            "set-option",
+            "-w",
+            "-t",
+            target,
+            "remain-on-exit",
+            "failed",
+            ";",
+            "set-option",
+            "-t",
+            target,
+            "prefix",
+            "None",
+            ";",
+            "set-option",
+            "-t",
+            target,
+            "prefix2",
+            "None",
+            ";",
+            "set-option",
+            "-t",
+            target,
+            "status",
+            "off",
+            ";",
+            "respawn-pane",
+            "-k",
+            "-t",
+            target,
+            "/bin/sh",
+            launchFile,
+          ]);
+        } catch (cause) {
+          await cleanup();
+          throw cause;
+        }
+      },
+      catch: () => tmuxError("tmux_monitor_launch", "Could not open the NeoPi agent monitor."),
+    }),
+    () => Effect.promise(cleanup).pipe(Effect.ignoreCause({ log: true })),
+  );
+  return {
+    executable: owner.executable,
+    args: [
+      ...prefix,
+      "attach-session",
+      "-E",
+      "-t",
+      target,
+      ";",
+      "set-option",
+      "-t",
+      target,
+      "destroy-unattached",
+      "on",
+    ],
+  };
+});
 
 export const makeManagedTmuxHost = (
   stateDir: string,
@@ -767,16 +918,7 @@ export const makeManagedTmuxHost = (
         }
         // Login shell configuration must not run, and configured secrets never appear in argv.
         // The launcher replaces itself so the tmux pane PID is the exact NeoPi owner PID.
-        const env = Object.entries(input.env)
-          .filter(
-            ([key]) =>
-              !Object.hasOwn(paneEnvironment, key) &&
-              !/^(?:T3CODE_|VITE_|OMP_HOST_)/.test(key) &&
-              /^[A-Za-z_][A-Za-z_0-9]*$/.test(key),
-          )
-          .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
-          .join("");
-        const script = `/bin/rm -f -- ${shellQuote(launchFile)}\n${env}exec ${argv.map(shellQuote).join(" ")}\n`;
+        const script = `/bin/rm -f -- ${shellQuote(launchFile)}\n${managedPaneExports(input.env)}exec ${argv.map(shellQuote).join(" ")}\n`;
         await NodeFSP.writeFile(launchFile, script, { mode: 0o600, flag: "wx" });
         try {
           const { stdout } = await run(
@@ -885,7 +1027,8 @@ export const makeManagedTmuxHost = (
                 "-F",
                 "#{session_id}",
               ]);
-              if (pane.stdout.trim() === id) await run(["-N", "kill-session", "-t", id]);
+              if (pane.stdout.trim() === id)
+                await run(["-N", "kill-session", "-t", `=${session}:`]);
             }).pipe(Effect.ignore),
     );
   });

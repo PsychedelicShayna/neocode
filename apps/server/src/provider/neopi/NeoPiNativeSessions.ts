@@ -3631,7 +3631,7 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
             });
             attachedCwd = yield* fs.realPath(cwd);
           }
-          // Keep dialogs in the pane until PsychedelicShayna/neopi#TBD-provenance-followup fixes deferred dialog origin routing.
+          // Keep dialogs in the pane until PsychedelicShayna/neopi#878 fixes deferred dialog origin routing.
           if (enableAttachedNativeDialogs) {
             yield* enableNativeDialog(client, "set_ask_dialog");
             yield* enableNativeDialog(client, "set_form_dialog");

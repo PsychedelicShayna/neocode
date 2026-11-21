@@ -43,6 +43,23 @@ unanswered questions, running background jobs, and live subagents keep it runnin
 Returning to its tab opens the saved session again; your unsent draft stays intact.
 This idle release never stops a session owned by a terminal.
 
+### Stop a managed NeoPi session
+
+When the optional tmux backend owns a session, closing its tab or hiding its TUI
+leaves NeoPi running. The sidebar distinguishes an alive owner, a reply or
+compaction in progress, an owner that needs input, and an exited owner.
+
+Right-click the session and choose **Stop** to request NeoPi's normal shutdown.
+NeoCode tells you if this interrupts a reply or compaction. If the row says
+**Stop needs input**, open the session's **TUI** and answer NeoPi's prompt.
+**Stop requested** means a request was made, not that the process has exited.
+
+If the row says **Stop unconfirmed**, **Force Stop** is available on Linux when
+NeoCode can still verify the exact pane and process image and the host provides
+pidfd support through `/usr/bin/python3`. It does not wait for NeoPi to save; it
+never stops other sessions or their shared tmux server. **Exited** appears only
+after NeoCode verifies both the pane and the process are no longer running.
+
 ## Pin and reorder threads
 
 Pin a thread from its menu to keep it above your active work.

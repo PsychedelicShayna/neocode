@@ -48,6 +48,29 @@ export const NeoPiNativeSessionLive = Schema.Struct({
   branch: Schema.NullOr(Schema.String),
 });
 export type NeoPiNativeSessionLive = typeof NeoPiNativeSessionLive.Type;
+export const NeoPiManagedSessionLifecycle = Schema.Struct({
+  /** Opaque publication identity; a stale menu cannot stop a replacement. */
+  imageId: Schema.String,
+  liveness: Schema.Literals(["alive", "exited", "unknown"]),
+  stop: Schema.Literals([
+    "idle",
+    "requested",
+    "awaiting-input",
+    "unconfirmed",
+    "forcing",
+    "exited",
+  ]),
+  work: Schema.NullOr(Schema.Literals(["reply", "compaction", "reply-and-compaction"])),
+  canForceStop: Schema.Boolean,
+});
+export type NeoPiManagedSessionLifecycle = typeof NeoPiManagedSessionLifecycle.Type;
+export const NeoPiManagedSessionStopInput = Schema.Struct({
+  ref: NeoPiNativeSessionRef,
+  imageId: Schema.String,
+  action: Schema.Literals(["stop", "force"]),
+});
+export type NeoPiManagedSessionStopInput = typeof NeoPiManagedSessionStopInput.Type;
+
 export const NeoPiNativeSessionSummary = Schema.Struct({
   ref: NeoPiNativeSessionRef,
   sessionId: Schema.String,
@@ -66,6 +89,7 @@ export const NeoPiNativeSessionSummary = Schema.Struct({
   ]),
   /** Absent when no owner process answered or the server predates live state. */
   live: Schema.optional(NeoPiNativeSessionLive),
+  managed: Schema.optional(NeoPiManagedSessionLifecycle),
   /** When the session was settled out of the active list, ISO 8601; absent while active. */
   settledAt: Schema.optional(Schema.String),
 });

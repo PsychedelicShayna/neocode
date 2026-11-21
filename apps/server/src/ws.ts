@@ -3180,6 +3180,14 @@ const makeWsRpcLayer = (
             neopiNativeSessions.setSettled(input),
             { "rpc.aggregate": "workspace" },
           ),
+        [WS_METHODS.neopiManagedSessionStop]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.neopiManagedSessionStop,
+            neopiNativeSessions.stopManaged(input),
+            {
+              "rpc.aggregate": "workspace",
+            },
+          ),
         [WS_METHODS.neopiNativeSessionsGetDiffPreview]: (input) =>
           observeRpcEffect(
             WS_METHODS.neopiNativeSessionsGetDiffPreview,

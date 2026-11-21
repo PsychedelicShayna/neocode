@@ -39,6 +39,7 @@ const ControlSnapshot = Schema.Struct({
   dialogs: Schema.optional(Schema.Array(Schema.Struct({ family: Schema.optional(Schema.String) }))),
 });
 export type NeoPiControlSnapshot = typeof ControlSnapshot.Type;
+export const decodeNeoPiControlSnapshot = Schema.decodeUnknownOption(ControlSnapshot);
 
 const ControlRegistry = Schema.fromJsonString(
   Schema.Struct({

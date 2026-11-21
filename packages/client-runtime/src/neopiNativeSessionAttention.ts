@@ -1,4 +1,4 @@
-import type { NeoPiNativeSessionSummary } from "@t3tools/contracts";
+import type { NeoPiManagedSessionLifecycle, NeoPiNativeSessionSummary } from "@t3tools/contracts";
 
 /**
  * What a native session asks of the user right now: `waiting` is blocked on
@@ -7,6 +7,26 @@ import type { NeoPiNativeSessionSummary } from "@t3tools/contracts";
  * `working` choose a section; `done` marks a row within recent history.
  */
 export type NativeSessionStatus = "waiting" | "done" | "working" | "idle";
+
+const MANAGED_STOP_LABEL = {
+  requested: "Stop requested",
+  "awaiting-input": "Stop needs input",
+  unconfirmed: "Stop unconfirmed",
+  forcing: "Force Stop requested",
+  exited: "Exited",
+} as const;
+
+export function managedSessionSidebarLabel(
+  liveness: NeoPiManagedSessionLifecycle["liveness"],
+  stop: NeoPiManagedSessionLifecycle["stop"],
+  attention: NativeSessionStatus,
+) {
+  if (stop !== "idle") return MANAGED_STOP_LABEL[stop];
+  if (liveness === "exited") return "Exited";
+  if (liveness === "unknown") return "Liveness unknown";
+  if (attention === "waiting") return "Needs input";
+  return attention === "working" ? "Working" : "Alive";
+}
 
 export type NativeSessionSection = "attention" | "working" | "recent" | "settled";
 

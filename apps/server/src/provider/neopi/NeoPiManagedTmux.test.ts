@@ -8,11 +8,13 @@ import {
   bindManagedTmuxOwner,
   bindOrStartManagedTmux,
   makeManagedTmuxHost,
+  managedControlPublication,
   managedTmuxLaunchPlan,
   verifyManagedTmuxLease,
   managedTmuxClient,
   managedTmuxConfig,
   resolveManagedTmuxOwner,
+  type ManagedTmuxBinding,
   type ManagedTmuxConfig,
 } from "./NeoPiManagedTmux.ts";
 
@@ -176,6 +178,52 @@ describe("managed tmux pane lookup", () => {
   });
 });
 
+describe("managed lifetime pane evidence", () => {
+  const binding = {
+    socket: ownedSocket,
+    providerInstanceId: ProviderInstanceId.make("neopi"),
+    ...requested,
+    session: "owner",
+    owner: bindManagedTmuxOwner(requested, pane, [entry]),
+    process: { start: "1001", image: "1:2002" },
+  };
+
+  it("refuses a replacement control image published in the original pane at the original PID", () => {
+    const replacement = {
+      ...entry,
+      meta: { ...publication, instanceId: "replacement", imageId: "changed" },
+    };
+    expect(
+      managedControlPublication(binding, JSON.stringify({ version: 1, sessions: [replacement] })),
+    ).toEqual({ kind: "changed" });
+  });
+
+  effectIt.effect("Force Stop validates the pane before signaling the exact process", () =>
+    Effect.gen(function* () {
+      const host = makeManagedTmuxHost(ownedState, executable, "linux");
+      exec.mockReset();
+      exec.mockResolvedValueOnce({ stdout: "$2|@3|%9|321|0|off\n" });
+      expect(yield* Effect.flip(host.force(binding))).toMatchObject({
+        code: "tmux_owner_changed",
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+      exec.mockResolvedValueOnce({ stdout: "$2|@3|%4|321|0|off\n" });
+      exec.mockResolvedValueOnce({ stdout: "" });
+      yield* host.force(binding);
+      expect(exec.mock.calls[1]?.[1].slice(0, 6)).toEqual([
+        "-N",
+        "-S",
+        ownedSocket,
+        "list-panes",
+        "-s",
+        "-t",
+      ]);
+      expect(exec.mock.calls[2]?.[0]).toBe("/usr/bin/python3");
+      expect(exec.mock.calls[2]?.[1].slice(-3)).toEqual(["321", "1001", "1:2002"]);
+    }),
+  );
+});
+
 describe("managed tmux owner startup", () => {
   const source = {
     binary: "/opt/npi nightly",
@@ -258,7 +306,7 @@ describe("managed tmux owner startup", () => {
           if (args.includes("kill-session")) return { stdout: "" };
           throw new Error("Unexpected tmux command");
         });
-        const host = makeManagedTmuxHost(ownedState, executable);
+        const host = makeManagedTmuxHost(ownedState, executable, "linux");
         const verifyLease = vi.fn(() => Effect.void);
         const start = () =>
           host.launch({
@@ -281,7 +329,9 @@ describe("managed tmux owner startup", () => {
           }),
         );
         const findHolder = vi.fn(() => Effect.succeed("original-holder"));
-        expect(yield* bindOrStartManagedTmux(undefined, rebind, start, findHolder)).toEqual({
+        expect(
+          yield* bindOrStartManagedTmux<ManagedTmuxBinding>(undefined, rebind, start, findHolder),
+        ).toEqual({
           kind: "contended",
           instanceId: "original-holder",
         });

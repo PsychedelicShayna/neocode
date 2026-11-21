@@ -1,4 +1,5 @@
 import {
+  managedSessionSidebarLabel,
   nativeSessionProjectLabel,
   partitionNativeSessions,
   type NativeSessionEntry,
@@ -7,7 +8,12 @@ import {
   type NativeSessionVisitState,
 } from "@t3tools/client-runtime/neopi-native-session-attention";
 import type { NativeSessionList } from "@t3tools/client-runtime/neopi-native-sessions";
-import type { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import type {
+  EnvironmentId,
+  NeoPiManagedSessionLifecycle,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
 import {
   agentIdentity,
   nativeSessionIdentityKey,
@@ -90,6 +96,11 @@ interface RowModel {
   /** Another process holds the file and NeoCode cannot attach. */
   readonly locked: boolean;
   readonly terminalOwned: boolean;
+  readonly ownerImage: string | undefined;
+  readonly ownerLiveness: NeoPiManagedSessionLifecycle["liveness"] | undefined;
+  readonly stopState: NeoPiManagedSessionLifecycle["stop"] | undefined;
+  readonly stopWork: NeoPiManagedSessionLifecycle["work"];
+  readonly canForceStop: boolean;
   readonly timeLabel: string;
 }
 
@@ -128,6 +139,11 @@ function toRowModel(
     active,
     locked: session.owner.kind === "process" && !session.owner.attachable,
     terminalOwned: session.owner.kind === "process",
+    ownerImage: session.managed?.imageId,
+    ownerLiveness: session.managed?.liveness,
+    stopState: session.managed?.stop,
+    stopWork: session.managed?.work ?? null,
+    canForceStop: session.managed?.canForceStop ?? false,
     timeLabel: compactTimeLabel(session.settledAt ?? session.modifiedAt),
   };
 }
@@ -372,7 +388,12 @@ const NativeSessionRow = memo(function NativeSessionRow({
       !active &&
       "opacity-70 transition-opacity hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none",
   );
-  const label = `${model.title}${presentation ? `, ${presentation.label}` : ""}`;
+  const lifecycleLabel =
+    model.ownerLiveness && model.stopState
+      ? managedSessionSidebarLabel(model.ownerLiveness, model.stopState, status)
+      : undefined;
+  const labelStatus = lifecycleLabel ?? presentation?.label;
+  const label = `${model.title}${labelStatus ? `, ${labelStatus}` : ""}`;
   const settleButton = (
     <Tooltip>
       <TooltipTrigger
@@ -405,9 +426,15 @@ const NativeSessionRow = memo(function NativeSessionRow({
   );
   const statusLabel = presentation ? (
     <span className={cn("inline-flex items-center gap-1 font-medium", presentation.className)}>
-      <presentation.Icon aria-hidden className="size-4 shrink-0" />
-      <span role="status">{presentation.label}</span>
+      <presentation.Icon
+        aria-hidden={status !== "done"}
+        aria-label={status === "done" ? "Done" : undefined}
+        className="size-4 shrink-0"
+      />
+      <span role="status">{lifecycleLabel ?? presentation.label}</span>
     </span>
+  ) : lifecycleLabel ? (
+    <span role="status">{lifecycleLabel}</span>
   ) : (
     model.timeLabel
   );
@@ -431,7 +458,7 @@ const NativeSessionRow = memo(function NativeSessionRow({
           <AgentLabel identity={identity} />
           <span className="relative ml-auto flex h-6 min-w-8 shrink-0 items-center justify-end">
             <span className="inline-flex justify-end text-xs tabular-nums text-secondary-label transition-opacity group-hover/sidebar-row:opacity-0">
-              {model.timeLabel}
+              {model.ownerImage ? statusLabel : model.timeLabel}
             </span>
             {settleButton}
           </span>
@@ -542,11 +569,21 @@ export function NativeEnvironmentAttentionList({
 }) {
   const result = useEnvironmentQuery(nativeSessionAtoms.list({ environmentId, input: {} }));
   const { refresh } = result;
+  const pollingStop =
+    result.data?.sessions.some(
+      ({ managed }) =>
+        managed?.stop === "requested" ||
+        managed?.stop === "awaiting-input" ||
+        managed?.stop === "forcing",
+    ) ?? false;
   useEffect(() => {
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") refresh();
     };
-    const interval = window.setInterval(refreshWhenVisible, REFRESH_INTERVAL_MS);
+    const interval = window.setInterval(
+      refreshWhenVisible,
+      pollingStop ? 2000 : REFRESH_INTERVAL_MS,
+    );
     // Terminal owners can create or finish sessions without a NeoCode mutation.
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refreshWhenVisible);
@@ -555,9 +592,10 @@ export function NativeEnvironmentAttentionList({
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [refresh]);
+  }, [refresh, pollingStop]);
 
   const setSettled = useAtomCommand(nativeSessionAtoms.setSettled);
+  const stopManaged = useAtomCommand(nativeSessionAtoms.stopManaged);
   const selected = useNativeSessionSelection((state) => state.target);
   const openFile = selected?.environmentId === environmentId ? selected.ref.sessionFile : null;
   const visits = useNativeSessionVisits((state) => state.environments[environmentId]) ?? NO_VISITS;
@@ -689,6 +727,10 @@ export function NativeEnvironmentAttentionList({
           .show(
             [
               { id: "open", label: "Open", disabled: row.locked },
+              ...(row.ownerLiveness === "alive" && row.stopState === "idle"
+                ? [{ id: "stop", label: "Stop" }]
+                : []),
+              ...(row.canForceStop ? [{ id: "force", label: "Force Stop" }] : []),
               ...(row.settled
                 ? [{ id: "unsettle", label: "Un-settle" }]
                 : row.status === "waiting" || row.status === "working"
@@ -697,14 +739,40 @@ export function NativeEnvironmentAttentionList({
             ],
             { x: event.clientX, y: event.clientY },
           )
-          .then((action) => {
-            if (action === "open") void choose(row);
-            else if (action === "settle") void settle(row, true);
-            else if (action === "unsettle") void settle(row, false);
-          });
+          .then(async (action) => {
+            if (action === "open") return choose(row);
+            if (action === "settle") return settle(row, true);
+            if (action === "unsettle") return settle(row, false);
+            const imageId = row.ownerImage;
+            if ((action !== "stop" && action !== "force") || !imageId) return;
+            const work =
+              row.stopWork === "reply-and-compaction"
+                ? "the current reply and context compaction"
+                : row.stopWork === "reply"
+                  ? "the current reply"
+                  : "context compaction";
+            const prompt =
+              action === "force"
+                ? `Force Stop "${row.title}"? This kills the NeoPi process without waiting for it to save.`
+                : row.stopWork
+                  ? `Stop "${row.title}"? This interrupts ${work}.`
+                  : null;
+            if (prompt && !(await api.dialogs.confirm(prompt, { variant: "destructive" }))) return;
+            setError(null);
+            const response = await stopManaged({
+              environmentId,
+              input: {
+                ref: { providerInstanceId: row.providerInstanceId, sessionFile: row.sessionFile },
+                action,
+                imageId,
+              },
+            });
+            if (response._tag === "Failure") throw squashAtomCommandFailure(response);
+          })
+          .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
       },
     };
-  }, [environmentId, open, setSettled]);
+  }, [environmentId, open, setSettled, stopManaged]);
 
   // The window belongs to one view of the list; a new search starts from the first step.
   const [shown, setShown] = useState({ query: deferredQuery, limit: ROWS_STEP });

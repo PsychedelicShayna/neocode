@@ -10,6 +10,8 @@ import {
   NeoPiNativeSessionRecord,
   NeoPiNativeSessionsError,
   type NeoPiNativeEssentialEnvelope,
+  type NeoPiManagedSessionLifecycle,
+  type NeoPiManagedSessionStopInput,
   type NeoPiNativeObservationLifecycle,
   type NeoPiNativeSessionRef,
   type NeoPiNativeSessionSummary,
@@ -28,6 +30,7 @@ import {
   type NeoPiNativeSessionsWatchInput,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import {
   make as makeClient,
   type HostToolCallFrame,
@@ -82,6 +85,8 @@ import { parseNeoPiLaunchArguments } from "./NeoPiLaunchArgs.ts";
 import { prepareNeoPiNativePrompt } from "./NeoPiNativeAttachments.ts";
 import {
   decodeNeoPiControlRegistry,
+  decodeNeoPiControlSnapshot,
+  neoPiLiveFromControlSnapshot,
   neoPiOwnerVersion,
   olderOwnerMessage,
   resolveNativeLive,
@@ -90,9 +95,11 @@ import { NeoPiNativeProjection, type NeoPiNativeRequestMark } from "./NeoPiNativ
 import { readNeoPiNativeObservation, sameObservationDomain } from "./NeoPiNativeCursor.ts";
 import { observeNeoPiJournalEntry, observeNeoPiMessage } from "./NeoPiStopOutcome.ts";
 import type { NeoPiModelsConnection } from "./NeoPiModelsConnection.ts";
+import { managedStopStatus, submitManagedStopOnce } from "./NeoPiManagedLifecycle.ts";
 import {
   bindOrStartManagedTmux,
   makeManagedTmuxHost,
+  managedControlPublication,
   managedTmuxClient,
   managedTmuxConfig,
   rebindManagedTmux,
@@ -352,6 +359,13 @@ export interface NeoPiNativeSessionsDependencies {
   readonly afterReadScan?: Effect.Effect<void>;
   /** Drops the shared listing so the next list rescans; absent in tests with a fresh catalog per call. */
   readonly invalidateCatalog?: Effect.Effect<void>;
+  readonly managedLifecycleList?: (
+    rows: NeoPiNativeSessionSummary[],
+  ) => Effect.Effect<void, NeoPiNativeSessionsError>;
+  readonly managedStop?: (
+    profile: NeoPiNativeProfile,
+    input: NeoPiManagedSessionStopInput,
+  ) => Effect.Effect<void, NeoPiNativeSessionsError>;
   readonly managedTmuxView?: (
     profile: NeoPiNativeProfile,
     ref: NeoPiNativeSessionRef,
@@ -1867,6 +1881,7 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
         if (existing >= 0) rows[existing] = summary;
         else rows.push(summary);
       }
+      yield* dependencies.managedLifecycleList?.(rows) ?? Effect.void;
       rows.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
       const settlement = dependencies.settlement;
       if (settlement) {
@@ -2714,6 +2729,17 @@ export const makeNeoPiNativeSessionsWith = Effect.fn("NeoPiNativeSessions.makeWi
     modelsConnection,
     resolveWorkspace,
     setSettled,
+    stopManaged: (input: NeoPiManagedSessionStopInput) =>
+      Effect.gen(function* () {
+        if (!dependencies.managedStop)
+          return yield* fail("Managed NeoPi Stop is unavailable.", "tmux_no_owner");
+        const profile = yield* dependencies.profile(input.ref.providerInstanceId);
+        const file = yield* dependencies.canonicalize(input.ref.sessionFile);
+        if (file !== input.ref.sessionFile)
+          return yield* fail("The selected native session has changed.", "session_changed");
+        yield* dependencies.managedStop(profile, input);
+        yield* invalidateCatalog;
+      }),
   };
 });
 
@@ -2727,7 +2753,11 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
   const managedConfig = yield* managedTmuxConfig(process.env.T3CODE_NEOPI_MANAGED_TMUX);
   const managedHost =
     process.env.T3CODE_NEOPI_TMUX === "1"
-      ? makeManagedTmuxHost(yield* fs.realPath(config.stateDir), yield* resolveTmuxExecutable)
+      ? makeManagedTmuxHost(
+          yield* fs.realPath(config.stateDir),
+          yield* resolveTmuxExecutable,
+          yield* HostProcessPlatform,
+        )
       : undefined;
   const canonicalize = Effect.fnUntraced(function* (file: string) {
     if (!NodePath.isAbsolute(file))
@@ -2919,6 +2949,191 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       yield* verifyLease(profile, { ...binding, owner });
       return { ...binding, owner };
     });
+  const lifecycleScope = yield* Effect.scope;
+  const managedLifecycle =
+    managedHost &&
+    (() => {
+      const forcing = new Set<string>();
+      const inspect = Effect.fnUntraced(function* (
+        binding: ManagedTmuxBinding,
+        panes: readonly string[] | undefined,
+        registry: string | undefined,
+        branch: string | null,
+      ) {
+        const { liveness: physical, process } = yield* managedHost.observe(binding, panes);
+        const publication = managedControlPublication(binding, registry);
+        const liveness =
+          physical === "alive" && publication?.kind === "changed" ? "unknown" : physical;
+        const snapshot =
+          liveness === "alive" && publication?.kind === "same"
+            ? decodeNeoPiControlSnapshot(publication.snapshot)
+            : undefined;
+        const control = snapshot?._tag === "Some" ? snapshot.value : undefined;
+        const live = control && neoPiLiveFromControlSnapshot(control, branch);
+        const requestedAt = yield* managedHost.stopTime(binding);
+        const now = yield* Clock.currentTimeMillis;
+        const key = binding.owner.imageId;
+        const stop = managedStopStatus(
+          liveness,
+          requestedAt,
+          live?.state === "waiting",
+          now,
+          forcing.has(key),
+        );
+        // Legacy bindings can use the original publication's birth time even if
+        // the endpoint is unresponsive. Never infer identity from the PID alone.
+        const identity =
+          publication?.kind === "same" && process && publication.start === Number(process.start)
+            ? (binding.process ?? process)
+            : undefined;
+        const streaming = control?.busy?.streaming ?? control?.session?.isStreaming;
+        const compacting = control?.busy?.compacting ?? control?.session?.isCompacting;
+        const managed: NeoPiManagedSessionLifecycle = {
+          imageId: key,
+          liveness,
+          stop,
+          work: streaming
+            ? compacting
+              ? "reply-and-compaction"
+              : "reply"
+            : compacting
+              ? "compaction"
+              : null,
+          canForceStop: stop === "unconfirmed" && liveness === "alive" && identity !== undefined,
+        };
+        return { live, managed, identity };
+      });
+      const decorate: NonNullable<NeoPiNativeSessionsDependencies["managedLifecycleList"]> = (
+        rows,
+      ) =>
+        Effect.gen(function* () {
+          const availableBindings = yield* managedHost.list.pipe(Effect.orElseSucceed(() => []));
+          if (availableBindings.length === 0) return;
+          const bindings = new Map(
+            availableBindings.map((binding) => [binding.sessionFile, binding]),
+          );
+          const candidates = rows.flatMap((row, index) => {
+            const binding = bindings.get(row.ref.sessionFile);
+            return binding?.providerInstanceId === row.ref.providerInstanceId
+              ? [{ row, index, binding }]
+              : [];
+          });
+          if (candidates.length === 0) return;
+          const registries = new Map<ProviderInstanceId, string | undefined>();
+          const panes = yield* managedHost.panes.pipe(Effect.orElseSucceed(() => undefined));
+          for (const { binding } of candidates) {
+            if (registries.has(binding.providerInstanceId)) continue;
+            const registry = yield* profile(binding.providerInstanceId).pipe(
+              Effect.tap((profile) => assertManagedProfile(profile, binding)),
+              Effect.flatMap(registryJson),
+              Effect.orElseSucceed(() => undefined),
+            );
+            registries.set(binding.providerInstanceId, registry);
+          }
+          yield* Effect.forEach(
+            candidates,
+            ({ row, index, binding }) =>
+              inspect(
+                binding,
+                panes,
+                registries.get(binding.providerInstanceId),
+                row.live?.branch ?? null,
+              ).pipe(
+                Effect.tap(({ managed, live }) =>
+                  Effect.sync(() => {
+                    const { live: _previous, ...entry } = row;
+                    rows[index] = {
+                      ...entry,
+                      ...(managed.liveness === "exited"
+                        ? { owner: { kind: "none" as const } }
+                        : {}),
+                      managed,
+                      ...(live ? { live } : {}),
+                    };
+                  }),
+                ),
+                Effect.ignore,
+              ),
+            { concurrency: 8, discard: true },
+          );
+        });
+      const stop: NonNullable<NeoPiNativeSessionsDependencies["managedStop"]> = (profile, input) =>
+        Effect.gen(function* () {
+          yield* profile.validate;
+          const binding = yield* managedHost.read(input.ref.sessionFile);
+          if (!binding || binding.owner.imageId !== input.imageId)
+            return yield* fail(
+              "The selected managed NeoPi owner has changed.",
+              "tmux_owner_changed",
+            );
+          yield* assertManagedProfile(profile, binding);
+          if (input.action === "force") {
+            const [panes, registry] = yield* Effect.all(
+              [managedHost.panes, registryJson(profile)],
+              { concurrency: 2 },
+            );
+            const { managed, identity } = yield* inspect(binding, panes, registry, null);
+            if (managed.liveness === "exited") return;
+            if (!managed.canForceStop || !identity || forcing.has(input.imageId))
+              return yield* fail(
+                "This owner is not eligible for Force Stop.",
+                "tmux_force_not_available",
+              );
+            yield* profile.validate;
+            if (forcing.has(input.imageId)) return;
+            forcing.add(input.imageId);
+            yield* managedHost
+              .force({ ...binding, process: identity })
+              .pipe(Effect.ensuring(Effect.sync(() => forcing.delete(input.imageId))));
+            return;
+          }
+          const panes = yield* managedHost.panes;
+          const observed = yield* managedHost.observe(binding, panes);
+          if (observed.liveness === "exited") return;
+          if (observed.liveness !== "alive")
+            return yield* fail(
+              "Cannot verify the selected managed NeoPi pane.",
+              "tmux_owner_changed",
+            );
+          yield* submitManagedStopOnce(
+            managedHost.markStop(binding),
+            Effect.gen(function* () {
+              const client = yield* makeClient({
+                spawn: (command) => spawner.spawn(command),
+                command: profile.source.binary,
+                args: ["ctl", "pipe", binding.owner.instanceId, "--label", "neocode-native-stop"],
+                cwd: config.cwd,
+                env: profile.source.env,
+                requestTimeoutMs: 3500,
+              });
+              if (!client.capabilities.has("control_v1")) return;
+              const raw = yield* client.request({ type: "get_status" });
+              const status = yield* decodeControlIdentity(raw);
+              const file = yield* canonicalize(status.session.sessionFile);
+              yield* Effect.try(() =>
+                verifyManagedTmuxStatus(binding.owner, binding.sessionFile, {
+                  ...(raw as object),
+                  session: { ...status.session, sessionFile: file },
+                }),
+              );
+              yield* profile.validate;
+              const refreshed = yield* managedHost.observe(binding, yield* managedHost.panes);
+              if (refreshed.liveness !== "alive") return;
+              yield* client.request({
+                type: "slash",
+                text: "/exit",
+                if: { generation: status.revisions.generation },
+              });
+            }).pipe(
+              Effect.scoped,
+              Effect.timeout("8 seconds"),
+              Effect.ignore,
+              Effect.forkIn(lifecycleScope),
+            ),
+          );
+        });
+      return { decorate, stop };
+    })();
   const connect: NeoPiNativeSessionsDependencies["connect"] = (
     profile,
     input,
@@ -3314,6 +3529,12 @@ export const makeNeoPiNativeSessions = Effect.fn("NeoPiNativeSessions.make")(fun
       ),
     catalog,
     invalidateCatalog,
+    ...(managedLifecycle
+      ? {
+          managedLifecycleList: managedLifecycle.decorate,
+          managedStop: managedLifecycle.stop,
+        }
+      : {}),
     connect,
     managedTmuxView: (profile, ref) =>
       Effect.gen(function* () {

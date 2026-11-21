@@ -138,6 +138,17 @@ export function submitNativeForm(
   };
 }
 
+const noNativeFormErrors: NativeFormErrors = {};
+
+export function visibleNativeFormErrors(
+  form: NativeForm,
+  draft: NativeFormDraft,
+  hasInvalidSubmit: boolean,
+): NativeFormErrors {
+  if (!hasInvalidSubmit) return noNativeFormErrors;
+  return submitNativeForm(form, draft).errors ?? noNativeFormErrors;
+}
+
 function formTextValue(
   field: Extract<FormField, { kind: "text" }>,
   text: string,

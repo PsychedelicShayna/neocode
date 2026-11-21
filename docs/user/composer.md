@@ -48,7 +48,8 @@ multi-choice question you can do both, or continue without selecting anything.
 Your message draft is preserved.
 
 In a session NeoCode runs, NeoPi forms also appear above the composer. Fill in
-the required fields, then select **Submit form** or **Dismiss**. If NeoPi
+the required fields, then select **Submit form** or **Dismiss**. Field errors
+first appear after an invalid submission and update as you edit. If NeoPi
 closes the form or its time runs out, the form disappears without sending
 your unfinished edits.
 In terminal-attached sessions, questions and forms stay in the terminal.

@@ -4,6 +4,7 @@ import {
   changeFormChoice,
   defaultFormChoice,
   submitNativeForm,
+  visibleNativeFormErrors,
   type FormBlock,
   type FormField,
 } from "./neopiNativeForm.ts";
@@ -112,6 +113,22 @@ describe("inline NeoPi form", () => {
       title: "database",
       replicas: 2,
     });
+  });
+
+  it("updates visible validation errors as the draft changes after an invalid submit", () => {
+    const form = selectNativeSessionDialog(openForm().dialogs);
+    if (form?.kind !== "form") throw new Error("expected inline form");
+    const invalidDraft = { "0:2": "database", "0:3": "0" };
+    expect(visibleNativeFormErrors(form, invalidDraft, false)).toEqual({});
+
+    const result = submitNativeForm(form, invalidDraft);
+    expect(result.errors).toEqual({ "0:3": "Enter 1 or more." });
+    const hasInvalidSubmit = result.errors !== undefined;
+    expect(visibleNativeFormErrors(form, invalidDraft, hasInvalidSubmit)).toEqual(result.errors);
+    expect(
+      visibleNativeFormErrors(form, { ...invalidDraft, "0:3": "4" }, hasInvalidSubmit),
+    ).toEqual({});
+    expect(visibleNativeFormErrors(form, invalidDraft, hasInvalidSubmit)).toEqual(result.errors);
   });
 
   it("closes the timed form upon the owner's cancellation, without synthesizing a reply", () => {

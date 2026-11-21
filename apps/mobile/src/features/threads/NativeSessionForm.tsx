@@ -5,17 +5,17 @@ import {
   formSpanText,
   nativeFormImageSource,
   submitNativeForm,
+  visibleNativeFormErrors,
   type FormBlock,
   type FormSpan,
   type NativeForm,
   type NativeFormChoice,
   type NativeFormDraft,
-  type NativeFormErrors,
   type NativeFormResponse,
 } from "@t3tools/client-runtime/neopi-native-form";
 import { launchImageLibraryAsync } from "expo-image-picker";
 import { Image } from "expo-image";
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ScrollView, TextInput, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { MaterialButton } from "../../components/MaterialButton";
@@ -112,7 +112,11 @@ export function NativeSessionForm({
   respond: (response: NativeFormResponse) => Promise<unknown>;
 }) {
   const [draft, setDraft] = useState<NativeFormDraft>({});
-  const [errors, setErrors] = useState<NativeFormErrors>({});
+  const [hasInvalidSubmit, setHasInvalidSubmit] = useState(false);
+  const errors = useMemo(
+    () => visibleNativeFormErrors(form, draft, hasInvalidSubmit),
+    [form, draft, hasInvalidSubmit],
+  );
   const [failure, setFailure] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
@@ -135,8 +139,8 @@ export function NativeSessionForm({
   const submit = () => {
     if (picking.current) return;
     const result = submitNativeForm(form, draft);
-    setErrors(result.errors ?? {});
-    if (result.response) void send(result.response);
+    if (result.errors) setHasInvalidSubmit(true);
+    else void send(result.response);
   };
   return (
     <View className="grow-0 border-t border-border bg-card" style={{ maxHeight: "40%" }}>

@@ -5,15 +5,15 @@ import {
   formSpanText,
   nativeFormImageSource,
   submitNativeForm,
+  visibleNativeFormErrors,
   type FormBlock,
   type FormSpan,
   type NativeForm,
   type NativeFormChoice,
   type NativeFormDraft,
-  type NativeFormErrors,
   type NativeFormResponse,
 } from "@t3tools/client-runtime/neopi-native-form";
-import { useId, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import { readFileAsDataUrl } from "../ChatView.logic";
 import { ComposerBanner } from "../chat/ComposerBanner";
 import { Button } from "../ui/button";
@@ -119,7 +119,11 @@ export function NativeSessionForm({
 }) {
   const id = useId();
   const [draft, setDraft] = useState<NativeFormDraft>({});
-  const [errors, setErrors] = useState<NativeFormErrors>({});
+  const [hasInvalidSubmit, setHasInvalidSubmit] = useState(false);
+  const errors = useMemo(
+    () => visibleNativeFormErrors(form, draft, hasInvalidSubmit),
+    [form, draft, hasInvalidSubmit],
+  );
   const [failure, setFailure] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
@@ -142,8 +146,8 @@ export function NativeSessionForm({
   const submit = () => {
     if (imageReads.current) return;
     const result = submitNativeForm(form, draft);
-    setErrors(result.errors ?? {});
-    if (result.response) void send(result.response);
+    if (result.errors) setHasInvalidSubmit(true);
+    else void send(result.response);
   };
   return (
     <div

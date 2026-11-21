@@ -36,6 +36,7 @@ export function NeoPiConversation({
     loadOlder,
     olderAvailable,
     busy,
+    runPaused,
   } = useNeoPiConversation(threadRef);
   useEffect(() => {
     // Any change of the runtime re-reads the binding (a stop must not leave a stale "NeoCode
@@ -141,6 +142,7 @@ export function NeoPiConversation({
         <NativeTimelineView
           rows={rows}
           busy={busy === true}
+          runPaused={runPaused}
           {...(assistantName ? { assistantName } : {})}
           environmentId={threadRef.environmentId}
           projectId={projectId}

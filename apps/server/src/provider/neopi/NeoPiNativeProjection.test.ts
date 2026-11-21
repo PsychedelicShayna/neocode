@@ -101,7 +101,7 @@ describe("NeoPiNativeProjection", () => {
     },
   );
 
-  it("preserves append provenance across text deltas, but not replacement snapshots or end", () => {
+  it("preserves text append provenance across streaming deltas, but not replacement snapshots or end", () => {
     const projection = published();
     const messageId = "live";
     projection.fold({ type: "message_start", messageId, message: assistant("First") });
@@ -114,6 +114,32 @@ describe("NeoPiNativeProjection", () => {
       assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " paragraph" },
     });
     assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial);
+    const content: Record<string, unknown>[] = assistant("First paragraph").content;
+    for (const event of [
+      {
+        type: "thinking_delta",
+        block: { type: "thinking", thinking: "Considering next steps." },
+        delta: "Considering next steps.",
+      },
+      {
+        type: "toolcall_delta",
+        block: { type: "toolCall", id: "call", name: "read", arguments: { path: "src" } },
+        delta: '{"path":"src',
+      },
+    ]) {
+      content.push(event.block);
+      projection.fold({
+        type: "message_update",
+        messageId,
+        message: { role: "assistant", content: [...content] },
+        assistantMessageEvent: {
+          type: event.type,
+          contentIndex: content.length - 1,
+          delta: event.delta,
+        },
+      });
+      assert.equal(servedMessage(projection, messageId)?.textAppendGeneration, initial, event.type);
+    }
     projection.fold({
       type: "message_start",
       messageId,

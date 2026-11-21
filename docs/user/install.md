@@ -395,10 +395,10 @@ prompt. Unknown entry types and extension content remain available as canonical
 JSON alongside native text, images, reasoning and tool records.
 
 Under **Settings → General → Response streaming**, choose **Show finished paragraphs**
-to reveal each completed paragraph or code block while NeoPi works. Any remaining
-text already received appears when the message or run ends, even if the session
-owner disconnects. Native sessions without a saved project use their environment's
-setting.
+to reveal each completed paragraph or code block while NeoPi works. Unfinished
+text stays hidden while the run pauses to continue or wait for background work.
+It appears when the message or run finishes. Native sessions without a saved
+project use their environment's setting.
 
 In a thread's right panel, choose **Session tree** to inspect alternate branches.
 Filter tools and system events, search loaded entries, and

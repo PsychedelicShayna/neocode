@@ -279,7 +279,8 @@ function projectParagraph(
         previous.row.textAppendGeneration === row.textAppendGeneration &&
         row.text.length >= previous.row.text.length));
   const scan = appended ? previous.scan : createAssistantParagraphScanner();
-  const boundary = appended && previous.row === row ? previous.boundary : scan(row.text);
+  const boundary =
+    appended && row.text.length === previous.row.text.length ? previous.boundary : scan(row.text);
   const sameText = appended && boundary === previous.boundary;
   const text = sameText ? (previous.entry?.message.text ?? "") : row.text.slice(0, boundary);
   const entry =

@@ -1521,15 +1521,22 @@ export class NeoPiNativeProjection {
     const { message, stopOutcome } = observeNeoPiMessage(native);
     this.#lastMessageId = messageId;
     const assistantEvent = asRecord(frame.assistantMessageEvent);
-    // Only the native text-delta event guarantees the snapshot extends its
-    // previous open text. Starts, replacements, and rebuilds get a new key.
+    const eventType = assistantEvent?.type;
+    // Text deltas append to a text block. Thinking and tool-call events touch
+    // only their own blocks, so they do not invalidate the text prefix.
+    // Starts, replacement snapshots, and unrecognized updates get a new key.
     const textAppendGeneration =
       type === "message_end" || message.role !== "assistant"
         ? undefined
         : (type === "message_update" &&
             frame.snapshot !== true &&
-            assistantEvent?.type === "text_delta" &&
-            typeof assistantEvent.delta === "string" &&
+            ((eventType === "text_delta" && typeof assistantEvent?.delta === "string") ||
+              eventType === "thinking_start" ||
+              eventType === "thinking_delta" ||
+              eventType === "thinking_end" ||
+              eventType === "toolcall_start" ||
+              eventType === "toolcall_delta" ||
+              eventType === "toolcall_end") &&
             held?.class === "message" &&
             held.textAppendGeneration) ||
           NodeCrypto.randomUUID();

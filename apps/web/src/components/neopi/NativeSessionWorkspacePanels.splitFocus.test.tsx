@@ -123,12 +123,17 @@ async function mount(terminalOpen: boolean) {
   });
 }
 
-async function submit(command: string, key = "Enter") {
+async function openExLine() {
   // Use the registered command directly: the default keybinding deliberately
   // leaves Ctrl+; to the shell while terminal focus is active.
   await act(() => runCommand("exLine.open"));
   const input = host.querySelector<HTMLInputElement>('input[aria-label="Command"]')!;
   expect(document.activeElement).toBe(input);
+  return input;
+}
+
+async function submit(command: string, key = "Enter") {
+  const input = await openExLine();
   act(() => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, command);
     input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -137,6 +142,24 @@ async function submit(command: string, key = "Enter") {
     input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
     document.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
   });
+}
+
+function escapeTerminal(terminal: HTMLTextAreaElement) {
+  terminal.focus();
+  act(() => {
+    for (let i = 0; i < 2; i++) {
+      terminal.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "\\",
+          code: "Backslash",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    }
+  });
+  expect(document.activeElement).toBe(document.body);
 }
 
 it.each([
@@ -198,21 +221,7 @@ it.each([
   async (command, key, interveningFocus, returnsToTerminal) => {
     await mount(true);
     const terminal = host.querySelector<HTMLTextAreaElement>("[data-terminal-id] textarea")!;
-    terminal.focus();
-    act(() => {
-      for (let i = 0; i < 2; i++) {
-        terminal.dispatchEvent(
-          new KeyboardEvent("keydown", {
-            key: "\\",
-            code: "Backslash",
-            ctrlKey: true,
-            bubbles: true,
-            cancelable: true,
-          }),
-        );
-      }
-    });
-    expect(document.activeElement).toBe(document.body);
+    escapeTerminal(terminal);
     if (interveningFocus) {
       const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
       composer.focus();
@@ -223,3 +232,34 @@ it.each([
     expect(document.activeElement).toBe(returnsToTerminal ? terminal : document.body);
   },
 );
+
+it("does not restore the escaped terminal after focus moves to the composer and back to Ex", async () => {
+  await mount(true);
+  const terminal = host.querySelector<HTMLTextAreaElement>("[data-terminal-id] textarea")!;
+  const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
+  escapeTerminal(terminal);
+  const ex = await openExLine();
+  composer.focus();
+  expect(document.activeElement).toBe(composer);
+  expect(ex.isConnected).toBe(true);
+  await submit("split");
+  expect(host.querySelectorAll("[data-terminal-id]")).toHaveLength(2);
+  expect(document.activeElement).toBe(document.body);
+});
+
+it("splits the terminal focused after Ex opened, not the terminal that was escaped", async () => {
+  useRightPanelStore.getState().openTerminal(target, "panel-shell");
+  await mount(true);
+  const drawer = host.querySelector<HTMLElement>('[data-terminal-owner="drawer"]')!;
+  const panel = document.querySelector<HTMLElement>('[data-terminal-owner="right-panel"]')!;
+  const escaped = drawer.querySelector<HTMLTextAreaElement>("[data-terminal-id] textarea")!;
+  const lastFocused = panel.querySelector<HTMLTextAreaElement>("[data-terminal-id] textarea")!;
+  escapeTerminal(escaped);
+  const ex = await openExLine();
+  act(() => lastFocused.focus());
+  expect(document.activeElement).toBe(lastFocused);
+  expect(ex.isConnected).toBe(true);
+  await submit("split");
+  expect(panel.querySelectorAll("[data-terminal-id]")).toHaveLength(2);
+  expect(drawer.querySelectorAll("[data-terminal-id]")).toHaveLength(1);
+});

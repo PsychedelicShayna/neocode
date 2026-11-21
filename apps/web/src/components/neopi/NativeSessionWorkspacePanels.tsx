@@ -369,19 +369,24 @@ export function NativeSessionWorkspacePanels({
     const focusNewTerminal = invocation === undefined;
     const located = locateTerminal(invocation);
     if (located?.surfaceId) {
-      useRightPanelStore.getState().activateSurface(target, located.surfaceId);
-      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction, focusNewTerminal);
+      // Reopening a sheet captures the keyboard, and a maximized panel
+      // would hide the origin. Split the hidden terminal without revealing it.
+      const reveal = panel.isOpen || (!sheet && !maximized);
+      panelControllers.current.get(located.surfaceId)?.splitTerminal(direction, {
+        focusNewTerminal,
+        reveal,
+      });
       return;
     }
     if (located) {
       useTerminalUiStateStore.getState().setActiveTerminal(target, located.terminalId);
       useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-      drawerRef.current?.splitTerminal(direction, focusNewTerminal);
+      drawerRef.current?.splitTerminal(direction, { focusNewTerminal });
       return;
     }
     if (getTerminalFocusOwner() !== "right-panel")
       useTerminalUiStateStore.getState().setTerminalOpen(target, true);
-    focusedTerminalController()?.splitTerminal(direction, focusNewTerminal);
+    focusedTerminalController()?.splitTerminal(direction, { focusNewTerminal });
   };
   useCommandHandlers("workspace", {
     "terminal.toggle": {

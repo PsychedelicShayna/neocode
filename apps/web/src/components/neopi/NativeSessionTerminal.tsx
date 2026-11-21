@@ -25,9 +25,14 @@ import {
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import { closeNativeTerminal } from "./closeNativeTerminal";
 
+interface TerminalSplitOptions {
+  readonly focusNewTerminal?: boolean;
+  readonly reveal?: boolean;
+}
+
 export interface NativeSessionTerminalHandle {
   newTerminal: () => void;
-  splitTerminal: (direction?: "horizontal" | "vertical", focusNewTerminal?: boolean) => void;
+  splitTerminal: (direction?: "horizontal" | "vertical", options?: TerminalSplitOptions) => void;
   closeActiveTerminal: () => void;
   /** Closes one terminal after the same confirmation `closeActiveTerminal` asks for. */
   closeTerminal: (terminalId: string) => void;
@@ -192,7 +197,8 @@ function NativeSessionTerminalBody({
   );
 
   const createTerminal = useCallback(
-    (kind: "new" | "horizontal" | "vertical", focusNewTerminal = true) => {
+    (kind: "new" | "horizontal" | "vertical", options?: TerminalSplitOptions) => {
+      const { focusNewTerminal = true, reveal = true } = options ?? {};
       const store = useTerminalUiStateStore.getState();
       const current = selectThreadTerminalUiState(store.terminalUiStateByThreadKey, target);
       const terminalId = nextTerminalId([
@@ -203,13 +209,17 @@ function NativeSessionTerminalBody({
       if (surface) {
         const panels = useRightPanelStore.getState();
         if (kind === "new") panels.openTerminal(target, terminalId);
-        else panels.splitTerminal(target, surface.id, terminalId, kind, focusNewTerminal);
+        else
+          panels.splitTerminal(target, surface.id, terminalId, kind, {
+            activate: focusNewTerminal,
+            reveal,
+          });
       } else if (kind === "new") store.newTerminal(target, terminalId);
       else if (kind === "vertical")
         store.splitTerminalVertical(target, terminalId, focusNewTerminal);
       else store.splitTerminal(target, terminalId, focusNewTerminal);
       if (focusNewTerminal) requestFocus();
-      else setAutoFocus(false);
+      else if (reveal) setAutoFocus(false);
       void openTerminal({
         environmentId: target.environmentId,
         input: { threadId, terminalId, cwd, providerInstanceId: target.ref.providerInstanceId },
@@ -243,8 +253,7 @@ function NativeSessionTerminalBody({
     };
     return {
       newTerminal: () => createTerminal("new"),
-      splitTerminal: (direction = "horizontal", focusNewTerminal) =>
-        createTerminal(direction, focusNewTerminal),
+      splitTerminal: (direction = "horizontal", options) => createTerminal(direction, options),
       closeActiveTerminal: () => confirmAndClose(activeTerminalId),
       closeTerminal: confirmAndClose,
     };

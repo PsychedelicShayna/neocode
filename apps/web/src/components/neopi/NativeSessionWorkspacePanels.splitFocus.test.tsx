@@ -6,11 +6,15 @@ import { act, createRef, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import { runCommand } from "~/commandTable";
-import { useRightPanelStore } from "~/rightPanelStore";
+import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "~/rightPanelLayout";
+import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 import { useTerminalUiStateStore } from "~/terminalUiStateStore";
 import { NativeSessionWorkspacePanels } from "./NativeSessionWorkspacePanels";
 
-vi.mock("~/hooks/useMediaQuery", () => ({ useMediaQuery: () => false }));
+const media = vi.hoisted(() => ({ narrow: false }));
+vi.mock("~/hooks/useMediaQuery", () => ({
+  useMediaQuery: (query: string) => query === RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY && media.narrow,
+}));
 vi.mock("~/state/terminalSessions", () => ({
   useKnownTerminalSessions: () => [],
   useAttachedTerminalSession: () => ({
@@ -62,6 +66,7 @@ let root: Root;
 let host: HTMLDivElement;
 
 beforeEach(() => {
+  media.narrow = false;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("localStorage", window.localStorage);
   useTerminalUiStateStore.setState({
@@ -109,18 +114,7 @@ async function mount(terminalOpen: boolean) {
   });
 }
 
-it.each([
-  ["split", "composer"],
-  ["split", "terminal"],
-  ["vsplit", "composer"],
-  ["vsplit", "terminal"],
-] as const)(":%s opens a new pane without moving focus from the %s", async (command, origin) => {
-  await mount(origin === "terminal");
-  const original = host.querySelector<HTMLElement>(
-    origin === "terminal" ? "[data-terminal-id] textarea" : '[aria-label="Composer"]',
-  );
-  expect(original).not.toBeNull();
-  original!.focus();
+async function submit(command: string) {
   // Use the registered command directly: the default keybinding deliberately
   // leaves Ctrl+; to the shell while terminal focus is active.
   await act(() => runCommand("exLine.open"));
@@ -136,6 +130,46 @@ it.each([
     );
     document.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
   });
+}
+
+it.each([
+  ["split", "composer"],
+  ["split", "terminal"],
+  ["vsplit", "composer"],
+  ["vsplit", "terminal"],
+] as const)(":%s opens a new pane without moving focus from the %s", async (command, origin) => {
+  await mount(origin === "terminal");
+  const original = host.querySelector<HTMLElement>(
+    origin === "terminal" ? "[data-terminal-id] textarea" : '[aria-label="Composer"]',
+  );
+  expect(original).not.toBeNull();
+  original!.focus();
+  await submit(command);
   expect(host.querySelectorAll("[data-terminal-id]")).toHaveLength(2);
   expect(document.activeElement).toBe(original);
+});
+
+it("splits the last-focused terminal without reopening its closed right-panel sheet", async () => {
+  media.narrow = true;
+  useRightPanelStore.getState().openTerminal(target, "panel-shell");
+  await mount(false);
+  const panelInput = document.querySelector<HTMLTextAreaElement>(
+    '[data-terminal-id="panel-shell"] textarea',
+  );
+  expect(panelInput).not.toBeNull();
+  act(() => panelInput!.focus());
+  expect(document.activeElement).toBe(panelInput);
+  await act(() => runCommand("rightPanel.toggle"));
+  const composer = host.querySelector<HTMLTextAreaElement>('[aria-label="Composer"]')!;
+  composer.focus();
+  await submit("split");
+  const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, target);
+  expect(panel.surfaces).toEqual([
+    expect.objectContaining({
+      terminalIds: ["panel-shell", expect.any(String)],
+      activeTerminalId: "panel-shell",
+    }),
+  ]);
+  expect(panel.isOpen).toBe(false);
+  expect(document.activeElement).toBe(composer);
 });

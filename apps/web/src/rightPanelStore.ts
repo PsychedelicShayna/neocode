@@ -157,7 +157,7 @@ interface RightPanelStoreState {
     surfaceId: string,
     terminalId: string,
     direction?: "horizontal" | "vertical",
-    activate?: boolean,
+    options?: { readonly activate?: boolean; readonly reveal?: boolean },
   ) => void;
   activateTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
   closeTerminal: (ref: WorkspaceRef, surfaceId: string, terminalId: string) => void;
@@ -642,12 +642,12 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             upsertSurface(current, terminalSurface(terminalId)),
           ),
         ),
-      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal", activate = true) =>
+      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal", options) =>
         set((state) =>
           userAction(state, workspaceKey(ref), (current) => ({
             ...current,
-            isOpen: true,
-            activeSurfaceId: surfaceId,
+            isOpen: options?.reveal === false ? current.isOpen : true,
+            activeSurfaceId: options?.reveal === false ? current.activeSurfaceId : surfaceId,
             surfaces: current.surfaces.map((surface) => {
               if (surface.id !== surfaceId || surface.kind !== "terminal") return surface;
               const { splitDirection: _splitDirection, ...baseSurface } = surface;
@@ -656,7 +656,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
                 terminalIds: surface.terminalIds.includes(terminalId)
                   ? surface.terminalIds
                   : [...surface.terminalIds, terminalId],
-                activeTerminalId: activate ? terminalId : surface.activeTerminalId,
+                activeTerminalId:
+                  options?.activate === false ? surface.activeTerminalId : terminalId,
                 ...(direction === "vertical" ? { splitDirection: "vertical" as const } : {}),
               };
             }),

@@ -163,8 +163,9 @@ request. Hover a row or right-click it to **Settle** or **Un-settle** it; sessio
 working or waiting cannot be settled. A settled session returns on its own when it becomes
 busy or gets new activity. Settling persists on the server, so it follows you across
 devices. **Working** means the NeoPi process running the session is streaming a reply or
-compacting; **Waiting** means it has a question, approval or plan review open. Panes you
-opened yourself, a queued message, and sessions with no running NeoPi show neither. A
+compacting; **Waiting** means it has a question, approval or plan review open. An open
+session's sidebar status updates with its session tab. Panes you opened yourself, a
+queued message, and sessions with no running NeoPi show neither. A
 session open in a terminal on a NeoPi older than the one NeoCode follows cannot be opened
 here until you restart it. Search lists matches from every section in one list.
 

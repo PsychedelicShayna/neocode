@@ -31,6 +31,7 @@ import {
   NATIVE_INBOX_LIMIT,
   emptyNativeSessionFeed,
   nativeObservationStatus,
+  nativeSessionKey,
   nativeTranscriptRows,
   reduceNativeSessionFeed,
   type NativeSession,
@@ -282,6 +283,61 @@ const makeHarness = Effect.fn("NativeObservationTest.makeHarness")(function* (
 });
 
 describe("native observation controller", () => {
+  it.effect("publishes sidebar activity from the view's lease without opening another", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const activity = h.atoms.activity(h.target.environmentId);
+        const key = nativeSessionKey(h.target);
+        const waitFor = (status: "idle" | "working" | "waiting" | undefined) =>
+          AtomRegistry.toStream(h.registry, activity).pipe(
+            Stream.filter((current) => current.get(key) === status),
+            Stream.runHead,
+            Effect.asVoid,
+          );
+        yield* AtomRegistry.mount(h.registry, activity);
+        expect(h.registry.get(activity).size).toBe(0);
+        expect(h.counts().active).toBe(0);
+
+        const unmount = h.registry.mount(h.watch);
+        const lease = yield* Queue.take(h.leases);
+        yield* waitFor("idle");
+        yield* lease.push({
+          type: "status",
+          revision: h.nextRevision(),
+          live: { state: "busy", isStreaming: true, pendingDialogs: 0, branch: null },
+        });
+        yield* waitFor("working");
+        yield* lease.push({
+          type: "obligation-opened",
+          revision: h.nextRevision(),
+          id: "question",
+          request: { type: "extension_ui_request", id: "question", method: "select" },
+        });
+        yield* waitFor("waiting");
+        yield* Effect.promise(() =>
+          h.atoms.request.run(h.registry, {
+            environmentId: h.target.environmentId,
+            input: { ref, command: { type: "extension_ui_response", id: "question" } },
+          }),
+        );
+        yield* waitFor("working");
+        yield* lease.push({
+          type: "status",
+          revision: h.nextRevision(),
+          live: { state: "idle", isStreaming: false, pendingDialogs: 0, branch: null },
+        });
+        yield* waitFor("idle");
+
+        expect(h.counts()).toEqual({ opens: 0, prompts: 0, active: 1 });
+        unmount();
+        yield* waitFor(undefined);
+        yield* Deferred.await(lease.released);
+        expect(h.counts().active).toBe(0);
+      }),
+    ),
+  );
+
   it.effect("does not create orphan feeds for commands without an observation", () =>
     Effect.scoped(
       Effect.gen(function* () {

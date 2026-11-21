@@ -1,4 +1,5 @@
 import type { NeoPiManagedSessionLifecycle, NeoPiNativeSessionSummary } from "@t3tools/contracts";
+import type { NativeSessionFeed } from "./neopiNativeSessions.ts";
 
 /**
  * What a native session asks of the user right now: `waiting` is blocked on
@@ -7,6 +8,22 @@ import type { NeoPiManagedSessionLifecycle, NeoPiNativeSessionSummary } from "@t
  * `working` choose a section; `done` marks a row within recent history.
  */
 export type NativeSessionStatus = "waiting" | "done" | "working" | "idle";
+
+export type NativeSessionActivity =
+  | "waiting"
+  | "working"
+  | "idle"
+  | NonNullable<NativeSessionFeed["runPause"]>;
+
+/** Use the live observation only while it describes the current connected owner. */
+export function observedNativeSessionActivity(
+  feed: NativeSessionFeed,
+): NativeSessionActivity | undefined {
+  if (!feed.connected || feed.movedTo) return undefined;
+  if (feed.dialogs.length > 0) return "waiting";
+  if (feed.busy) return "working";
+  return feed.runPause ?? "idle";
+}
 
 const MANAGED_STOP_LABEL = {
   requested: "Stop requested",
@@ -62,10 +79,12 @@ export function resolveNativeSessionStatus(
   session: NativeSessionSummaryLike,
   visits: NativeSessionVisitState,
   isOpen: boolean,
+  observed?: NativeSessionActivity,
 ): NativeSessionStatus {
-  const live = session.live?.state;
+  const live = observed ?? session.live?.state;
   if (live === "waiting") return "waiting";
-  if (live === "busy") return "working";
+  if (live === "busy" || live === "working" || live === "continuation" || live === "async-work")
+    return "working";
   if (isOpen) return "idle";
   const seen = visits.visited[session.ref.sessionFile] ?? visits.baseline;
   return toMs(session.modifiedAt) > toMs(seen) ? "done" : "idle";
@@ -75,9 +94,6 @@ export function nativeSessionSection(
   session: NativeSessionSummaryLike,
   status: NativeSessionStatus,
 ): NativeSessionSection {
-  // The server wakes a settled session the moment its owner gets busy or
-  // blocked, so a settled stamp here always means history.
-  if (session.settledAt !== undefined) return "settled";
   switch (status) {
     case "waiting":
       return "attention";
@@ -85,7 +101,8 @@ export function nativeSessionSection(
       return "working";
     case "done":
     case "idle":
-      return "recent";
+      // Live work may have woken the row before the catalog clears its shelf stamp.
+      return session.settledAt === undefined ? "recent" : "settled";
   }
 }
 
@@ -108,6 +125,7 @@ export function partitionNativeSessions<S extends NativeSessionSummaryLike>(
   sessions: ReadonlyArray<S>,
   visits: NativeSessionVisitState,
   openSessionFile: string | null,
+  activityOf?: (ref: NativeSessionSummaryLike["ref"]) => NativeSessionActivity | undefined,
 ): NativeSessionSections<S> {
   const attention: Array<NativeSessionEntry<S>> = [];
   const working: Array<NativeSessionEntry<S>> = [];
@@ -118,6 +136,7 @@ export function partitionNativeSessions<S extends NativeSessionSummaryLike>(
       session,
       visits,
       session.ref.sessionFile === openSessionFile,
+      activityOf?.(session.ref),
     );
     const section = nativeSessionSection(session, status);
     const target =

@@ -140,6 +140,25 @@ describe("partitionNativeSessions", () => {
   it("orders the settled shelf by settle time", () => {
     expect(files(sections.settled)).toEqual(["/settled-late.jsonl", "/settled-early.jsonl"]);
   });
+
+  it("follows run start, answer and run end before the next catalog response", () => {
+    const file = "/open.jsonl";
+    const modifiedAt = "2026-11-02T00:00:00Z";
+    const catalog = (state: "idle" | "waiting" | "busy") =>
+      session(file, modifiedAt, { live: live(state) });
+
+    const started = partitionNativeSessions([catalog("idle")], visits, file, () => "working");
+    expect(started.working[0]?.status).toBe("working");
+
+    const asked = partitionNativeSessions([catalog("busy")], visits, file, () => "waiting");
+    expect(asked.attention[0]?.status).toBe("waiting");
+
+    const answered = partitionNativeSessions([catalog("waiting")], visits, file, () => "working");
+    expect(answered.working[0]?.status).toBe("working");
+
+    const ended = partitionNativeSessions([catalog("busy")], visits, file, () => "idle");
+    expect(ended.recent[0]?.status).toBe("idle");
+  });
 });
 
 describe("nativeSessionProjectLabel", () => {
